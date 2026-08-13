@@ -2,11 +2,21 @@
 name = "slither"
 version = "0.1.0"
 edition = "2024"
-# Tracks the bubble / hiss MSRV (edition 2024, MSRV 1.96).
+# Tracks the hiss MSRV (edition 2024, MSRV 1.96) — same policy: a recent
+# stable, floored at `stable - 3`, bumped in lockstep with the `msrv` CI job.
 rust-version = "1.96"
-publish = false
+authors = ["Nicolas Di Prima <nicolas@primetype.co.uk>"]
 license = "MIT OR Apache-2.0"
-description = "A WireGuard-shaped Noise-over-UDP packet layer — an authenticated, encrypted datagram session built on the hiss datagram transport (IK over P-256 / ChaCha20-Poly1305 / BLAKE2b) — carrying a QUIC-shaped reliable frame layer inside the sealed packets (frames, ACK ranges, RFC 9002 loss detection + PTO; Leg 2, ratified)."
+description = "A WireGuard-shaped Noise-over-UDP packet layer carrying a QUIC-shaped reliable frame layer, built on the hiss Noise framework (IK over P-256 / ChaCha20-Poly1305 / BLAKE2b)."
+readme = "README.md"
+repository = "https://github.com/primetype/slither"
+homepage = "https://github.com/primetype/slither"
+documentation = "https://docs.rs/slither"
+keywords = ["noise", "udp", "wireguard", "quic", "datagram"]
+categories = ["cryptography", "network-programming"]
+# Repo infrastructure ships nothing to a consumer; SPEC.md ships on purpose —
+# it is the ratified protocol the rustdoc points at.
+exclude = ["/.github", "/CLAUDE.md", "/deny.toml", "/.gitignore", "/.serena"]
 
 # A library only. It holds the packet layer — the packtool wire headers, the mac1
 # DoS gate, the IK handshake driving (fresh-ephemeral retransmit), the datagram
@@ -14,12 +24,17 @@ description = "A WireGuard-shaped Noise-over-UDP packet layer — an authenticat
 # endpoint actor behind a `Wire` trait — plus the Leg 2 frame layer riding inside
 # the sealed plaintext (frame codec, ACK generation off the replay window, RFC
 # 9002 recovery; no congestion control, streams, or fragmentation — reserved).
-# It has ZERO `bubble-*` dependencies — extracted from the bubble-reboot
-# workspace into its own repository (2026/08/13); bubble consumes it as a
-# sibling path dependency.
+# An independent crate (extracted from the bubble-reboot workspace 2026/08/13):
+# every dependency resolves from crates.io, and nothing `bubble-*` appears here.
 [lib]
 name = "slither"
 path = "src/lib.rs"
+
+# docs.rs builds with every feature so the `testutil` module (the `FlakyWire`
+# in-memory network and the counting identity, behind `test-util`) is
+# documented — it is a consumer-facing surface, not test-only plumbing.
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Exposes the `testutil` module (the `FlakyWire` shim + the counting identity) in

@@ -41,10 +41,12 @@
 //! Every constant below is frozen in `slither/SPEC.md`; the code must match
 //! the spec. See [`wire`] for the byte layouts.
 //!
-//! # Extractability
+//! # Independence
 //!
-//! slither has **zero `bubble-*` dependencies** — it can live outside Bubble and
-//! become its own crate by deleting one line from the workspace manifest.
+//! slither is its own crate with **zero `bubble-*` dependencies** — everything
+//! it needs resolves from crates.io (`hiss`, `cryptoxide`, `packtool`,
+//! `tokio`), and nothing here assumes a host beyond a current-thread tokio
+//! runtime to run the endpoint actor on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

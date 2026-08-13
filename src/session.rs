@@ -2,7 +2,7 @@
 //! 6479-style anti-replay window, endpoint roaming, and the WireGuard timers.
 //!
 //! A [`Session`] wraps the crypto outputs of a completed handshake
-//! ([`Established`](crate::handshake::Established)) with the state a live datagram
+//! ([`Established`]) with the state a live datagram
 //! flow needs. It is transport-agnostic — it produces and consumes packet
 //! **bytes**; the [`endpoint`](crate::endpoint) actor moves them over the
 //! [`Wire`](crate::endpoint::Wire).
@@ -202,7 +202,7 @@ impl Session {
     ///
     /// Errors if `plaintext` exceeds [`MAX_PLAINTEXT`]. The Data header carries
     /// the exact hiss send counter, which is the AEAD associated data — the
-    /// counter is predicted from the mirrored [`next_counter`](Self::next_counter)
+    /// counter is predicted from the mirrored `next_counter`
     /// and asserted against the value `encrypt_next` returns.
     pub fn seal(&mut self, plaintext: &[u8], now: Instant) -> Result<Vec<u8>, SessionError> {
         let packet = self.seal_inner(plaintext)?;

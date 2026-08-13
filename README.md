@@ -81,9 +81,9 @@ one test uses a real UDP loopback socket.
 **Leg 1 — the sealed packet layer:** every wire constant is **ratified**
 (2026/07/16) and frozen in [`SPEC.md`](SPEC.md) §§1–8. **Leg 2 — the reliable
 frame layer:** built and **ratified** (2026/07/17), every frame layout and
-constant frozen in [`SPEC.md`](SPEC.md) §9. slither has **zero
-`bubble-*` dependencies** and is extractable to its own repo by deleting one
-line from the workspace manifest.
+constant frozen in [`SPEC.md`](SPEC.md) §9. slither is an **independent
+crate** with zero `bubble-*` dependencies — everything it needs resolves from
+crates.io.
 
 ## License
 

@@ -158,9 +158,9 @@ pub enum Event {
 // ── The Wire seam ─────────────────────────────────────────────────────────────
 
 /// The datagram substrate the endpoint runs over — a real UDP socket in
-/// production, an in-memory shim ([`testutil::FlakyWire`](crate::testutil)) in
-/// tests. Making the socket a trait keeps the whole protocol drivable without a
-/// kernel (the testability-first rule).
+/// production, an in-memory shim (`testutil::FlakyWire`, behind the
+/// `test-util` feature) in tests. Making the socket a trait keeps the whole
+/// protocol drivable without a kernel (the testability-first rule).
 #[allow(async_fn_in_trait)] // the actor is single-threaded; no cross-thread Send bound is needed.
 pub trait Wire {
     /// Send `buf` to `addr`, returning the bytes written.
