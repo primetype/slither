@@ -1,0 +1,96 @@
+[package]
+name = "slither"
+version = "0.1.0"
+edition = "2024"
+# Tracks the bubble / hiss MSRV (edition 2024, MSRV 1.96).
+rust-version = "1.96"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A WireGuard-shaped Noise-over-UDP packet layer — an authenticated, encrypted datagram session built on the hiss datagram transport (IK over P-256 / ChaCha20-Poly1305 / BLAKE2b) — carrying a QUIC-shaped reliable frame layer inside the sealed packets (frames, ACK ranges, RFC 9002 loss detection + PTO; Leg 2, ratified)."
+
+# A library only. It holds the packet layer — the packtool wire headers, the mac1
+# DoS gate, the IK handshake driving (fresh-ephemeral retransmit), the datagram
+# session (replay window, WireGuard timers, roaming, rekey), and the tokio UDP
+# endpoint actor behind a `Wire` trait — plus the Leg 2 frame layer riding inside
+# the sealed plaintext (frame codec, ACK generation off the replay window, RFC
+# 9002 recovery; no congestion control, streams, or fragmentation — reserved).
+# It has ZERO `bubble-*` dependencies — extracted from the bubble-reboot
+# workspace into its own repository (2026/08/13); bubble consumes it as a
+# sibling path dependency.
+[lib]
+name = "slither"
+path = "src/lib.rs"
+
+[features]
+# Exposes the `testutil` module (the `FlakyWire` shim + the counting identity) in
+# non-test builds, so the Leg 2 reliable-frame crate can drive slither over the
+# same in-memory network. Off by default; slither's own tests pull it in
+# implicitly via `cfg(test)`.
+test-util = []
+
+[dependencies]
+# The Noise handshake and the sealed datagram transport. slither declares its IK
+# handshake (P-256, msg1 carrying the 12-byte timestamp payload) via the `noise!`
+# macro — hiss generates fixed-size sans-io state machines, so the messages frame
+# straight into slither's packets — then rides the datagram mode
+# (`Transport::into_datagram` → `DatagramSend`/`DatagramRecv`) for every Data
+# packet: the send half owns the monotonic counter that slither puts in its
+# packet header, the recv half is stateless so replay rejection is slither's
+# duty. Also supplies `P256`, the P-256 key types, the `DhProvider<P256>` seam
+# (so a hardware static could drive it one day), the software `EphemeralOnly`
+# provider, and `SessionId`. `default-features = false` keeps hiss to the P-256
+# surface slither names — the `x25519-cryptoxide` default backs a curve slither
+# never touches, and the classic I/O drivers are unused (sans-io needs neither).
+hiss = { path = "../rename", default-features = false }
+
+# Keyed BLAKE2b for mac1 ONLY (the day-one DoS gate: the raw primitive that keys a
+# cheap tag off the recipient's public static so a garbage flood is dropped before
+# any curve/DH work). Taken from cryptoxide DIRECTLY per the raw-primitive rule —
+# NOT via `hiss::noise::*` — and pinned to EXACTLY the version hiss uses (0.5.1,
+# verified against hiss's Cargo.toml). `default-features = false, features =
+# ["blake2"]` is the minimal surface: only the `Blake2b`/keyed-`Blake2b` primitive,
+# none of cryptoxide's other ciphers or KDFs. No RustCrypto for any slither
+# cryptography.
+cryptoxide = { version = "0.5.1", default-features = false, features = ["blake2"] }
+
+# The fixed-size, const-`SIZE`-pinned wire headers (`InitHeader`/`RespHeader`/
+# `DataHeader`). Each header is a `#[derive(Packed)]` struct with byte-array fields
+# whose multi-byte integers slither encodes big-endian itself (packtool packs raw
+# integers little-endian; the wire is big-endian, so the header fields are `[u8; N]`
+# filled via `to_be_bytes`). The maintainer's crate; pinned to 0.6.
+packtool = "0.6"
+
+# The async runtime pieces the UDP endpoint actor needs: `net` for the
+# `tokio::net::UdpSocket` behind the `Wire` trait, `time` for the retransmit /
+# keepalive / liveness / rekey timers, and `sync` for the mpsc command + event
+# channels that connect the `!Send` actor to its handles, and `macros` for the `select!`
+# the actor's event loop is built on (inbound datagrams, handle commands, and the timer
+# tick, raced on one task). slither provides no runtime of its own; the actor runs on the
+# consumer's current-thread runtime (a `LocalSet`, like the `!Send` island transport in
+# `bubble-client`).
+tokio = { version = "1", features = ["net", "time", "sync", "macros"] }
+
+# Typed, structured errors for the public surface (callers match on `SlitherError`
+# / `ConnectError` variants). A library, so `thiserror`, not `anyhow`.
+thiserror = "2"
+
+# CSPRNG plumbing for the handshake ephemerals and the retransmit jitter: the
+# software identity seeds a fresh `ChaCha20Rng` per handshake attempt (a FRESH
+# ephemeral every retransmit is a WireGuard requirement) and draws the uniform
+# jitter (≤ 333 ms) from the same stream. NOT a crypto crate in the Bubble sense —
+# it carries no key material and performs no slither cryptography; every Noise/curve
+# operation flows through `hiss`. Pinned to match `bubble-client`.
+rand_chacha = "0.9"
+rand_core = { version = "0.9", features = ["os_rng"] }
+
+# Structured diagnostics (the workspace convention): the DoS-gate drop counters, the
+# roaming trace, the unlisted-static reject, and the handshake give-up all surface
+# as `tracing` events rather than logs, so a host can wire them to its subscriber.
+tracing = "0.1"
+
+[dev-dependencies]
+# NOT a new crate — `tokio` is already a dependency above. This dev-only entry adds
+# `test-util` (the PAUSED CLOCK the timer tests drive: retransmit at 5 s, give-up at
+# 90 s, keepalive at 10 s, Dead at 15 s, rekey at 120 s — all in virtual time), plus
+# `rt`/`macros` for `#[tokio::test]`.
+tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net", "sync"] }
