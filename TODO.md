@@ -51,9 +51,12 @@ throughout. Wire bytes do not move in phases 1–3.
 
    Dropping the object at any stage = silent reject (nothing transmitted).
    Accept queue parks **stage-0 objects only** (raw ~196 B + addr), bounded,
-   overflow drops silently; dedup by `(source addr, sender_index)`
-   replace-with-newest (retransmits keep the index, refresh ephemeral +
-   timestamp); each `Intro` carries a deadline (initiator gives up at 90 s).
+   overflow drops silently; dedup by **source addr alone**, replace-with-newest
+   (CORRECTED 2026-08-13: SPEC §5 Initiator 2 ratifies a completely fresh
+   initiation per retransmit — new ephemeral, NEW index, new timestamp — so an
+   index-bearing dedup key would never match; the earlier parenthetical here
+   claiming retransmits keep the index was wrong); each `Intro` carries a
+   deadline (initiator gives up at 90 s).
 
 4. **hiss addition (proposed): split msg1 read.** `noise!` additionally
    emits `read_message_1_intro(&msg1) → (ClaimedStatic, MidRead)` and
