@@ -18,8 +18,7 @@
 //! compute it); the real authentication is the Noise handshake underneath.
 //! BLAKE2b is taken from `cryptoxide` directly (the raw-primitive rule).
 
-use cryptoxide::blake2b::Blake2b;
-use cryptoxide::digest::Digest;
+use cryptoxide::hashing::blake2b::Blake2b;
 use hiss::curve::p256::P256r1PublicKey;
 
 /// The mac1 domain-separation label (frozen in `slither/SPEC.md`, ratified
@@ -45,21 +44,21 @@ const COMPRESSED_KEY_LEN: usize = 33;
 /// writes those same 33 bytes).
 pub fn mac1_key(recipient: &P256r1PublicKey) -> [u8; MAC1_KEY_LEN] {
     let compressed: [u8; COMPRESSED_KEY_LEN] = recipient.to_compressed();
-    let mut hasher = Blake2b::new(MAC1_KEY_LEN);
-    Digest::input(&mut hasher, MAC1_LABEL);
-    Digest::input(&mut hasher, &compressed);
     let mut key = [0u8; MAC1_KEY_LEN];
-    Digest::result(&mut hasher, &mut key);
+    Blake2b::<{ MAC1_KEY_LEN * 8 }>::new()
+        .update(MAC1_LABEL)
+        .update(&compressed)
+        .finalize_at(&mut key);
     key
 }
 
 /// Compute the mac1 tag over `preceding` (all packet bytes before the tag) under
 /// a pre-derived `key` from [`mac1_key`].
 pub fn mac1_tag(key: &[u8; MAC1_KEY_LEN], preceding: &[u8]) -> [u8; MAC1_LEN] {
-    let mut hasher = Blake2b::new_keyed(MAC1_LEN, key);
-    Digest::input(&mut hasher, preceding);
     let mut tag = [0u8; MAC1_LEN];
-    Digest::result(&mut hasher, &mut tag);
+    Blake2b::<{ MAC1_LEN * 8 }>::new_keyed(key)
+        .update(preceding)
+        .finalize_at(&mut tag);
     tag
 }
 

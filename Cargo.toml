@@ -41,17 +41,17 @@ test-util = []
 # provider, and `SessionId`. `default-features = false` keeps hiss to the P-256
 # surface slither names — the `x25519-cryptoxide` default backs a curve slither
 # never touches, and the classic I/O drivers are unused (sans-io needs neither).
-hiss = { path = "../rename", default-features = false }
+hiss = { version = "0.3.1", default-features = false }
 
 # Keyed BLAKE2b for mac1 ONLY (the day-one DoS gate: the raw primitive that keys a
 # cheap tag off the recipient's public static so a garbage flood is dropped before
 # any curve/DH work). Taken from cryptoxide DIRECTLY per the raw-primitive rule —
-# NOT via `hiss::noise::*` — and pinned to EXACTLY the version hiss uses (0.5.1,
-# verified against hiss's Cargo.toml). `default-features = false, features =
-# ["blake2"]` is the minimal surface: only the `Blake2b`/keyed-`Blake2b` primitive,
-# none of cryptoxide's other ciphers or KDFs. No RustCrypto for any slither
-# cryptography.
-cryptoxide = { version = "0.5.1", default-features = false, features = ["blake2"] }
+# NOT via `hiss::noise::*` — and pinned to EXACTLY the range hiss uses
+# (`>=0.6.0, <0.7`, verified against hiss 0.3.1's Cargo.toml). `default-features =
+# false, features = ["blake2"]` is the minimal surface: only the
+# `Blake2b`/keyed-`Blake2b` primitive, none of cryptoxide's other ciphers or KDFs.
+# No RustCrypto for any slither cryptography.
+cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = ["blake2"] }
 
 # The fixed-size, const-`SIZE`-pinned wire headers (`InitHeader`/`RespHeader`/
 # `DataHeader`). Each header is a `#[derive(Packed)]` struct with byte-array fields
@@ -60,15 +60,18 @@ cryptoxide = { version = "0.5.1", default-features = false, features = ["blake2"
 # filled via `to_be_bytes`). The maintainer's crate; pinned to 0.6.
 packtool = "0.6"
 
-# The async runtime pieces the UDP endpoint actor needs: `net` for the
-# `tokio::net::UdpSocket` behind the `Wire` trait, `time` for the retransmit /
-# keepalive / liveness / rekey timers, and `sync` for the mpsc command + event
-# channels that connect the `!Send` actor to its handles, and `macros` for the `select!`
-# the actor's event loop is built on (inbound datagrams, handle commands, and the timer
-# tick, raced on one task). slither provides no runtime of its own; the actor runs on the
-# consumer's current-thread runtime (a `LocalSet`, like the `!Send` island transport in
-# `bubble-client`).
-tokio = { version = "1", features = ["net", "time", "sync", "macros"] }
+# The async runtime pieces the UDP endpoint actor needs: `rt` for
+# `tokio::task::spawn_local` (previously unified in by hiss's Apple-platform
+# tokio dependency; hiss 0.3.1 pulls in no async runtime on any platform, so
+# slither declares it itself), `net` for the `tokio::net::UdpSocket` behind the
+# `Wire` trait, `time` for the retransmit / keepalive / liveness / rekey timers,
+# and `sync` for the mpsc command + event channels that connect the `!Send`
+# actor to its handles, and `macros` for the `select!` the actor's event loop is
+# built on (inbound datagrams, handle commands, and the timer tick, raced on one
+# task). slither provides no runtime of its own; the actor runs on the
+# consumer's current-thread runtime (a `LocalSet`, like the `!Send` island
+# transport in `bubble-client`).
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 
 # Typed, structured errors for the public surface (callers match on `SlitherError`
 # / `ConnectError` variants). A library, so `thiserror`, not `anyhow`.
@@ -79,9 +82,16 @@ thiserror = "2"
 # ephemeral every retransmit is a WireGuard requirement) and draws the uniform
 # jitter (≤ 333 ms) from the same stream. NOT a crypto crate in the Bubble sense —
 # it carries no key material and performs no slither cryptography; every Noise/curve
-# operation flows through `hiss`. Pinned to match `bubble-client`.
-rand_chacha = "0.9"
-rand_core = { version = "0.9", features = ["os_rng"] }
+# operation flows through `hiss`. Pinned to the `rand_core` 0.10 line hiss 0.3.1's
+# public bounds name (`hiss::rand_core` re-exports it): an RNG handed to
+# `EphemeralOnly::new` must implement the SAME rand_core's `CryptoRng`.
+rand_chacha = "0.10"
+rand_core = "0.10"
+
+# The 32-byte OS-entropy seed for the endpoint's index/jitter `ChaCha20Rng`.
+# rand_core 0.10 no longer ships `OsRng` (it moved to `rand` as `SysRng`);
+# `getrandom::fill` is that same syscall surface without the rest of `rand`.
+getrandom = "0.4"
 
 # Structured diagnostics (the workspace convention): the DoS-gate drop counters, the
 # roaming trace, the unlisted-static reject, and the handshake give-up all surface

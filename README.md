@@ -7,7 +7,7 @@ A WireGuard-shaped Noise-over-UDP packet layer — an authenticated, encrypted,
 slither borrows WireGuard's homework — a cheap mac1 DoS gate, fresh-ephemeral
 handshake retransmission, an anti-replay sliding window, endpoint roaming, and the
 keepalive/liveness/rekey timers — but the cryptography is Bubble's: the
-[`hiss`](../../rename) Noise **IK** handshake over
+[`hiss`](https://crates.io/crates/hiss) Noise **IK** handshake over
 **P-256 / ChaCha20-Poly1305 / BLAKE2b** and its out-of-order datagram transport,
 with keyed **BLAKE2b** for mac1 taken from `cryptoxide` directly. It is the
 QUIC-style "framing over a Noise channel instead of TLS" direction, at the packet

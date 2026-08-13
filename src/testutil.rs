@@ -18,7 +18,7 @@ use hiss::curve::p256::{P256r1PrivateKey, P256r1PublicKey};
 use hiss::noise::P256;
 use hiss::provider::{CryptoKeyProvider, DhProvider, EphemeralOnly};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
 use tokio::sync::mpsc;
 
 use crate::endpoint::Wire;

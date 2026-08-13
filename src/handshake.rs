@@ -49,7 +49,7 @@ use hiss::noise::{Blake2b, ChaChaPoly, P256};
 use hiss::noise::{DatagramRecv, DatagramSend, HandshakeError, SessionId};
 use hiss::provider::{CryptoKeyProvider, DhProvider, EphemeralOnly};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
 
 use crate::SlitherChannel;
 use crate::mac;

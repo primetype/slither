@@ -32,7 +32,7 @@ use std::time::Duration;
 use hiss::curve::p256::P256r1PublicKey;
 use packtool::{Packed, View};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{OsRng, RngCore, SeedableRng, TryRngCore};
+use rand_core::{Rng, SeedableRng};
 use tokio::sync::mpsc;
 // The actor's timers run on tokio's clock so a paused test runtime advances them.
 use tokio::time::{self, Instant, MissedTickBehavior};
@@ -191,12 +191,10 @@ pub struct Config {
 
 impl Config {
     /// A fresh configuration with an empty allow-list, no persistent keepalive,
-    /// and an `OsRng`-seeded index/jitter CSPRNG.
+    /// and an OS-entropy-seeded index/jitter CSPRNG.
     pub fn new() -> Self {
         let mut seed = [0u8; 32];
-        OsRng
-            .try_fill_bytes(&mut seed)
-            .expect("OS entropy for the slither index/jitter CSPRNG");
+        getrandom::fill(&mut seed).expect("OS entropy for the slither index/jitter CSPRNG");
         let rng = ChaCha20Rng::from_seed(seed);
         hiss::zeroize::zeroize_array(&mut seed);
         Self {
