@@ -1,2 +1,5 @@
 /target
 /.serena
+# Not committed (hiss convention): every CI/gate run re-resolves from the
+# index, so a break inside a semver-compatible range surfaces immediately.
+Cargo.lock

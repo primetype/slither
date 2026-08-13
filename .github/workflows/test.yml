@@ -1,0 +1,48 @@
+name: Test
+
+# Stage 2 of the pipeline. Triggers on completion of the `Check` workflow
+# and runs only when Check succeeded. Tests the exact commit Check
+# validated (workflow_run checks out the default branch by default, so we
+# pin the ref to the triggering commit). Mirrors hiss's pipeline.
+
+on:
+  workflow_run:
+    workflows: ["Check"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: "test (${{ matrix.os }} · ${{ matrix.features.label }})"
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Two axes. OS: the suite runs almost entirely on the in-memory
+      # FlakyWire, but one test drives a real UDP loopback socket, and the
+      # maintainer develops on macOS — cover both kernels. Features:
+      # `test-util` is the only feature; `--all-features` compiles the
+      # `testutil` module as *exported* surface (`#![warn(missing_docs)]`
+      # applies to it there) rather than cfg(test) plumbing.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        features:
+          - label: "default"
+            flags: ""
+          - label: "all features"
+            flags: "--all-features"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Key the cache per feature set: matrix instances of one job share
+          # a key by default, so without this the configs would evict each
+          # other and thrash on every run.
+          key: ${{ matrix.features.flags }}
+      - name: "cargo test (${{ matrix.features.label }})"
+        run: cargo test ${{ matrix.features.flags }}

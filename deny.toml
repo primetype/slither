@@ -1,0 +1,36 @@
+# cargo-deny configuration — the supply-chain gate run by the `Check` and
+# `Audit` CI workflows. Run locally with `cargo deny check`.
+# Schema v2 (cargo-deny 0.14+). Mirrors hiss's configuration.
+
+[advisories]
+version = 2
+# RUSTSEC advisories deny by default. To accept one, add its ID here with
+# a comment explaining why.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses present across the dependency graph (dev deps
+# included). Derived from `cargo metadata`; extend only when a new
+# dependency actually requires it, with a comment naming the crate.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Dev trees routinely pull duplicate versions of small crates; that is not
+# worth failing CI over. Real concerns (a banned crate) go here.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# No git sources: every dependency resolves from crates.io.

@@ -1,0 +1,36 @@
+name: Audit
+
+# The supply-chain gate, on a clock: the same `cargo deny check` that runs
+# as the `deny` job in `Check` — advisories, licenses, bans, sources,
+# configured by `deny.toml` — re-run daily against an unchanged tree.
+#
+# `Check` runs on push, and every input to cargo-deny moves without one:
+# a RUSTSEC advisory is published on the discloser's timetable, and with
+# no committed `Cargo.lock` every run re-resolves the graph fresh, so a
+# new upstream release that drags in a license change, a duplicate, or a
+# non-registry source surfaces here too — during exactly the idle windows
+# in which `Check` never fires. A separate workflow because it needs a
+# `schedule:` trigger, and `Check` is the `workflow_run` trigger for
+# `Test`. Mirrors hiss's Audit workflow.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo-deny (advisories · licenses · bans · sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
