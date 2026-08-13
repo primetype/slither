@@ -68,6 +68,14 @@ while let Some(event) = endpoint.next_event().await {
 }
 ```
 
+The runnable version — two endpoints over real UDP loopback sockets,
+handshake, one reliable message each way — is
+[`examples/udp_loopback.rs`](examples/udp_loopback.rs):
+
+```sh
+cargo run --example udp_loopback
+```
+
 ## Testability
 
 The socket sits behind a small `Wire` trait, so the whole protocol is drivable

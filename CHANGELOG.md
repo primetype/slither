@@ -28,6 +28,9 @@ into its own repository.
 - **The endpoint actor**: one UDP socket behind a `Wire` trait, driven by a
   single `!Send` tokio task (`LocalSet`); sessions surface as an `Event`
   stream, inbound handshakes are gated by an allow-list of remote statics.
+- **`examples/udp_loopback.rs`**: two endpoints over real UDP loopback
+  sockets — handshake, one reliable message each way — runnable with
+  `cargo run --example udp_loopback`.
 - **`testutil`** (feature `test-util`): the `FlakyWire` in-memory network
   (loss, reorder, duplication, delay, partition) and a deterministic
   counting identity, so a consumer can drive the whole protocol without a
