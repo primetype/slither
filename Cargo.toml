@@ -16,7 +16,7 @@ keywords = ["noise", "udp", "wireguard", "quic", "datagram"]
 categories = ["cryptography", "network-programming"]
 # Repo infrastructure ships nothing to a consumer; SPEC.md ships on purpose —
 # it is the ratified protocol the rustdoc points at.
-exclude = ["/.github", "/CLAUDE.md", "/deny.toml", "/.gitignore", "/.serena"]
+exclude = ["/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena"]
 
 # A library only. It holds the packet layer — the packtool wire headers, the mac1
 # DoS gate, the IK handshake driving (fresh-ephemeral retransmit), the datagram
