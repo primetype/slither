@@ -1,11 +1,11 @@
 # slither v0.2 — implementation plan
 
-> **Status: DRAFT 2026/08/14, awaiting maintainer approval.**
-> Inputs: `SPEC-v2-DRAFT.md` (ratified, 52 rulings) and `STORIES.md`
-> (30 stories; S1–S28 approved, S29–S30 drafted 2026/08/14).
+> **Status: APPROVED 2026/08/14.** All ten decisions in §6 are ruled
+> (rulings 53–59); the spec text is amended to match.
+> Inputs: `SPEC.md` (ratified 2026/08/14, 59 rulings) and `STORIES.md`
+> (30 capability stories, all approved).
 > The spec is the authority. Where this plan and the spec disagree, the
-> spec wins and this plan is wrong — **except** for the items in §6,
-> which are decisions this plan asks the maintainer to rule on.
+> spec wins and this plan is wrong.
 
 This is a **clean rewrite**. The existing `src/` (6 757 lines) implements
 the v0.1 wire, which v2 supersedes; none of its module boundaries survive
@@ -34,8 +34,8 @@ never a read; randomness comes from one seeded RNG; nothing allocates a
 task. That is what makes §16.10's kernel-free drivability real and what
 makes Appendix B's paused-clock obligations writable at all.
 
-`compat` is new. The spec stops at §16.2's verb surface; everything the
-user asked for — `BufWriter`, `tokio_util::codec`, `Stream`/`Sink`,
+`compat` is new. It is now §16.11 of the spec, ratified as rulings 55–58.
+Everything asked for — `BufWriter`, `tokio_util::codec`, `Stream`/`Sink`,
 `tower::Service` — is a **shell-layer adapter over those verbs**, adds no
 core state, and touches no wire byte. It is nonetheless a first-class
 deliverable, not a nicety, because it decides the shape of the shell: see
@@ -98,8 +98,7 @@ src/
 ## 2. The one architectural decision that gates everything
 
 **How does a handle reach the core?** The answer decides whether
-`AsyncWrite` is natural or an ordeal, so it must be settled before
-Slice 3.
+`AsyncWrite` is natural or an ordeal. Ruled before slice 3, as required.
 
 §16.3 calls handles "thin channel-backed clients". §16.8 calls for "the
 quinn pattern" — "per-stream wakers key the shell's blocked-readers /
@@ -107,7 +106,7 @@ blocked-writers maps" — and requires accessors to be "synchronous reads
 of a shared cell the driver updates". Those two sentences describe
 different mechanisms, and the second is the one quinn actually is.
 
-**Proposal — split the seam by what it costs.**
+**Ruled — split the seam by what it costs (ruling 53, §16.3).**
 
 | Surface | Mechanism | Why |
 |---|---|---|
@@ -131,14 +130,14 @@ driver, which drains `poll_output()` to `Timeout` and does the I/O. The
 core contract of §16.4 is untouched: the shell still drains after every
 mutating call — it is just not always the driver that made the call.
 
-**This needs a ruling** (D1, §6) because it amends §16.3's wording. It is
-shell-only: no wire byte, no core type, no timer.
+This amended §16.3's wording as **ruling 53** (D1, §6). Shell-only: no
+wire byte, no core type, no timer.
 
 ---
 
 ## 3. The composability layer
 
-The user's target, typed honestly. A `Connection` is a multiplexer, so
+The maintainer's target, typed honestly. A `Connection` is a multiplexer, so
 the byte-oriented object is a **stream**, not the connection — everything
 below follows from that one substitution.
 
@@ -172,7 +171,7 @@ tokio::io::copy(&mut File::open(path).await?, &mut w).await?;
 w.shutdown().await?;                    // finish + await acknowledgement
 ```
 
-Two semantics must be pinned, because both are guessable wrongly (D3, D4):
+Two semantics are pinned, because both are guessable wrongly (rulings 56, 57):
 
 - **`poll_flush` is a no-op that returns `Ready`.** Bytes accepted by
   `poll_write` are already in send state; `poll_write` only ever accepts

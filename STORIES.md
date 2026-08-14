@@ -17,7 +17,7 @@
 > The unit is *what a user of the crate can do*, stated so each one is
 > directly testable. Six (S1, S3, S6, S7, S12, S20) are the maintainer's
 > own; the rest fill the surface around them. Every story names its spec
-> anchor in the ratified `SPEC-v2-DRAFT.md`, its DH cost where the staged
+> anchor in the ratified `SPEC.md`, its DH cost where the staged
 > accept makes cost the point, and whether it is drivable on the paused
 > clock. **This set is the acceptance criteria for the implementation
 > plan.**
