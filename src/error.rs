@@ -225,6 +225,46 @@ mod tests {
     fn _assert_clone<T: Clone>() {}
     fn _assert_send_sync<T: Send + Sync + 'static>() {}
 
+    /// The exhaustiveness fence for `WriteError`, and the reason it lives
+    /// **here** rather than beside the other nine in `tests/spec_errors.rs`.
+    ///
+    /// `WriteError` is the one type carrying `#[non_exhaustive]` (ruling
+    /// 61 — §19 reserves `Stopped` for the STOP_SENDING round). That
+    /// attribute has **no effect within the defining crate** and full
+    /// effect outside it, so an integration test in `tests/` — a separate
+    /// crate — is *forced* to write a wildcard arm. The wildcard then
+    /// silently absorbs any variant added later, which is precisely the
+    /// event the fence exists to catch. An out-of-crate exhaustiveness
+    /// fence over a `#[non_exhaustive]` enum cannot work, by
+    /// construction; `tests/spec_errors.rs` covers the other nine, where
+    /// it does work, and defers this one here.
+    ///
+    /// Found by mutation testing at slice 0: an eleventh variant added to
+    /// `WriteError` passed `cargo build`, `cargo test`, and the
+    /// out-of-crate test named for this exact check.
+    ///
+    /// **Do not add a `_` arm.** Failing to compile is the whole point:
+    /// when `Stopped` lands, this match is a deliberate stop so that §18.1
+    /// and §19 are reconciled on purpose rather than by a wildcard.
+    #[test]
+    fn write_error_is_exhaustive_in_crate() {
+        fn fence(e: WriteError) {
+            match e {
+                WriteError::Reset(code) => {
+                    let _: u64 = code;
+                }
+                WriteError::ConnectionLost(inner) => {
+                    let _: ConnectionLost = inner;
+                }
+                WriteError::Finished => {}
+            }
+        }
+        // Call it, so the fence is live code and not merely a coercion.
+        fence(WriteError::Reset(0));
+        fence(WriteError::ConnectionLost(ConnectionLost::TimedOut));
+        fence(WriteError::Finished);
+    }
+
     /// `ConnectionLost` is fanned out to every holder of a dead
     /// connection, so it must be cloneable. A future payload that is not
     /// would break this silently at the point of use; here it breaks at

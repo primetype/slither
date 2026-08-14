@@ -778,6 +778,24 @@ impl<P: DhProvider<P256>> DhProvider<P256> for CountingProvider<P> {
 mod tests {
     use super::*;
 
+    /// Every success-path receive in this module goes through this.
+    ///
+    /// A bare `recv_from().await` **hangs** when routing, a send path, or
+    /// cancel-safety is broken, so the regression arrives as a CI timeout
+    /// minutes later rather than as a red test you can bisect. Slice 0's
+    /// mutation review found three separate breakages — misrouted
+    /// delivery, a stubbed `send_to`, and a cancel-safety violation —
+    /// that were caught *only* as a hang.
+    ///
+    /// The timeout is generous and in virtual time under
+    /// `start_paused = true`, so it costs nothing on the happy path.
+    async fn recv_ok(wire: &FlakyWire, buf: &mut [u8]) -> (usize, std::net::SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(5), wire.recv_from(buf))
+            .await
+            .expect("recv_from hung: routing, send path or cancel-safety is broken")
+            .expect("recv")
+    }
+
     fn addr(n: u8) -> SocketAddr {
         format!("10.0.0.{n}:400{n}").parse().expect("literal addr")
     }
@@ -811,7 +829,7 @@ mod tests {
         }
 
         let mut buf = [0u8; 1200];
-        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, src) = recv_ok(&b, &mut buf).await;
 
         assert_eq!(&buf[..n], b"!");
         assert_eq!(src, a.local_addr());
@@ -857,7 +875,7 @@ mod tests {
 
         let mut buf = [0u8; 16];
         for i in 0..100u8 {
-            let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+            let (n, src) = recv_ok(&b, &mut buf).await;
             assert_eq!(n, 1);
             assert_eq!(buf[0], i, "datagram {i} arrived out of order");
             assert_eq!(src, a.local_addr());
@@ -937,7 +955,7 @@ mod tests {
         );
 
         // The datagram survived the cancellation, intact …
-        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, src) = recv_ok(&b, &mut buf).await;
         assert_eq!(&buf[..n], b"payload");
         assert_eq!(src, a.local_addr());
 
@@ -985,7 +1003,7 @@ mod tests {
             a.send_to(&[i], b.local_addr()).await.expect("send");
         }
         for i in 0..30u8 {
-            let (n, _) = b.recv_from(&mut buf).await.expect("recv");
+            let (n, _) = recv_ok(&b, &mut buf).await;
             assert_eq!(buf[..n][0], i, "equal deadlines must deliver FIFO");
         }
     }
@@ -1002,7 +1020,7 @@ mod tests {
 
         let mut buf = [0u8; 16];
         for _ in 0..2 {
-            let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+            let (n, src) = recv_ok(&b, &mut buf).await;
             assert_eq!(&buf[..n], b"dup");
             assert_eq!(src, a.local_addr());
         }
@@ -1015,6 +1033,63 @@ mod tests {
         assert_eq!(net.sends(), 1, "one send, two deliveries");
     }
 
+    /// The draw-order contract at the seam where it can break: index
+    /// based drops (`drop_at` / `drop_first`) consume **no** RNG draw,
+    /// while the probabilistic path consumes two (loss, then duplicate).
+    /// The two are therefore not interchangeable, and mixing them in one
+    /// policy is the only configuration that can expose a regression.
+    ///
+    /// Slice 0's mutation review found this untested: making index drops
+    /// consume a draw anyway went **entirely undetected**, because no test
+    /// combined an index-based drop with a nonzero `loss`. A regression
+    /// would silently desync every later send's draw in exactly the
+    /// fixture a handshake-retry test wants — "the first two initiations
+    /// die, then normal jitter" — and would read as flakiness, not a bug.
+    ///
+    /// This is a **characterization pin**, not a derivation: the sequence
+    /// below is whatever seed 4242 produces today. It has no meaning of
+    /// its own and it is not a wire value. If it changes, the draw order
+    /// changed — decide whether that was intended, then re-pin. Do not
+    /// re-pin reflexively.
+    #[tokio::test(start_paused = true)]
+    async fn index_drops_do_not_perturb_the_probabilistic_draw_order() {
+        let net = Network::seeded(4242);
+        let a = net.endpoint(addr(70));
+        let b = net.endpoint(addr(71));
+        a.set_policy(FlakyPolicy {
+            loss: 0.5,
+            drop_at: [0, 7].into_iter().collect(),
+            ..FlakyPolicy::perfect()
+        });
+        for i in 0..24u8 {
+            a.send_to(&[i], b.local_addr()).await.expect("send");
+        }
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(200), b.recv_from(&mut buf)).await
+        {
+            got.push(buf[..n][0]);
+        }
+
+        assert!(
+            !got.contains(&0) && !got.contains(&7),
+            "index-dropped sends must never arrive; got {got:?}"
+        );
+        assert!(
+            !got.is_empty() && got.len() < 22,
+            "fixture must lose some and keep some, or it proves nothing \
+             (got {} of a possible 22)",
+            got.len()
+        );
+        assert_eq!(got, PINNED_DRAW_ORDER, "the RNG draw order changed");
+    }
+
+    /// See [`index_drops_do_not_perturb_the_probabilistic_draw_order`].
+    const PINNED_DRAW_ORDER: &[u8] = &[3, 4, 12, 13, 14, 16, 17, 18, 19];
+
+    /// byte-identical outcomes.
     /// `drop_at` consumes no RNG draw, so two different seeds must give
     /// byte-identical outcomes.
     #[tokio::test(start_paused = true)]
@@ -1079,7 +1154,7 @@ mod tests {
 
         net.heal_path(a.local_addr(), b.local_addr());
         a.send_to(b"z", b.local_addr()).await.expect("send");
-        let (n, _) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, _) = recv_ok(&b, &mut buf).await;
         assert_eq!(&buf[..n], b"z", "healing restores the path");
     }
 
@@ -1115,7 +1190,7 @@ mod tests {
         tokio::time::sleep_until(until + Duration::from_millis(1)).await;
 
         a.send_to(b"y", b.local_addr()).await.expect("healed");
-        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, src) = recv_ok(&b, &mut buf).await;
         assert_eq!(&buf[..n], b"y");
         assert_eq!(src, a.local_addr());
         assert_eq!(net.tap().len(), 1, "only the healed send was tapped");
@@ -1131,7 +1206,7 @@ mod tests {
         a.send_to(&big, b.local_addr()).await.expect("send");
 
         let mut buf = [0u8; crate::constants::MAX_DATAGRAM];
-        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, src) = recv_ok(&b, &mut buf).await;
         assert_eq!(n, crate::constants::MAX_DATAGRAM);
         assert_eq!(src, a.local_addr());
         assert!(buf.iter().all(|byte| *byte == 0xab));
@@ -1148,7 +1223,7 @@ mod tests {
         net.inject(forged, b.local_addr(), b"x");
 
         let mut buf = [0u8; 16];
-        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        let (n, src) = recv_ok(&b, &mut buf).await;
         assert_eq!(&buf[..n], b"x");
         assert_eq!(src, forged, "the forged source is reported verbatim");
         assert_eq!(net.sends(), 0, "an injection is not a wire's send");
@@ -1217,7 +1292,7 @@ mod tests {
                 assert_eq!(sender.await.expect("join"), 5);
 
                 let mut buf = [0u8; 16];
-                let (n, _src) = b.recv_from(&mut buf).await.expect("recv");
+                let (n, _src) = recv_ok(&b, &mut buf).await;
                 assert_eq!(&buf[..n], b"local");
 
                 // And a generic driver with no `Send` bound accepts it.

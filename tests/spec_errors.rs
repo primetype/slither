@@ -68,9 +68,16 @@ fn connection_lost_is_exhaustively_matched() {
     let _: fn(ConnectionLost) = match_connection_lost;
 }
 
+/// NOT an exhaustiveness fence, despite the shape of its neighbours.
+/// `WriteError` is `#[non_exhaustive]`, so out of crate this cannot be
+/// one — see the comment on `match_write_error`'s wildcard arm. The real
+/// fence is `src/error.rs::tests::write_error_is_exhaustive_in_crate`.
+/// Kept only to check the three known variants' payload shapes.
 #[test]
-fn write_error_is_exhaustively_matched() {
-    let _: fn(WriteError) = match_write_error;
+fn write_error_known_variants_have_the_documented_shapes() {
+    match_write_error(WriteError::Reset(0));
+    match_write_error(WriteError::ConnectionLost(ConnectionLost::TimedOut));
+    match_write_error(WriteError::Finished);
 }
 
 #[test]
@@ -193,12 +200,17 @@ fn match_write_error(e: WriteError) {
             let _: ConnectionLost = inner;
         }
         WriteError::Finished => {}
-        _ => panic!(
-            "WriteError gained a variant this exhaustiveness fence doesn't \
-             recognise (documented set: Reset(u64) / ConnectionLost(..) / \
-             Finished, plus the reserved-but-undelivered `Stopped` of §19) \
-             — SPEC.md §18.1/§19 and this file need to be reconciled"
-        ),
+        // NOT a fence. `WriteError` is `#[non_exhaustive]` (ruling 61),
+        // and this file is a separate crate, so the compiler REQUIRES this
+        // arm — which means it silently absorbs any variant added later.
+        // Proven by mutation at slice 0: an eleventh variant passed
+        // `cargo build`, `cargo test`, and this very test.
+        //
+        // The real fence for `WriteError` is IN-CRATE, at
+        // `src/error.rs::tests::write_error_is_exhaustive_in_crate`, where
+        // `#[non_exhaustive]` has no effect and the match is genuinely
+        // exhaustive. Do not try to restore a fence here; it cannot work.
+        _ => unreachable!("see src/error.rs for this type's real fence"),
     }
 }
 

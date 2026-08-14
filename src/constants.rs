@@ -313,7 +313,7 @@ pub const K_GRANULARITY: Duration = Duration::from_millis(K_GRANULARITY_MS);
 /// The RTT assumed before any sample has been taken. §13.1.
 pub const K_INITIAL_RTT: Duration = Duration::from_millis(K_INITIAL_RTT_MS);
 
-/// The cap on the PTO backoff **multiplier**, `2⁶`. §13.3, §13.5.
+/// The cap on the PTO backoff **multiplier**, `2⁶`. §13.3.
 pub const PTO_BACKOFF_CAP: u32 = 64;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -535,6 +535,26 @@ const _: () = assert!(K_TIME_THRESHOLD_NUM > K_TIME_THRESHOLD_DEN); // > 1, or i
 const _: () = assert!(KEEPALIVE_TIMEOUT_MS < DEAD_TIMEOUT_MS);
 const _: () = assert!(MAX_ACK_DELAY_MS < KEEPALIVE_TIMEOUT_MS);
 const _: () = assert!(K_GRANULARITY_MS <= MAX_ACK_DELAY_MS);
+
+// ---------------------------------------------------------------------
+// Derivations the spec states in prose notation, added after slice 0's
+// fidelity review. Ruling 63 named the hazard: a value written "2⁶" or
+// "65 536 (2¹⁶)" is a judgement call an implementer can resolve wrongly
+// and *self-consistently*, so nothing turns red. `PTO_BACKOFF_CAP` was
+// already guarded; `REKEY_EPOCH_MSGS` is the identical shape and was not.
+const _: () = assert!(REKEY_EPOCH_MSGS == 1 << 16); // §7.7 "65 536 (2¹⁶)"
+
+// A close reply may not be rate-limited more slowly than the linger it
+// runs inside, or the linger would expire with replies still owed (§15.1).
+const _: () = assert!(CLOSE_REPLY_MIN_INTERVAL_MS < CLOSE_LINGER_MS);
+
+// The per-source cap is a share of the queue, not a second, larger bound
+// (§6.3) — inverting them would make the per-source limit unreachable.
+const _: () = assert!(INTRO_MAX_PER_SOURCE <= INTRO_QUEUE_CAP);
+
+// §7.3's budget must admit at least one response to one initiation, or a
+// responder could never answer an unvalidated address at all.
+const _: () = assert!(AMPLIFICATION_FACTOR as usize * INIT_PACKET_LEN >= RESP_PACKET_LEN);
 const _: () = assert!(RETRANSMIT_BASE_MS + RETRANSMIT_JITTER_MAX_MS < HANDSHAKE_GIVEUP_MS);
 const _: () = assert!(INTRO_TTL_MS < HANDSHAKE_GIVEUP_MS);
 const _: () = assert!(PERSISTENT_KEEPALIVE_MIN_MS <= PERSISTENT_KEEPALIVE_DEFAULT_MS);
