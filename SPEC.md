@@ -546,17 +546,29 @@ exactly three fields across the whole grammar — `sender_index`,
 is a single byte or an opaque octet string, and octet strings have no
 byte order. Little-endian for two reasons: it matches **WireGuard**, whose
 header integers are little-endian and whose posture §3.4 already adopts
-for the clear counter; and it makes the `counter` on the wire
-**byte-identical to the ChaCha20-Poly1305 nonce** Noise derives from it,
-which big-endian would leave as its byte-reverse (§3.4).
+for the clear counter; and — **for the reference suite** — it makes the
+`counter` on the wire byte-identical to the ChaCha20-Poly1305 nonce Noise
+derives from it, which big-endian would leave as its byte-reverse (§3.4).
+That second reason is suite-specific and the rule is not: Noise encodes
+the ChaChaPoly nonce little-endian but the AES-GCM nonce big-endian, so a
+future AEAD inverts the coincidence without disturbing the rule, which
+rests on WireGuard's shape.
 
-Two things this rule does **not** reach, both of which stay as they are.
-§8.1's varints are byte-identical to RFC 9000 §16 and therefore
-big-endian; the mixed reading is not observable, because the frame layer
-rides **inside** the AEAD and never appears in the same cleartext as a
-header. And §2.4's canonical static comparison (§6.7's tie-break) is a
-lexicographic comparison of equal-length **octet strings**, not an integer
-encoding, so no byte order applies to it at all.
+**Three** things this rule does **not** reach, all of which stay as they
+are.
+
+1. §8.1's varints are byte-identical to RFC 9000 §16 and therefore
+   big-endian. The mixed reading is not observable: the frame layer rides
+   **inside** the AEAD and never appears in the same cleartext as a header.
+2. §5.2's msg1 payload timestamp is `ts_secs(8, BE) ‖ ts_nanos(4, BE)` —
+   big-endian **deliberately**, because §5.3's strictly-greater test is an
+   ordering, and a big-endian `ts_secs` orders correctly compared as an
+   octet string. Unlike the varints this one *is* observable beside the
+   header, since the responder decrypts msg1 while still holding the
+   header bytes: it is a considered exception, not an oversight.
+3. §2.4's canonical static comparison (§6.7's tie-break) is a lexicographic
+   comparison of equal-length **octet strings**, not an integer encoding,
+   so no byte order applies to it at all.
 
 A datagram shorter than its type's fixed minimum,
 longer than `MAX_DATAGRAM`, or bearing an unknown type or version is
@@ -609,16 +621,23 @@ type(1) ‖ version(1) ‖ receiver_index(4) ‖ counter(8)        ← DataHeade
   session (and thus a key) before decryption (§17.3).
 - `counter` — exactly the value the seal returned: the hiss-owned monotonic
   send counter, which is simultaneously the AEAD nonce, the packet number
-  (§7.1), and the epoch selector (§7.7). Little-endian per §3.1, so these
-  eight bytes **are** the low eight bytes of the ChaChaPoly nonce, not a
-  byte-reversal of them. Full 8 bytes, in clear, no
+  (§7.1), and the epoch selector (§7.7). Little-endian per §3.1, so under
+  the reference suite these eight bytes **are** the nonce's trailing eight
+  bytes: Noise builds the ChaChaPoly nonce as `32 zero bits ‖ LE64(counter)`,
+  so the wire bytes and nonce bytes `[4, 12)` coincide exactly rather than
+  by reversal. (Noise's AES-GCM nonce rule is big-endian, so the
+  coincidence is a reference-suite property; the `u64`-LE rule is not.)
+  Full 8 bytes, in clear, no
   truncation and no header protection in this version — the WireGuard
   posture; truncated packet numbers and header protection are deferred
-  metadata levers (§19). Until Appendix A.2's counter accessor ships, a
-  mirror-and-assert interim — the implementation mirrors the expected next
-  counter and `debug_assert_eq!`s it against each seal's returned value —
-  is conformant; the mirrored value feeds **only** the AD construction and
-  is never fed back to hiss.
+  metadata levers (§19). Appendix A.2's `next_counter()` accessor has
+  **shipped**, and naming the counter before the seal is the operative
+  mechanism — the header is the AEAD associated data, so it must be built
+  *before* sealing. The mirror-and-assert interim (mirror the expected next
+  counter, `debug_assert_eq!` it against each seal's returned value) is
+  retained here only as the **fallback shape**, not as the mechanism to
+  implement; were it used, the mirrored value would feed **only** the AD
+  construction and never be fed back to hiss.
 - **There is no cleartext length field**: the AEAD gives the exact
   plaintext length, and the frame parser runs to the end of it (§8.2).
 - An **empty plaintext** (16-byte tag-only ciphertext; a 30-byte datagram)

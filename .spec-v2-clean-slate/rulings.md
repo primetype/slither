@@ -1140,3 +1140,45 @@ found in one sentence what the review process structurally could not,
 because review examines what is contested and a default is by definition
 what nobody contested. Before a freeze, the question worth asking is not
 "is every decision right" but "which lines here were never decisions."
+
+**Ruling 64 — three corrections to its own text, from the independent
+derivation.** The golden-wire deriver, working from spec text alone with
+no sight of `src/` or the implementation plan, read ruling 64 the day it
+landed and returned three defects in it. All three are in the ruling's
+*rationale*, none in its rule; the header stays little-endian. Recorded
+because the ruling was written by the same reader who verified it, which
+is exactly the failure mode the derivation exists to catch — and it caught
+its own commissioning ruling first.
+
+1. **"Two things this rule does not reach" was wrong: there are three.**
+   §5.2's msg1 payload timestamp is `ts_secs(8, BE) ‖ ts_nanos(4, BE)` —
+   a multi-byte integer on the wire, big-endian, unmentioned. Worse, the
+   ruling's own defence of the mixed reading ("never observable in the
+   same cleartext") **fails for this one**: the responder decrypts msg1
+   while still holding the header bytes, so both orders genuinely are
+   visible together. The timestamp stays big-endian — §5.3's
+   strictly-greater test is an ordering, and a big-endian `ts_secs` orders
+   correctly compared as an octet string, which is a substantive reason
+   and not an accident — but it is now named as a considered exception
+   rather than passed over in silence.
+2. **The counter/nonce byte-identity is a reference-suite property, not a
+   general one.** Noise encodes the ChaChaPoly nonce little-endian and the
+   AES-GCM nonce **big-endian**, so under a future AES suite the identity
+   inverts. The claim sat unqualified in §3.1 and §3.4 — sections §2.2
+   declares suite-independent. Both now scope it explicitly. The rule is
+   unaffected: it rests on WireGuard's shape, and the nonce coincidence
+   was always the lesser of the two reasons.
+3. **"The low eight bytes of the ChaChaPoly nonce" was imprecise to the
+   point of wrong.** Noise builds the nonce as `32 zero bits ‖
+   LE64(counter)`; the counter occupies bytes `[4, 12)`, which are the
+   *trailing* bytes. Read as integer significance, the "low" bytes of that
+   12-byte value are the four zeros at `[0, 4)`.
+
+*Generalisation.* Ruling 64 itself argued that a specification's unargued
+lines are invisible to the process that ratified it. The immediate sequel
+is narrower and sharper: **a ruling's rationale is not reviewed by the act
+of ratifying its rule.** The maintainer ruled on "little-endian, yes or
+no"; the three paragraphs of justification written around that answer went
+in unexamined, and two of them were suite-specific claims stated as
+general ones. Rationale is what the next reader reasons *from* — a wrong
+reason survives longer than a wrong rule, because nothing tests it.
