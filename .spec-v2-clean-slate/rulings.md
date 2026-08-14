@@ -1182,3 +1182,51 @@ no"; the three paragraphs of justification written around that answer went
 in unexamined, and two of them were suite-specific claims stated as
 general ones. Rationale is what the next reader reasons *from* — a wrong
 reason survives longer than a wrong rule, because nothing tests it.
+
+**Ruling 65 — the pre-AEAD length gate is exact for handshake packets.**
+Surfaced by the independent golden-wire derivation as a **three-way**
+conflict in normative text: §3.1 gated on "shorter than its type's fixed
+minimum", §5.5 took a msg2 on the first "**length-correct**, index-matching,
+mac1-valid" one, and §6.2's cost table said "short/oversize". For Data the
+three agree — it genuinely is a range, 30 to `MAX_DATAGRAM`. For the two
+handshake types, which `INIT_PACKET_LEN` and `RESP_PACKET_LEN` fix at 196
+and 107, a minimum-only gate admits an over-long packet.
+
+**Why that is a defect and not a latitude.** §4.1 defines mac1's preimage
+as "all packet bytes preceding the tag". Under a minimum gate the tag's
+position is a function of the received length, so the preimage extent is
+undefined by the spec and two conformant implementations can disagree.
+Worse, §4.3 states plainly that mac1's key is derived from public data and
+that anyone holding the recipient's static can mint mac1-valid packets — so
+an attacker pads an initiation, recomputes mac1, and the packet passes. The
+padding lands between msg1's fixed 174 bytes and the tag, where **neither
+Noise's AEAD nor any secret authenticates it**. The gate is now exact for
+both handshake types, which forecloses the malleability and resolves the
+preimage to `[0, 180)` and `[0, 91)` — constants, tabulated in §4.1.
+
+*The deriver followed working rule 3 and refused to pick a side*, recording
+instead that it believed §5.5 and the `_PACKET_LEN` constants held the
+intent while §3.1 held the bug. That reading is correct and is why the
+ruling goes this way: "fixed minimum" is exactly right for Data, and reads
+as a generalisation across all three types made without re-examination —
+the same shape of error as ruling 64's unargued default, one layer down.
+
+**Ruling 66 — mac1's BLAKE2b is plain: no salt, no personalisation.** §4.1
+gave the construction but never named the parameters. The natural reading
+is plain (WireGuard's precedent is plain keyed BLAKE2s, and it is what
+`cryptoxide`'s default constructor gives), but a personalised BLAKE2b
+changes **every** output byte, and the golden freeze makes that permanent
+in this slice. Now stated: both invocations plain, domain separation by
+**concatenation** — `MAC1_LABEL` as a prefix on the key preimage — never by
+the primitive's personalisation parameter. The key preimage is 12 + 65 =
+**77 bytes** on the reference suite.
+
+*The class of finding matters more than this instance.* Rulings 65 and 66
+are both **unstated parameters of a stated construction** — not wrong
+values, absent ones. A specification can define a cryptographic primitive
+completely enough to review and still leave an implementer a free choice
+that changes every byte. Neither gap was visible to ten rounds of review,
+because review reads what is written and these were gaps in what was
+written. Both were found by the *first reader forbidden from consulting an
+implementation* — which is the argument for that constraint, stated as
+evidence rather than as principle.

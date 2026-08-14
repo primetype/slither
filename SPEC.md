@@ -570,7 +570,26 @@ are.
    comparison of equal-length **octet strings**, not an integer encoding,
    so no byte order applies to it at all.
 
-A datagram shorter than its type's fixed minimum,
+**[RATIFIED 2026/08/14 — ruling 65]** The pre-AEAD length gate is
+**exact** for the two fixed-size handshake packets and a **range** for
+Data:
+
+| Type | Accepted length |
+|---|---|
+| `PKT_HANDSHAKE_INIT` | exactly `INIT_PACKET_LEN` (196) |
+| `PKT_HANDSHAKE_RESP` | exactly `RESP_PACKET_LEN` (107) |
+| `PKT_DATA` | `DATA_HEADER_LEN + AEAD_TAG_LEN` (30) ≤ len ≤ `MAX_DATAGRAM` (1200) |
+
+Exactness on the handshake types is load-bearing, not tidiness. §4.1
+defines mac1's preimage as "all packet bytes preceding the tag", so a
+variable length would move the tag and leave the preimage extent
+undefined; and because mac1's key is derived from **public** data (§4.3),
+any third party could pad an initiation and recompute a valid mac1,
+appending trailing bytes that neither Noise's AEAD nor any secret covers.
+Fixing the length forecloses that malleability and resolves the preimage
+to a constant per type (§4.1).
+
+A datagram outside its type's accepted length,
 longer than `MAX_DATAGRAM`, or bearing an unknown type or version is
 silently dropped before any further work. This pre-AEAD gate is the
 **only** silent-drop tier for malformed traffic: a packet that fails here
@@ -675,6 +694,24 @@ mac1 = keyed-BLAKE2b-128(key, all packet bytes preceding the tag)
 |---|---|
 | `MAC1_LABEL` | `b"slither mac1"` |
 | `MAC1_LEN` | 16 |
+
+**[RATIFIED 2026/08/14 — ruling 66]** Both BLAKE2b invocations are
+**plain**: no salt and no personalisation (absent / all-zero), matching
+WireGuard's plain keyed BLAKE2s. Domain separation is by **concatenation**
+— `MAC1_LABEL` is a prefix on the key preimage — and never by the
+primitive's personalisation parameter. The key preimage is therefore
+`MAC1_LABEL.len() + STATIC_PUBLIC_LEN` = 12 + 65 = **77 bytes** for the
+reference suite. This is stated because a personalised BLAKE2b changes
+every output byte, and the golden freeze makes that permanent.
+
+Because §3.1 fixes the handshake packets at exact lengths (ruling 65),
+"all packet bytes preceding the tag" resolves to a constant extent:
+
+| Packet | mac1 preimage | mac1 occupies |
+|---|---|---|
+| HandshakeInit | `[0, 180)` = `INIT_PACKET_LEN − MAC1_LEN` | `[180, 196)` |
+| HandshakeResp | `[0, 91)` = `RESP_PACKET_LEN − MAC1_LEN` | `[91, 107)` |
+| Data | — no mac1 | — |
 
 `recipient_static_canonical` is the recipient's static public key in the
 canonical encoding of §2.4 — for the reference suite, the 65-byte
@@ -991,7 +1028,7 @@ are final — each is honest about the security state it represents.
 
 | Stage | Cumulative responder cost | Visible to the application | Automatic (non-policy) rejections |
 |---|---|---|---|
-| `Intro` — length-gated, classified, mac1-verified, parked | 1 keyed hash, **0 DH** | source address, `sender_index` | short/oversize, unknown type/version, bad mac1 — all silent, before the queue |
+| `Intro` — length-gated, classified, mac1-verified, parked | 1 keyed hash, **0 DH** | source address, `sender_index` | wrong length (§3.1 — exact for handshakes), unknown type/version, bad mac1 — all silent, before the queue |
 | `read_identity()` → `Claimed` | **1 DH** (`es`)† | the **claimed** static | structurally unreadable msg1 (`Malformed`) |
 | `authenticate()` → `Proven` | **2 DH** (+ `ss`) | possession proven; the initiation timestamp | tail-tag failure (`HandshakeFailed`); timestamp replay (`Replay` — the guard is not policy) |
 | `accept()` → `Connection` | **4 DH** (+ `ee`, `se`; msg2 sent) | an established connection | — |

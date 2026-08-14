@@ -19,7 +19,7 @@ categories = ["cryptography", "network-programming"]
 # it is the ratified protocol the rustdoc points at.
 exclude = [
     "/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena",
-    # The wire-v2 design record: 64 rulings, their reviews, and the frozen
+    # The wire-v2 design record: 66 rulings, their reviews, and the frozen
     # intermediate drafts. Provenance a maintainer needs and a consumer does
     # not — SPEC.md is what ships.
     "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/.slices",
