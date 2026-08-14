@@ -1269,3 +1269,44 @@ the **v0.1** wire as ratified and point at deleted code. Ruling 63 gave
 prose constants an identifier so they could be grepped; the same disease
 one layer out has no such fix, only the discipline of treating every
 non-spec restatement as a claim to verify rather than a fact to read.
+
+**Ruling 68 — the AEAD tag is 16 bytes on every suite; only `PK` varies.**
+Found by slice 1's fidelity reviewer, which noticed that `classify`'s Data
+lower bound uses `constants::AEAD_TAG_LEN` while `C::AEAD_TAG_LEN` sits in
+scope, unused, in a function generic over the suite *precisely so* the
+other §2.3 sizes can be per-suite. Chasing the discrepancy into the spec
+found two ratified statements that cannot both hold:
+
+- **§2.3** defines `TAG` as "the suite AEAD's tag size" — explicitly a
+  per-suite quantity — and lists `AEAD_TAG_LEN` among *reference-suite*
+  values.
+- **§3.5** states `MAX_PLAINTEXT` as a flat `1170 (= MAX_DATAGRAM − 14 −
+  16)` and the data-path overhead as a flat `14 + 16 = 30 B`.
+
+A suite whose tag were not 16 falsifies §3.5. The reviewer stopped at the
+conflict and reported it rather than changing one token, which was right
+twice over: **it is not a one-token patch.** Making the Data floor
+per-suite makes `MAX_PLAINTEXT` and `MAX_DATAGRAM_PAYLOAD` per-suite too,
+and reshapes several of slice 0's committed constant assertions.
+
+**Ruled: `TAG` is fixed at 16 for every suite, and `PK` is the only
+per-suite quantity in §2.3's formulas.** The precedent is already in the
+spec one section away — §4.4 fixes mac1 at keyed-BLAKE2b for every suite
+rather than following the suite's Hash, on the reasoning that a per-suite
+choice there would demand a capability from every backend and buy nothing.
+The same holds here, and the cost is genuinely zero: **every AEAD Noise
+defines has a 16-byte tag** (ChaCha20-Poly1305 and AES-GCM alike), so the
+generality being surrendered has no instance. The code is correct as
+written; the spec's wording was the defect.
+
+*This is the fourth finding of one shape in a single slice* — after 65
+(the length gate), 66 (BLAKE2b's parameters) and 67 (a `Cargo.toml`
+claiming a §18.2 obligation). Each is **a stated construction with an
+unstated or mis-stated scope**, and none is a wrong value. The pattern is
+now specific enough to act on: *when the spec introduces a symbol in a
+formula, it must say what varies it.* §2.3 wrote `TAG` beside `PK` and
+made them look alike; one was per-suite and one was not, and nothing in
+the text distinguished them. Rulings 63 gave prose constants an
+identifier; this one says a **formula's free variables need their domain
+stated**, which is the same disease at the level of derivations rather
+than values.

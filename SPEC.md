@@ -489,7 +489,15 @@ same fate as garbage. The version byte does not encode the suite.
 
 ### 2.3 Per-suite derived sizes
 
-With `PK` = `Curve::PUBLIC_KEY_SIZE` and `TAG` = the suite AEAD's tag size:
+**[RATIFIED 2026/08/14 — ruling 68]** With `PK` = `Curve::PUBLIC_KEY_SIZE`
+and `TAG` = `AEAD_TAG_LEN` = **16**, *fixed for every suite* — the AEAD
+tag length does **not** follow the suite, exactly as §4.4 fixes mac1 at
+keyed-BLAKE2b rather than following the suite's Hash. **`PK` is the only
+per-suite quantity in the formulas below.** This is what keeps §3.5's
+`MAX_PLAINTEXT` a flat 1 200 − 14 − 16 and the data-path overhead a flat
+30 B; were `TAG` per-suite, both would be per-suite too, which §3.5
+denies. Nothing real is foreclosed: every AEAD Noise defines —
+ChaCha20-Poly1305 and AES-GCM alike — has a 16-byte tag.
 
 ```
 MSG1_LEN        = PK + (PK + TAG) + (MSG1_PAYLOAD_LEN + TAG)   (e ‖ enc_s ‖ enc_payload)
@@ -498,8 +506,9 @@ INIT_PACKET_LEN = 6  + MSG1_LEN + 16                           (InitHeader ‖ m
 RESP_PACKET_LEN = 10 + MSG2_LEN + 16                           (RespHeader ‖ msg2 ‖ mac1)
 ```
 
-Reference-suite values (P-256: `PK` = 65; ChaCha20-Poly1305: `TAG` = 16 =
-`AEAD_TAG_LEN`; `MSG1_PAYLOAD_LEN` = 12 — §5.2, test-pinned):
+Reference-suite values (P-256: `PK` = 65; `MSG1_PAYLOAD_LEN` = 12 — §5.2,
+test-pinned). `AEAD_TAG_LEN` appears in the table below for reference and
+is **not** a reference-suite value: per ruling 68 it is 16 on every suite:
 
 | Constant | Value |
 |---|---|
