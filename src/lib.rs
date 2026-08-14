@@ -99,6 +99,7 @@
 
 pub mod constants;
 pub mod error;
+pub mod packet;
 pub mod shell;
 pub(crate) mod varint;
 
@@ -109,3 +110,24 @@ pub use error::{
     AcceptError, AuthError, ConfigError, ConnectError, ConnectionLost, DatagramError, IntroError,
     MessageError, ReadError, WriteError,
 };
+pub use packet::Channel;
+
+/// The `hiss` slither was built against, re-exported so the version you
+/// must match is findable.
+///
+/// [`channel!`] expands to absolute `::hiss::…` paths — `hiss::noise!`
+/// emits them and a `macro_rules` wrapper cannot rewrite them — so a crate
+/// that invokes it **must depend on `hiss` itself**, on the same minor
+/// line slither does:
+///
+/// ```toml
+/// [dependencies]
+/// slither = "0.2"
+/// hiss = "0.3"
+/// ```
+///
+/// **This re-export does not remove that requirement.** It exists so the
+/// version can be read off slither's own docs, and so a type that crosses
+/// the boundary (a `Curve::PublicKey`, a `DhProvider`) can be named
+/// through one path when you would rather not name two.
+pub use hiss;

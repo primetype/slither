@@ -163,3 +163,15 @@ tower-service = { version = "0.3", optional = true }
 # `test-util` (the PAUSED CLOCK the timer tests drive: every timer in SPEC.md
 # resolves in virtual time), plus `rt`/`macros` for `#[tokio::test]`.
 tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net", "sync"] }
+
+# NOT a new crate either — `hiss` is already a dependency above, and this adds
+# no crate to the graph: `x25519-cryptoxide` is a feature of `hiss` that turns
+# on a feature of `cryptoxide`, which is itself already a dependency. Under the
+# library's `default-features = false`, hiss offers slither exactly ONE curve, so
+# SPEC.md §2.3's per-suite size derivation (`MSG1_LEN = PK + (PK + TAG) + …`)
+# would be a compile-shape claim no test ever executes — on the one slice whose
+# whole job is to freeze those sizes. With this, a second suite over X25519 can
+# be declared in the test profile, whose `PK` differs from P-256's, and the four
+# derivations checked against a second data point. No runtime dependency, no
+# version change, no wire byte.
+hiss = { version = "0.3.2", features = ["x25519-cryptoxide"] }
