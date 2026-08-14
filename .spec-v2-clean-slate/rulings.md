@@ -1078,3 +1078,65 @@ prose-derived values agree: 65, 0x07, 2, 2, 9/8, 64, 12 000, 2 400, 1 s,
 1 s. Three readings, no divergence — which is the only evidence that a
 transcription is right, since a single reader checking their own work
 proves nothing.
+
+**Ruling 64 — the packet header is little-endian.** §3.1 said "all
+multi-byte header fields are big-endian" through every draft from v1
+onward. `grep -n -i endian` over `rulings.md` returns **nothing**: across
+63 rulings and ten rounds the byte order was never argued. It was an
+inherited default — "network byte order is what protocols do" — carried
+forward untouched because nobody looked at it.
+
+Looked at, it loses on its own merits. The rule reaches **three fields**:
+`sender_index`, `receiver_index`, `counter`. Everything else in every
+header is a single byte or an opaque octet string. Against those three:
+
+1. **WireGuard is little-endian**, and slither's packet layer is
+   WireGuard-shaped by construction. §3.4 invokes "the WireGuard posture"
+   *by name* to justify the full 8-byte clear counter, and then encoded
+   that same counter the opposite way round from WireGuard.
+2. **The counter *is* the nonce.** §3.4 already says the value is
+   "simultaneously the AEAD nonce"; Noise encodes the ChaChaPoly nonce
+   little-endian. Big-endian made the wire bytes the byte-*reverse* of the
+   nonce they denote — a gratuitous discrepancy at the one place a header
+   integer meets a cryptographic construction.
+3. **packtool packs little-endian natively.** Big-endian forced every
+   header field to `[u8; N]` with `to_be_bytes`/`from_be_bytes` at each
+   site, discarding the typed-field guarantee packtool exists to provide
+   and adding a hand-conversion — a place to be wrong — per field.
+
+**The consistency objection, and why it fails.** The obvious defence of
+big-endian is §8.1: the varints are byte-identical to RFC 9000 §16 and so
+big-endian, and a wire that mixes orders reads badly. It fails on a fact
+about slither specifically — **the frame layer rides inside the AEAD**. A
+hexdump of a slither datagram shows the header and *nothing else*; the
+varints are ciphertext until a key opens them. The two orders are never
+observable in the same cleartext, so the inconsistency has no reader. What
+remains is each half matching its own lineage: the WireGuard-shaped header
+little-endian, the QUIC-shaped frames big-endian.
+
+**Scope, stated so it is not over-applied.** §8.1's varints do **not**
+change. §2.4/§6.7's static comparison does **not** change: it compares
+equal-length canonical octet strings lexicographically, which is not an
+integer encoding and has no byte order. No length, no constant, no frame
+layout and no behaviour moves — only the order of bytes within three
+header fields.
+
+**Why the timing was the whole question.** mac1's preimage is "all packet
+bytes preceding the tag" (§4.1), so the header bytes feed the DoS gate;
+the 14-byte data header is the AEAD associated data verbatim (§3.4).
+Endianness is therefore load-bearing on both the gate and the AD, and the
+golden vectors that freeze all of it land in slice 1 — Appendix B freezes
+them "for the first time at wire version 1, then held byte-identical."
+Free to decide today; a wire version to decide tomorrow. Raised because
+slice 1 was about to make it permanent, not because it was urgent on its
+own.
+
+*Generalisation, and it is the uncomfortable one.* A ratified spec's
+**unargued** lines are its weakest, and they are invisible to exactly the
+process that ratified it: sixty-three rulings all reviewed decisions
+somebody had *made*. Nothing in ten rounds was pointed at the defaults
+nobody chose. The maintainer's question — "why do we need big endian?" —
+found in one sentence what the review process structurally could not,
+because review examines what is contested and a default is by definition
+what nobody contested. Before a freeze, the question worth asking is not
+"is every decision right" but "which lines here were never decisions."

@@ -539,8 +539,26 @@ golden freeze (§4.4), with no shipped bytes to move.
 | `0x05` | reserved | cookie reply / mac2 (§19) — never emitted, silently dropped |
 | `0x06..` | reserved | future — never emitted, silently dropped |
 
-Every packet opens with `type: u8, version: u8`. **All multi-byte header
-fields are big-endian.** A datagram shorter than its type's fixed minimum,
+Every packet opens with `type: u8, version: u8`. **[RATIFIED 2026/08/14 —
+ruling 64]** **All multi-byte header fields are little-endian.** That is
+exactly three fields across the whole grammar — `sender_index`,
+`receiver_index` and `counter` — because everything else in every header
+is a single byte or an opaque octet string, and octet strings have no
+byte order. Little-endian for two reasons: it matches **WireGuard**, whose
+header integers are little-endian and whose posture §3.4 already adopts
+for the clear counter; and it makes the `counter` on the wire
+**byte-identical to the ChaCha20-Poly1305 nonce** Noise derives from it,
+which big-endian would leave as its byte-reverse (§3.4).
+
+Two things this rule does **not** reach, both of which stay as they are.
+§8.1's varints are byte-identical to RFC 9000 §16 and therefore
+big-endian; the mixed reading is not observable, because the frame layer
+rides **inside** the AEAD and never appears in the same cleartext as a
+header. And §2.4's canonical static comparison (§6.7's tie-break) is a
+lexicographic comparison of equal-length **octet strings**, not an integer
+encoding, so no byte order applies to it at all.
+
+A datagram shorter than its type's fixed minimum,
 longer than `MAX_DATAGRAM`, or bearing an unknown type or version is
 silently dropped before any further work. This pre-AEAD gate is the
 **only** silent-drop tier for malformed traffic: a packet that fails here
@@ -591,7 +609,9 @@ type(1) ‖ version(1) ‖ receiver_index(4) ‖ counter(8)        ← DataHeade
   session (and thus a key) before decryption (§17.3).
 - `counter` — exactly the value the seal returned: the hiss-owned monotonic
   send counter, which is simultaneously the AEAD nonce, the packet number
-  (§7.1), and the epoch selector (§7.7). Full 8 bytes, in clear, no
+  (§7.1), and the epoch selector (§7.7). Little-endian per §3.1, so these
+  eight bytes **are** the low eight bytes of the ChaChaPoly nonce, not a
+  byte-reversal of them. Full 8 bytes, in clear, no
   truncation and no header protection in this version — the WireGuard
   posture; truncated packet numbers and header protection are deferred
   metadata levers (§19). Until Appendix A.2's counter accessor ships, a

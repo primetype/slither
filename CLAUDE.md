@@ -3,7 +3,7 @@
 ## The spec is the authority (hard rule)
 
 **`SPEC.md` is the ratified protocol for slither's wire — version 1, the
-first released wire.** Ratified 2026/08/14 after 63 rulings across ten
+first released wire.** Ratified 2026/08/14 after 64 rulings across ten
 rounds. Every wire constant, layout, timer value and behaviour in it is
 frozen, and **the code must match the spec** — never the other way round.
 

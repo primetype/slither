@@ -19,7 +19,7 @@ categories = ["cryptography", "network-programming"]
 # it is the ratified protocol the rustdoc points at.
 exclude = [
     "/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena",
-    # The wire-v2 design record: 63 rulings, their reviews, and the frozen
+    # The wire-v2 design record: 64 rulings, their reviews, and the frozen
     # intermediate drafts. Provenance a maintainer needs and a consumer does
     # not — SPEC.md is what ships.
     "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/.slices",
@@ -97,10 +97,12 @@ hiss = { version = "0.3.2", default-features = false }
 cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = ["blake2"] }
 
 # The fixed-size, const-`SIZE`-pinned wire headers (`InitHeader`/`RespHeader`/
-# `DataHeader`). Each header is a `#[derive(Packed)]` struct with byte-array fields
-# whose multi-byte integers slither encodes big-endian itself (packtool packs raw
-# integers little-endian; the wire is big-endian, so the header fields are `[u8; N]`
-# filled via `to_be_bytes`). The maintainer's crate; pinned to 0.6.
+# `DataHeader`). Each header is a `#[derive(Packed)]` struct whose multi-byte
+# fields are plain `u32`/`u64`: SPEC.md §3.1 makes the header little-endian
+# (ruling 64) and packtool packs raw integers little-endian, so the derive is
+# the encoder and no per-field byte conversion appears anywhere. The frame
+# layer is unaffected — §8.1's varints are RFC 9000's, big-endian, and hand-
+# encoded in `varint.rs`. The maintainer's crate; pinned to 0.6.
 packtool = "0.6"
 
 # The async runtime pieces the shell actor needs: `rt` for
