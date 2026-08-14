@@ -19,7 +19,7 @@ categories = ["cryptography", "network-programming"]
 # it is the ratified protocol the rustdoc points at.
 exclude = [
     "/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena",
-    # The wire-v2 design record: 66 rulings, their reviews, and the frozen
+    # The wire-v2 design record: 67 rulings, their reviews, and the frozen
     # intermediate drafts. Provenance a maintainer needs and a consumer does
     # not — SPEC.md is what ships.
     "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/.slices",
@@ -135,10 +135,15 @@ rand_core = "0.10"
 # `getrandom::fill` is that same syscall surface without the rest of `rand`.
 getrandom = "0.4"
 
-# Structured diagnostics (SPEC.md §18.2's trace targets): the DoS-gate drop
-# counters, the roaming trace, the unlisted-static reject and the handshake
-# give-up all surface as `tracing` events rather than logs, so a host can wire
-# them to its subscriber.
+# Structured diagnostics (SPEC.md §18.2's trace targets). §18.2 is a CLOSED
+# list of exactly five — `slither::policy`, `::replay`, `::frames`, `::roam`,
+# `::io` — and it is operator-visible contract: renaming, dropping or *adding*
+# one is a protocol revision. They surface as `tracing` events rather than logs
+# so a host can wire them to its own subscriber. Note what is deliberately NOT
+# here: the pre-AEAD DoS gate (§3.1) emits nothing — it is silent in the trace
+# as well as to the peer (ruling 67). An earlier version of this comment
+# claimed §18.2 carried "the DoS-gate drop counters … and the handshake
+# give-up"; §18.2 contains neither, and the claim was the error.
 tracing = "0.1"
 
 # ── Optional: the integration surfaces, all off by default ────────────────

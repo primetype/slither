@@ -1230,3 +1230,42 @@ because review reads what is written and these were gaps in what was
 written. Both were found by the *first reader forbidden from consulting an
 implementation* — which is the argument for that constraint, stated as
 evidence rather than as principle.
+
+**Ruling 67 — the pre-AEAD gate is silent in the trace too; §18.2 stays
+closed at five targets.** Surfaced by slice 1's planner, which found that
+slither's **committed `Cargo.toml`** asserted a §18.2 obligation §18.2 does
+not contain: "the DoS-gate drop counters, the roaming trace, the
+unlisted-static reject and the handshake give-up all surface as `tracing`
+events", attributed to §18.2. Of those four, §18.2 carries the roaming
+trace; the DoS-gate counters and the handshake give-up appear nowhere in
+its five targets at all.
+
+The gate emits **nothing**. §18.2's list is unchanged — and unchanged is
+the substantive half of this ruling, because §18.2 declares itself
+operator-visible contract in which "renaming or dropping one is a protocol
+revision", which makes *adding* one a protocol revision too. The
+alternative was live and not unreasonable: "silent" in §3.1 plausibly means
+nothing signalled **to the peer or the application**, which would not
+forbid a local counter, and a flood is precisely the event an operator
+needs to see and today cannot. Declined for now — deferring costs nothing
+because the gate can gain a target in any later version, while adding one
+in the freeze slice spends a protocol revision on observability that no
+story asks for.
+
+*The process point is why this was found at all.* The planner declined to
+reword the `Cargo.toml` comment itself, on the grounds that **a committed
+file making a spec claim should not be quietly corrected by an
+implementer** — it either states the spec's obligation or the spec gains
+the obligation, and which one is a maintainer's call, not an editorial
+tidy-up. That is working rule 5 applied to a case the rule does not
+literally name, and it is right: an agent that had "fixed" the comment
+would have erased the only evidence that the two documents disagreed.
+
+*Generalisation.* Prose **outside** the spec that restates a spec
+obligation is unversioned, ungated and untested — no gate in the release
+table reads a `Cargo.toml` comment — so it drifts silently and then reads
+as authority to the next agent, which is exactly how CLAUDE.md came to name
+the **v0.1** wire as ratified and point at deleted code. Ruling 63 gave
+prose constants an identifier so they could be grepped; the same disease
+one layer out has no such fix, only the discipline of treating every
+non-spec restatement as a claim to verify rather than a fact to read.

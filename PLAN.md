@@ -2,7 +2,7 @@
 
 > **Status: APPROVED 2026/08/14.** All ten decisions in §6 are ruled
 > (rulings 53–59); the spec text is amended to match.
-> Inputs: `SPEC.md` (ratified 2026/08/14, 66 rulings) and `STORIES.md`
+> Inputs: `SPEC.md` (ratified 2026/08/14, 67 rulings) and `STORIES.md`
 > (30 capability stories, all approved).
 > The spec is the authority. Where this plan and the spec disagree, the
 > spec wins and this plan is wrong.
@@ -277,7 +277,7 @@ code compiles, but when its stories are paused-clock tests that pass.
 | # | Slice | Delivers | Stories closed |
 |---|---|---|---|
 | 0 | **Ground** | branch + skeleton, `constants.rs`, `error.rs`, `varint.rs`, `Wire` + `UdpSocket` impl, `testutil` (`Network`, `FlakyWire`, `FlakyPolicy`, counting identity), the two-endpoint paused-clock fixture | — (closes S24's attestation gap) |
-| 1 | **Packets & the gate** | §2 suite decl, §3 headers via packtool, §3.5 sizes, §4 mac1, version/prologue silent drop. **Golden-wire vectors land here** — 174/81/196/107 pinned as byte tests before any code can move them | S22 (partial) |
+| 1 | **Packets & the gate** | §2 suite decl, §3 headers via packtool, §3.5 sizes, §4 mac1, the length/type/version silent-drop gate (§3.1, exact for handshakes per ruling 65). `PROLOGUE` is *declared* here but only *binds* in slice 2: §5.1 folds it into the Noise transcript, so a mismatch fails the handshake **cryptographically** and is never a silent drop. **Golden-wire vectors land here** — 174/81/196/107 pinned as byte tests before any code can move them | S22 (partial) |
 | 2 | **Handshake & the ladder** | §5 driving (5 s + jitter, give-up 90 s), §6.1–6.3 typestate + intro queue, §17.1 guard, §17.2–17.4 tables, shell `Endpoint`/`Connecting`/staged handles | S2, S6, S7, S8, S9, S10, S21, S22, S29 |
 | 3 | **The walking skeleton** | §7.1–7.2 counter + replay window, §7.7 ratchet, §7.9, §8 frame codec with CLOSE/PING/ACK only, §15 CLOSE + teardown matrix, §16.4 poll contract on both cores, §16.5 timer table, §16.7 plan-seal-commit, the driver, `closed()` | S1, S23, S26, S27 (`closed()` half) |
 | 4 | **Streams** | §9.1–9.7 ids, implicit open, both halves, RESET_STREAM, GC; §10 flow control; §16.9 early sends + id-at-establishment | S12 (lossless), S13, S14, S17 |
