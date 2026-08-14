@@ -1,34 +1,46 @@
 # Slice 0 — "Ground" — implementation plan
 
-> **Status: DRAFT, awaiting orchestrator review.** Written 2026/08/14
-> against `SPEC.md` (ratified 2026/08/14, 59 rulings), `PLAN.md`
-> (approved 2026/08/14), `STORIES.md` (30 approved stories) and
-> `CLAUDE.md`.
+> **Status: REVISED 2026/08/14 — all ten questions answered; ready to
+> implement.** Written against `SPEC.md`, `PLAN.md` (approved
+> 2026/08/14), `STORIES.md` (30 approved stories) and `CLAUDE.md`.
+>
+> **Revision 2 folds in rulings 60, 61 and 62 and the orchestrator's five
+> answers.** The draft raised five disputed points; all five resolved in
+> the plan's favour on substance, one (`#[non_exhaustive]`) against it on
+> the remedy:
+>
+> | Raised | Outcome |
+> |---|---|
+> | `MESSAGE_OVERFLOW` 0x06 conflict (R1/Q-M5) | **Upheld, and wider than found.** §18.1's closing sentence *and* the Named-constants table both still read `0x00`–`0x05`; §9.8 prose still argued against minting the code. All three now fixed in `SPEC.md`. Codes are **`0x00`–`0x06`, `0x07`–`0x0f` reserved, ≥ `0x10` application** |
+> | `error.rs` ≠ "§18.1 verbatim" (R2) | **Upheld.** `ConfigError` ships. Ten types, 41 variants |
+> | send-failure injection missing (R3) | **Upheld and made normative** — §16.10, **ruling 60**, which also makes seeded determinism a MUST and attests all three fixture names. Closes S24's attestation gap |
+> | `Connecting` is a handle (Q-M4) | **Ruling 62.** Argument carried; generalised to *a future that changes protocol state when dropped is a handle; one that does not, is not.* `ConnectError` keeps exactly two variants |
+> | `#[non_exhaustive]` everywhere (Q-M1) | **Declined — ruling 61.** `WriteError` **only**. See §5.3 |
 >
 > **The spec is the authority.** Where this plan and `SPEC.md` disagree,
-> the spec wins and this plan is wrong. Three places below I believe the
-> *brief* is wrong or incomplete; each is called out with `⚠ BRIEF` and
-> repeated in §12.
+> the spec wins and this plan is wrong.
 
 ## Sources consulted (and deliberately not consulted)
 
 Read narrowly, per `CLAUDE.md` working rule 1 (an agent already died
-ingesting `SPEC.md` whole):
+ingesting `SPEC.md` whole). Line numbers are **post-amendment**
+(`SPEC.md` grew from 5 577 to 5 643 lines with rulings 60–62; the ranges
+the draft was written against have shifted):
 
 | Range | What |
 |---|---|
-| `SPEC.md` 5531–5577 | "Named constants" consolidated table — the authority for §4 |
-| `SPEC.md` 4851–4922 | §18.1 the error taxonomy |
+| `SPEC.md` 5597–5643 | "Named constants" consolidated table — the authority for §4 |
+| `SPEC.md` 4897–4988 | §18.1 the error taxonomy + **ruling 61** |
 | `SPEC.md` 2429–2451 | §8.1 varint encoding |
 | `SPEC.md` 4150–4217 | §16.3 the `Wire` trait + the failing-send trace obligation |
-| `SPEC.md` 4517–4527 | §16.10 kernel-free drivability |
-| `SPEC.md` 4923–4965 | §18.2 trace targets |
+| `SPEC.md` 4536–4573 | §16.10 kernel-free drivability + **ruling 60** (the attested fixture surface) |
+| `SPEC.md` 4989–5031 | §18.2 trace targets |
 | `SPEC.md` 476–520, 608–625 | §2.3 / §2.4 / §3.5 — needed to *derive* the sizes rather than transcribe magic numbers |
 | `SPEC.md` 2490–2513, 3688–3701 | §8.3 frame table, §15.3 error-code registry — the consolidated table names these rows without naming their members |
-| `SPEC.md` 3792–3830, 3855–3892, 4039–4060 | §16.2 shell surface + ruling 44's `ConfigError` + §16.3 handle lifetimes |
-| `SPEC.md` 5466–5524 | Appendix B — the fixture obligations that constrain `testutil` |
+| `SPEC.md` 3792–3830, 3855–3892, 4039–4060, 4096–4112 | §16.2 shell surface + ruling 44's `ConfigError` + §16.3 handle lifetimes + **ruling 62** |
+| `SPEC.md` 5466–5524 (pre-amendment numbering) | Appendix B — the fixture obligations that constrain `testutil` |
 | `PLAN.md` §1, §3, §4, §9 | module map, composability/features, slice table, doc obligations |
-| `STORIES.md` S24, S25 | the attestation gap and the `Wire` story |
+| `STORIES.md` S24, S25 | the attestation gap (now closed by ruling 60) and the `Wire` story |
 | `hiss-0.3.2` `Cargo.toml`, `curve/p256/mod.rs`, `noise/datagram.rs` | to pin `STATIC_PUBLIC_LEN` and `MAX_EPOCH_JUMP` against hiss rather than against a literal |
 
 **Not consulted for guidance:** the v0.1 `src/` bodies. One exception,
@@ -64,16 +76,21 @@ substrate works.
 | 3 | `src/constants.rs` | new |
 | 4 | `src/error.rs` | new |
 | 5 | `src/varint.rs` | new |
-| 6 | `src/shell/mod.rs` | new — **structurally required, missing from the brief's table** |
+| 6 | `src/shell/mod.rs` | new — structurally required (`wire.rs` needs a parent) |
 | 7 | `src/shell/wire.rs` | new |
 | 8 | `src/testutil/mod.rs` | new |
 
 ### Definition of done
 
 All eight `CLAUDE.md` gates green on the slice-0 commit, **each run and
-its output pasted** (working rule 7), plus
+its output pasted** (working rule 7 — the exact commands are §14), plus
 `testutil::tests::a_byte_crosses_two_flaky_wires_under_injected_loss`
 (§9) passing on `#[tokio::test(start_paused = true)]`.
+
+Gate 6 ("wire pins") needs its slice-0 reading stated rather than
+assumed: **no golden-wire vectors exist until slice 1**, so in this slice
+the pins are the 39 compile-time assertions in `constants.rs` and the
+independently-authored transcription test. §14 says how to report it.
 
 ---
 
@@ -88,8 +105,8 @@ signature and v0.1's 33-byte compressed static (`[u8; 33]` in
 failure mode the clean rewrite exists to avoid.
 
 `examples/` also references the v0.1 API and must go in the same commit
-(it is not in the brief's list; `cargo build --all-targets` fails
-otherwise, so gate 1 catches it either way).
+(`cargo build --all-targets` fails otherwise, so gate 1 catches it
+either way).
 
 ---
 
@@ -101,9 +118,12 @@ otherwise, so gate 1 catches it either way).
 version = "0.2.0"
 edition = "2024"          # unchanged
 rust-version = "1.96"     # unchanged; lockstep with hiss 0.3.2 (verified)
-
-exclude = [ …existing…, "/.slices" ]   # ← the slice plans must not ship
 ```
+
+`exclude` already carries `"/.slices"` — the maintainer applied it when
+answering Q-O4, so slice 0 must **not** re-add it. Verify it is still
+there rather than assuming; it is the only thing standing between the
+slice plans and the published crate.
 
 `description` needs rewriting: the current one describes the v0.1 wire
 ("no congestion control, streams, or fragmentation — reserved"), all
@@ -177,12 +197,16 @@ assertions); adding it now would ship an untested dependency.
 
 Nothing in `Cargo.toml` is testable except by the gates. Gate 1
 (`--all-features --all-targets`) and gate 8 (`cargo deny check`) *are*
-this file's tests. One extra local check before handing off:
-`cargo build --no-default-features` and each feature alone
-(`--features sink`, `--features codec`, `--features tower`) — the gate
-table runs only `--all-features`, which cannot catch a feature that fails
-in isolation. Recommend adding these four to CI's `Check` job as part of
-slice 0; that is a CI change, so flagged as a question (§13, Q3).
+this file's tests.
+
+**One CI change lands in slice 0** (Q-O3, answered — split):
+`cargo build --no-default-features` joins the `Check` job **now**,
+because it is meaningful today: `test-util` gates the whole `testutil`
+module, so a default build that accidentally depends on it breaks
+immediately. The three per-feature builds (`--features sink` / `codec` /
+`tower`) are **deferred to slice 8**, when those features actually gate
+code — a build that compiles nothing proves nothing. `--all-features`
+already covers them until then.
 
 ---
 
@@ -290,7 +314,7 @@ vectors that land in slice 1).
 | 63 | `K_TIME_THRESHOLD_DEN` | `8` | `u32` | — ⚠ name unattested |
 | 64 | `K_GRANULARITY` | `1 ms` | `Duration` | — (§13.2) |
 | 65 | `K_INITIAL_RTT` | `333 ms` | `Duration` | — (§13.1) |
-| 66 | `PTO_BACKOFF_CAP` | `64` | `u32` | **= `1 << 6`** (§13.3, spec writes "2⁶") ⚠ see Q-M2 |
+| 66 | `PTO_BACKOFF_CAP` | `64` | `u32` | **= `1 << 6`** (§13.3 caps `2^pto_count`; §13.5 "2⁶× too long" — the **multiplier**, settled) |
 | 67 | `INITIAL_WINDOW` | `12_000` | `u64` | **= `10 × MAX_DATAGRAM`** (RFC 9002 `kInitialWindow` at this MTU) |
 | 68 | `MINIMUM_WINDOW` | `2_400` | `u64` | **= `2 × MAX_DATAGRAM`** (RFC 9002 `kMinimumWindow`) |
 | 69 | `LOSS_REDUCTION_FACTOR` | `0.5` | `f64` | — (§14.2) — see §4.4 |
@@ -314,8 +338,15 @@ vectors that land in slice 1).
 | 87 | `STREAM_LIMIT_ERROR` | `0x03` | `u64` | — |
 | 88 | `STREAM_STATE_ERROR` | `0x04` | `u64` | — |
 | 89 | `FINAL_SIZE_ERROR` | `0x05` | `u64` | — |
-| 90 | `MESSAGE_OVERFLOW` | `0x06` | `u64` | — (§15.3, **ruling 52**) **⚠ CONFLICT — see §12 R1** |
+| 90 | `MESSAGE_OVERFLOW` | `0x06` | `u64` | — (§15.3, **ruling 52**) — **conflict resolved 2026/08/14, see R1** |
 | 91 | `APPLICATION_ERROR_BASE` | `0x10` | `u64` | — (§15.3, "≥ 0x10 application") ⚠ name unattested |
+
+The error-code range is now consistent across all four places that state
+it — §15.3's registry, §18.1's closing sentence, the Named-constants
+table, and §9.8's prose: **`0x00`–`0x06`, `0x07`–`0x0f` reserved
+(transport-reserved, never sent), `≥ 0x10` application.** Implement
+exactly that. `0x07`–`0x0f` gets **no constants**; it is a gap, and a
+`RESERVED_*` name for each would invite one to be sent.
 
 The ceiling of `PERSISTENT_KEEPALIVE`'s admissible range is
 `DEAD_TIMEOUT` **exclusive** (ruling 40) — no separate constant; the
@@ -469,9 +500,12 @@ deferred, or `#[ignore]`d. Runtime tests add only what `const` cannot do:
 3. `frame_types_are_distinct` — collect all 14 frame-type constants,
    assert no duplicates and that none falls inside
    `FRAME_STREAM_BASE..=FRAME_STREAM_MAX` except the STREAM range itself.
-4. `error_codes_are_distinct_and_below_the_application_base` — the seven
-   transport codes are unique and `< APPLICATION_ERROR_BASE`, and
-   `0x07..0x10` is the reserved gap.
+4. `error_codes_are_distinct_and_below_the_application_base` — the
+   **seven** transport codes (`NO_ERROR` … `MESSAGE_OVERFLOW`) are
+   unique, contiguous `0x00..=0x06`, and `< APPLICATION_ERROR_BASE`;
+   `0x07..0x10` is the reserved gap and no constant occupies it. This
+   test is the standing guard for R1's failure mode — a restatement of
+   the registry drifting from the registry.
 5. `epoch_jump_matches_hiss` — belt-and-braces runtime mirror of the
    const assert, in case hiss's const turns out not to be const-context
    reachable under `default-features = false` (**verify at
@@ -482,14 +516,15 @@ deferred, or `#[ignore]`d. Runtime tests add only what `const` cannot do:
 
 ## 5. `src/error.rs`
 
-### ⚠ BRIEF — this file is §18.1 **plus one type §18.1 excludes**
+### This file is §18.1 **plus one type §18.1 excludes**
 
-The brief says "§18.1's closed taxonomy, verbatim". That would ship a
-crate whose §16.2 shell surface does not compile. `set_persistent_keepalive`
-returns `Result<(), ConfigError>` (§16.2 line 3817), and **ruling 44**
-defines `ConfigError::{KeepaliveTooShort, KeepaliveTooLong}` while stating
-that it *"deliberately sits outside §18.1's protocol-error taxonomy, which
-stays closed: no peer, no packet, and no connection state is involved."*
+"§18.1's closed taxonomy, verbatim" alone would ship a crate whose §16.2
+shell surface does not compile. `set_persistent_keepalive` returns
+`Result<(), ConfigError>` (§16.2), and **ruling 44** defines
+`ConfigError::{KeepaliveTooShort, KeepaliveTooLong}` while stating that it
+*"deliberately sits outside §18.1's protocol-error taxonomy, which stays
+closed: no peer, no packet, and no connection state is involved."*
+Confirmed by the orchestrator; ten types is right.
 
 So: `error.rs` carries §18.1's **nine** types verbatim, **plus**
 `ConfigError` from §16.2/ruling 44, with a module doc that states exactly
@@ -499,18 +534,24 @@ S24's sibling story pins it: `STORIES.md` line 129 requires
 
 ### 5.1 The types, exactly
 
+**`#[non_exhaustive]` appears on `WriteError` and nowhere else**
+(ruling 61). Every other type below is exhaustive on purpose; §5.3 has
+the reasoning, and a reviewer who "fixes" the inconsistency by adding the
+attribute to the other nine has undone a ruling.
+
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ConnectError {
     #[error("a connection to this static already exists")]
     AlreadyConnected,
     #[error("the initial connect gave up after HANDSHAKE_GIVEUP")]
     TimedOut,
+    // NO `EndpointDropped` (ruling 62): a `Connecting` is a handle, so
+    // the driver cannot stop beneath one and the variant would describe
+    // no reachable state. §18.1 stays closed.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum IntroError {
     #[error("the parked introduction outlived INTRO_TTL")]
     Expired,
@@ -523,7 +564,6 @@ pub enum IntroError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum AuthError {
     #[error("the timestamp guard rejected this initiation as a replay")]
     Replay,
@@ -536,7 +576,6 @@ pub enum AuthError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum AcceptError {
     #[error("no initiation is parked for this static, or it fails the replacement basis")]
     Stale,
@@ -545,7 +584,6 @@ pub enum AcceptError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ConnectionLost {                    // ← MUST derive Clone: see §5.2
     #[error("no authenticated packet arrived for DEAD_TIMEOUT")]
     TimedOut,
@@ -563,6 +601,9 @@ pub enum ConnectionLost {                    // ← MUST derive Clone: see §5.2
     EndpointDropped,
 }
 
+/// The **one** non-exhaustive error type (ruling 61): §19 explicitly
+/// reserves `Stopped` for the STOP_SENDING round, so this type
+/// demonstrably will gain a variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum WriteError {
@@ -572,12 +613,12 @@ pub enum WriteError {
     ConnectionLost(#[from] ConnectionLost),
     #[error("write after finish")]
     Finished,
-    // NO `Stopped`: STOP_SENDING is deferred (§9.9); the variant is
-    // reserved for that round and MUST NOT be added here.
+    // NO `Stopped` yet: STOP_SENDING is deferred (§9.9). The variant is
+    // reserved for that round and MUST NOT be added here — the
+    // `#[non_exhaustive]` above is the reservation, not a licence.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ReadError {
     #[error("the peer reset the stream: code {0}")]
     Reset(u64),
@@ -586,7 +627,6 @@ pub enum ReadError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum MessageError {
     #[error("the message exceeds MESSAGE_RECV_MAX")]
     TooLarge,
@@ -595,7 +635,6 @@ pub enum MessageError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum DatagramError {
     #[error("the datagram exceeds MAX_DATAGRAM_PAYLOAD")]
     TooLarge,
@@ -603,9 +642,10 @@ pub enum DatagramError {
     ConnectionLost(#[from] ConnectionLost),
 }
 
-/// Outside §18.1 by ruling 44 — a configuration error, not a protocol one.
+/// Outside §18.1 by ruling 44 — a configuration error, not a protocol
+/// one: no peer, no packet, no connection state, nothing observable on
+/// the wire. Exhaustive, like the taxonomy proper (ruling 61).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ConfigError {
     #[error("the persistent-keepalive interval is below the 1 s floor")]
     KeepaliveTooShort,
@@ -640,32 +680,42 @@ fn _assert_clone<T: Clone>() {}
 
 `Clone` propagates to all four embedding types, so all four derive it too.
 
-### 5.3 `#[non_exhaustive]` — which types, and the tension
+### 5.3 `#[non_exhaustive]` — `WriteError` only (ruling 61)
 
-**Recommend `#[non_exhaustive]` on all ten**, with this reasoning stated
-in the module doc:
+**Settled 2026/08/14. The draft recommended applying it to all ten types;
+that was declined, and the reasoning is recorded in §18.1 so it is not
+re-proposed.** The rule is now:
 
-- §18.1 is closed **as a specification**: no variant may be added without
-  a ratification decision. That is a *process* guarantee.
-- `#[non_exhaustive]` is a *semver* guarantee: it reserves the right to
-  add a variant in a future wire line without a major bump. §19 already
-  names two reservations that will land — `WriteError::Stopped` when
-  STOP_SENDING arrives (§9.9), and whatever the range-tracker ACK needs
-  — and §16.2's `Notification` is already declared non-exhaustive for
-  exactly this reason ("a later wire line may add a kind without a
-  breaking change").
-- The two are not in conflict, and the module doc must say so, because a
-  reviewer will read `#[non_exhaustive]` on a "closed" taxonomy as a
-  contradiction: **closed means slither may not add one; non-exhaustive
-  means a consumer may not assume slither never will.**
+> `#[non_exhaustive]` goes **only where a variant is actually reserved**.
 
-The cost is real: consumers must write a `_ =>` arm. That is the correct
-trade for a transport whose §19 explicitly reserves future variants.
-`ConfigError` is non-exhaustive on the same grounds (a future config
-setter adds a bound).
+- **`WriteError` carries it** — §19 explicitly reserves `Stopped` for the
+  STOP_SENDING round, so that type demonstrably will gain a variant.
+- **The other nine are exhaustive.** The taxonomy is closed by process,
+  and the type system should say the same thing wherever that is true.
 
-Recommended, not asserted — this is a semver decision the maintainer may
-want to rule on (Q-M1).
+The argument that carried it, which the draft missed: a consumer matching
+an exhaustive enum with **no `_` arm** gets a **compile error** the day a
+variant is added — and for a transport that is the loud failure worth
+having. A wildcard arm silently swallows a new error into a branch
+written for the old ones, which is strictly worse than a build break. The
+draft weighed only the ergonomic cost of the `_` arm and never weighed
+what the `_` arm *does* when a variant lands.
+
+The price is that adding a variant to any of the nine is a major version
+bump. Ruling 61 calls that "the correct price and a useful brake", and it
+is consistent with the taxonomy being closed by process anyway: a variant
+addition already requires a ratification decision, so it is never a quiet
+patch release regardless.
+
+Two neighbours stay as they are, for reasons that do not generalise:
+§16.2's `Notification` remains `#[non_exhaustive]` — it is a *signal set*
+a later wire line may extend, not an error taxonomy — and `ConfigError`
+sits outside §18.1 entirely (ruling 44) and is exhaustive.
+
+**Implementation note.** `#[non_exhaustive]` on nine fewer types means
+slice 0's own tests, and every test in slices 1–8, match without `_`
+arms. That is a feature: §5.6 test 1's exhaustive-match fence becomes the
+*normal* way the crate matches its own errors, not a special construct.
 
 ### 5.4 Other derives
 
@@ -700,7 +750,12 @@ not slice 0's — they belong to `compat/io.rs`. Scope fence.
    type over every variant, with **no `_` arm**, inside a `#[cfg(test)]`
    function. Adding a variant makes it fail to compile; that is the
    mechanical enforcement of "closed", and it is stronger than a comment.
-   (Written **before** the enum, per working rule 6.)
+   (Written **before** the enum, per §10's author swap.) This works for
+   all ten types, `WriteError` included: **`#[non_exhaustive]` has no
+   effect inside the crate that declares it**, so an in-crate match must
+   still cover every variant and the fence catches an addition there too.
+   The attribute only forces a `_` arm on *downstream* consumers — which
+   is exactly the asymmetry ruling 61 wants.
 2. `connection_lost_is_clone` — §5.2.
 3. `display_strings_are_non_empty_and_lowercase_initial` — every
    `to_string()` is non-empty and does not end in `.` (thiserror style
@@ -914,16 +969,16 @@ The three candidates and their trade-offs:
 | **Explicit RPITIT** (`fn send_to(&self, …) -> impl Future<Output = …> + '_`) | Equivalent in every way that matters, and it silences the lint by being explicit. Rejected only because it is **not what §16.3 writes**, and §16.3 is normative. Worth a ruling request if the lint proves noisy under `-D warnings`. |
 | **`async-trait`** | **Rejected.** It boxes every future — an allocation per datagram on the hottest path in the crate — adds a proc-macro dependency to the audit surface, and defaults to adding `Send` bounds (`#[async_trait(?Send)]` is needed to avoid it). A mechanism whose *default* violates a `CLAUDE.md` invariant is the wrong mechanism. |
 
-**The consequence that reaches slice 2, and must not be decided by
-accident here:** because AFIT is not dyn-compatible, `Endpoint` cannot
-hold a `Box<dyn Wire>`. It must be generic — `Endpoint<W: Wire>` — and
-that parameter leaks into `Connecting`, and possibly into the staged
-handles. §2.2 already makes the shell type generic over the suite
-(`Endpoint<C: Channel>`), so this is a second parameter, not the first.
+**The consequence that reaches slice 2 — decided, not left to
+accident (Q-O2, answered):** because AFIT is not dyn-compatible,
+`Endpoint` cannot hold a `Box<dyn Wire>`. **Slice 2 uses
+`Endpoint<W: Wire>`**, generic; that parameter leaks into `Connecting`
+and possibly into the staged handles. §2.2 already makes the shell type
+generic over the suite (`Endpoint<C: Channel>`), so this is a second
+parameter, not the first, and AFIT makes it near-forced anyway.
 
-Slice 0 must not foreclose the alternative. It does not: if slice 2
-decides it wants type erasure, a **private** `DynWire` shim in `shell/`
-—
+The alternative stays available and is not foreclosed: if slice 2 or
+later wants type erasure, a **private** `DynWire` shim in `shell/` —
 
 ```rust
 trait DynWire {
@@ -936,8 +991,8 @@ impl<W: Wire> DynWire for W { … }
 
 — erases it without touching the public trait, without a spec change, and
 without a `Send` bound. Slice 0's obligation is to write the trait as
-specified and to record this note so slice 2 makes the call deliberately.
-Raised as Q-O2.
+specified; the choice above is recorded here so slice 2 implements a
+decision rather than discovering a constraint.
 
 ### 7.3 What `shell/wire.rs` must NOT contain
 
@@ -979,12 +1034,27 @@ Raised as Q-O2.
 
 ## 8. `src/testutil/mod.rs`
 
-> `FlakyWire` is named in `SPEC.md` §16.3/§16.10 and in Appendix B.
-> `Network` and `FlakyPolicy` are **not** — S24 calls this "an
-> attestation gap to close, since a downstream crate already depends on
-> all three". Slice 0 cannot close a spec gap (only a ruling can), but it
-> can and must (a) keep the three names stable, and (b) hand the
-> maintainer the precise text to attest. Drafted in §14, Q-M3.
+> **The attestation gap is closed. §16.10 gained ruling 60 on
+> 2026/08/14**, and this file is now implementing a normative surface,
+> not a test convention. Four things follow, and each is a MUST:
+>
+> 1. **All three names are contract** — `testutil::Network`,
+>    `testutil::FlakyWire`, `testutil::FlakyPolicy` — *"on the same terms
+>    as §18.2's trace targets: renaming or dropping one is a protocol
+>    revision, because a consumer's test suite is built on them."* So
+>    slice 0 may not rename them for taste, and neither may any later
+>    slice.
+> 2. **`Network` is "the in-memory routing fabric… it owns the
+>    address→endpoint map and moves datagrams between `FlakyWire`s"** —
+>    §8.2 below is that sentence, implemented.
+> 3. **`FlakyPolicy` carries loss, reordering, duplication *and send
+>    failure*, and MUST be deterministic under a caller-supplied seed.**
+>    Both halves are normative — §8.3 and §8.4.
+> 4. **Send-failure injection "belongs in `FlakyPolicy` from the start:
+>    retrofitting it later would rewrite the tests of every slice that
+>    had already ridden the fixture."** It is slice 0's, explicitly.
+>
+> This closes S24's attestation gap, which the story listed as owed.
 
 ### 8.1 Module gate
 
@@ -1140,8 +1210,18 @@ impl FlakyPolicy {
 }
 ```
 
-**The determinism contract, stated as a rule the implementation must
-follow and a test must pin:**
+**The determinism contract. Normative under ruling 60** — *"It MUST be
+deterministic under a caller-supplied seed. A flow test that cannot be
+replayed byte-for-byte from its seed is not a regression test, and the
+loss-dependent behaviour in §13 and §7.5 is exactly where a
+once-in-a-thousand-runs failure would otherwise be unactionable."*
+The rules below are how that MUST is met; test 3 in §8.7 is how it is
+pinned.
+
+Note the phrase **caller-supplied**: `Network::seeded(seed)` is the
+normative constructor and `Network::new()` is sugar for `seeded(0)`.
+There is no OS-entropy path, and adding one later would violate the
+ruling.
 
 - **One `ChaCha20Rng` per `FlakyWire`, not one per `Network`.** Seeded
   `ChaCha20Rng::seed_from_u64(net_seed ^ (ordinal as u64).wrapping_mul(0x9E3779B97F4A7C15))`
@@ -1167,23 +1247,26 @@ follow and a test must pin:**
   recommend index-based policies for anything asserting a specific
   outcome.
 
-### 8.4 Send-failure injection — ⚠ BRIEF: **missing from the brief, and required**
+### 8.4 Send-failure injection — normative, slice 0's, ruling 60
 
-The brief's `testutil` list is `Network`, `FlakyWire`, `FlakyPolicy`, and
-the counting identity. It omits send failure. Appendix B (`SPEC.md`
-5489–5497) is explicit:
+The draft raised this as a gap in the brief. It is now settled in the
+spec's own text. §16.10:
+
+> **"Send-failure injection is required, not optional."** Ruling 49 makes
+> a failing `send_to` a trace obligation, and Appendix B's obligation for
+> it is unreachable without a fixture that can fail a send. **It belongs
+> in `FlakyPolicy` from the start: retrofitting it later would rewrite
+> the tests of every slice that had already ridden the fixture.**
+
+and Appendix B, unchanged:
 
 > *"Give the endpoint a `Wire` whose `send_to` returns `ENETUNREACH` for
-> a bounded interval, then heals. […] **A `FlakyWire` that can fail sends
-> is the fixture; the obligation is unreachable without one.**"*
+> a bounded interval, then heals. […] A `FlakyWire` that can fail sends
+> is the fixture; the obligation is unreachable without one."*
 
-That is ruling 49, §18.2's `slither::io` target, and S25's second
-acceptance clause. It is not slice 7's to add: the fixture belongs to the
-`Wire` implementation, and retrofitting it in slice 7 means changing
-`FlakyWire`'s public surface after two slices have written tests against
-it. **Slice 0 ships it.** It is ~20 lines (`SendFailure` above, one branch
-in `send_to`), so this is not scope creep — it is the brief's list being
-one item short.
+So `SendFailure` and the `failing_sends_until` constructor are slice 0
+deliverables, not slice 7's. Cost: ~20 lines and one branch in `send_to`.
+Test 10 in §8.7 proves it works two slices before anything depends on it.
 
 ### 8.5 `FlakyWire`, and the counting identity
 
@@ -1240,21 +1323,20 @@ nothing else counts.** Key generation is not a DH. This has to be exact,
 because §6.1's whole design argument is "one DH to inspect, two to
 authenticate" and the ladder assertions are how it is enforced.
 
-**⚠ The `Identity` impl cannot land in slice 0.** `CountingIdentity` must
-`impl Identity`, and `Identity` is the trait §16.4 names in
-`core::Endpoint<I: Identity>` — a **slice 2** file that does not exist,
-and which the v0.2 module map (PLAN.md §1) gives no home to at all (v0.1
-kept it in `handshake.rs`, which v2 deletes). Recommendation:
+**The `Identity` impl lands in slice 2, not slice 0 (Q-O1, confirmed).**
+`CountingIdentity` must `impl Identity`, and `Identity` is the trait
+§16.4 names in `core::Endpoint<I: Identity>` — a **slice 2** file that
+does not exist, and which the v0.2 module map gives no home to at all
+(v0.1 kept it in `handshake.rs`, which v2 deletes). So:
 
 - **Slice 0 ships `CountingProvider` + `DhCounter`** — the DH counter is
   the deliverable the later slices assert on, and it depends only on
   hiss, which exists today.
 - **Slice 2 adds `CountingIdentity: Identity`** in the same file, when
-  the trait exists.
+  the trait exists. **No module-map deviation** — nothing new is minted
+  in slice 0 and `src/identity.rs` is not created.
 
-This defers nothing that slices 0–1 need (neither drives a handshake) and
-foregoes nothing. Raised as Q-O1, because it is a deviation from the
-brief's table.
+This defers nothing that slices 0–1 need: neither drives a handshake.
 
 ### 8.6 What `testutil` must NOT contain
 
@@ -1444,14 +1526,26 @@ varint-fit assertions from `constants.rs` and move them into
 `varint.rs`'s tests — a small loss (they become runtime, not compile
 time) for full independence.
 
-**Working rule 6 applies to two files.** `constants.rs`'s transcription
-test (§4.5 test 1) and `error.rs`'s exhaustive-match fence (§5.6 test 1)
-must be written by a *different* agent than the one writing the file, and
-written from `SPEC.md` first. For a slice whose entire value is "the
-constants are right", one author writing both is the failure mode
-`CLAUDE.md` names explicitly. Suggest: agent A writes `constants.rs`,
-agent C writes its transcription test; agent C writes `error.rs`, agent A
-writes its fence.
+**The author swap applies to exactly two files — `constants.rs` and
+`error.rs` — and nowhere else (Q-O5, answered).**
+
+`constants.rs`'s transcription test (§4.5 test 1) and `error.rs`'s
+exhaustive-match fence (§5.6 test 1) are written by a *different* agent
+than the one writing the file, from `SPEC.md` first. Concretely: **agent
+A writes `constants.rs`, agent C writes its transcription test; agent C
+writes `error.rs`, agent A writes its fence.**
+
+The reason is *not* `CLAUDE.md`'s working rule 6, which names
+story-level acceptance tests and slice 0 closes no story. It is narrower
+and sharper: **an implementer who mis-transcribes a constant will
+mis-transcribe it into its own test identically, and both will look
+right.** That is the self-consistency failure the rule exists for, and
+transcription is where it bites hardest — a wrong `IK_MSG1_LEN` with a
+matching test is a green build and a broken wire.
+
+Everywhere else in slice 0 — `varint.rs`, `shell/wire.rs`,
+`testutil/mod.rs` — **the implementer writes their own tests.** Those
+files encode behaviour that fails visibly; they are not transcription.
 
 **Wave 2** is one agent on `testutil/mod.rs` — the largest single file in
 the slice (~600 lines with tests) and the one with the real design
@@ -1473,8 +1567,8 @@ what exists.
 
 - **The `Wire` trait's dyn-incompatibility** (§7.2) constrains slice 2's
   `Endpoint` to a generic parameter or a private erasure shim. It does
-  not foreclose either. Recorded as Q-O2 so slice 2 chooses rather than
-  discovers.
+  not foreclose either. Q-O2 settles it: **generic**, with the shim
+  available later.
 - **`varint` as `pub(crate)`** (§6.1) can be promoted without a break.
 - **`CountingIdentity` deferred to slice 2** (§8.5) — nothing in slices
   0–1 drives a handshake, so nothing is blocked.
@@ -1494,20 +1588,29 @@ I walked slices 1–8 against the ten types. Coverage:
 | 7 mobility | roaming, keepalive, contested | ✅ — **the contested probe deliberately shares `ConnectionLost::TimedOut`** (§15.4: "the same variant, no new one"). A reviewer will want to add `Contested`; ruling 45 already declined it — it surfaces as a `Notification`, not an error |
 | 8 composability | `io::Error` conversions | ✅ — conversions, not variants |
 
-**One residual gap, and I believe it is a real one in the spec, not in my
-reading:** `ConnectError` has **no `EndpointDropped`**, while
-`IntroError`, `AuthError`, `AcceptError` and `ConnectionLost` all do. If
-the driver stops while a `Connecting` is in flight, the only variants
-available are `AlreadyConnected` and `TimedOut`, and neither is true.
+**The one residual gap the draft found is now closed by ruling 62.**
+`ConnectError` has **no `EndpointDropped`**, while `IntroError`,
+`AuthError`, `AcceptError` and `ConnectionLost` all do. The draft argued
+this was safe because a `Connecting` must be a handle — §16.3 says *"the
+driver lives while any handle lives"*, and ruling 50 makes dropping a
+`Connecting` a state-changing event, which only makes sense if it is one.
 
-The resolution I believe is correct: §16.3 says *"the driver lives while
-any handle lives; dropping every handle stops it"*, and ruling 50 makes
-dropping a `Connecting` a state-changing event — which only makes sense
-if a `Connecting` **is** a handle. If it is, the driver cannot stop
-beneath a live `Connecting` and the variant is unreachable, exactly as
-`AcceptError::AlreadyConnected` was deleted for being unreachable. That
-is consistent and needs no change. But it is inferred, not stated, and it
-is the kind of thing that becomes a slice-2 argument. Q-M4.
+That is now ratified, and generalised past the special case:
+
+> **A future that changes protocol state when dropped is a handle; one
+> that does not, is not.** (§16.3, ruling 62)
+
+A `Connecting` **owns an in-flight protocol attempt** — a pending, its
+index, and §5.5's retransmit train — so it is a handle and the driver
+cannot stop beneath it. A `closed()` future owns nothing and merely
+observes, so it is not. The consequence is stated in the spec:
+`ConnectError` needs no `EndpointDropped`, §18.1 stays closed as written,
+and **the asymmetry against the staged errors is correct rather than an
+omission** — a staged verb is a round-trip to a driver it does not keep
+alive; an outbound attempt keeps its own driver running.
+
+Slice 0 therefore ships `ConnectError` with exactly two variants, and
+`src/error.rs` carries that comment so nobody re-derives the question.
 
 ### Feature layout vs `PLAN.md` §3
 
@@ -1549,58 +1652,63 @@ thirteen resolve from crates.io. No path deps, no git sources —
 
 - **`Cargo.lock` stays uncommitted.** `.gitignore` already lists it.
   A `Cargo.lock` currently exists on disk, untracked — correct.
-- **`.slices/` must be added to `Cargo.toml`'s `exclude`**, or the slice
-  plans ship inside the published crate.
-- **`PLAN.md` §1's module map says the crate doc carries "the four
-  documentation obligations"; §9 lists five.** A stale count in the
-  approved plan. The brief and §9 agree on five; slice 0 writes five.
-  Worth correcting in `PLAN.md` (Q-O4).
+- **`.slices` in `Cargo.toml`'s `exclude` — done** (Q-O4, applied by the
+  maintainer). Slice 0 verifies rather than re-adds.
+- **`PLAN.md` §1's "four documentation obligations" — fixed** (Q-O4);
+  §1 and §9 now both say five. Slice 0's `lib.rs` writes five.
 
 ---
 
-## 12. Risks and open questions
+## 12. Risks — resolved and remaining
 
-**R1 — `MESSAGE_OVERFLOW` (0x06): the consolidated table and §15.3
-disagree. ⚠ Needs a ruling.**
-The Named-constants table (line 5570) reads *"wire error codes | 0x00–0x05
-+ ≥ 0x10 application"*. §15.3's registry defines **`0x06 MESSAGE_OVERFLOW`**,
-ratified 2026/08/14 as ruling 52, and §18.1, §9.8 and PLAN.md's slice 6
-row all depend on it. The consolidated table appears not to have been
-updated after ruling 52.
+### Resolved since the draft
 
-Per `CLAUDE.md` working rule 3 I am **not** silently picking one. My
-reading is that **§15.3 is right and the table row is stale**: 0x06 is
-carried by three ratified passages and the table row is a one-line
-summary. Recommendation: implement §15.3 (`0x00`–`0x06`, `0x07`–`0x0f`
-reserved, `≥ 0x10` application) and amend the table row. Flagged as
-Q-M5 — if the maintainer rules the other way, `MESSAGE_OVERFLOW` comes
-out of `constants.rs` and ruling 52 needs revisiting, which is a much
-bigger change than a constant.
+**R1 — `MESSAGE_OVERFLOW` (0x06). ✅ RESOLVED, and the defect was wider
+than the draft found.** The draft found the Named-constants table still
+reading `0x00`–`0x05` against §15.3's `0x06 MESSAGE_OVERFLOW` (ruling
+52). Ruling 52's application had in fact updated the two **normative**
+sections (§15.3, §9.8) and missed **three** restatements, found by three
+different routes: the Named-constants table (this plan), **§18.1's own
+closing sentence** (the maintainer), and a §9.8 prose paragraph still
+arguing the code was not worth minting (round 9). All three are now
+fixed. §15.3 was authoritative exactly as recommended.
 
-**R2 — `ConfigError` is missing from the brief's `error.rs`
-description. ⚠ The brief is incomplete.** §5 above. Shipping "§18.1
-verbatim" alone gives a crate whose §16.2 surface cannot compile and
-whose S24-adjacent story (`STORIES.md` line 129) cannot be written.
-Assumption made and continued: `error.rs` ships all ten types, with the
-module doc explaining why the tenth is outside the taxonomy.
+**The transferable lesson, which is `CLAUDE.md` working rule 4 in
+concrete form:** a ruling that changes a value must be verified by
+grepping for the **rationale**, not only the token. Two of the three
+misses were prose that still argued the reversed position while quoting
+no number at all. Slice 0's §4.5 test 4 is the standing mechanical guard
+for the one restatement that lives in code.
 
-**R3 — send-failure injection is missing from the brief's `testutil`
-list. ⚠ The brief is incomplete.** §8.4. Appendix B says the obligation
-is *unreachable* without it. Assumption made and continued: slice 0
-ships it.
+**R2 — `ConfigError` missing from the brief. ✅ RESOLVED — the brief was
+wrong.** `error.rs` ships all ten types.
 
-**R4 — `CountingIdentity` cannot be completed in slice 0.** §8.5. The
-`Identity` trait has no home in the v0.2 module map. Assumption:
-`CountingProvider` + `DhCounter` now, the `Identity` impl in slice 2.
-Q-O1.
+**R3 — send-failure injection missing from the brief. ✅ RESOLVED, and
+now normative** — §16.10, ruling 60, which additionally makes seeded
+determinism a MUST and attests `Network` / `FlakyWire` / `FlakyPolicy` as
+contract. **S24's attestation gap is closed.**
 
-**R5 — the `Wire` trait's dyn-incompatibility propagates into slice 2's
-`Endpoint` type.** §7.2. Not a slice-0 defect — the spec's trait is
-`async fn` and the spec is the authority — but it is the highest-leverage
-thing slice 0 hands forward, because reversing it later means changing
-`Endpoint`'s generic parameters, which changes every handle type. Q-O2.
+**R4 — `CountingIdentity` in slice 0. ✅ RESOLVED** (Q-O1). Provider and
+counter now; `Identity` impl in slice 2. No module-map deviation.
 
-**R6 — seven constant names do not exist in the spec.** `STATIC_PUBLIC_LEN`,
+**R5 — the `Wire` trait's dyn-incompatibility. ✅ RESOLVED** (Q-O2):
+`Endpoint<W: Wire>`, generic. A `DynWire` shim stays available later
+without a spec change.
+
+**R-new — `#[non_exhaustive]`: the draft's recommendation was wrong, and
+the correction is worth keeping.** The draft argued for it on all ten
+types, weighing only the ergonomic cost of the consumer's `_` arm. It
+never weighed what that arm *does* when a variant lands: it silently
+routes a new error into a branch written for the old ones. Ruling 61
+takes the compile break instead, on `WriteError` alone (§19 reserves
+`Stopped`). Recorded here so the uniform-application argument is not
+re-proposed by a later slice that notices the inconsistency.
+
+### Still open
+
+
+
+**R6 — twelve constant names do not exist in the spec.** `STATIC_PUBLIC_LEN`,
 `STREAM_FLAG_MASK`, `CREDIT_REGRANT_DIVISOR`, `CLOSE_REPLY_MIN_INTERVAL`,
 `ACK_ELICITING_PER_ACK`, `K_TIME_THRESHOLD_NUM`/`_DEN`,
 `SHELL_LATENESS_BOUND`, `APPLICATION_ERROR_BASE`, the two
@@ -1609,17 +1717,17 @@ thing slice 0 hands forward, because reversing it later means changing
 `PERSISTENT_KEEPALIVE` and states its range in prose). Each is a **value**
 the spec fixes and a **name** it does not. Every one gets a doc comment
 saying "not a spec name; §X fixes the value". A reader grepping the spec
-for `SHELL_LATENESS_BOUND` finds nothing and must be told why. Q-M3 asks
-whether the maintainer wants them attested.
+for `SHELL_LATENESS_BOUND` finds nothing and must be told why.
+**Q-M3, half answered:** ship them with these names, doc-commented as
+unattested; the amendment is written **after** `constants.rs` exists,
+from real names rather than guesses. Full list in §15, "Owed to the
+spec".
 
-**R7 — `PTO_BACKOFF_CAP` is ambiguous.** The table gives "2⁶". Is the
-constant the multiplier (64) or the exponent (6)? I chose 64 with
-`assert!(PTO_BACKOFF_CAP == 1 << 6)`, because the table writes a
-magnitude, not an exponent. RFC 9002 backs off as `2^pto_count`, so slice
-5 will clamp `pto_count ≤ 6` — the same thing said differently, and the
-assert makes both readable. **Slice 5 must re-read §13.3** to confirm
-which the surrounding prose means; if it means the exponent, the constant
-is renamed there, not here. Low risk, flagged so it is not forgotten.
+**R7 — `PTO_BACKOFF_CAP`. ✅ SETTLED by reading, no ruling needed.** It
+is the **multiplier, 64**: §13.3 caps `2^pto_count` and §13.5 says "2⁶×
+too long". Keep `assert!(PTO_BACKOFF_CAP == 1 << 6)`, which leaves both
+readings legible in the source. Slice 5 clamps `pto_count ≤ 6` — the same
+statement from the other side.
 
 **R8 — I read v0.1 symbol names.** Declared at the top. The brief said
 not to read `src/` for guidance. I read: a symbol-name-only overview of
@@ -1649,96 +1757,158 @@ it. If the path is not reachable, drop the const assert and keep §4.5
 test 5 as the pin. Two minutes to check at implementation time; noted so
 it is not discovered as a build break.
 
-**R11 — feature-isolation builds are not in the gate table.**
-`--all-features` cannot catch a `codec`-only build that fails because
-`sink`'s items are missing behind a `cfg`. Four extra `cargo build`
-invocations. Q-O3 asks whether to add them to CI now or at slice 8.
+**R11 — feature-isolation builds. ✅ SPLIT** (Q-O3).
+`--no-default-features` joins the `Check` job in slice 0 — meaningful
+today, because `test-util` gates the whole `testutil` module. The three
+per-feature builds move to **slice 8**, when `sink`/`codec`/`tower`
+actually gate code; until then they compile nothing and prove nothing.
+Residual risk carried to slice 8: a `codec`-only build that fails because
+`sink`'s items sit behind a `cfg`. Noted in this plan so slice 8 inherits
+it rather than rediscovers it.
+
+---
+## 13. Questions — all answered
+
+No question in this plan blocks implementation. Recorded here as
+decisions, with the reasoning, so a later slice does not re-litigate one.
+
+### Maintainer rulings
+
+| # | Question | Ruling |
+|---|---|---|
+| **Q-M1** → **ruling 61** | `#[non_exhaustive]` on every error type, or some? | **`WriteError` only; the other nine are exhaustive.** The draft's uniform recommendation was **declined**. A consumer matching without a `_` arm gets a compile error the day a variant is added — the loud failure worth having; a wildcard arm silently swallows a new error into a branch written for the old ones. §19 reserves `Stopped`, so `WriteError` alone demonstrably will gain one. §5.3 |
+| **Q-M2** | Is `PTO_BACKOFF_CAP` the multiplier (64) or the exponent (6)? | **Settled by reading, no ruling.** The **multiplier, 64** — §13.3 caps `2^pto_count`, §13.5 says "2⁶× too long". Keep `assert!(PTO_BACKOFF_CAP == 1 << 6)`. §4.1 row 66 |
+| **Q-M3** | Attest `Network`/`FlakyPolicy` and the twelve unnamed constants? | **Half applied, half deferred.** The fixture attestation is **ruling 60** (§16.10) — all three names are now contract. The constants: ship them with these names, doc-commented as unattested, and list them in §15 so the amendment can be written from real names once `constants.rs` exists. **Do not guess the spec text now.** |
+| **Q-M4** → **ruling 62** | Is a `Connecting` a handle? | **Yes** — the draft's argument carried, and the spec now states the *principle* rather than the special case: **a future that changes protocol state when dropped is a handle; one that does not, is not.** `ConnectError` ships with exactly two variants; §18.1 stays closed; the asymmetry against the staged errors is correct, not an omission. §11 |
+| **Q-M5** | The `MESSAGE_OVERFLOW` 0x06 conflict. | **Upheld, and wider than found.** §15.3 was authoritative; **three** restatements had gone stale (the Named-constants table, §18.1's closing sentence, a §9.8 prose paragraph). All fixed. Implement **`0x00`–`0x06`**, `0x07`–`0x0f` reserved, ≥ `0x10` application. §4.1, R1 |
+
+### Orchestrator answers
+
+| # | Question | Answer |
+|---|---|---|
+| **Q-O1** | `CountingIdentity` in slice 0 or slice 2? | **Slice 2.** `CountingProvider` + `DhCounter` in slice 0. No module-map deviation; `src/identity.rs` is not minted. §8.5 |
+| **Q-O2** | `Endpoint<W: Wire>` or an erasure shim? | **Generic, `Endpoint<W: Wire>`.** AFIT's dyn-incompatibility makes it near-forced; a `DynWire` shim stays available later without a spec change. §7.2 |
+| **Q-O3** | Feature-isolation builds in CI now? | **Split.** `--no-default-features` joins the `Check` job **now** (`test-util` gates `testutil`, so it is meaningful today). The three per-feature builds go to **slice 8** — a build that compiles nothing proves nothing. §3, R11 |
+| **Q-O4** | `PLAN.md` §1's stale "four" doc obligations. | **Fixed**, along with `.slices` in `Cargo.toml`'s `exclude`. Slice 0 verifies both rather than re-applying. §11 |
+| **Q-O5** | Does working rule 6's author swap apply? | **Keep it, narrowly — `constants.rs` and `error.rs` only**, and for a reason that is not the rule's: an implementer who mis-transcribes a constant mis-transcribes it into its own test identically, and both look right. Everywhere else in slice 0 the implementer writes their own tests. §10 |
 
 ---
 
-## 13. Questions for the orchestrator
+## 14. Handoff checklist
 
-**Q-O1 — `CountingIdentity` in slice 0, or slice 2?** The `Identity`
-trait has no home in the v0.2 module map, so the `Identity` impl cannot
-compile in slice 0. **Assumption made and continued:** slice 0 ships
-`CountingProvider` + `DhCounter` (the DH counter later slices assert on),
-slice 2 adds `CountingIdentity: Identity` when the trait exists. Confirm,
-or tell me to mint `src/identity.rs` in slice 0 — which is a module-map
-deviation and therefore yours to authorise, not mine.
+Per `CLAUDE.md` working rule 7 — **do not report a gate as green without
+running it; paste the command and its output.** Run in this order; a red
+gate stops the slice.
 
-**Q-O2 — does slice 2 want `Endpoint<W: Wire>` or a private erasure
-shim?** Not a slice-0 blocker (slice 0 writes the trait verbatim either
-way), but the answer shapes slice 2's public types and is cheaper to
-decide now than to discover. **Assumption:** generic; a `DynWire` shim is
-available later without a spec change.
+### Pre-flight (not gates, but they fail fastest)
 
-**Q-O3 — add the four feature-isolation builds to CI in slice 0?**
-`--no-default-features`, `--features sink`, `--features codec`,
-`--features tower`. **Assumption:** add them locally to slice 0's
-hand-off checklist, propose the CI change at slice 8 when there is
-feature-gated code to break. Say the word and I will fold them into the
-`Check` job now.
+```bash
+git -C . rm -r src examples          # §2 — one commit, naming 5324ce5
+grep -n '"/\.slices"' Cargo.toml     # Q-O4 must still be applied
+grep -n 'Cargo.lock' .gitignore      # must remain ignored (hiss convention)
+```
 
-**Q-O4 — `PLAN.md` §1 says "four documentation obligations"; §9 lists
-five.** Stale count in the approved plan. **Assumption:** five is right
-(the brief agrees). Worth a one-word fix to `PLAN.md`; not mine to make.
+### The eight gates
 
-**Q-O5 — who writes the mirror tests?** Working rule 6 says the test
-author is not the implementer. §10 proposes agents A and C swap for
-`constants.rs`'s transcription test and `error.rs`'s exhaustive fence.
-Confirm that is the intent for a slice with no story-level acceptance
-tests, or relax it — the rule names *story-level* acceptance tests, and
-slice 0 closes no story.
+```bash
+# 1 — Compiles
+cargo build --all-features --all-targets
+
+# 1b — feature floor (Q-O3; new to the Check job in this slice)
+cargo build --no-default-features
+
+# 2 — Format
+cargo fmt --all --check
+
+# 3 — Lints
+cargo clippy --all-features --all-targets -- -D warnings
+
+# 4 — Docs (both invocations, both with -D warnings)
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+# 5 — Tests (both invocations)
+cargo test
+cargo test --all-features
+
+# 6 — Wire pins: no golden vectors exist until slice 1. In slice 0 this
+#     gate is the compile-time assertions in constants.rs (they cannot be
+#     skipped) plus the transcription test. Name it explicitly:
+cargo test --all-features constants
+
+# 7 — MSRV
+cargo +1.96 check --all-features --all-targets
+
+# 8 — Supply chain
+cargo deny check
+```
+
+### The slice-0 acceptance test, named
+
+```bash
+cargo test --all-features a_byte_crosses_two_flaky_wires_under_injected_loss -- --nocapture
+```
+
+### Report format
+
+For each of the above: the command, and its output (or its tail plus the
+summary line for the verbose ones). **Gate 6 needs a sentence**, because
+it is the one that does not mean in slice 0 what it means in slice 1:
+*"no golden-wire vectors exist yet; the wire pins in this slice are the
+39 compile-time assertions in `constants.rs` and the transcription test,
+both of which passed."* State it rather than letting a reader assume the
+golden vectors ran.
+
+### Hand-forward notes for slice 1
+
+- The golden-wire vectors land in slice 1 and pin 174 / 81 / 196 / 107.
+  `constants.rs` already asserts all four **as derivations**, so a
+  disagreement between the vectors and the constants is a ruling request,
+  never an expectation to update.
+- `STATIC_PUBLIC_LEN` is pinned against `P256::PUBLIC_KEY_SIZE`; slice 1
+  should **re-pin it against the `noise!`-declared channel's
+  `PUBLIC_KEY_SIZE`** once that type exists, which is the tighter bound.
+- Verify R10 at implementation time: whether
+  `hiss::noise::datagram::MAX_EPOCH_JUMP` is reachable in a `const`
+  context under `default-features = false`. If not, drop that one const
+  assert and keep §4.5 test 5.
 
 ---
 
-## 14. Questions for the maintainer
+## 15. Owed to the spec
 
-*(design decisions that would become ratified rulings; none blocks the
-plan — each has a documented assumption)*
+Ship these names now, doc-commented as unattested; write the amendment
+**after** `constants.rs` exists, from the real names (Q-M3). Each is a
+value `SPEC.md` fixes and a name it never gives, so a reader grepping the
+spec for the identifier finds nothing.
 
-**Q-M1 — `#[non_exhaustive]` on a closed taxonomy.** §18.1 is closed by
-process; `#[non_exhaustive]` is a semver reservation. **Recommendation:
-apply it to all ten error types.** §19 already reserves
-`WriteError::Stopped` for the STOP_SENDING round, and §16.2's
-`Notification` is already non-exhaustive on identical reasoning — a later
-wire line adding a variant should not be a major bump. The cost is a `_`
-arm in consumer matches, which is the correct price for a transport with
-declared future variants. **Assumed applied.** If you prefer exhaustive
-enums (better consumer ergonomics, and "closed" taken at its strongest),
-say so — it costs nothing now and everything later.
+| Implementation name | Value | Spec home | What the spec says instead |
+|---|---|---|---|
+| `STATIC_PUBLIC_LEN` | 65 | §2.4 | "the 65-byte uncompressed SEC1 storage form"; §2.3 writes it as `PK` |
+| `PKT_RESERVED_UNUSED` | 0x04 | §3.1 | "reserved packet types … 0x04 (unused)" |
+| `PKT_RESERVED_COOKIE` | 0x05 | §3.1 | "0x05 (cookie/mac2)" |
+| `FRAME_STOP_SENDING_RESERVED` | 0x05 | §8.3 | "(reserved: STOP_SENDING)" |
+| `STREAM_FLAG_MASK` | 0x07 | §8.4 | the three flags are named; their union is not |
+| `CREDIT_REGRANT_DIVISOR` | 2 | §10.3 | "credit re-grant threshold … ½ window consumed" |
+| `ACK_ELICITING_PER_ACK` | 2 | §12.4 | "every 2nd ack-eliciting" |
+| `K_TIME_THRESHOLD_NUM` / `_DEN` | 9 / 8 | §13.2 | "time threshold … 9⁄8" |
+| `PTO_BACKOFF_CAP` | 64 | §13.3 | written as "2⁶" |
+| `CLOSE_REPLY_MIN_INTERVAL` | 1 s | §15.1 | "close-reply rate … ≤ 1 per s" |
+| `SHELL_LATENESS_BOUND` | 250 ms | §16.5 | the spec calls it `L` |
+| `PERSISTENT_KEEPALIVE_DEFAULT` / `_MIN` | 10 s / 1 s | §7.5 | one bare `PERSISTENT_KEEPALIVE`, with its range in prose |
+| `APPLICATION_ERROR_BASE` | 0x10 | §15.3 | "≥ 0x10 application" |
 
-**Q-M2 — is `PTO_BACKOFF_CAP` the multiplier (64) or the exponent (6)?**
-The table writes "2⁶". **Recommendation: the multiplier, 64**, with a
-compile-time `assert!(PTO_BACKOFF_CAP == 1 << 6)` so both readings are
-visible in the source. §13.3's prose should settle it at slice 5.
-**Assumed 64.**
+Two shapes recur and are worth naming in the amendment rather than
+listing thirteen exceptions:
 
-**Q-M3 — attest `Network` and `FlakyPolicy`, and the twelve unnamed
-constants?** S24 already calls the first an attestation gap. The second
-(R6) is the same species: values the spec fixes and names it never gives,
-which downstream readers will grep for and not find. **Recommendation:
-one small spec amendment covering both** — a paragraph in §16.10 naming
-`testutil::{Network, FlakyPolicy}` alongside `FlakyWire` as the fixture
-surface, and a footnote to the Named-constants table listing the derived
-and prose-only constants with their implementation names. Slice 0 ships
-the names either way, doc-commented as unattested. **Assumed: ship, flag,
-amend later.**
+1. **A ratio or rate stated in prose** (`½ window`, `every 2nd`, `9⁄8`,
+   `≤ 1 per s`, `2⁶`) needs an identifier and a stated *unit* —
+   "multiplier or exponent?" was a real ambiguity here (Q-M2).
+2. **A range stated in prose against one named constant**
+   (`PERSISTENT_KEEPALIVE`, admissible `[1 s, DEAD_TIMEOUT)`) becomes two
+   or three identifiers in code. Naming the default and the floor —
+   leaving the ceiling as a comparison against `DEAD_TIMEOUT` — is the
+   shape that cannot drift.
 
-**Q-M4 — is a `Connecting` a handle for the purpose of "the driver lives
-while any handle lives" (§16.3)?** If yes, `ConnectError` needs no
-`EndpointDropped` and the closed taxonomy is complete. If no, a
-`Connecting` can outlive the driver with no variant to resolve to, and
-§18.1 has a hole. **Recommendation: yes, it is a handle** — ruling 50
-makes dropping one a state-changing event (it stops the msg1 train and
-frees the static), which only makes sense if it is one. **Assumed yes;
-`ConnectError` ships with two variants exactly as §18.1 writes it.**
-
-**Q-M5 — the `MESSAGE_OVERFLOW` conflict (R1).** The Named-constants
-table says wire error codes are `0x00–0x05`; §15.3 defines `0x06
-MESSAGE_OVERFLOW` under ruling 52. **Recommendation: §15.3 is
-authoritative and the table row is stale** — 0x06 is load-bearing in
-§9.8, §15.3, §18.2 and PLAN.md's slice 6. **Assumed: implement 0x00–0x06;
-the table row wants a one-line amendment.** This is the one item in this
-plan where a wrong call puts a wrong byte on the wire, so it is the one
-I would most like ruled before slice 3 packs a RESET_STREAM.
+Nothing here changes a value, a byte, or a behaviour. It is an
+attestation debt, and slice 0 is where it becomes concrete enough to pay.

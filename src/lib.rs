@@ -1,83 +1,111 @@
-//! `slither` — a WireGuard-shaped Noise-over-UDP packet layer.
+//! A WireGuard-shaped Noise-over-UDP packet layer carrying a QUIC-shaped
+//! reliable frame layer.
 //!
-//! slither carries an **authenticated, encrypted, unreliable** datagram session
-//! between two peers over UDP. It borrows WireGuard's homework — a cheap mac1
-//! DoS gate, fresh-ephemeral handshake retransmission, an anti-replay sliding
-//! window, endpoint roaming, and the keepalive/liveness/rekey timers — but the
-//! cryptography is Bubble's: the Noise **IK** handshake over
-//! **P-256 / ChaCha20-Poly1305 / BLAKE2b** ([`SlitherChannel`]) from `hiss`, and
-//! keyed **BLAKE2b** for mac1 from `cryptoxide` directly.
+//! slither seals every datagram with an IK handshake over P-256 /
+//! ChaCha20-Poly1305 / BLAKE2b (driven entirely through
+//! [`hiss`](https://docs.rs/hiss)), gates initiations behind a keyed-BLAKE2b
+//! mac1, and carries streams, messages and unreliable datagrams inside the
+//! sealed plaintext with flow control, RFC 9002 loss recovery and
+//! congestion control. Connections roam across address changes, rekey by
+//! ratchet, and are accepted in *stages*, so an application can inspect a
+//! peer's claimed identity before spending a second DH on it.
 //!
-//! # Delivery semantics — read this first
-//!
-//! The sealed **packet layer** (Leg 1, ratified) is a datagram: a packet may
-//! be lost or reordered, and the only per-packet guarantees are
-//! confidentiality, authenticity, and exactly-once acceptance of each counter
-//! within a session (the replay window suppresses duplicates).
-//!
-//! The **frame layer** (Leg 2, ratified) rides inside the sealed plaintext
-//! ([`frame`]) and adds **reliable, unordered, exactly-once messages** on top:
-//! a [`SessionHandle::send`](endpoint::SessionHandle::send) becomes a
-//! sequence-numbered DATA frame, retransmitted (RFC 9002 loss detection and
-//! PTO, the crate-internal `recovery` module) on fresh counters until ACKed,
-//! and surfaced to the peer exactly once. Messages are independent (no ordering, no head-of-line
-//! blocking); ordered streams, fragmentation, and congestion control are
-//! deliberately out — reserved frame space. Reliability lives within the
-//! connection: what a dead connection had not delivered is lost.
+//! **`SPEC.md` is the authority.** Every constant, header layout, frame
+//! type and timer in this crate is ratified there, and where the code and
+//! the spec disagree the spec is right. The module layout is deliberately
+//! one-to-one with the spec's sections so a reviewer can find the code for
+//! a section without searching.
 //!
 //! # Shape
 //!
-//! A single [`Endpoint`](endpoint::Endpoint) owns one UDP socket (behind the
-//! [`Wire`](endpoint::Wire) trait, so the whole protocol is drivable without a
-//! real socket) and runs as a `!Send` single-actor task, like the island
-//! transport in `bubble-client`.
-//! [`connect`](endpoint::Endpoint::connect) opens a session as the initiator;
-//! inbound handshakes are gated by an **allow-list** of permitted remote statics
-//! (the family-devices set; the caller owns policy). Session lifecycle and
-//! inbound payloads surface on an [`Event`](endpoint::Event) stream.
+//! ```text
+//! core::Endpoint / core::Connection   pure state machines, no I/O, no clock
+//!         ↑ poll_output() to Timeout, after every mutating call    (§16.4)
+//! shell: one !Send driver task        owns the cores, owns the Wire (§16.3)
+//!         ↑ handles
+//! compat: AsyncRead/Write · Stream/Sink · Codec · tower            (§16.11)
+//! ```
 //!
-//! # The wire (ratified 2026/07/16)
+//! The cores never read a clock — `now: Instant` is an argument on every
+//! mutating call — and the shell is a **single `!Send` actor** run with
+//! `tokio::task::spawn_local` on a current-thread runtime inside a
+//! `LocalSet`. Nothing on that path requires `Send`, deliberately: a
+//! hardware-backed static key (an iOS Secure Enclave `SecKey`) is not
+//! `Send`, and a transport that demanded it would exclude the case the DH
+//! provider seam exists for.
 //!
-//! Every constant below is frozen in `slither/SPEC.md`; the code must match
-//! the spec. See [`wire`] for the byte layouts.
+//! Because the cores are pure and [`shell::wire::Wire`] is the only I/O
+//! seam, **the whole protocol is drivable without a kernel**: two
+//! endpoints over the in-memory `testutil` fabric on tokio's paused clock,
+//! with every timer resolving in virtual time.
 //!
-//! # Independence
+//! # The five documentation obligations
 //!
-//! slither is its own crate with **zero `bubble-*` dependencies** — everything
-//! it needs resolves from crates.io (`hiss`, `cryptoxide`, `packtool`,
-//! `tokio`), and nothing here assumes a host beyond a current-thread tokio
-//! runtime to run the endpoint actor on.
+//! Five hazards have no code fix. A consumer meets each one by getting it
+//! wrong, so each is stated here as well as at its call site.
+//!
+//! 1. **Reconnecting is `close()` then dial, not `connect()` again.**
+//!    `connect()` to a static that already has a live connection returns
+//!    [`ConnectError::AlreadyConnected`]. "Call connect again" is the
+//!    natural guess and it is wrong.
+//! 2. **A *claimed* static is not an authenticated one.** The identity
+//!    `read_identity()` reveals during a staged accept is an
+//!    **unauthenticated assertion**, made before any DH proves possession.
+//!    Denylisting on it lets an attacker claim any public key in order to
+//!    get its owner banned. Authorise on it; do not punish on it.
+//! 3. **A connection with nothing to say dies.** An idle connection is
+//!    torn down after `DEAD_TIMEOUT` (25 s), so connecting ahead of need
+//!    does not keep a path warm. It is deliberate, and it is the single
+//!    most surprising behaviour for a new consumer; a connection that must
+//!    outlive its traffic needs a persistent keepalive.
+//! 4. **Teardown triggers on dropping every *handle*, not the endpoint.**
+//!    The connection lives as long as any handle to it does, and ends when
+//!    the last one is dropped — the opposite of the obvious guess, and
+//!    sensitive to the order your values fall out of scope.
+//! 5. **Messages and streams do not mix on one connection.** Using
+//!    `send_message` alongside `open_uni` on the same connection is a
+//!    programming error with a defined, loud failure. The safe and unsafe
+//!    shapes look alike at the call site, which is exactly why it is
+//!    written down.
+//!
+//! # Modules
+//!
+//! - [`constants`] — every named constant the spec fixes, one home, with
+//!   the derived ones re-derived as compile-time assertions.
+//! - [`error`] — the closed error taxonomy of §18.1, plus `ConfigError`.
+//!   Its ten types are re-exported at the crate root.
+//! - [`shell`] — the I/O shell. Slice by slice it grows the driver and the
+//!   handles; today it carries [`shell::wire::Wire`], the datagram seam an
+//!   application supplies.
+//! - `testutil` — the in-memory `Network` / `FlakyWire` / `FlakyPolicy`
+//!   fabric and the counting DH provider, behind the `test-util` feature.
+//!   Attested surface (ruling 60), not a test convention: it is
+//!   deterministic under a caller-supplied seed, and renaming one of those
+//!   three types is a protocol revision.
+//!
+//! # Features
+//!
+//! Nothing is on by default.
+//!
+//! | Feature | What it adds |
+//! |---|---|
+//! | `test-util` | the `testutil` module, for driving slither in a downstream crate's tests |
+//! | `sink` | `Stream` / `Sink` adapters |
+//! | `codec` | `tokio_util::codec` support; implies `sink` |
+//! | `tower` | a `tower::Service` shape over the message verb |
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod endpoint;
-pub mod frame;
-pub mod handshake;
-pub mod mac;
-pub(crate) mod recovery;
-pub mod session;
-pub mod wire;
+pub mod constants;
+pub mod error;
+pub mod shell;
+pub(crate) mod varint;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
 
-#[cfg(test)]
-mod flow;
-#[cfg(test)]
-mod flow_frames;
-
-/// The pinned Noise protocol for a slither session:
-/// **`Noise_IK_P256_ChaChaPoly_BLAKE2b`**.
-///
-/// The type is the [`hiss::noise!`]-generated pattern in [`handshake`] — the
-/// pattern is named `IK` deliberately, because the pattern name is part of the
-/// Noise protocol identity hashed into every transcript. The dialling peer is
-/// the **initiator**; the accepting peer the responder. The responder's static
-/// is pre-known to the initiator (the IK `<- s` pre-message, supplied to
-/// [`connect`](endpoint::Endpoint::connect) as the remote static). All Noise
-/// runs through `hiss`. Pinned by `handshake::tests::protocol_name_is_pinned`.
-///
-/// slither v1 is **plain IK** — no PSK. First-contact secrecy gating (an
-/// `IKpsk1` variant) is deliberately out of scope for Leg 1.
-pub type SlitherChannel = handshake::IK;
+pub use error::{
+    AcceptError, AuthError, ConfigError, ConnectError, ConnectionLost, DatagramError, IntroError,
+    MessageError, ReadError, WriteError,
+};

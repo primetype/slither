@@ -1,0 +1,1229 @@
+//! The kernel-free test fixtures — `SPEC.md` §16.10, ruling 60.
+//!
+//! This module is **normative surface, not a test convention**. Ruling 60
+//! attests [`Network`], [`FlakyWire`] and [`FlakyPolicy`] *"on the same
+//! terms as §18.2's trace targets: renaming or dropping one is a protocol
+//! revision, because a consumer's test suite is built on them."*
+//!
+//! # What it is
+//!
+//! [`Network`] is the in-memory routing fabric: it owns the
+//! address → endpoint map and moves datagrams between [`FlakyWire`]s. A
+//! `FlakyWire` is a [`Wire`], so an endpoint
+//! driven over one is driven over exactly the seam it will use in
+//! production — with no socket, no port, and no kernel. Every delay is a
+//! `tokio::time::sleep_until`, so on tokio's paused clock the whole
+//! protocol runs in virtual time.
+//!
+//! # Determinism is a MUST
+//!
+//! Ruling 60: the fabric *"MUST be deterministic under a caller-supplied
+//! seed. A flow test that cannot be replayed byte-for-byte from its seed is
+//! not a regression test, and the loss-dependent behaviour in §13 and §7.5
+//! is exactly where a once-in-a-thousand-runs failure would otherwise be
+//! unactionable."*
+//!
+//! Concretely, and these are contract rather than implementation detail:
+//!
+//! - [`Network::seeded`] is the constructor; [`Network::new`] is
+//!   `seeded(0)`. **There is no OS-entropy path**, and adding one would
+//!   violate the ruling.
+//! - **One RNG per [`FlakyWire`]**, seeded from the network seed and the
+//!   wire's registration ordinal — so adding a third endpoint to a test
+//!   does not reshuffle the first two's draws.
+//! - **A fixed draw order per `send_to`**, documented on
+//!   [`FlakyWire::send_to`].
+//! - No wall clock, no `SystemTime`, no thread identity, and no hash
+//!   iteration order anywhere in a decision path. Registration order is an
+//!   explicit counter and every map is ordered.
+//!
+//! For anything asserting a *specific* outcome, prefer the index-based
+//! tools — [`FlakyPolicy::drop_at`] and [`FlakyPolicy::drop_first`] — over
+//! probabilistic loss. Probabilistic loss is reproducible under a seed but
+//! brittle: it moves when an unrelated send is added.
+//!
+//! # Everything here is `!Send`, on purpose
+//!
+//! `Network` and `FlakyWire` hold `Rc`s. They are the fixture for an actor
+//! that must not require `Send`, so a `Send` fixture would let a `Send`
+//! bound creep into the driver unnoticed.
+
+use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::io;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::time::Duration;
+
+use hiss::curve::{Curve, DhCurve, p256::P256};
+use hiss::provider::{CryptoKeyProvider, DhProvider};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
+use tokio::sync::Notify;
+use tokio::time::Instant;
+
+use crate::shell::wire::Wire;
+
+/// `ENETUNREACH` for this target — 101 on Linux and Android, 51 on the
+/// BSDs and Apple platforms.
+///
+/// The default errno [`FlakyPolicy::failing_sends_until`] injects, so a
+/// test can assert the exact `raw_os_error()` the driver will see.
+pub const ENETUNREACH: i32 = if cfg!(any(target_os = "linux", target_os = "android")) {
+    101
+} else {
+    51
+};
+
+/// The golden-ratio odd constant used to decorrelate per-wire RNG seeds.
+const SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Observation
+// ═══════════════════════════════════════════════════════════════════════
+
+/// One observed datagram.
+///
+/// Deliberately just bytes: `testutil` never parses a packet. Slice 1's
+/// golden-wire assertions and Appendix B's *"no further msg1 leaves the
+/// endpoint after the drop"* obligation both read this, and both supply
+/// their own meaning for the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spied {
+    /// The sending wire's address.
+    pub src: SocketAddr,
+    /// The address the datagram was addressed to.
+    pub dst: SocketAddr,
+    /// The datagram, verbatim.
+    pub bytes: Vec<u8>,
+}
+
+/// A view of every accepted send on a [`Network`].
+///
+/// All taps from one network share **one** log, so [`Tap::drain`] empties
+/// it for every holder, and a tap taken *after* some sends still sees
+/// them.
+///
+/// "Accepted" means the send was not refused by an injected send failure
+/// and was not blackholed by a partition — it is what left the wire, which
+/// is a different question from what arrived. Loss and duplication are
+/// applied *after* the tap.
+#[derive(Clone, Debug)]
+pub struct Tap(Rc<RefCell<Vec<Spied>>>);
+
+impl Tap {
+    /// How many datagrams have been recorded.
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// Whether nothing has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    /// Take everything recorded so far, emptying the shared log.
+    pub fn drain(&self) -> Vec<Spied> {
+        self.0.borrow_mut().drain(..).collect()
+    }
+
+    /// Copy everything recorded so far, leaving the log intact.
+    pub fn snapshot(&self) -> Vec<Spied> {
+        self.0.borrow().clone()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Policy
+// ═══════════════════════════════════════════════════════════════════════
+
+/// An injected `send_to` failure, active until an instant.
+///
+/// The error handed to the caller is built from [`SendFailure::raw_os`]
+/// when that is non-zero — so `raw_os_error()` is observable — and from
+/// [`SendFailure::kind`] otherwise.
+#[derive(Clone, Debug)]
+pub struct SendFailure {
+    /// The `io::ErrorKind` to report. Used directly only when `raw_os` is
+    /// zero; otherwise it records what `raw_os` decodes to.
+    pub kind: io::ErrorKind,
+    /// The raw OS error to report, or `0` for "no errno, use `kind`".
+    pub raw_os: i32,
+    /// Sends fail while `Instant::now() < until`.
+    pub until: Instant,
+}
+
+impl SendFailure {
+    fn to_io_error(&self) -> io::Error {
+        if self.raw_os != 0 {
+            io::Error::from_raw_os_error(self.raw_os)
+        } else {
+            io::Error::from(self.kind)
+        }
+    }
+}
+
+/// How one [`FlakyWire`] mistreats the datagrams it sends.
+///
+/// Every field is public, so a test may build one literally; the
+/// constructors below cover the shapes the spec's obligations ask for.
+#[derive(Clone, Debug)]
+pub struct FlakyPolicy {
+    /// P(drop) per datagram, `0.0`–`1.0`.
+    pub loss: f64,
+    /// P(deliver a second copy), `0.0`–`1.0`.
+    pub duplicate: f64,
+    /// Minimum one-way delay.
+    pub base_delay: Duration,
+    /// Uniform additional delay in `[0, jitter)`.
+    ///
+    /// **Reordering lives here.** Two datagrams whose draws cross swap —
+    /// which is how a real network reorders, composes with the paused
+    /// clock for free, and means "reorder" needs no separate knob.
+    pub jitter: Duration,
+    /// Drop the first N datagrams unconditionally, then behave normally.
+    pub drop_first: usize,
+    /// Drop exactly these 0-based send indices. No RNG is involved.
+    pub drop_at: BTreeSet<usize>,
+    /// Fail `send_to` while `Instant::now()` is inside the window.
+    pub send_failure: Option<SendFailure>,
+}
+
+impl FlakyPolicy {
+    /// No loss, no duplication, no delay.
+    pub fn perfect() -> Self {
+        FlakyPolicy {
+            loss: 0.0,
+            duplicate: 0.0,
+            base_delay: Duration::ZERO,
+            jitter: Duration::ZERO,
+            drop_first: 0,
+            drop_at: BTreeSet::new(),
+            send_failure: None,
+        }
+    }
+
+    /// Drop the first `n` datagrams, then deliver perfectly.
+    ///
+    /// Index-based, so the outcome does not depend on a draw — this is the
+    /// tool for Appendix B's *"the first two msg1s die"*.
+    pub fn drop_first(n: usize) -> Self {
+        FlakyPolicy {
+            drop_first: n,
+            ..Self::perfect()
+        }
+    }
+
+    /// Drop exactly these 0-based send indices, and no others.
+    pub fn drop_at(indices: impl IntoIterator<Item = usize>) -> Self {
+        FlakyPolicy {
+            drop_at: indices.into_iter().collect(),
+            ..Self::perfect()
+        }
+    }
+
+    /// Drop each datagram with probability `rate`.
+    ///
+    /// Reproducible under the network seed, but brittle: the draw a given
+    /// datagram sees moves when an unrelated send is added ahead of it.
+    /// Prefer [`FlakyPolicy::drop_at`] when asserting a specific outcome.
+    pub fn lossy(rate: f64) -> Self {
+        FlakyPolicy {
+            loss: rate,
+            ..Self::perfect()
+        }
+    }
+
+    /// Delay every delivery by `base`, plus a uniform draw in
+    /// `[0, jitter)`.
+    #[must_use]
+    pub fn with_delay(self, base: Duration, jitter: Duration) -> Self {
+        FlakyPolicy {
+            base_delay: base,
+            jitter,
+            ..self
+        }
+    }
+
+    /// Deliver a second identical copy with probability `rate`.
+    #[must_use]
+    pub fn with_duplication(self, rate: f64) -> Self {
+        FlakyPolicy {
+            duplicate: rate,
+            ..self
+        }
+    }
+
+    /// `send_to` returns `ENETUNREACH` until `until`, then heals.
+    ///
+    /// The ruling-49 / S25 fixture (Appendix B): *"Give the endpoint a
+    /// `Wire` whose `send_to` returns `ENETUNREACH` for a bounded
+    /// interval, then heals."* A failing send is a **trace** obligation on
+    /// the driver, not a connection-killing event, and this is how that is
+    /// tested.
+    #[must_use]
+    pub fn failing_sends_until(self, until: Instant) -> Self {
+        FlakyPolicy {
+            send_failure: Some(SendFailure {
+                kind: io::ErrorKind::NetworkUnreachable,
+                raw_os: ENETUNREACH,
+                until,
+            }),
+            ..self
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The fabric
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A datagram waiting in an inbox.
+///
+/// Ordered by `(deliver_at, seq)`. The sequence number breaks ties, which
+/// keeps equal-deadline datagrams FIFO and, more importantly, keeps the
+/// heap **deterministic**.
+#[derive(Debug, PartialEq, Eq)]
+struct Queued {
+    deliver_at: Instant,
+    seq: u64,
+    src: SocketAddr,
+    bytes: Vec<u8>,
+}
+
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deliver_at
+            .cmp(&other.deliver_at)
+            .then(self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct EndpointState {
+    /// A min-heap: `Reverse` inverts `BinaryHeap`'s max-heap order.
+    inbox: BinaryHeap<Reverse<Queued>>,
+    notify: Rc<Notify>,
+}
+
+struct Inner {
+    seed: u64,
+    /// Ordered, never iterated for a decision — but ordered anyway, so no
+    /// hash seed can ever reach a decision path.
+    endpoints: BTreeMap<SocketAddr, EndpointState>,
+    partitioned: BTreeSet<SocketAddr>,
+    blocked: BTreeSet<(SocketAddr, SocketAddr)>,
+    log: Rc<RefCell<Vec<Spied>>>,
+    /// Every `send_to` call, counted **before** any policy decision.
+    sends: usize,
+    /// Monotonic tie-breaker for the inboxes.
+    seq: u64,
+    /// Registration counter — explicit, so wire ordinals never depend on
+    /// map order.
+    ordinal: usize,
+}
+
+/// An in-memory datagram fabric: a set of addresses, each with an inbox,
+/// and a policy per sending endpoint.
+///
+/// Single-threaded by construction (`Rc`, `RefCell`) — the same shape as
+/// the `!Send` driver it feeds.
+#[derive(Clone)]
+pub struct Network(Rc<RefCell<Inner>>);
+
+impl Default for Network {
+    fn default() -> Self {
+        Network::new()
+    }
+}
+
+impl Network {
+    /// A network with a fixed RNG seed.
+    ///
+    /// Every delivery decision is a function of this seed and the per-wire
+    /// send order — **the same test yields the same drops, delays and
+    /// duplicates on every run.**
+    pub fn seeded(seed: u64) -> Network {
+        Network(Rc::new(RefCell::new(Inner {
+            seed,
+            endpoints: BTreeMap::new(),
+            partitioned: BTreeSet::new(),
+            blocked: BTreeSet::new(),
+            log: Rc::new(RefCell::new(Vec::new())),
+            sends: 0,
+            seq: 0,
+            ordinal: 0,
+        })))
+    }
+
+    /// `seeded(0)`.
+    ///
+    /// There is deliberately no OS-entropy constructor: a testutil whose
+    /// failures are irreproducible is worse than no testutil (ruling 60).
+    pub fn new() -> Network {
+        Network::seeded(0)
+    }
+
+    /// Register `addr` and return the [`Wire`] bound to it.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` is already registered.
+    pub fn endpoint(&self, addr: SocketAddr) -> FlakyWire {
+        let (ordinal, seed, notify) = {
+            let mut inner = self.0.borrow_mut();
+            assert!(
+                !inner.endpoints.contains_key(&addr),
+                "{addr} is already registered on this network"
+            );
+            let notify = Rc::new(Notify::new());
+            inner.endpoints.insert(
+                addr,
+                EndpointState {
+                    inbox: BinaryHeap::new(),
+                    notify: Rc::clone(&notify),
+                },
+            );
+            let ordinal = inner.ordinal;
+            inner.ordinal += 1;
+            (ordinal, inner.seed, notify)
+        };
+
+        // One stream per wire, decorrelated by ordinal: adding a third
+        // endpoint to a test does not reshuffle the first two's draws.
+        let wire_seed = seed ^ (ordinal as u64).wrapping_mul(SEED_STRIDE);
+
+        FlakyWire {
+            addr,
+            net: Rc::clone(&self.0),
+            rng: RefCell::new(ChaCha20Rng::seed_from_u64(wire_seed)),
+            policy: RefCell::new(FlakyPolicy::perfect()),
+            sent: Cell::new(0),
+            notify,
+        }
+    }
+
+    /// Blackhole `addr` in both directions: it sends and receives nothing.
+    pub fn partition(&self, addr: SocketAddr) {
+        self.0.borrow_mut().partitioned.insert(addr);
+    }
+
+    /// Undo [`Network::partition`].
+    pub fn heal(&self, addr: SocketAddr) {
+        self.0.borrow_mut().partitioned.remove(&addr);
+    }
+
+    /// Blackhole the path `from → to`, leaving `to → from` alone.
+    pub fn block_path(&self, from: SocketAddr, to: SocketAddr) {
+        self.0.borrow_mut().blocked.insert((from, to));
+    }
+
+    /// Undo [`Network::block_path`].
+    pub fn heal_path(&self, from: SocketAddr, to: SocketAddr) {
+        self.0.borrow_mut().blocked.remove(&(from, to));
+    }
+
+    /// A view of every accepted send. All taps share one log.
+    pub fn tap(&self) -> Tap {
+        Tap(Rc::clone(&self.0.borrow().log))
+    }
+
+    /// Total `send_to` calls, counted before any policy decision — so
+    /// drops, blackholes and injected send failures are all included.
+    ///
+    /// This is what distinguishes *"we tried to send"* from *"it
+    /// arrived"*, which is what ruling 50's *"no further msg1 leaves the
+    /// endpoint"* assertion needs.
+    pub fn sends(&self) -> usize {
+        self.0.borrow().sends
+    }
+
+    /// Deliver a datagram that appears to come from `from` — an address no
+    /// [`FlakyWire`] need own.
+    ///
+    /// The forgery fixture: mac1 garbage, off-path spoofing, and a source
+    /// address that never sent anything. No policy applies, nothing is
+    /// counted in [`Network::sends`], and nothing is tapped — this is not
+    /// a send by any wire. Delivery is immediate.
+    ///
+    /// A datagram for an unregistered or partitioned `to` is dropped, as
+    /// it would be by [`FlakyWire::send_to`].
+    pub fn inject(&self, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+        let mut inner = self.0.borrow_mut();
+        let now = Instant::now();
+        deliver(&mut inner, from, to, bytes.to_vec(), now);
+    }
+}
+
+/// Push one datagram into `to`'s inbox, or drop it.
+fn deliver(inner: &mut Inner, src: SocketAddr, dst: SocketAddr, bytes: Vec<u8>, at: Instant) {
+    if inner.partitioned.contains(&dst) {
+        return;
+    }
+    let seq = inner.seq;
+    inner.seq += 1;
+    // An unregistered destination drops the datagram: a real socket would
+    // get an ICMP port-unreachable at best, and slither ignores those.
+    let Some(ep) = inner.endpoints.get_mut(&dst) else {
+        return;
+    };
+    ep.inbox.push(Reverse(Queued {
+        deliver_at: at,
+        seq,
+        src,
+        bytes,
+    }));
+    ep.notify.notify_waiters();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The wire
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The in-memory [`Wire`] (§16.3, §16.10) — the implementation the
+/// paused-clock flow tests ride.
+///
+/// Both `Wire` methods take `&self` (§16.3 property 3), so every mutable
+/// field sits behind a `Cell`/`RefCell`. `FlakyWire` is deliberately
+/// **`!Send`**: it is the fixture for an actor that must not require
+/// `Send`, so a `Send` `FlakyWire` would let a `Send` bound creep into the
+/// driver unnoticed.
+pub struct FlakyWire {
+    addr: SocketAddr,
+    net: Rc<RefCell<Inner>>,
+    rng: RefCell<ChaCha20Rng>,
+    policy: RefCell<FlakyPolicy>,
+    /// This wire's 0-based send index, for `drop_at` / `drop_first`.
+    sent: Cell<usize>,
+    notify: Rc<Notify>,
+}
+
+impl FlakyWire {
+    /// The address this wire is registered at.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Replace this wire's policy. Takes effect from the next send.
+    ///
+    /// The send index is **not** reset: `drop_at` indices count every send
+    /// this wire has made, so a policy installed mid-run does not silently
+    /// renumber history.
+    pub fn set_policy(&self, policy: FlakyPolicy) {
+        *self.policy.borrow_mut() = policy;
+    }
+
+    /// A clone of this wire's policy.
+    pub fn policy(&self) -> FlakyPolicy {
+        self.policy.borrow().clone()
+    }
+
+    /// A uniform draw in `[0, 1)` from this wire's stream.
+    fn draw_unit(&self) -> f64 {
+        // 53 bits of mantissa, the standard construction.
+        let bits = self.rng.borrow_mut().next_u64() >> 11;
+        bits as f64 / (1u64 << 53) as f64
+    }
+
+    /// One delay draw: `base_delay + uniform[0, jitter)`.
+    ///
+    /// The draw is taken **even when `jitter` is zero**, so a delivery
+    /// always consumes exactly one `u64` from the stream.
+    fn draw_delay(&self, policy: &FlakyPolicy) -> Duration {
+        let raw = self.rng.borrow_mut().next_u64();
+        let jitter_ns = policy.jitter.as_nanos() as u64;
+        if jitter_ns == 0 {
+            policy.base_delay
+        } else {
+            policy.base_delay + Duration::from_nanos(raw % jitter_ns)
+        }
+    }
+}
+
+impl Wire for FlakyWire {
+    /// Send `buf` to `addr`, applying this wire's [`FlakyPolicy`].
+    ///
+    /// # The routing, step by step
+    ///
+    /// 1. Count the send — **before** any policy decision.
+    /// 2. If a send failure is active for `now`, return `Err`. Nothing is
+    ///    queued and **nothing is tapped**.
+    /// 3. If this wire is partitioned, or the path to `addr` is blocked,
+    ///    return `Ok(buf.len())` and drop silently. **A blackhole is not a
+    ///    send error**: conflating the two would make the ruling-49
+    ///    fixture untestable, because a test could not tell an injected
+    ///    `ENETUNREACH` from a topology change.
+    /// 4. Record in the tap.
+    /// 5. Decide how many copies to deliver: 0 (lost), 1, or 2
+    ///    (duplicated).
+    /// 6. Draw a delay per copy and queue it.
+    ///
+    /// # The draw order is contract
+    ///
+    /// Changing it changes every seeded test's outcome, so it is part of
+    /// the determinism contract rather than an implementation detail:
+    ///
+    /// 1. `drop_at` / `drop_first` — index-based, **no draw at all**;
+    /// 2. one `f64` draw for `loss`;
+    /// 3. one `f64` draw for `duplicate` — taken even when the loss draw
+    ///    has already decided the outcome, so a non-index-dropped send
+    ///    always consumes exactly two `f64` draws;
+    /// 4. one `u64` draw per delivery for `jitter`.
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        let index = self.sent.get();
+        self.sent.set(index + 1);
+        self.net.borrow_mut().sends += 1;
+
+        let policy = self.policy.borrow().clone();
+
+        // 2. Injected send failure.
+        if let Some(failure) = &policy.send_failure
+            && Instant::now() < failure.until
+        {
+            return Err(failure.to_io_error());
+        }
+
+        // 3. Topology. A blackhole, not an error.
+        {
+            let net = self.net.borrow();
+            if net.partitioned.contains(&self.addr) || net.blocked.contains(&(self.addr, addr)) {
+                return Ok(buf.len());
+            }
+        }
+
+        // 4. Tap.
+        self.net.borrow().log.borrow_mut().push(Spied {
+            src: self.addr,
+            dst: addr,
+            bytes: buf.to_vec(),
+        });
+
+        // 5. Deliveries.
+        let deliveries = if index < policy.drop_first || policy.drop_at.contains(&index) {
+            0
+        } else {
+            let lost = self.draw_unit() < policy.loss;
+            let duplicated = self.draw_unit() < policy.duplicate;
+            match (lost, duplicated) {
+                (true, _) => 0,
+                (false, false) => 1,
+                (false, true) => 2,
+            }
+        };
+
+        // 6. Queue.
+        let now = Instant::now();
+        for _ in 0..deliveries {
+            let delay = self.draw_delay(&policy);
+            let mut net = self.net.borrow_mut();
+            deliver(&mut net, self.addr, addr, buf.to_vec(), now + delay);
+        }
+
+        Ok(buf.len())
+    }
+
+    /// Receive one datagram, waiting out its injected delay in virtual
+    /// time.
+    ///
+    /// # Cancel safety
+    ///
+    /// **The datagram is popped after the sleep, never before.** Dropping
+    /// this future loses nothing: the datagram stays in the inbox and the
+    /// next call gets it. That is not optional — the driver `select!`s
+    /// `recv_from` against its command channel and its timer, so a dropped
+    /// future must lose nothing.
+    ///
+    /// # Truncation
+    ///
+    /// A datagram longer than `buf` is copied to `buf.len()` bytes and
+    /// that count is returned, matching `tokio::net::UdpSocket::recv_from`
+    /// (POSIX `recvfrom` without `MSG_TRUNC`). The driver's buffer is
+    /// `MAX_DATAGRAM`, so an oversize datagram arrives truncated and dies
+    /// at §3.5's length gate.
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let next = {
+                let net = self.net.borrow();
+                net.endpoints
+                    .get(&self.addr)
+                    .and_then(|ep| ep.inbox.peek().map(|Reverse(q)| q.deliver_at))
+            };
+
+            let Some(deliver_at) = next else {
+                // Nothing queued. There is no yield point between the peek
+                // above and this await, and the fabric is single-threaded,
+                // so no wakeup can be missed in the gap.
+                self.notify.notified().await;
+                continue;
+            };
+
+            // THE line that makes §16.10 work: on the paused clock this
+            // auto-advances virtual time once every task is idle.
+            tokio::time::sleep_until(deliver_at).await;
+
+            // Only now do we take it.
+            let mut net = self.net.borrow_mut();
+            let Some(ep) = net.endpoints.get_mut(&self.addr) else {
+                continue;
+            };
+            let due = ep
+                .inbox
+                .peek()
+                .is_some_and(|Reverse(q)| q.deliver_at <= Instant::now());
+            if !due {
+                continue;
+            }
+            let Reverse(queued) = ep.inbox.pop().expect("peeked above");
+            let n = queued.bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&queued.bytes[..n]);
+            return Ok((n, queued.src));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The counting DH provider
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A shared, cheap handle on a DH call count.
+///
+/// `Rc<Cell<_>>`, so it is `!Send` like everything else on the actor path.
+/// Clones observe the same count.
+#[derive(Clone, Debug, Default)]
+pub struct DhCounter(Rc<Cell<u32>>);
+
+impl DhCounter {
+    /// A counter at zero.
+    pub fn new() -> Self {
+        DhCounter(Rc::new(Cell::new(0)))
+    }
+
+    /// The number of `dh` calls observed.
+    pub fn get(&self) -> u32 {
+        self.0.get()
+    }
+
+    /// Set the count back to zero.
+    pub fn reset(&self) {
+        self.0.set(0);
+    }
+
+    /// Wrap `inner` so its `dh` calls land on this counter.
+    pub fn provider<P>(&self, inner: P) -> CountingProvider<P> {
+        CountingProvider {
+            inner,
+            dhs: Rc::clone(&self.0),
+        }
+    }
+}
+
+/// Wraps a `DhProvider<P256>` and counts every `dh` call.
+///
+/// **Exactly one increment per `DhProvider::dh` call, and nothing else
+/// counts** — key generation is not a DH. That has to be exact, because
+/// §6.1's whole design argument is *"one DH to inspect, two to
+/// authenticate"*, and the ladder assertions later slices make (`0` at
+/// park, `1` after `read_identity()`, `2` after `authenticate()`, `4` per
+/// cancel-and-redial cycle) are how it is enforced.
+pub struct CountingProvider<P> {
+    inner: P,
+    dhs: Rc<Cell<u32>>,
+}
+
+impl<P> CountingProvider<P> {
+    /// The wrapped provider.
+    pub fn inner(&self) -> &P {
+        &self.inner
+    }
+}
+
+impl<P: CryptoKeyProvider<P256>> CryptoKeyProvider<P256> for CountingProvider<P> {
+    type Error = P::Error;
+    type PrivateKey = P::PrivateKey;
+
+    fn public_key(
+        &self,
+        key: &Self::PrivateKey,
+    ) -> Result<<P256 as Curve>::PublicKey, Self::Error> {
+        self.inner.public_key(key)
+    }
+
+    fn generate_static_key(&mut self) -> Result<Self::PrivateKey, Self::Error> {
+        self.inner.generate_static_key()
+    }
+
+    fn generate_ephemeral_key(&mut self) -> Result<Self::PrivateKey, Self::Error> {
+        self.inner.generate_ephemeral_key()
+    }
+}
+
+impl<P: DhProvider<P256>> DhProvider<P256> for CountingProvider<P> {
+    fn dh(
+        &self,
+        key: &Self::PrivateKey,
+        peer: &<P256 as Curve>::PublicKey,
+    ) -> Result<<P256 as DhCurve>::SharedSecret, Self::Error> {
+        self.dhs.set(self.dhs.get() + 1);
+        self.inner.dh(key, peer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:400{n}").parse().expect("literal addr")
+    }
+
+    /// **The slice-0 definition-of-done test.**
+    ///
+    /// Four things it proves: a byte crosses A → B through the [`Wire`]
+    /// trait over a [`FlakyWire`]; an injected loss policy really drops,
+    /// deterministically; **virtual time advances** (the `elapsed`
+    /// assertion fails if `recv_from` busy-waits or the `sleep_until` is
+    /// missing); and `timeout` composes with `recv_from`, which is the
+    /// cancellation property the driver's `select!` will rely on.
+    #[tokio::test(start_paused = true)]
+    async fn a_byte_crosses_two_flaky_wires_under_injected_loss() {
+        let wall_t0 = std::time::Instant::now();
+
+        let net = Network::seeded(0xA11CE);
+        let a = net.endpoint("10.0.0.1:4001".parse().expect("literal addr"));
+        let b = net.endpoint("10.0.0.2:4002".parse().expect("literal addr"));
+
+        // The first two datagrams die; the third gets through. Index-based,
+        // so the outcome does not depend on an RNG draw.
+        a.set_policy(
+            FlakyPolicy::drop_at([0, 1])
+                .with_delay(Duration::from_millis(50), Duration::from_millis(10)),
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            a.send_to(b"!", b.local_addr()).await.expect("send");
+        }
+
+        let mut buf = [0u8; 1200];
+        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+
+        assert_eq!(&buf[..n], b"!");
+        assert_eq!(src, a.local_addr());
+        assert_eq!(net.sends(), 3, "all three left the wire");
+        assert_eq!(
+            net.tap().len(),
+            3,
+            "all three were tapped; two were dropped after"
+        );
+
+        // Virtual time advanced by the injected one-way delay …
+        let elapsed = Instant::now() - t0;
+        assert!(
+            (Duration::from_millis(50)..Duration::from_millis(60)).contains(&elapsed),
+            "delivery waited base_delay + jitter in virtual time, got {elapsed:?}",
+        );
+
+        // … and nothing else is coming.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the two dropped datagrams never arrive",
+        );
+
+        // A regression to real sleeps should be loud, not slow.
+        assert!(
+            wall_t0.elapsed() < Duration::from_secs(1),
+            "the test spent real time; virtual time is not being used",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perfect_policy_delivers_everything_in_order() {
+        let net = Network::seeded(1);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        a.set_policy(FlakyPolicy::perfect());
+
+        for i in 0..100u8 {
+            a.send_to(&[i], b.local_addr()).await.expect("send");
+        }
+
+        let mut buf = [0u8; 16];
+        for i in 0..100u8 {
+            let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], i, "datagram {i} arrived out of order");
+            assert_eq!(src, a.local_addr());
+        }
+        assert_eq!(net.sends(), 100);
+    }
+
+    /// A trace of one seeded scenario: what arrived, in what order, and at
+    /// what offset from the start.
+    async fn trace(seed: u64) -> Vec<(Vec<u8>, Duration)> {
+        let net = Network::seeded(seed);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        a.set_policy(
+            FlakyPolicy::lossy(0.3)
+                .with_duplication(0.1)
+                .with_delay(Duration::ZERO, Duration::from_millis(20)),
+        );
+
+        let t0 = Instant::now();
+        for i in 0..50u8 {
+            a.send_to(&[i], b.local_addr()).await.expect("send");
+        }
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16];
+        // Drain until nothing more can arrive: 20 ms of jitter is the
+        // whole horizon, so a 1 s timeout is generous.
+        while let Ok(Ok((n, _src))) =
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf)).await
+        {
+            out.push((buf[..n].to_vec(), Instant::now() - t0));
+        }
+        out
+    }
+
+    /// **The reproducibility contract** (ruling 60), as a test rather than
+    /// a comment.
+    #[tokio::test(start_paused = true)]
+    async fn seeded_runs_are_identical() {
+        let first = trace(7).await;
+        let second = trace(7).await;
+        assert!(!first.is_empty(), "the scenario delivered nothing at all");
+        assert_eq!(first, second, "the same seed produced a different trace");
+    }
+
+    /// Guards against a policy that silently ignores the RNG: a `loss`
+    /// field that is never read would pass `seeded_runs_are_identical` and
+    /// fail this.
+    #[tokio::test(start_paused = true)]
+    async fn different_seeds_diverge() {
+        let first = trace(7).await;
+        let second = trace(8).await;
+        assert_ne!(first, second, "two seeds produced identical traces");
+    }
+
+    /// §8.2's pop-after-sleep rule, mechanically enforced. Getting this
+    /// backwards is the single most likely silent-data-loss bug in the
+    /// slice, and it would present two slices later as an unreproducible
+    /// flake.
+    #[tokio::test(start_paused = true)]
+    async fn recv_from_is_cancel_safe() {
+        let net = Network::seeded(3);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        a.set_policy(FlakyPolicy::perfect().with_delay(Duration::from_millis(50), Duration::ZERO));
+
+        a.send_to(b"payload", b.local_addr()).await.expect("send");
+
+        // Poll a `recv_from`, then drop it well before `deliver_at`.
+        let mut buf = [0u8; 32];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the datagram is not due yet",
+        );
+
+        // The datagram survived the cancellation, intact …
+        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..n], b"payload");
+        assert_eq!(src, a.local_addr());
+
+        // … and exactly once.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the datagram was delivered twice",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jitter_reorders_and_the_heap_is_stable() {
+        // Large jitter relative to send spacing: order must break at least
+        // once across the run.
+        let net = Network::seeded(11);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        a.set_policy(FlakyPolicy::perfect().with_delay(Duration::ZERO, Duration::from_millis(100)));
+        for i in 0..30u8 {
+            a.send_to(&[i], b.local_addr()).await.expect("send");
+        }
+        let mut order = Vec::new();
+        let mut buf = [0u8; 16];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf)).await
+        {
+            order.push(buf[..n][0]);
+        }
+        assert_eq!(order.len(), 30, "nothing was lost, only reordered");
+        let sent: Vec<u8> = (0..30).collect();
+        assert_ne!(order, sent, "jitter never reordered anything");
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, sent, "reordering must not invent or lose bytes");
+
+        // With no jitter, equal deadlines deliver FIFO — the sequence
+        // tie-break in the heap.
+        let net = Network::seeded(11);
+        let a = net.endpoint(addr(3));
+        let b = net.endpoint(addr(4));
+        a.set_policy(FlakyPolicy::perfect());
+        for i in 0..30u8 {
+            a.send_to(&[i], b.local_addr()).await.expect("send");
+        }
+        for i in 0..30u8 {
+            let (n, _) = b.recv_from(&mut buf).await.expect("recv");
+            assert_eq!(buf[..n][0], i, "equal deadlines must deliver FIFO");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplication_delivers_two_identical_copies() {
+        let net = Network::seeded(5);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        // Duplicate everything.
+        a.set_policy(FlakyPolicy::perfect().with_duplication(1.0));
+
+        a.send_to(b"dup", b.local_addr()).await.expect("send");
+
+        let mut buf = [0u8; 16];
+        for _ in 0..2 {
+            let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+            assert_eq!(&buf[..n], b"dup");
+            assert_eq!(src, a.local_addr());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "exactly two copies, not three",
+        );
+        assert_eq!(net.sends(), 1, "one send, two deliveries");
+    }
+
+    /// `drop_at` consumes no RNG draw, so two different seeds must give
+    /// byte-identical outcomes.
+    #[tokio::test(start_paused = true)]
+    async fn drop_at_is_exact() {
+        async fn run(seed: u64) -> Vec<u8> {
+            let net = Network::seeded(seed);
+            let a = net.endpoint(addr(1));
+            let b = net.endpoint(addr(2));
+            a.set_policy(FlakyPolicy::drop_at([1, 3]));
+            for i in 0..5u8 {
+                a.send_to(&[i], b.local_addr()).await.expect("send");
+            }
+            let mut got = Vec::new();
+            let mut buf = [0u8; 16];
+            while let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf)).await
+            {
+                got.push(buf[..n][0]);
+            }
+            got
+        }
+
+        assert_eq!(run(0).await, vec![0, 2, 4]);
+        assert_eq!(
+            run(0).await,
+            run(999_999).await,
+            "an index-based drop must not depend on the seed",
+        );
+    }
+
+    /// §8.2 step 3's distinction: a blackhole is not a send error.
+    #[tokio::test(start_paused = true)]
+    async fn partition_blackholes_without_a_send_error() {
+        let net = Network::seeded(2);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+        net.partition(a.local_addr());
+
+        let n = a.send_to(b"x", b.local_addr()).await.expect("Ok, not Err");
+        assert_eq!(n, 1);
+        assert_eq!(net.sends(), 1, "the send was counted");
+        assert!(net.tap().is_empty(), "a blackholed send is not tapped");
+
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing crosses a partition",
+        );
+
+        // One-directional blocking is separate from a full partition.
+        net.heal(a.local_addr());
+        net.block_path(a.local_addr(), b.local_addr());
+        a.send_to(b"y", b.local_addr()).await.expect("Ok, not Err");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing crosses a blocked path",
+        );
+
+        net.heal_path(a.local_addr(), b.local_addr());
+        a.send_to(b"z", b.local_addr()).await.expect("send");
+        let (n, _) = b.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..n], b"z", "healing restores the path");
+    }
+
+    /// The ruling-49 fixture, proved usable several slices before anything
+    /// depends on it.
+    #[tokio::test(start_paused = true)]
+    async fn send_failure_is_an_err_and_then_heals() {
+        let net = Network::seeded(4);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+
+        let until = Instant::now() + Duration::from_secs(3);
+        a.set_policy(FlakyPolicy::perfect().failing_sends_until(until));
+
+        let err = a
+            .send_to(b"x", b.local_addr())
+            .await
+            .expect_err("the send must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NetworkUnreachable);
+        assert_eq!(err.raw_os_error(), Some(ENETUNREACH));
+        assert_eq!(net.sends(), 1, "a failed send is still counted");
+        assert!(net.tap().is_empty(), "a failed send is not tapped");
+
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing was queued",
+        );
+
+        // Advance past the window, in virtual time.
+        tokio::time::sleep_until(until + Duration::from_millis(1)).await;
+
+        a.send_to(b"y", b.local_addr()).await.expect("healed");
+        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..n], b"y");
+        assert_eq!(src, a.local_addr());
+        assert_eq!(net.tap().len(), 1, "only the healed send was tapped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversize_datagram_is_truncated_like_a_socket() {
+        let net = Network::seeded(6);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+
+        let big = vec![0xab; 2000];
+        a.send_to(&big, b.local_addr()).await.expect("send");
+
+        let mut buf = [0u8; crate::constants::MAX_DATAGRAM];
+        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(n, crate::constants::MAX_DATAGRAM);
+        assert_eq!(src, a.local_addr());
+        assert!(buf.iter().all(|byte| *byte == 0xab));
+    }
+
+    /// The forgery fixture slices 1–2 need for mac1 garbage and off-path
+    /// spoofing.
+    #[tokio::test(start_paused = true)]
+    async fn inject_forges_a_source() {
+        let net = Network::seeded(8);
+        let b = net.endpoint(addr(2));
+        let forged: SocketAddr = "203.0.113.9:9999".parse().expect("literal addr");
+
+        net.inject(forged, b.local_addr(), b"x");
+
+        let mut buf = [0u8; 16];
+        let (n, src) = b.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..n], b"x");
+        assert_eq!(src, forged, "the forged source is reported verbatim");
+        assert_eq!(net.sends(), 0, "an injection is not a wire's send");
+        assert!(net.tap().is_empty(), "an injection is not tapped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unregistered_destination_is_dropped_not_an_error() {
+        let net = Network::seeded(9);
+        let a = net.endpoint(addr(1));
+        let nowhere: SocketAddr = "198.51.100.7:1".parse().expect("literal addr");
+
+        let n = a.send_to(b"x", nowhere).await.expect("Ok, not Err");
+        assert_eq!(n, 1);
+        assert_eq!(net.sends(), 1);
+        assert_eq!(net.tap().len(), 1, "it did leave the wire");
+    }
+
+    /// The DH ladder's instrument: exactly one increment per `dh`, and
+    /// nothing else counts.
+    #[test]
+    fn dh_counter_counts_only_dh() {
+        use hiss::provider::EphemeralOnly;
+
+        let counter = DhCounter::new();
+        let mut provider = counter.provider(EphemeralOnly::new(ChaCha20Rng::seed_from_u64(42)));
+
+        let ephemeral = provider.generate_ephemeral_key().expect("keygen");
+        assert_eq!(counter.get(), 0, "key generation is not a DH");
+        let static_key = provider.generate_static_key().expect("keygen");
+        assert_eq!(counter.get(), 0, "key generation is not a DH");
+        let peer = provider.public_key(&static_key).expect("public_key");
+        assert_eq!(counter.get(), 0, "public_key is not a DH");
+
+        provider.dh(&ephemeral, &peer).expect("dh");
+        assert_eq!(counter.get(), 1);
+
+        // Clones observe the same count.
+        let observer = counter.clone();
+        provider.dh(&static_key, &peer).expect("dh");
+        assert_eq!(observer.get(), 2);
+        assert_eq!(counter.get(), 2);
+
+        observer.reset();
+        assert_eq!(counter.get(), 0, "reset is shared too");
+    }
+
+    /// A compile-fence mirroring `shell::wire`'s: the fixture is driven
+    /// from a task that never required `Send`, and nothing in this module
+    /// names `Send`.
+    #[tokio::test(start_paused = true)]
+    async fn the_whole_module_is_not_send() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = Network::seeded(12);
+                let a = net.endpoint(addr(1));
+                let b = net.endpoint(addr(2));
+                let b_addr = b.local_addr();
+
+                // `spawn_local` takes a `!Send` future — `spawn` would not
+                // compile here, which is the whole point.
+                let sender = tokio::task::spawn_local(async move {
+                    a.send_to(b"local", b_addr).await.expect("send")
+                });
+                assert_eq!(sender.await.expect("join"), 5);
+
+                let mut buf = [0u8; 16];
+                let (n, _src) = b.recv_from(&mut buf).await.expect("recv");
+                assert_eq!(&buf[..n], b"local");
+
+                // And a generic driver with no `Send` bound accepts it.
+                fn _drives_any_wire<W: Wire>(_w: &W) {}
+                _drives_any_wire(&b);
+            })
+            .await;
+    }
+}

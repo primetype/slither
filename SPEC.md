@@ -5641,3 +5641,50 @@ rulings).**
 | `L` (shell lateness bound) | 250 ms | §16.5 |
 | wire error codes | 0x00–0x06 + ≥ 0x10 application; 0x07–0x0f reserved | §15.3 |
 | session index | nonzero u32, random, re-drawn across both tables | §17.3 |
+
+### Constants the spec fixes but never names
+
+**[RATIFIED 2026/08/14 — ruling 63]** Every value above is normative, but
+thirteen of them are stated as prose, as a compressed range, or under a
+one-letter alias, and therefore have **no identifier a reader can grep
+for**. Two independent readers of this document — slice 0's planner and
+its conformance-test author, working without sight of each other —
+both stopped at the same gap, which is the evidence that it is one.
+
+The identifiers below are **normative names for values this document
+already fixes**. Nothing here changes a value, a byte, or a behaviour.
+
+| Name | Value | Home | What the table says instead |
+|---|---|---|---|
+| `STATIC_PUBLIC_LEN` | 65 B | §2.4 | "the 65-byte uncompressed SEC1 storage form"; §2.3 writes it `PK` |
+| `PKT_RESERVED_UNUSED` / `PKT_RESERVED_COOKIE` | 0x04 / 0x05 | §3.1 | "reserved packet types … 0x04 (unused), 0x05 (cookie/mac2)" |
+| `FRAME_STOP_SENDING_RESERVED` | 0x05 | §8.3 | "(reserved: STOP_SENDING)" |
+| `STREAM_FLAG_MASK` | 0x07 | §8.4 | the three flags are named; their union is not |
+| `CREDIT_REGRANT_DIVISOR` | 2 | §10.3 | "credit re-grant threshold … ½ window consumed" |
+| `ACK_ELICITING_PER_ACK` | 2 | §12.4 | "every 2nd ack-eliciting" |
+| `K_TIME_THRESHOLD_NUM` / `_DEN` | 9 / 8 | §13.2 | "time threshold … 9⁄8" |
+| `PTO_BACKOFF_CAP` | **64** | §13.3 | written "2⁶" |
+| `CLOSE_REPLY_MIN_INTERVAL` | 1 s | §15.1 | "close-reply rate … ≤ 1 per s" |
+| `SHELL_LATENESS_BOUND` | 250 ms | §16.5 | the spec calls it `L` |
+| `PERSISTENT_KEEPALIVE_DEFAULT` / `_MIN` | 10 s / 1 s | §7.5 | one bare `PERSISTENT_KEEPALIVE`, range in prose |
+| `APPLICATION_ERROR_BASE` | 0x10 | §15.3 | "≥ 0x10 application" |
+
+**Two shapes recur, and naming them is worth more than the thirteen
+entries.** Both are ways a specification can be complete and still
+unimplementable without a guess.
+
+1. **A ratio or rate stated in prose** — `½ window`, `every 2nd`, `9⁄8`,
+   `≤ 1 per s`, `2⁶` — needs an identifier **and a stated unit**.
+   `PTO_BACKOFF_CAP` proves the point: "2⁶" is a multiplier (64) in
+   §13.3's sentence and reads as an exponent (6) in the table, and an
+   implementer who guessed wrong would back off 64× too little with
+   nothing red to show for it.
+2. **A range stated in prose against one named constant** — the
+   admissible `[1 s, DEAD_TIMEOUT)` for `PERSISTENT_KEEPALIVE` — becomes
+   two or three identifiers in code. Name the **default** and the
+   **floor**, and leave the ceiling as a comparison against
+   `DEAD_TIMEOUT`: a named ceiling would be a second place for
+   `DEAD_TIMEOUT` to be written down, and therefore a place it can drift.
+
+A future constant SHOULD be added to the table with an identifier, not
+only a value, and a prose-stated ratio SHOULD carry its unit.

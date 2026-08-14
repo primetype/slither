@@ -1038,3 +1038,43 @@ rather than obeying** — working rule 5 doing its job:
 3. `CountingIdentity` cannot land in slice 0 — `Identity` has no home in
    the module map until slice 2. Ships as `CountingProvider` + `DhCounter`
    now, the `Identity` impl in slice 2.
+
+**Ruling 63 — thirteen constants the spec fixes but never names.**
+Surfaced independently by slice 0's planner and its conformance-test
+author, working without sight of each other: both stopped at the same
+gap, which is what makes it a gap rather than a preference. Values stated
+as prose (`½ window`, `every 2nd`, `9⁄8`, `≤ 1 per s`, `2⁶`), as a
+compressed range (`reserved packet types … 0x04, 0x05`), or under a
+one-letter alias (`L`) are normative but have **no identifier a reader
+can grep for**. The Named-constants table gains a subsection giving each
+one a normative name. No value, byte or behaviour changes.
+
+*The two recurring shapes matter more than the thirteen entries*, because
+both are ways a specification can be complete and still unimplementable
+without a guess:
+1. **A prose ratio or rate needs an identifier AND a stated unit.**
+   `PTO_BACKOFF_CAP` is the proof: "2⁶" is a multiplier (64) in §13.3's
+   sentence and reads as an exponent (6) in the table. An implementer who
+   guessed wrong backs off 64× too little **with nothing red to show for
+   it** — no test fails, because the constant is self-consistent.
+2. **A prose range against one named constant becomes two or three
+   identifiers in code.** Name the default and the floor; leave the
+   ceiling as a comparison against `DEAD_TIMEOUT`. A named ceiling would
+   be a second place `DEAD_TIMEOUT` is written down, and therefore a
+   place it can drift.
+
+Going forward: a new constant SHOULD enter the table with an identifier,
+not only a value, and a prose-stated ratio SHOULD carry its unit.
+
+**Process note — the author swap earned its cost on its first use.** The
+conformance-test author (sonnet) wrote `tests/spec_constants.rs` and
+`tests/spec_errors.rs` from `SPEC.md` alone, forbidden from reading
+`src/` or the plan's transcription table, and given constant **names**
+but no **values**. It read four ranges plus three it had to find itself
+(§8.3 for per-name frame types, §2.3/§2.4 for `STATIC_PUBLIC_LEN` — which
+the consolidated table never names — and ruling 44's passage for
+`ConfigError`). A third independent reading by me confirmed all thirteen
+prose-derived values agree: 65, 0x07, 2, 2, 9/8, 64, 12 000, 2 400, 1 s,
+1 s. Three readings, no divergence — which is the only evidence that a
+transcription is right, since a single reader checking their own work
+proves nothing.
