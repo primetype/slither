@@ -21,7 +21,8 @@ exclude = [
     # The wire-v2 design record: 59 rulings, their reviews, and the frozen
     # intermediate drafts. Provenance a maintainer needs and a consumer does
     # not — SPEC.md is what ships.
-    "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/PLAN.md", "/STORIES.md",
+    "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/.slices",
+    "/PLAN.md", "/STORIES.md",
 ]
 
 # A library only. It holds the packet layer — the packtool wire headers, the mac1

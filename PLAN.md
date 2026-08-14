@@ -48,7 +48,7 @@ must be able to find the code for a section without searching.
 
 ```
 src/
-  lib.rs                    re-exports; the crate-level doc carries the four
+  lib.rs                    re-exports; the crate-level doc carries the five
                             documentation obligations (§9 below)
   constants.rs              every named constant, one place       ("Named constants")
   error.rs                  the closed taxonomy, verbatim                  (§18.1)

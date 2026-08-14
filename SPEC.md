@@ -4093,6 +4093,25 @@ a reason to keep a connection alive: a `closed()` future is not a handle,
 and holding one while dropping every `Connection` still stops the driver
 and still kills the session silently.
 
+**A `Connecting` *is* a handle.** **[RATIFIED 2026/08/14 — ruling 62]**
+The driver lives while a `Connecting` lives, and dropping the last
+`Connecting` — with no `Endpoint` and no `Connection` outstanding — stops
+it. This is the distinction against the `closed()` future above, and it
+is a real one rather than a special case: a `Connecting` **owns an
+in-flight protocol attempt** — a pending, its index, and §5.5's
+retransmit train, which is why ruling 50 makes dropping it a
+state-changing event — while a `closed()` future owns nothing and merely
+observes. A future that changes protocol state when dropped is a handle;
+one that does not, is not.
+The consequence is that **`ConnectError` needs no `EndpointDropped`** and
+§18.1 stays closed as written: a `Connecting` cannot outlive the driver,
+so there is no state for such a variant to describe. The asymmetry with
+`IntroError`, `AuthError` and `AcceptError` — which all carry
+`EndpointDropped` — is therefore correct and not an omission: a staged
+object's verb is a **round-trip to a driver it does not keep alive**, so
+the driver can stop underneath it; an outbound attempt keeps its own
+driver running.
+
 **Dropping a `Connecting` cancels the attempt.** **[RATIFIED 2026/08/14 —
 ruling 50]** A `Connecting` is a future, and dropping it **cancels the
 outbound attempt immediately**: §5.5's retransmit train stops, the
@@ -4525,6 +4544,33 @@ is the whole of the substitution, which is why the same flow tests run
 unchanged over a real `tokio::net::UdpSocket`, and why a `Wire` that
 fails its sends is the only fixture ruling 49's trace obligation needs.
 
+**The fixture surface, attested.** **[RATIFIED 2026/08/14 — ruling 60]**
+This section named `FlakyWire` alone while the fixture it belongs to has
+three parts, all of which a downstream crate already depends on by name:
+
+- **`testutil::Network`** — the in-memory routing fabric. It owns the
+  address→endpoint map and moves datagrams between `FlakyWire`s; it is
+  what makes "two endpoints without a kernel" a single object rather
+  than a test-local convention.
+- **`testutil::FlakyWire`** — a `Wire` (§16.3) attached to a `Network` at
+  one address.
+- **`testutil::FlakyPolicy`** — the impairment applied to each datagram:
+  loss, reordering, duplication, and **send failure**. It **MUST** be
+  deterministic under a caller-supplied seed. A flow test that cannot be
+  replayed byte-for-byte from its seed is not a regression test, and the
+  loss-dependent behaviour in §13 and §7.5 is exactly where a
+  once-in-a-thousand-runs failure would otherwise be unactionable.
+
+**Send-failure injection is required, not optional.** Ruling 49 makes a
+failing `send_to` a trace obligation, and Appendix B's obligation for it
+is unreachable without a fixture that can fail a send. It belongs in
+`FlakyPolicy` from the start: retrofitting it later would rewrite the
+tests of every slice that had already ridden the fixture.
+
+These three names are **contract**, on the same terms as §18.2's trace
+targets: renaming or dropping one is a protocol revision, because a
+consumer's test suite is built on them.
+
 ### 16.11 The composability surface
 
 **[RATIFIED 2026/08/14 — rulings 55, 56, 57, 58]**
@@ -4917,8 +4963,28 @@ deleted.
 - **`DatagramError::{TooLarge, ConnectionLost(ConnectionLost)}`** —
   `TooLarge`: payload > `MAX_DATAGRAM_PAYLOAD` at the handle (§11.4).
 
-The wire error codes (`0x00`–`0x05`, ≥ `0x10` application) are §15.3's
-registry.
+The wire error codes (`0x00`–`0x06`, ≥ `0x10` application; `0x07`–`0x0f`
+reserved) are §15.3's registry. *(`0x06` is ruling 52's
+`MESSAGE_OVERFLOW`; this sentence and the Named-constants table both read
+`0x00`–`0x05` until 2026/08/14, when ruling 52's application was found to
+have updated §15.3 and §9.8 but neither of the two places that restate
+them.)*
+
+**[RATIFIED 2026/08/14 — ruling 61]** *`#[non_exhaustive]` goes only
+where a variant is actually reserved.* The taxonomy is closed by process,
+and the type system should say the same thing wherever that is true. So
+**`WriteError` alone** carries `#[non_exhaustive]` — §19 explicitly
+reserves `Stopped` for the STOP_SENDING round, so that type demonstrably
+will gain a variant — and **every other error type is exhaustive**. A
+consumer therefore matches without a `_` arm and gets a **compile error**
+the day a variant is added, which for a transport is the loud failure
+worth having: a wildcard arm would silently swallow a new error into a
+branch written for the old ones. The cost is that adding a variant to any
+other type is a major version bump, which is the correct price and a
+useful brake. (§16.2's `Notification` remains `#[non_exhaustive]` on its
+own reasoning — it is a signal set a later wire line may extend, not an
+error taxonomy — and `ConfigError` sits outside §18.1 entirely, by
+ruling 44.)
 
 ### 18.2 Trace targets — the operator contract
 
@@ -5573,5 +5639,5 @@ rulings).**
 | `INTRO_QUEUE_CAP` / `INTRO_MAX_PER_SOURCE` / `INTRO_TTL` | 1024 / 4 / 15 s | §6.3 |
 | `TS_GUARD_ORPHAN_CAP` | 1024 | §17.1 |
 | `L` (shell lateness bound) | 250 ms | §16.5 |
-| wire error codes | 0x00–0x05 + ≥ 0x10 application | §15.3 |
+| wire error codes | 0x00–0x06 + ≥ 0x10 application; 0x07–0x0f reserved | §15.3 |
 | session index | nonzero u32, random, re-drawn across both tables | §17.3 |

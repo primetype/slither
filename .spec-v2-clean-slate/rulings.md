@@ -950,3 +950,91 @@ retry loop — rather than from the replacement story.
 
 **`STORIES.md` is COMPLETE at 30 approved stories** and is the acceptance
 criteria for `PLAN.md`. D10 is closed.
+
+---
+
+## Round 10 — slice 0 planning (2026/08/14)
+
+The implementation process the maintainer set: a planning agent per
+slice, then an implementer, then two verifiers in parallel (opus +
+sonnet) for breadth, then my review, looping on findings. Slice 0's
+planner (opus) produced `.slices/00-ground/PLAN.md` — 1 744 lines,
+~370 lines of SPEC.md read across 11 targeted ranges, never the whole
+file. It found three real defects and asked ten questions.
+
+**A fourth instance of the ruling-52 verification miss, and the pattern
+is now clear enough to name.** Ruling 52 minted `MESSAGE_OVERFLOW` =
+`0x06` and its application updated §15.3 and §9.8 — the **normative**
+sections. It did not update the places that **restate** them. Found so
+far, each by a different route:
+
+1. §9.8's "One consequence, stated" prose, still arguing the code was not
+   worth minting (found by reading, round 9).
+2. The consolidated **Named-constants table**: `wire error codes
+   0x00–0x05` (found by the slice-0 planner).
+3. **§18.1's own closing sentence**: `0x00`–`0x05` again (found by me,
+   while applying ruling 61 two lines above it).
+
+**The generalisation: a ruling's blast radius is every place that
+restates the thing it changed, not every place that defines it.** A
+grep for the changed token finds definitions; summaries paraphrase, and
+paraphrases do not contain the token. For future rulings the check is:
+grep the *old* value, the *new* value, and the rationale — then read the
+document's summary tables and closing sentences by hand, because those
+are written in prose and will not match any of the three.
+
+**Ruling 60 — the fixture surface is attested and its determinism is
+normative.** §16.10 named `FlakyWire` alone while the fixture has three
+parts, all depended on by name downstream. Now attested: `Network` (the
+routing fabric), `FlakyWire` (a `Wire` at one address), `FlakyPolicy`
+(the impairment). Two things are made normative rather than left to
+taste: **`FlakyPolicy` MUST be deterministic under a caller-supplied
+seed** — a flow test that cannot be replayed byte-for-byte from its seed
+is not a regression test, and §13/§7.5's loss-dependent behaviour is
+exactly where a one-in-a-thousand failure would be unactionable — and
+**send-failure injection is required from the start**, because ruling
+49's trace obligation is untestable without it and retrofitting it later
+would rewrite the tests of every slice that had already ridden the
+fixture. The three names are contract on §18.2's terms. Closes S24's
+attestation gap.
+
+**Ruling 61 — `#[non_exhaustive]` goes only where a variant is actually
+reserved.** `WriteError` alone (§19 reserves `Stopped` for the
+STOP_SENDING round); every other error type is exhaustive. A consumer
+matches with no `_` arm and gets a **compile error** the day a variant is
+added — for a transport that is the loud failure worth having, since a
+wildcard arm silently swallows a new error into a branch written for the
+old ones. Adding a variant elsewhere is a major bump: the correct price,
+and a useful brake. Declined: uniform `#[non_exhaustive]` on all ten
+types (a permanent ergonomic tax on types that will never change, buying
+semver freedom for a taxonomy that is closed by process anyway).
+
+**Ruling 62 — a `Connecting` IS a handle; a `closed()` future is not.**
+The driver lives while a `Connecting` lives. The distinction is
+principled rather than a carve-out: **a future that changes protocol
+state when dropped is a handle; one that does not, is not.** A
+`Connecting` owns an in-flight attempt — a pending, its index, §5.5's
+retransmit train — which is precisely why ruling 50 makes dropping it
+state-changing. A `closed()` future owns nothing and merely observes.
+Consequence: **`ConnectError` needs no `EndpointDropped`** and §18.1
+stays closed. The asymmetry against `IntroError`/`AuthError`/
+`AcceptError`, which all carry it, is correct: a staged verb is a
+round-trip to a driver it does **not** keep alive, so that driver can
+stop underneath it; an outbound attempt keeps its own driver running.
+
+**Settled by reading, no ruling needed.** `PTO_BACKOFF_CAP` = 2⁶ is the
+**multiplier (64), not the exponent**: §13.3 caps `2^pto_count`, and
+§13.5 says "2⁶× too long". The planner flagged it as ambiguous; the
+sentence structure settles it. A compile-time
+`assert!(PTO_BACKOFF_CAP == 1 << 6)` keeps both readings visible anyway.
+
+**Three brief errors of mine the planner caught and worked around
+rather than obeying** — working rule 5 doing its job:
+1. "`error.rs` is §18.1 verbatim" is wrong. Ruling 44 puts
+   `ConfigError::{KeepaliveTooShort, KeepaliveTooLong}` deliberately
+   *outside* the closed taxonomy, and §16.2's surface does not compile
+   without it. Ten types, 41 variants.
+2. The brief omitted `src/shell/mod.rs`, which is structurally required.
+3. `CountingIdentity` cannot land in slice 0 — `Identity` has no home in
+   the module map until slice 2. Ships as `CountingProvider` + `DhCounter`
+   now, the `Identity` impl in slice 2.
