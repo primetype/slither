@@ -18,7 +18,7 @@ categories = ["cryptography", "network-programming"]
 # Repo infrastructure ships nothing to a consumer; SPEC.md ships on purpose —
 # it is the ratified protocol the rustdoc points at.
 exclude = [
-    "/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena",
+    "/.github", "/CLAUDE.md", "/TODO.md", "/deny.toml", "/.gitignore", "/.serena", "/.claude",
     # The wire-v2 design record: 68 rulings, their reviews, and the frozen
     # intermediate drafts. Provenance a maintainer needs and a consumer does
     # not — SPEC.md is what ships.

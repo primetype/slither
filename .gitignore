@@ -1,5 +1,10 @@
 /target
 /.serena
+# Agent scaffolding: `.claude/worktrees/` holds the throwaway git worktrees
+# that mutation-testing reviewers run in, so a reviewer breaking the tree on
+# purpose cannot collide with an agent reading it. Created and removed per
+# review; never project content.
+/.claude
 # Not committed (hiss convention): every CI/gate run re-resolves from the
 # index, so a break inside a semver-compatible range surfaces immediately.
 Cargo.lock

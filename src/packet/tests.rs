@@ -168,6 +168,61 @@ fn short_is_dropped() {
     );
 }
 
+/// Ruling 65: the pre-AEAD length gate is **exact** for the two
+/// fixed-size handshake packets, not the superseded "shorter than a fixed
+/// minimum" reading. Under that superseded reading a 197-byte
+/// HandshakeInit would pass the gate — §4.1's preimage extent would stop
+/// being a constant, and because mac1's key is derived from public data
+/// (§4.3), anyone could pad an initiation and recompute a valid tag.
+///
+/// The short side of this boundary (`LEN - 1` ⇒ `None`) is already
+/// covered by `short_is_dropped`, and by itself does not distinguish
+/// "exact" from "minimum" — both readings drop a too-short packet. Only
+/// the **over-length** side (`LEN + 1` ⇒ `None`) does: a `<` check where
+/// the code should use `!=` accepts it. All three points of the boundary
+/// are asserted together here, for both handshake types, so the test
+/// reads as one triple rather than two unrelated cases.
+#[test]
+fn handshake_length_is_exact_not_a_minimum() {
+    let init = init_datagram(constants::VERSION);
+    let short_init = &init[..constants::INIT_PACKET_LEN - 1];
+    let mut over_init = init.clone();
+    over_init.push(0x99);
+    assert_eq!(over_init.len(), constants::INIT_PACKET_LEN + 1);
+
+    assert!(
+        classify::<ReferenceSuite>(short_init).is_none(),
+        "INIT_PACKET_LEN - 1 must be dropped"
+    );
+    assert!(
+        classify::<ReferenceSuite>(&init).is_some(),
+        "INIT_PACKET_LEN must pass"
+    );
+    assert!(
+        classify::<ReferenceSuite>(&over_init).is_none(),
+        "INIT_PACKET_LEN + 1 must be dropped (ruling 65: exact, not a minimum)"
+    );
+
+    let resp = resp_datagram(constants::VERSION);
+    let short_resp = &resp[..constants::RESP_PACKET_LEN - 1];
+    let mut over_resp = resp.clone();
+    over_resp.push(0x99);
+    assert_eq!(over_resp.len(), constants::RESP_PACKET_LEN + 1);
+
+    assert!(
+        classify::<ReferenceSuite>(short_resp).is_none(),
+        "RESP_PACKET_LEN - 1 must be dropped"
+    );
+    assert!(
+        classify::<ReferenceSuite>(&resp).is_some(),
+        "RESP_PACKET_LEN must pass"
+    );
+    assert!(
+        classify::<ReferenceSuite>(&over_resp).is_none(),
+        "RESP_PACKET_LEN + 1 must be dropped (ruling 65: exact, not a minimum)"
+    );
+}
+
 /// §2.2: "A mismatched-suite packet dies silently at the length gate or at
 /// mac1 — the same fate as garbage." This test is `classify`-only, so it
 /// stays independent of any live second `Channel` even though one is now
