@@ -94,8 +94,14 @@ the spec rounds.
    already died of context exhaustion ingesting it. Work from the spec
    sections **quoted into your brief**; if you need more, use targeted
    `grep -n` plus `Read` with offset/limit. §9.8 is 140 lines.
-2. **Write notes incrementally**, so partial progress survives a
-   failure. Do not batch all findings to the end.
+2. **Create the output file before reading anything**, then append as you
+   go. Not "write incrementally" as an aspiration — the file exists, with
+   its heading skeleton, *before the first `Read`*. A slice-2 planning
+   agent stalled after ten minutes having read a great deal and written
+   nothing; all of it was lost, and its own last words were that it was
+   **about to** write the skeleton. An agent that intends to persist
+   later has not persisted. If you have read something worth keeping, it
+   belongs on disk before you read the next thing.
 3. **When you find two statements in conflict, do not default to the
    code-like rule.** Twice in this project the prose held the correct
    intent and the formal rule held the bug. Report the conflict; do not
