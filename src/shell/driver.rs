@@ -123,7 +123,7 @@ use crate::packet::Handshake;
 use super::connection::Connection;
 use super::shared::{
     Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink,
-    StaticState, Wakers, now,
+    StaticState, Wakers, now, resolve_slot,
 };
 use super::staged::Intro;
 use super::wire::Wire;
@@ -303,8 +303,29 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     // ═══════════════════════════════════════════════════════════════════
 
     /// Drain both cores to their terminal `Timeout` and collect the I/O.
+    ///
+    /// # Exhausting the pass bound is a panic, like both inner loops
+    ///
+    /// [`serve_endpoint`](Self::serve_endpoint) and
+    /// [`serve_connection`](Self::serve_connection) both end their
+    /// `DRAIN_BOUND` loop in a named `panic!`; this one used to fall
+    /// through silently, which is the one asymmetry of the three. It is
+    /// not benign: falling through means proceeding to `release_dead`,
+    /// `prune_ready` and then [`deadline`](Self::deadline) with connection
+    /// cores still dirty and the endpoint core undrained — and `deadline`
+    /// **pops**, so an undrained `Transmit` sitting there is destroyed
+    /// rather than sent. A silent exhaustion therefore degrades to a lost
+    /// CLOSE and 25 s of `DEAD_TIMEOUT` for the peer, which is exactly the
+    /// failure the `deadline` docs describe.
+    ///
+    /// Panicking is now also *cheaper* than it was when this loop was
+    /// written: [`Driver`]'s `Drop` runs [`stop`](Self::stop) on an unwind,
+    /// so a driver panic degrades to `ConnectionLost::EndpointDropped` and
+    /// `ConnectError::Local` rather than to a frozen endpoint. Loud beats
+    /// silent in both directions.
     fn serve(&mut self) -> Vec<Outgoing> {
         let mut out = Vec::new();
+        let mut settled = false;
 
         for _ in 0..DRAIN_BOUND {
             self.serve_endpoint(&mut out);
@@ -322,12 +343,17 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 .map(|(id, _)| *id)
                 .collect();
             if dirty.is_empty() {
+                settled = true;
                 break;
             }
             for id in dirty {
                 self.serve_connection(id, &mut out);
             }
         }
+        assert!(
+            settled,
+            "the shell's drain did not settle in {DRAIN_BOUND} passes (§16.4)"
+        );
 
         self.release_dead();
         self.prune_ready();
@@ -529,7 +555,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             record.remote_static.clone(),
             session_id,
         );
-        slot.borrow_mut().resolve(PendingOutcome::Ready(handle));
+        resolve_slot(&slot, PendingOutcome::Ready(handle));
     }
 
     /// §5.5's give-up, or ruling 72's local failure: resolve the
@@ -549,7 +575,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             .borrow_mut()
             .release_static(&record.static_key, record.attempt);
         if let Some(slot) = record.slot {
-            slot.borrow_mut().resolve(PendingOutcome::Failed(error));
+            resolve_slot(&slot, PendingOutcome::Failed(error));
         }
     }
 
@@ -584,8 +610,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             // the same answer the core itself would have given.
             record.cell.borrow_mut().core = None;
             if let Some(slot) = record.slot {
-                slot.borrow_mut()
-                    .resolve(PendingOutcome::Failed(ConnectError::Local));
+                resolve_slot(&slot, PendingOutcome::Failed(ConnectError::Local));
             }
         }
     }
@@ -863,7 +888,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                     .state
                     .borrow_mut()
                     .release_static(&static_key, attempt);
-                slot.borrow_mut().resolve(PendingOutcome::Failed(error));
+                resolve_slot(&slot, PendingOutcome::Failed(error));
             }
         }
     }
@@ -890,20 +915,48 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// `u32` absent from both tables, so no live route is ever keyed on it.
     /// Any other placeholder would have a 2⁻³² chance per live session of
     /// evicting somebody else's route.
+    ///
+    /// # The order of the two statements below is §16.4's MUST
+    ///
+    /// §16.4: "the shell delivers `Retired` to `handle_connection_event`
+    /// **before** releasing the connection's shell-side bookkeeping (else
+    /// the index route and the guard-entry pin leak for the endpoint's
+    /// life)". This used to run the other way round — `self.conns.remove`
+    /// first — which is the literal inverse.
+    ///
+    /// It was harmless at the time for exactly one reason:
+    /// `handle_connection_event` emits nothing
+    /// (`src/core/endpoint/mod.rs:808-832`), so no endpoint output could
+    /// be looked up against a record that had just been removed. That is
+    /// a property of today's core, not of the seam — §16.1's PENDING-branch
+    /// tie-break at `accept()` ("cancels the pending and installs in its
+    /// place", slice 7) is a cancel that *would* produce output for `id`,
+    /// and it would have found `self.conns.get(&id) == None` and been
+    /// dropped on the floor at `serve_endpoint`'s `ToConnection` arm.
+    /// The membership test replaces the removal as the guard, so the
+    /// early return is unchanged and the record is still present for the
+    /// duration of the call.
+    ///
+    /// Note also that the `Retired` delivered here is **synthesised by the
+    /// shell**, not emitted by a connection core: §16.4's list of the
+    /// cases that carry one ("in both cases") does not reach ruling 50's
+    /// cancel at all. The ordering rationale does, so the ordering is
+    /// held here too rather than argued away.
     fn command_cancel(&mut self, slot: &Rc<RefCell<PendingSlot<I>>>) {
         let Some(id) = slot.borrow().id else {
             // The `Connect` ahead of us in the queue failed, so there is no
             // pending to cancel and the static was already released.
             return;
         };
-        let Some(_record) = self.conns.remove(&id) else {
+        if !self.conns.contains_key(&id) {
             return;
-        };
+        }
         self.shell
             .state
             .borrow_mut()
             .endpoint
             .handle_connection_event(now(), id, ToEndpoint::Retired { our_index: 0 });
+        self.conns.remove(&id);
         // The shell-side static was released synchronously by
         // `Connecting::drop` — before this command was even queued, which
         // is what makes the immediate redial work with no clock advance.
@@ -1013,12 +1066,29 @@ impl<I: Identity, W: Wire> Driver<I, W> {
     /// latches `EndpointDropped` over connections that may already have
     /// died.
     ///
+    /// # The wakers are woken with the borrow released
+    ///
+    /// `Waker::wake` runs the **consumer's** executor, and an executor that
+    /// polls a ready task inline rather than queueing it re-enters
+    /// `Connection::poll_closed`, which takes this same `borrow_mut`. That
+    /// is `already mutably borrowed` inside the driver task — from a
+    /// consumer doing nothing wrong, on a `Waker` this crate does not
+    /// supply. So the borrow ends first and
+    /// [`Wakers::take_all`](super::shared::Wakers::take_all), which is
+    /// `#[must_use]`, is what makes that the only spelling available.
+    ///
     /// [`stop`]: Self::stop
     fn latch(cell: &Rc<RefCell<ConnCell<I::Suite>>>, lost: ConnectionLost) {
-        let mut borrow = cell.borrow_mut();
-        if borrow.closed.is_none() {
+        let woken = {
+            let mut borrow = cell.borrow_mut();
+            if borrow.closed.is_some() {
+                return;
+            }
             borrow.closed = Some(lost);
-            borrow.closed_wakers.wake_all();
+            borrow.closed_wakers.take_all()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 
@@ -1071,8 +1141,7 @@ impl<I: Identity, W: Wire> Driver<I, W> {
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
             if let Command::Connect { slot, .. } = command {
-                slot.borrow_mut()
-                    .resolve(PendingOutcome::Failed(ConnectError::Local));
+                resolve_slot(&slot, PendingOutcome::Failed(ConnectError::Local));
             }
         }
 
@@ -1080,8 +1149,7 @@ impl<I: Identity, W: Wire> Driver<I, W> {
             Self::latch(&record.cell, ConnectionLost::EndpointDropped);
             record.cell.borrow_mut().core = None;
             if let Some(slot) = record.slot.take() {
-                slot.borrow_mut()
-                    .resolve(PendingOutcome::Failed(ConnectError::Local));
+                resolve_slot(&slot, PendingOutcome::Failed(ConnectError::Local));
             }
         }
 

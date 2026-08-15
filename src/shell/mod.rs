@@ -385,16 +385,44 @@ mod tests {
         .await;
     }
 
-    /// Rulings 81/84's ordering, from the outside: after §15.2's linger
-    /// expires the core drops its state and emits `Retired`, and the shell
-    /// hands that to the endpoint core **before** releasing its own
-    /// bookkeeping. The observable consequence is that the static is free
-    /// again — a redial to it succeeds — and `is_established()` has gone
-    /// false on a handle the application still holds.
+    /// Rulings 81/84's ordering, from the outside: `Closed(_)` fires at
+    /// the death, `ToEndpoint::Retired` only at `CLOSE_LINGER` expiry, and
+    /// the shell hands that `Retired` to the endpoint core **before**
+    /// releasing its own bookkeeping (§16.4's MUST) — "else the index
+    /// route and the guard-entry pin leak for the endpoint's life".
     ///
-    /// The broken version — releasing the shell record first, so `Retired`
-    /// never reaches the endpoint core — leaves the static LIVE for the
-    /// endpoint's life, and the redial below returns `AlreadyConnected`.
+    /// # The two degenerate builds this separates, and how
+    ///
+    /// 1. **Released at the death.** Weaken `Driver::release_dead`'s gate
+    ///    from `closed.is_some() && !is_established()` to `closed.is_some()`
+    ///    and the shell tears the record down the moment `close()` seals,
+    ///    dropping the connection core *before* it ever emits `Retired`.
+    ///    The **first half** below is what sees that: during the linger
+    ///    §15.2 still holds the session — that is what makes the linger
+    ///    able to receive, and its reply rule is CLOSE's only reliability
+    ///    mechanism — so `is_established()` must still answer `true` and
+    ///    the static must still be occupied.
+    ///
+    /// 2. **`Retired` dropped on the floor.** Delete the
+    ///    `handle_connection_event` call in `Driver::serve_connection`'s
+    ///    `ToEndpoint` arm. The **second half** is what sees that, and it
+    ///    is the half that used to assert nothing: *neither*
+    ///    `is_established()` *nor* `Endpoint::connect`'s `Ok` can observe
+    ///    it. `release_dead` nulls `ConnCell::core` and frees the
+    ///    **mirror** — `ShellState::statics`, §16.1's synchronous
+    ///    admission test — whether or not the `Retired` was delivered, and
+    ///    `connect()` is answered from that mirror. Only `core::Endpoint`'s
+    ///    own map still holds the static, and the sole thing that reports
+    ///    its answer back is the **resolved `Connecting`**: a dropped one
+    ///    throws it away. So the redial is driven to a completed handshake
+    ///    here rather than dropped on the next line. Under the mutation
+    ///    the core answers `AlreadyConnected`, no msg1 is ever
+    ///    transmitted, and `redial.await` resolves `Err`.
+    ///
+    /// The third build — a *core* that emits `Retired` at the death
+    /// instead of at the expiry — is a mutation of frozen `src/core/**`,
+    /// pinned there (`src/core/connection/tests.rs`, §15.2's linger
+    /// tests). At this seam it is indistinguishable from build 1.
     #[tokio::test(start_paused = true)]
     async fn a_closed_connection_frees_its_static_when_the_linger_expires() {
         local(async {
@@ -421,13 +449,55 @@ mod tests {
             settle().await;
 
             assert!(!a.is_established(), "the linger never expired");
+            drop(a);
+            drop(b);
+
+            // `connect()`'s `Ok` proves nothing: it is the mirror's
+            // answer. Take a wire reading first — under the mutation the
+            // endpoint core refuses before anything is sealed, so **no
+            // msg1 leaves at all**, and this separates without B's
+            // cooperation.
+            let tap = pair.net.tap();
+            let from_a = || {
+                tap.snapshot()
+                    .iter()
+                    .filter(|spied| spied.src == pair.a.addr)
+                    .count()
+            };
+            let before = from_a();
+
             let redial = pair
                 .a
                 .endpoint
                 .connect(pair.b.addr, pair.b.public_static)
-                .expect("`Retired` never reached the endpoint core: the route leaked");
-            drop(redial);
-            drop(b);
+                .expect("the shell mirror still said LIVE after the linger");
+            settle().await;
+            assert!(
+                from_a() > before,
+                "no msg1 left the wire: `core::Endpoint::connect` refused the redial, \
+                 so `Retired` never reached the endpoint core and the static leaked",
+            );
+
+            // And the endpoint core's own answer, end to end. B's draining
+            // linger started at the same instant as A's closing one (the
+            // fabric is delay-free), so its static is free too and the
+            // whole 4-DH ladder must climb again.
+            let accept = async {
+                let intro = pair.b.endpoint.accept().await.expect("an introduction");
+                let claimed = intro.read_identity().await.expect("read_identity");
+                let proven = claimed.authenticate().await.expect("authenticate");
+                proven.accept().await.expect("accept")
+            };
+            let (again_a, again_b) = tokio::join!(
+                async {
+                    redial.await.expect(
+                        "the endpoint core still held the static: `Retired` was not delivered",
+                    )
+                },
+                accept,
+            );
+            assert!(again_a.is_established());
+            assert!(again_b.is_established());
         })
         .await;
     }
@@ -478,6 +548,227 @@ mod tests {
             drop(dialling);
         })
         .await;
+    }
+
+    /// A `Waker` is **application-supplied**, and this crate does not get
+    /// to assume what `wake()` does with it. An executor that polls a
+    /// ready task *inline* — rather than pushing it onto a run queue, as
+    /// tokio does — re-enters `Connection::poll_closed` synchronously, and
+    /// `poll_closed` takes `ConnCell`'s `borrow_mut`.
+    ///
+    /// The broken version is what `Driver::latch` used to be: `borrow_mut`
+    /// held across `closed_wakers.wake_all()`. The inline poll below then
+    /// hits `already mutably borrowed` **inside the driver task**, mid-drain
+    /// — which `spawn_local` swallows, so the only evidence left is the two
+    /// assertions here: the inline poll never completed, and `Driver::drop`
+    /// ran `stop()` so the endpoint now answers `Local` instead of
+    /// `AlreadyConnected`.
+    ///
+    /// Restoring the borrow is the mutation; both assertions separate it.
+    #[tokio::test(start_paused = true)]
+    async fn a_waker_that_polls_inline_does_not_re_enter_a_live_borrow() {
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        local(async {
+            let pair = Pair::seeded(12);
+            let (a, b) = pair.establish().await;
+            let a = Rc::new(a);
+
+            let waker = inline_waker();
+            let outcome: Rc<Cell<Option<ConnectionLost>>> = Rc::new(Cell::new(None));
+
+            // Park under our waker. One poll is what registers in
+            // `ConnCell::closed_wakers`; the future stays alive for the
+            // rest of the test so its `WakerSlot` guard does not unpark it.
+            let mut parked: Pin<Box<dyn Future<Output = ConnectionLost>>> = Box::pin(a.closed());
+            assert!(
+                parked
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending(),
+                "a healthy connection resolved `closed()`",
+            );
+
+            ON_WAKE.with(|slot| {
+                // The closure owns its own handle, so nothing here borrows
+                // a local and the whole action is `'static` — which is what
+                // a real executor's waker looks like.
+                let handle = Rc::clone(&a);
+                let outcome = Rc::clone(&outcome);
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Poll straight back into the same cell, which is what
+                    // an inline executor does with a ready task. A fresh
+                    // future rather than the parked one, so this cannot
+                    // recurse: after the death it resolves on its first
+                    // poll.
+                    let mut inline = Box::pin(handle.closed());
+                    let polled = inline
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    if let Poll::Ready(lost) = polled {
+                        outcome.set(Some(lost));
+                    }
+                }));
+            });
+
+            // The peer closes. A's driver latches and wakes inside
+            // `serve_connection`'s drain — the borrow under review.
+            b.close(9, b"inline").await;
+            settle().await;
+
+            assert_eq!(
+                outcome.take(),
+                Some(ConnectionLost::PeerClosed {
+                    code: 9,
+                    reason: b"inline".to_vec(),
+                }),
+                "the inline re-poll never completed: the waker ran under \
+                 `ConnCell`'s borrow and the driver task panicked",
+            );
+
+            // And the driver is alive rather than merely quiet. `connect()`
+            // tests `driver_stopped` *before* the static mirror, so a
+            // stopped driver answers `Local` here where a live one, with A
+            // still draining, answers `AlreadyConnected`.
+            assert_eq!(
+                pair.a
+                    .endpoint
+                    .connect(pair.b.addr, pair.b.public_static)
+                    .err(),
+                Some(ConnectError::AlreadyConnected),
+                "the driver stopped: `Driver::drop` ran `stop()` on an unwind",
+            );
+
+            // The thread-local outlives the test on this thread.
+            ON_WAKE.with(|slot| *slot.borrow_mut() = None);
+            drop(parked);
+        })
+        .await;
+    }
+
+    /// The second half of the same finding, on the other waker site:
+    /// `PendingSlot::resolve` used to call `Waker::wake` while the
+    /// caller's `slot.borrow_mut()` was live, and `Connecting::poll`
+    /// borrows that same slot.
+    ///
+    /// Driven by §5.5's give-up rather than by a death, because that is
+    /// the path that resolves a `Connecting` from the driver:
+    /// `fail_pending` → `resolve_slot`.
+    ///
+    /// The broken version: wake inside the borrow in
+    /// [`resolve_slot`](super::shared::resolve_slot). The inline re-poll
+    /// then finds the slot already borrowed.
+    #[tokio::test(start_paused = true)]
+    async fn an_inline_waker_may_re_poll_a_connecting_from_wake() {
+        use std::cell::{Cell, RefCell};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        local(async {
+            let pair = Pair::seeded(13);
+            // Nobody answers, so the attempt runs to §5.5's give-up.
+            pair.net.partition(pair.b.addr);
+
+            let dialling = pair
+                .a
+                .endpoint
+                .connect(pair.b.addr, pair.b.public_static)
+                .expect("the static is NONE");
+            // The driver must *start* the attempt before the clock jumps,
+            // or §5.5's 90 s give-up is measured from the far side of the
+            // advance and nothing fires.
+            settle().await;
+            type Dial = Pin<Box<crate::shell::Connecting<crate::testutil::TestIdentity>>>;
+            let dialling: Rc<RefCell<Dial>> = Rc::new(RefCell::new(Box::pin(dialling)));
+            let outcome: Rc<Cell<Option<ConnectError>>> = Rc::new(Cell::new(None));
+
+            let waker = inline_waker();
+            assert!(
+                dialling
+                    .borrow_mut()
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending(),
+                "the dial resolved before the give-up",
+            );
+
+            ON_WAKE.with(|action| {
+                let dialling = Rc::clone(&dialling);
+                let outcome = Rc::clone(&outcome);
+                *action.borrow_mut() = Some(Box::new(move || {
+                    // Poll straight back in, which is what an inline
+                    // executor does. `Connecting::poll` takes the very
+                    // borrow `resolve_slot` must have released by now.
+                    let polled = dialling
+                        .borrow_mut()
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    if let Poll::Ready(Err(error)) = polled {
+                        outcome.set(Some(error));
+                    }
+                }));
+            });
+
+            tokio::time::advance(crate::constants::HANDSHAKE_GIVEUP + Duration::from_secs(1)).await;
+            settle().await;
+
+            assert_eq!(
+                outcome.take(),
+                Some(ConnectError::TimedOut),
+                "the inline re-poll never completed: the waker ran under \
+                 `PendingSlot`'s borrow and the driver task panicked",
+            );
+
+            ON_WAKE.with(|action| *action.borrow_mut() = None);
+        })
+        .await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // An executor whose `wake()` runs application code inline
+    //
+    // `Waker` is supplied by the consumer, so nothing in this crate gets
+    // to assume `wake()` merely pushes to a run queue — tokio's does, and
+    // that is why no ordinary test here can reach the two re-entrancy
+    // sites F10 names. `std::task::Wake` requires `Send + Sync` and every
+    // cell being re-entered is `!Send`, so the action travels through a
+    // thread-local; the driver cannot tell the difference, because the
+    // re-entry is a synchronous call out of `wake()` either way.
+    // ═══════════════════════════════════════════════════════════════════
+
+    thread_local! {
+        /// What [`InlineWaker`] runs, synchronously, on the thread that
+        /// woke it — in both tests above, the driver's own.
+        static ON_WAKE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    struct InlineWaker;
+
+    impl std::task::Wake for InlineWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            // Taken out and put back, so the action is free to park and be
+            // woken again without a nested borrow of its own.
+            let action = ON_WAKE.with(|slot| slot.borrow_mut().take());
+            if let Some(mut action) = action {
+                action();
+                ON_WAKE.with(|slot| *slot.borrow_mut() = Some(action));
+            }
+        }
+    }
+
+    fn inline_waker() -> std::task::Waker {
+        std::task::Waker::from(std::sync::Arc::new(InlineWaker))
     }
 
     /// Poll a future once without a runtime turn.

@@ -86,15 +86,31 @@ impl Wakers {
         self.parked.remove(&key);
     }
 
-    /// Wake everyone parked here and clear the map.
+    /// Take everyone parked here, clearing the map.
     ///
     /// Clearing is not an optimisation: a woken task re-polls and parks
     /// again if it still needs to, and leaving stale wakers behind would
     /// wake tasks whose futures have since been dropped.
-    pub(crate) fn wake_all(&mut self) {
-        for (_, waker) in std::mem::take(&mut self.parked) {
-            waker.wake();
-        }
+    ///
+    /// # Why this hands the wakers back instead of waking them
+    ///
+    /// This used to be a `wake_all(&mut self)` that called `Waker::wake`
+    /// on the spot. Its only caller — `Driver::latch` — reaches it through
+    /// a live `RefCell::borrow_mut` of the [`ConnCell`], and **a `Waker` is
+    /// application-supplied**: `wake()` runs whatever the consumer's
+    /// executor does, and an executor that polls a ready task inline
+    /// rather than queueing it re-enters `Connection::poll_closed`, which
+    /// takes that same borrow. `already mutably borrowed` inside the
+    /// driver task, from a consumer doing nothing wrong. Returning the
+    /// wakers makes the borrow-then-wake order the only order the type
+    /// permits, rather than a rule a caller has to remember.
+    ///
+    /// tokio's own wakers only push to a run queue, so nothing in this
+    /// crate's tests could reach it — which is precisely why it had to be
+    /// closed by construction and not by argument.
+    #[must_use = "the wakers must be woken after the cell borrow ends (§16.8)"]
+    pub(crate) fn take_all(&mut self) -> Vec<Waker> {
+        std::mem::take(&mut self.parked).into_values().collect()
     }
 }
 
@@ -275,11 +291,43 @@ impl<I: Identity> PendingSlot<I> {
         }
     }
 
-    pub(crate) fn resolve(&mut self, outcome: PendingOutcome<I>) {
-        self.outcome = outcome;
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
+    /// Install `outcome`, handing back what the caller must dispose of
+    /// **outside** the borrow: the previous outcome and the parked waker.
+    ///
+    /// Use [`resolve_slot`] rather than calling this directly; it is the
+    /// one place that gets the ordering right.
+    #[must_use = "the previous outcome and the waker must be disposed of outside the borrow"]
+    fn resolve(&mut self, outcome: PendingOutcome<I>) -> (PendingOutcome<I>, Option<Waker>) {
+        let previous = std::mem::replace(&mut self.outcome, outcome);
+        (previous, self.waker.take())
+    }
+}
+
+/// Resolve a `Connecting`'s slot, then wake it — **in that order, with the
+/// borrow released in between**.
+///
+/// Two things here run consumer code, and neither may run under
+/// `slot.borrow_mut()`:
+///
+/// * `Waker::wake` is the consumer's executor. An executor that polls a
+///   ready task inline re-enters `Connecting::poll`, which borrows this
+///   same cell. See [`Wakers::take_all`] for the same hazard on the
+///   connection side.
+/// * **dropping the previous outcome.** A `PendingOutcome::Ready` owns a
+///   [`Connection`](super::connection::Connection), whose `Drop` takes
+///   `ConnCell`'s borrow *and* may stop the driver (ruling 88). Today
+///   every driver-side path takes `record.slot` out before resolving, so
+///   the previous outcome is always `Waiting` and the drop is free — a
+///   property of the current call sites, not of this function, which is
+///   the sort of thing that quietly stops being true.
+pub(crate) fn resolve_slot<I: Identity>(
+    slot: &Rc<RefCell<PendingSlot<I>>>,
+    outcome: PendingOutcome<I>,
+) {
+    let (previous, waker) = slot.borrow_mut().resolve(outcome);
+    drop(previous);
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
