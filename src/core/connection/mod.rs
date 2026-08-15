@@ -63,6 +63,16 @@ pub(crate) mod testfix;
 #[cfg(test)]
 mod tests_streams;
 
+// Slice 5a's §12 and §13/§14 tests, written from `SPEC.md` and
+// `CONTRACT-5a.md` by two authors who never saw this slice's code and never
+// saw each other's file (working rule 6). Declared here rather than by
+// either of them, so that no agent could reach another's path — the race
+// that destroyed 68 tests in slice 2a.
+#[cfg(test)]
+mod tests_ack;
+#[cfg(test)]
+mod tests_recovery;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Instant;
