@@ -397,6 +397,19 @@ pub const INTRO_TTL: Duration = Duration::from_millis(INTRO_TTL_MS);
 /// The most orphaned timestamp-guard entries retained. §17.1.
 pub const TS_GUARD_ORPHAN_CAP: usize = 1024;
 
+/// How long an orphaned timestamp-guard entry survives before aging out.
+/// §17.1, ruling 70.
+///
+/// **An alias of [`INTRO_TTL`], deliberately — not a second literal.** §17.1
+/// specified this only as prose ("an `INTRO_TTL`-scale timer"), which is a
+/// normative value an implementer cannot write down without inventing an
+/// identifier, and inventing one means choosing whether it is *exactly*
+/// `INTRO_TTL` or merely near it. Ruling 70 names it and binds it, so there
+/// is one place the value lives and the two cannot drift apart — the same
+/// reasoning that made ruling 63 name a default and leave a ceiling as a
+/// comparison rather than a second copy of the number.
+pub const TS_GUARD_ORPHAN_TTL: Duration = INTRO_TTL;
+
 // ═══════════════════════════════════════════════════════════════════════
 // Shell (§16.5)
 // ═══════════════════════════════════════════════════════════════════════

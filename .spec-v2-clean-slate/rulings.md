@@ -1310,3 +1310,59 @@ the text distinguished them. Rulings 63 gave prose constants an
 identifier; this one says a **formula's free variables need their domain
 stated**, which is the same disease at the level of derivations rather
 than values.
+
+**Rulings 69–71 — three defects in §6.3/§17.1/§16.4, all found by slice
+2a's planner refusing to resolve them.** Each is *a stated construction
+with an unstated or contradicted scope* — the shape slice 1 produced four
+times. That the same shape now dominates two consecutive slices is itself
+the finding: it is not a coincidence of §3, it is how this specification
+fails.
+
+**Ruling 69 — evict-oldest orders by last refresh, never by park time.**
+§6.3 said a full queue "evicts the oldest unconsumed entry (**by park
+time**)" while `INTRO_TTL` runs "15 s after the entry's **last refresh**",
+and dedup's replace-with-newest explicitly "refreshes its TTL". Two
+clocks, one queue. The rule and its own rationale two bullets above are in
+direct contradiction: that rationale promises "dedup's replace-with-newest
+and the evict-oldest guarantee give a retransmitting genuine peer **the
+same per-packet race as any fresh initiator**" — and under park-time
+ordering the opposite holds exactly. A genuine peer retransmitting for
+14 s carries the *oldest* park time in the queue and is evicted **first**,
+while every attacker's freshly-parked entry is younger than it. The
+guarantee inverts precisely for the party it names.
+
+Ruled: one age key, last refresh, serving both expiry and eviction; the
+per-source cap's "oldest unconsumed" reads the same way. *This is the
+third time in this project that prose held the correct intent while the
+formal rule held the bug* (CLAUDE.md working rule 3), and the third time
+an agent that reported the conflict instead of resolving it was right.
+
+**Ruling 70 — `TS_GUARD_ORPHAN_TTL`, an alias of `INTRO_TTL`.** §17.1 aged
+guard orphans on "an `INTRO_TTL`-scale timer" in three separate places and
+named no constant. "Scale" is not implementable: it leaves open whether
+the interval is exactly `INTRO_TTL` or merely comparable to it, and an
+implementer must invent an identifier and then guess its binding. Named
+now, and **bound as an alias rather than given its own literal** — one
+value, two names, no second place for 15 s to be written down and drift.
+Ruling 63 diagnosed this disease for constants; §17.1 was still carrying a
+case of it.
+
+**Ruling 71 — §16.4 gains `intro_source` and `intro_sender_index`.** §6.3
+requires that a refreshed entry's "accessors reflect the newest bytes **at
+call time**"; §6.1 exposes `source()` and `sender_index()` at 0 DH; §6.2's
+`Intro` has both. §16.4's core API listed **no accessor for either**, so
+the shell had nothing to read them through. Cached-at-surfacing is not a
+workaround but a wrong answer: §5.5 mints a **new random index on every
+retransmit**, so a cached `sender_index()` reports a value that is no
+longer on the wire the moment a refresh lands. Additive to the core, no
+wire change. The list was elided, not closed.
+
+*The generalisation, now that this shape has produced seven rulings across
+two slices.* An API listing in a specification is read as **exhaustive**
+by the only audience that matters — the implementer — whether or not its
+author meant it that way. §16.4's elision was invisible while nobody was
+building against it and became a hole the moment someone was. The same is
+true of ruling 64's "two things this rule does not reach" (there were
+three) and of §2.3's `TAG` sitting beside `PK` as though both varied. **A
+list that is not exhaustive must say so**, because a reader cannot
+distinguish an omission from a decision.

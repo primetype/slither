@@ -3,7 +3,7 @@
 ## The spec is the authority (hard rule)
 
 **`SPEC.md` is the ratified protocol for slither's wire — version 1, the
-first released wire.** Ratified 2026/08/14 after 68 rulings across ten
+first released wire.** Ratified 2026/08/14 after 71 rulings across ten
 rounds. Every wire constant, layout, timer value and behaviour in it is
 frozen, and **the code must match the spec** — never the other way round.
 
@@ -103,9 +103,23 @@ the spec rounds.
    later has not persisted. If you have read something worth keeping, it
    belongs on disk before you read the next thing.
 3. **When you find two statements in conflict, do not default to the
-   code-like rule.** Twice in this project the prose held the correct
-   intent and the formal rule held the bug. Report the conflict; do not
-   silently pick one.
+   code-like rule.** **Three times** in this project the prose held the
+   correct intent and the formal rule held the bug — most recently ruling
+   69, where §6.3's evict-oldest rule said "by park time" while the
+   rationale two bullets above promised a retransmitting peer "the same
+   per-packet race as any fresh initiator", which park-time ordering
+   inverts exactly. Report the conflict; do not silently pick one. Every
+   agent that has reported rather than resolved has been right.
+8. **A list in the spec is read as exhaustive whether or not it says so.**
+   §16.4's core API omitted the stage-0 accessors and the omission was
+   invisible until someone built against it (ruling 71); ruling 64 said
+   "two things this rule does not reach" when there were three; §2.3 wrote
+   `TAG` beside `PK` as though both varied per suite (ruling 68). Seven
+   rulings across two slices share this one shape — **a stated
+   construction with an unstated or contradicted scope**. It is the most
+   productive defect class this project has. Hunt it deliberately: when
+   the spec introduces a symbol, a parameter or a list, ask what bounds
+   it, and whether the text says.
 4. **Grep for the rationale, not only the token.** A verification that
    greps for a changed value will miss prose still arguing the position
    you reversed. This happened, and shipped a self-contradicting section.

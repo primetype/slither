@@ -1172,7 +1172,8 @@ below).
 - **Per-source cap**: at most `INTRO_MAX_PER_SOURCE` chains per source IP,
   counting the **sum of unconsumed stage-0 entries and consumed chains**.
   An arrival that would exceed the cap replaces that IP's oldest
-  **unconsumed** entry — eviction operates on the unconsumed tier only;
+  **unconsumed** entry — oldest **by last refresh**, as in evict-oldest
+  below (ruling 69); eviction operates on the unconsumed tier only;
   consumed chains are DH-paid, and non-evictable for it: **app-held**
   after `read_identity()`, or **endpoint-frozen** for a
   mid-state-carrying entry (freeze-on-carry, below), which the
@@ -1182,8 +1183,16 @@ below).
   `INTRO_TTL` like any entry (honesty clause below).
   `read_identity()` is net-zero for its source's count (−1 unconsumed,
   +1 consumed).
-- **Overflow: evict-oldest.** A full queue evicts the oldest unconsumed
-  entry (by park time) in favour of the arrival: a genuine initiation
+- **Overflow: evict-oldest.** **[RATIFIED 2026/08/15 — ruling 69]** A full
+  queue evicts the oldest unconsumed entry **by last refresh — the same
+  clock `INTRO_TTL` runs on**, never by original park time. A same-source
+  retransmit that replaces an entry's bytes therefore makes it young
+  again. This is what the guarantee two bullets above actually requires:
+  under park-time ordering a genuine peer retransmitting for 14 s holds
+  the *oldest* park time in the queue and is evicted first, while every
+  attacker's freshly-parked entry is younger — the precise opposite of
+  "the same per-packet race as any fresh initiator". One age key serves
+  both expiry and eviction. In favour of the arrival: a genuine initiation
   always obtains a slot — except where its own source's allowance is
   wholly held by consumed chains (the per-source drop above; honesty
   clause below) — and an attacker must win a per-packet race against
@@ -1590,7 +1599,7 @@ follow and neither may be dropped:
   separately single-use, and the guard's monotonic rule spends them in
   timestamp order.
 - **Only while the entry survives §17.1.** The guard entry is what makes
-  an initiation single-use; §17.1's own orphan aging (`INTRO_TTL`-scale)
+  an initiation single-use; §17.1's own orphan aging (`TS_GUARD_ORPHAN_TTL`)
   and LRU eviction recycle that entry, and a recycled entry re-arms the
   replay. This is why §17.1 **pins guard entries written by a tie-break
   admission or a winner-side record for `HANDSHAKE_GIVEUP` past the death
@@ -4349,6 +4358,9 @@ impl<I: Identity> core::Endpoint<I> {
     fn accept(&mut self, now: Instant, id: IntroId)
         -> Result<(ConnectionId, core::Connection), AcceptError>;
     fn reject(&mut self, id: IntroId);
+    // stage-0 accessors (§6.1, §6.3) — [RATIFIED 2026/08/15, ruling 71]:
+    fn intro_source(&self, id: IntroId) -> Option<SocketAddr>;
+    fn intro_sender_index(&self, id: IntroId) -> Option<u32>;
 }
 
 enum Disposition { ForConnection(ConnectionId), Done }
@@ -4791,7 +4803,8 @@ accepted (§6.4).
   `HANDSHAKE_GIVEUP` expiry instead. Only when the extension lapses does
   the entry demote to an ordinary orphan and enter the LRU below.
   Without this the guard entry is exactly what §6.7's single-use bound
-  rests on, and aging it out on an `INTRO_TTL`-scale timer re-arms the
+  rests on, and aging it out at `TS_GUARD_ORPHAN_TTL` (= `INTRO_TTL`,
+  ruling 70) re-arms the
   replay it was written to stop. The rationale for the value and the
   cost: 90 s is long enough to cover an application's reconnect backoff
   — the interval over which a re-armed replay would actually meet a new
@@ -4809,6 +4822,7 @@ accepted (§6.4).
 | Constant | Value |
 |---|---|
 | `TS_GUARD_ORPHAN_CAP` | 1024 orphan entries (≈ 45 B each) |
+| `TS_GUARD_ORPHAN_TTL` | **[RATIFIED 2026/08/15 — ruling 70]** `= INTRO_TTL` (15 s). An *alias*, not a second literal: one value, two names, so the two cannot drift. |
 
 **Honesty clause and mitigations.** **[RATIFIED 2026/08/14, amended
 2026/08/14]** Evicting an orphan
@@ -4862,7 +4876,7 @@ sole record that survives a `Stale` is the tie-break winner's, which is
 deliberate (§6.7). The cost, stated honestly, is that a replay of such
 a never-accepted initiation can be re-authenticated later, surfacing only
 as a fresh `Intro`. **(ii) Timer aging** — orphans age out on an
-`INTRO_TTL`-scale timer as well as the LRU cap. **(iii) LRU "use" is
+`TS_GUARD_ORPHAN_TTL` timer as well as the LRU cap. **(iii) LRU "use" is
 admission only** — recency refreshes on a successful post-`ss` record,
 never on a failed check, keeping the write path key-holder-only.
 
@@ -5723,6 +5737,7 @@ rulings).**
 | `AMPLIFICATION_FACTOR` | 3 (× authenticated bytes received, per unvalidated address) | §7.3 |
 | `INTRO_QUEUE_CAP` / `INTRO_MAX_PER_SOURCE` / `INTRO_TTL` | 1024 / 4 / 15 s | §6.3 |
 | `TS_GUARD_ORPHAN_CAP` | 1024 | §17.1 |
+| `TS_GUARD_ORPHAN_TTL` | `= INTRO_TTL` (15 s) | §17.1 |
 | `L` (shell lateness bound) | 250 ms | §16.5 |
 | wire error codes | 0x00–0x06 + ≥ 0x10 application; 0x07–0x0f reserved | §15.3 |
 | session index | nonzero u32, random, re-drawn across both tables | §17.3 |
