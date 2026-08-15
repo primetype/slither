@@ -3020,3 +3020,151 @@ reviewer's. Ruling 115 is the more instructive: the planner's conclusion
 was right, its evidence was a list, and the list has an exception sitting
 inside it that would have been inherited as reasoning by everyone
 downstream.
+
+---
+
+## Round 21 — slice 4b's implementer reports (2026/08/15)
+
+Three items flagged, one of them a contradiction in the contract I wrote
+the same day. All three are real.
+
+**Ruling 124 — a handle's own terminal state outranks the connection's
+death latch. The precedence is total and is stated here once, because two
+agents reading two sections resolved it two ways.**
+
+`CONTRACT-4b.md` §5 made `Ok(None)` and `Err(Reset)` **sticky**; §8 said
+every verb answers from the close latch *"before anything else"* and
+listed `read` → `ConnectionLost`. They disagree for one sequence: **read
+to EOF, then the connection dies, then read again.** The implementer
+followed §8, said so, and reported rather than silently picking — the
+right call, and the contradiction is mine.
+
+§5 is correct and §8's "before anything else" was written without this
+case in mind. **The order, for every 4b verb:**
+
+1. **This handle's own terminal state** — `Ok(None)` / `Err(Reset(code))`
+   for a receive half; `Ok(())` for a repeated `finish()` and
+   `Err(Finished)` for anything after `finish()` or `reset()` on a send
+   half.
+2. **The connection's death latch** — `Err(ConnectionLost(l))`.
+3. **The empty-buffer short-circuit** (rulings 110 and 119).
+4. **The core call**, which may park.
+
+The reason for 1 over 2: **a stream that reached EOF completed, and the
+connection dying afterwards does not un-complete it.** Reporting
+`ConnectionLost` to a reader that already received every byte and the FIN
+tells it a finished transfer failed — ruling 121's misreport with its
+sign flipped, and ruling 121 is *in this same contract*. A handle reports
+the fate of **its own stream**; the connection's fate is `closed()`'s to
+report, and a half that has already reached a terminal state has no
+further interaction with the connection left to fail. Slice 8 makes this
+load-bearing rather than tidy: `AsyncRead` requires a sticky EOF, so
+`read_to_end` over a connection that dies after the FIN would otherwise
+surface a spurious `io::Error`.
+
+The reason for 2 over 3: the empty-buffer rules exist **to avoid
+parking**, and a dead connection does not park. Answering `Ok(0)` or
+`Ok(Some(0))` there would report success on a corpse. The implementer
+guessed this ordering and guessed right; it is ratified rather than left
+as a guess.
+
+**A consequence the contract got wrong in passing:** `closed_locally`
+cannot be a `bool`. `finish()` is idempotent — a second one is `Ok(())` —
+while `finish()` after `reset()` is `Err(Finished)`, so the two terminal
+states have *different* answers and a `bool` conflates them, forcing
+`poll_finish` to fall through to the core and revert to death-first the
+moment a connection dies. It is now a three-state `LocalEnd`.
+
+**Pinned by mutation, not by argument.** Ruling 124's reordering broke
+none of the 642 tests standing at `c933e31` — every stream test passes
+against *both* orders, because none reads again after the connection is
+gone. Two tests were added and then verified by putting the old order
+back: both red, and nothing else moves. A rule no test separates is not
+ratified, it is merely written down.
+
+**Ruling 125 — a stream handle's `Drop` performs §16.2's last-handle
+`close(NO_ERROR, "")`. Ruling 115's blast radius included ruling 115.**
+
+§16.2:4392 is unconditional — *"Dropping the last handle to a
+`Connection` performs `close(NO_ERROR, "")`"* — and ruling 115, one day
+old, made a stream handle a handle. So the last handle to a connection
+can now be a `SendStream`, in **exactly the shape ruling 115's own
+rationale names**: a task that owns a stream and has let the connection
+handle go. Without the close, that connection emits nothing and the peer
+pays `DEAD_TIMEOUT` — a behaviour regression introduced by ruling 115, in
+the slice that ratified it.
+
+The implementer acted, flagged it as the one place it moved beyond the
+contract, and pinned it with a test that fails in **both** directions
+(dropping the `Connection` while a stream lives must *not* close;
+dropping that stream afterwards *must*). Ruling 88's exception is
+untouched: the genuinely-last drop in the process transmits nothing.
+
+**This is the ninth instance of "a ruling's blast radius includes the
+ruling"**, and the pattern has never once been caught by reviewing the
+ruling — only by an agent building against it. Ruling 115 was reviewed
+carefully enough to *correct the planner's reasoning* about which list
+§16.3:4409 is, and still shipped without anyone asking what else "handle"
+meant in a document that uses the word forty times.
+
+**Ruling 126 — the `Cargo.toml` test stanzas belong to the integrator,
+and this becomes working rule 15.**
+
+Cargo does not warn about a `[[test]]` whose file is missing; it
+**refuses to parse the manifest**, which reds every gate at once. So an
+implementer that adds live stanzas for its blind partner's files commits
+a tree on which no gate can run — and working rule 7 forbids reporting a
+gate green without running it. The alternative, creating placeholder test
+files, is the exact act that destroyed 68 tests in slice 2a.
+
+The implementer committed them **commented out** under a
+`SLICE 4b INTEGRATION: UNCOMMENT WHEN THE TEST FILES LAND` header, having
+checked that forgetting fails loudly rather than silently: with no stanza
+at all, cargo auto-discovers `tests/*.rs` **without** `required-features`,
+so a feature-less `cargo test` would try to compile them and fail. Right
+answer, and it asked the right question — *which agent lands the manifest
+change?*
+
+**New working rule 15: a file whose contents are only valid once both
+blind agents' work exists belongs to the integrator, and the briefs must
+say so.** It is the mirror of working rule 6. Rule 6 partitions files so
+two agents never write one path; rule 15 names the residue rule 6 leaves
+behind — the file that *neither* can validly write alone.
+
+**Ruling 127 — ruling 120's `join` check was insufficient as I wrote it,
+and the implementer strengthened it correctly.** I specified *"the same
+`StreamRef` on the same `ConnectionId`"*. **`ConnectionId` is not unique
+across two endpoints in one process** — which is precisely the shape of
+every test fixture in this crate, two endpoints over one `Network` — so
+that pair can collide and `join` would fuse two halves of two different
+connections into a `BiStream` whose `id()` lies and whose `Drop` resets a
+stream the caller never named. The check is now `Rc::ptr_eq` on the cells
+**and** the id **and** the ref; the extra conjunct cannot reject a
+legitimate pair, because both halves of a real stream always share one
+cell.
+
+**This is the fourth ruling of mine justified by a mechanism that is not
+what I said it was** (87, 89, 120, and 90's absent clause). Working rule
+11 was written after the first two and did not prevent this one, for the
+same reason it did not prevent 90: reading the code confirms that
+`ConnectionId` exists and identifies a connection, and cannot surface
+that it is scoped per-endpoint unless you ask what makes it unique. **The
+question that would have caught it is working rule 8's** — *what bounds
+this symbol, and does the text say?* — asked of a type rather than of a
+list.
+
+### What this round says about the process
+
+**Eleven of twelve agents that declined an instruction or flagged rather
+than acted have been right.** The implementer flagged three and acted on
+one, and its judgement about which to act on was correct: D1's cost is a
+25-second stall the gates cannot see, while C4's is a one-line ordering
+it had no authority to choose.
+
+Worth recording plainly: **none of the three findings was a defect in the
+implementation.** As in slice 4a, the failures were in the contract and
+in the rulings — 4a's five were three test defects and two spec
+conflicts, 4b's three are two contract defects and one process gap. Two
+consecutive slices have now produced zero implementation defects from the
+blind split, and the defects the split *does* surface have moved
+upstream, into the documents the agents build from.

@@ -123,10 +123,30 @@ pub struct SendStream<S: Handshake> {
     r: StreamRef,
     /// This handle's slot in `ConnCell::blocked_writers[r]`.
     key: u64,
-    /// Set by **both** [`finish`](Self::finish) and [`reset`](Self::reset).
-    /// `Drop` resets only while it is `false`.
-    closed_locally: bool,
+    /// This half's terminal state — **ruling 124 step 1**, which answers
+    /// ahead of the connection's death latch.
+    ///
+    /// It distinguishes `Finished` from `Reset` because the two have
+    /// *different* terminal answers for `finish()`: a second `finish()` is
+    /// idempotent `Ok(())`, while a `finish()` after `reset()` is
+    /// `Err(Finished)`. A `bool` conflates them and forces `poll_finish`
+    /// to fall through to the core, which then answers `ConnectionLost`
+    /// once the connection has died — the very inconsistency ruling 124
+    /// closes.
+    local_end: LocalEnd,
     id: Cell<Option<StreamId>>,
+}
+
+/// A send half's own terminal state, which outranks the connection's
+/// (ruling 124).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LocalEnd {
+    /// Neither `finish()` nor `reset()` has been called on this handle.
+    Live,
+    /// `finish()` succeeded: the FIN is in send state.
+    Finished,
+    /// `reset()` was called, before or after a `finish()`.
+    Reset,
 }
 
 impl<S: Handshake> SendStream<S> {
@@ -155,7 +175,7 @@ impl<S: Handshake> SendStream<S> {
             conn,
             r,
             key,
-            closed_locally: false,
+            local_end: LocalEnd::Live,
             id: Cell::new(None),
         }
     }
@@ -219,16 +239,22 @@ impl<S: Handshake> SendStream<S> {
         let (outcome, dirty) = {
             let mut cell = self.cell.borrow_mut();
 
-            // §8: every verb answers from the latch before anything else.
+            // **[RATIFIED 2026/08/15 — ruling 124]** Terminal state first,
+            // on this half as on the receive half: a handle reports the fate
+            // of *its own stream*, and the connection's fate is `closed()`'s
+            // to report. A half that has already finished or reset has no
+            // further interaction with the connection left to fail.
+            if self.local_end != LocalEnd::Live {
+                return Poll::Ready(Err(WriteError::Finished));
+            }
+            // Then the connection's death (ruling 124 step 2).
             if let Some(lost) = cell.closed.clone() {
                 return Poll::Ready(Err(WriteError::ConnectionLost(lost)));
             }
-            // Ruling 110, before the core is touched.
+            // Then ruling 110's empty-buffer short-circuit — below the death
+            // latch for the reason given in `poll_read`.
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
-            }
-            if self.closed_locally {
-                return Poll::Ready(Err(WriteError::Finished));
             }
             let Some(core) = cell.core.as_mut() else {
                 return Poll::Ready(Err(WriteError::ConnectionLost(no_core())));
@@ -289,6 +315,19 @@ impl<S: Handshake> SendStream<S> {
     pub(crate) fn poll_finish(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), WriteError>> {
         let (outcome, dirty) = {
             let mut cell = self.cell.borrow_mut();
+            // **Ruling 124 step 1** — this half's terminal state first. The
+            // two terminal answers differ, which is why `local_end` is an
+            // enum: `finish()` is idempotent, so a second one is `Ok(())`,
+            // while a `finish()` after `reset()` is `Err(Finished)`. Both
+            // outrank the connection's death: the FIN was accepted into send
+            // state when it was accepted, and the connection dying later
+            // does not un-accept it.
+            match self.local_end {
+                LocalEnd::Finished => return Poll::Ready(Ok(())),
+                LocalEnd::Reset => return Poll::Ready(Err(WriteError::Finished)),
+                LocalEnd::Live => {}
+            }
+            // Then the connection's death (ruling 124 step 2).
             if let Some(lost) = cell.closed.clone() {
                 return Poll::Ready(Err(WriteError::ConnectionLost(lost)));
             }
@@ -304,7 +343,7 @@ impl<S: Handshake> SendStream<S> {
             }
         };
         if outcome.is_ok() {
-            self.closed_locally = true;
+            self.local_end = LocalEnd::Finished;
         }
         if dirty {
             self.shell.mark_dirty(self.conn);
@@ -339,7 +378,7 @@ impl<S: Handshake> SendStream<S> {
         };
         // Set even when the connection is dead: this handle has been closed
         // locally either way, and `Drop` must not go on to reset it.
-        self.closed_locally = true;
+        self.local_end = LocalEnd::Reset;
         if dirty {
             self.shell.mark_dirty(self.conn);
         }
@@ -350,7 +389,7 @@ impl<S: Handshake> std::fmt::Debug for SendStream<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SendStream")
             .field("id", &self.id())
-            .field("closed_locally", &self.closed_locally)
+            .field("local_end", &self.local_end)
             .finish_non_exhaustive()
     }
 }
@@ -376,8 +415,8 @@ impl<S: Handshake> Drop for SendStream<S> {
         let dirty = {
             let mut cell = self.cell.borrow_mut();
             release_waker_slot(&mut cell.blocked_writers, self.r, self.key);
-            match (self.closed_locally, cell.core.as_mut()) {
-                (false, Some(core)) => {
+            match (self.local_end, cell.core.as_mut()) {
+                (LocalEnd::Live, Some(core)) => {
                     core.reset(now(), self.r, constants::NO_ERROR);
                     cell.dirty = true;
                     true
@@ -501,20 +540,31 @@ impl<S: Handshake> RecvStream<S> {
         let (outcome, dirty) = {
             let mut cell = self.cell.borrow_mut();
 
-            // §8: the latch answers first.
-            if let Some(lost) = cell.closed.clone() {
-                return Poll::Ready(Err(ReadError::ConnectionLost(lost)));
-            }
-            // Ruling 119, before the core is touched.
-            if buf.is_empty() {
-                return Poll::Ready(Ok(Some(0)));
-            }
-            // Ruling 121's latch, ahead of the core: the core is not sticky
-            // and would answer `Ok(None)` to a re-read after a reset.
+            // **[RATIFIED 2026/08/15 — ruling 124]** This handle's own
+            // terminal state answers first — ahead of the connection's death
+            // latch, not behind it. A stream that reached EOF *completed*;
+            // reporting `ConnectionLost` for it afterwards tells a reader
+            // that a finished transfer failed, which is ruling 121's
+            // misreport with its sign flipped. Slice 8 makes it concrete:
+            // `AsyncRead` requires a sticky EOF or `read_to_end` breaks.
+            // The core is not sticky and would answer `Ok(None)` to a
+            // re-read after a reset, which is why the latch lives here.
             match self.ended {
                 Some(Ended::Eof) => return Poll::Ready(Ok(None)),
                 Some(Ended::Reset(code)) => return Poll::Ready(Err(ReadError::Reset(code))),
                 None => {}
+            }
+            // Then the connection's death (ruling 124 step 2).
+            if let Some(lost) = cell.closed.clone() {
+                return Poll::Ready(Err(ReadError::ConnectionLost(lost)));
+            }
+            // Then ruling 119's empty-buffer short-circuit, before the core
+            // is touched. It sits *below* the death latch deliberately:
+            // its purpose is to avoid parking, and a dead connection does
+            // not park — answering `Ok(Some(0))` here would report success
+            // on a corpse.
+            if buf.is_empty() {
+                return Poll::Ready(Ok(Some(0)));
             }
             let Some(core) = cell.core.as_mut() else {
                 return Poll::Ready(Err(ReadError::ConnectionLost(no_core())));

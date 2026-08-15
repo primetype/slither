@@ -208,6 +208,19 @@ the spec rounds.
    would have been written against a guessed API and the integration would
    have read as a design disagreement rather than a missing file. **Commit
    the brief's inputs before dispatching, not after.**
+15. **A file whose contents are only valid once *both* blind agents' work
+   exists belongs to the integrator — and the briefs must say so.** This
+   is the mirror of rule 6. Rule 6 partitions paths so two agents never
+   write one file; rule 15 names the residue it leaves behind — the file
+   *neither* can validly write alone. Slice 4b's `Cargo.toml` is the
+   case: cargo does not warn about a `[[test]]` whose file is missing, it
+   **refuses to parse the manifest**, so an implementer adding live
+   stanzas for its partner's not-yet-existing test files commits a tree
+   on which *no gate can run at all* — while rule 7 forbids reporting a
+   gate green without running it, and creating placeholder test files is
+   the slice-2a accident that destroyed 68 tests. The implementer landed
+   them commented out under an integration header and asked whose job it
+   was. It is the integrator's.
 
 ## Release gates (hard rules)
 

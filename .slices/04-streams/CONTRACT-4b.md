@@ -307,10 +307,31 @@ handles** — staged objects are in it and are excluded. See ruling 115.
 
 ---
 
-## 8. After the connection dies — one rule, all verbs
+## 8. After the connection dies — ruling 124's precedence
 
-`ConnCell::closed` is set once by `Driver::latch` and read for ever.
-**Every 4b verb answers from it before anything else.**
+> **[AMENDED 2026/08/15 — ruling 124]** This section said *"every 4b verb
+> answers from the latch **before anything else**"*, which contradicted §5's
+> stickiness for the sequence *read to EOF → connection dies → read again*.
+> The implementer followed §8, flagged the contradiction, and was right to
+> report rather than pick. §5 wins. The total order is now:
+>
+> 1. **this handle's terminal state** (§5's stickiness; on a send half,
+>    `Ok(())` for a repeated `finish()`, `Err(Finished)` after `reset()`)
+> 2. **the connection's death latch**
+> 3. **the empty-buffer short-circuit** (rulings 110, 119)
+> 4. **the core call**
+>
+> A stream that reached EOF completed; the connection dying afterwards does
+> not un-complete it. The empty-buffer rules exist to avoid parking, and a
+> dead connection does not park — so they sit *below* the death latch.
+>
+> Consequence: `closed_locally` is a three-state `LocalEnd`, not a `bool`.
+> `finish()` is idempotent while `finish()` after `reset()` is
+> `Err(Finished)`, so the two terminal states have different answers.
+
+`ConnCell::closed` is set once by `Driver::latch` and read for ever. Once
+a handle has no terminal state of its own, **every 4b verb answers from
+the latch before touching the core.**
 
 | Verb | Answer once `closed == Some(l)` |
 |---|---|

@@ -856,6 +856,97 @@ mod tests {
         .await;
     }
 
+    /// **Ruling 124: a handle's own terminal state outranks the
+    /// connection's death latch.**
+    ///
+    /// The receive half. A reader that reached EOF *completed its
+    /// transfer*; the connection dying afterwards does not un-complete it,
+    /// and answering `ConnectionLost` to the next `read` reports a failure
+    /// about a success — ruling 121's misreport with its sign flipped.
+    /// Slice 8 makes it load-bearing rather than tidy: `AsyncRead` requires
+    /// a sticky EOF, so `read_to_end` over a connection that dies after the
+    /// FIN would surface a spurious `io::Error`.
+    ///
+    /// **What the broken build does:** with the death latch checked first —
+    /// which is what `CONTRACT-4b.md` §8 said, and what the implementer
+    /// built and correctly flagged as C4 — the final `read` is
+    /// `Err(ConnectionLost)` and this test fails on its last assertion.
+    /// Every other stream test in this file passes against both orders,
+    /// because none of them reads again after the connection is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_streams_eof_outlives_its_connection() {
+        local(async {
+            let pair = Pair::seeded(0x4B_0020);
+            let (a, b) = pair.establish().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            send.write(b"done").await.expect("write");
+            send.finish().await.expect("finish");
+            settle().await;
+
+            let mut recv = b.accept_uni().await.expect("accept_uni");
+            let mut buf = [0u8; 8];
+            let n = recv.read(&mut buf).await.expect("read").expect("bytes");
+            assert_eq!(&buf[..n], b"done");
+            assert_eq!(recv.read(&mut buf).await, Ok(None), "EOF");
+
+            // Now kill the connection under the finished reader.
+            b.close(0, b"").await;
+            settle().await;
+
+            assert_eq!(
+                recv.read(&mut buf).await,
+                Ok(None),
+                "ruling 124: the stream ended before the connection did, and \
+                 the handle reports the fate of its own stream"
+            );
+        })
+        .await;
+    }
+
+    /// **Ruling 124, the send half** — and the reason `local_end` is an
+    /// enum rather than the `bool` the contract specified.
+    ///
+    /// The two terminal answers differ: `finish()` is idempotent, so a
+    /// second one is `Ok(())`, while `write()` after it is
+    /// `Err(Finished)`. A `bool` cannot distinguish `Finished` from
+    /// `Reset`, which forces `poll_finish` to fall through to the core —
+    /// where a dead connection answers `ConnectionLost` and the ordering
+    /// silently reverts.
+    ///
+    /// **What the broken build does:** with the death latch first, the
+    /// second `finish()` is `Err(ConnectionLost)` and the `write` is too,
+    /// so both assertions fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_send_half_answers_from_its_own_state_after_death() {
+        local(async {
+            use crate::error::WriteError;
+
+            let pair = Pair::seeded(0x4B_0021);
+            let (a, _b) = pair.establish().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            send.write(b"x").await.expect("write");
+            send.finish().await.expect("finish");
+
+            a.close(0, b"").await;
+            settle().await;
+
+            assert_eq!(
+                send.finish().await,
+                Ok(()),
+                "ruling 124: `finish` stays idempotent across the death"
+            );
+            assert_eq!(
+                send.write(b"more").await,
+                Err(WriteError::Finished),
+                "ruling 124: the half's own terminal state, not the \
+                 connection's"
+            );
+        })
+        .await;
+    }
+
     /// **Ruling 115's consequence, and the one thing in 4b the contract
     /// left unstated — see `IMPLEMENTATION-4b.md` D1.**
     ///

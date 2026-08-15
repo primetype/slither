@@ -4198,6 +4198,28 @@ consulting the connection, mirroring ruling 110's rule that a zero-length
 `write` is `Ok(0)`. `Pending` keeps exactly one meaning at this surface:
 *there is work to wait for*.
 
+**[RATIFIED 2026/08/15 — ruling 124]** *A stream handle reports the fate
+of its own stream. Precedence, for every verb on all three handles:*
+
+1. **this handle's terminal state** — `Ok(None)` / `Err(Reset(code))` on
+   a receive half; `Ok(())` for a repeated `finish()` and `Err(Finished)`
+   for anything after `finish()` or `reset()` on a send half;
+2. **the connection's death** — `Err(ConnectionLost)`;
+3. **the empty-buffer short-circuit** (rulings 110, 119);
+4. **the connection itself**, which may block.
+
+The order of 1 over 2 is the substantive part. A stream that reached EOF
+**completed**, and the connection dying afterwards does not un-complete
+it: answering `ConnectionLost` to a reader that already took every byte
+and the FIN reports a failure about a success, which is ruling 121's
+misreport with its sign flipped. The connection's own fate is `closed()`'s
+to report. §16.11 makes this load-bearing rather than tidy — `AsyncRead`
+requires a sticky end-of-file, so a connection that dies after the FIN
+would otherwise surface a spurious `io::Error` to `read_to_end`. The
+order of 2 over 3 follows from what the empty-buffer rules are *for*:
+they exist to avoid blocking, and a dead connection does not block, so
+answering `Ok(0)` there would report success on a corpse.
+
 `open_bi`/`open_uni` wait for MAX_STREAMS allowance when the cumulative
 limit is exhausted (§10.4), woken by `StreamsAvailable` (§16.4); `write`
 waits for stream and connection credit
