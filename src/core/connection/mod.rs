@@ -51,6 +51,13 @@ pub(crate) mod timers;
 #[cfg(test)]
 mod tests;
 
+// Slice 4a's §9/§10 tests, written from `SPEC.md` and `CONTRACT-4a.md` in
+// an isolated worktree by an author who never saw this slice's code — and
+// whose 73 tests found three defects in the contract itself (Round 18).
+// Declared here at integration, for the same reason as `tests` above.
+#[cfg(test)]
+mod tests_streams;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Instant;

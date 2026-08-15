@@ -499,6 +499,18 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         match event {
             ConnEvent::Established => self.establish(id, cell),
             ConnEvent::Closed(lost) => Self::latch(cell, lost),
+            // Slice 4a's six stream events. The shell has no stream handles
+            // until 4b, so there is nothing to wake and nothing to latch;
+            // dropping them here is the whole of their slice-4a handling.
+            // 4b replaces this arm with the per-`StreamRef` waker maps
+            // (§16.8), which is why it is written as one arm rather than
+            // six — a six-arm version reads as six decisions taken.
+            ConnEvent::StreamOpened { .. }
+            | ConnEvent::StreamsAvailable { .. }
+            | ConnEvent::StreamReadable { .. }
+            | ConnEvent::StreamWritable { .. }
+            | ConnEvent::StreamFinished { .. }
+            | ConnEvent::StreamReset { .. } => {}
         }
     }
 

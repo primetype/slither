@@ -2684,3 +2684,113 @@ have produced a name that is not a pin) and conflict C-b's (the correct
 behaviour was undecided, and writing a test would have resolved it
 silently). **Not writing a test is the harder call and the right one**,
 and both refusals are recorded in its report with the reason.
+
+## Round 19 — slice 4a integration (2026/08/15)
+
+**Ruling 114 — §16.7 bounds *where* a seal happens, not *how much* is
+sealed; in slice 4, with no congestion bound, a mutating call flushes
+everything the ledger admits.** Two of the test author's 73 tests failed
+against the implementer's build, and both failed for one reason neither
+agent could resolve alone — which is the arrangement working, not
+failing.
+
+§16.7 says sealing "executes within the mutating call that triggers it …
+never lazily inside `poll_output()`". It is a rule about **placement**.
+It does not say a mutating call must flush the whole send buffer, and the
+implementer took the stronger reading — correctly, because slice 4 has
+nothing else that would ever send: §14's congestion window is slice 7,
+and there is no send clock. A partial flush would strand the remainder
+indefinitely, which is a liveness hole, not a design choice.
+
+The consequence is the part worth ratifying, because it is not obvious:
+**two sequential `write()` calls can never contend in slice 4, in any
+conforming build.** By the time the second runs, the first stream is
+already on the wire. §8.5's round-robin therefore governs the fill
+*within one pump*, never across calls.
+
+*Two tests, two different outcomes, and the difference is what each
+property needs.*
+
+`the_stream_fill_serves_pending_streams_round_robin` **is** reachable —
+through §16.9's pre-install writes, where nothing can be sealed because
+no session exists yet, so two streams accumulate and the install pumps
+both. Its fixture was rewritten to build that contention; its assertions
+are untouched. **Verified by mutation, because rewriting a test author's
+fixture puts the burden of proof on the integrator:** changing the fill's
+requeue from `push_back` to `push_front` — serve one stream to exhaustion
+— reds it, and restoring greens it.
+
+`credit_frames_precede_the_stream_fill_in_a_packet` is **not** reachable,
+and I established that by trying to build it rather than by accepting the
+report. The construction I attempted — an inbound packet that both raises
+our stream window and retires enough peer bytes to owe a MAX_DATA — fails
+on a premise I had wrong: **a blocked `write` means the core *refused* the
+bytes**, so they stay with the caller and there is no pending stream data
+for the credit frame to share a packet with. There is no slice-4 state in
+which stream data is pending across calls. It is kept, with its own
+"asserted nothing" guard intact, marked `#[ignore]` naming slice 7 — the
+slice whose congestion bound creates exactly that state. Deleting it
+would lose the obligation; leaving it running would fail a correct build.
+
+**The seam to slice 7 is one call site**: `pump()` gains a second bound,
+and both the intra-packet round-robin and the credit/fill coincidence
+become ordinary rather than exotic.
+
+*A note on what is and is not pinned.* `STREAM_FILL_QUANTUM` survives
+deletion — `room` is already bounded by the packet's remaining plaintext,
+so `room.min(QUANTUM)` and `room` behave identically at a 1 KiB quantum
+under a 1170-byte ceiling. The rotation is the mechanism that makes the
+round-robin real, and the rotation *is* pinned. The quantum is
+implementation-defined (§8.5) so this is not a defect, but its own doc
+comment claims "two streams alternate within one [packet]", which no test
+checks and which the quantum does not by itself produce. **Working rule
+9's shape found by mutating rather than by reading**: the first mutation
+I tried was the constant, and it survived.
+
+### Three fixture defects, and what they say about harnesses
+
+Three of the author's tests failed on a **precondition**, not on the
+behaviour under test: each delivered a single STREAM frame carrying
+2048/4096/8192 payload bytes, and `MAX_PLAINTEXT` is **1170**, so §3.1's
+size gate dropped the datagram **silently** — no error, no trace, no
+counter (§3.1 requires exactly that silence). The failure therefore
+presented as a memory leak in the reassembler. The author's own harness
+already had the chunking helper; the three now use it.
+
+**This is working rule 13 one layer down from where it was written.**
+Rule 13 says `FlakyWire` models a network and not a socket. Here the
+in-crate `Solo` fixture models a **frame stream** and not a **packet**, so
+an over-`MAX_PLAINTEXT` frame is indistinguishable from a lost one. Three
+tests aimed at §10.6 — the section that exists to close a memory
+amplification vector — asserted nothing, and would have shipped green if
+the implementer had not diagnosed the precondition rather than the
+symptom. *The harness's own abstraction is a coverage boundary, and it
+is invisible from inside the tests it enables.*
+
+### What the split produced this time
+
+**68 of 73 blind tests passed on first contact**, with zero name, type or
+value mismatches beyond the `now` arity that ruling 108 introduced *after*
+the author had finished. Of the five failures, **three were defects in the
+tests, two were a genuine spec conflict, and none was a defect in the
+implementation.** That distribution is new: in every prior slice the
+failures were implementation defects or spec gaps.
+
+The implementer also declined to fix `src/shell/driver.rs`, whose
+exhaustive `ConnEvent` match the six new variants break. It is not on its
+path (working rule 6), so it reported the exact arm needed and ran the
+gates in a detached scratchpad worktree with the stub applied *there* —
+leaving the delivered tree with no byte written under `src/shell/`. **Nine
+agents have now declined an instruction or a convenient shortcut, and all
+nine were right.**
+
+**Ruling 113's signature was already wrong when I wrote it**, and the
+implementer said so: `on_ack_range(now, r, range)` drops the FIN flag the
+send half needs to reach `DataRecvd`, so §9.7's send-side GC would ship
+untested. It infers the flag as `range.end == final_size`, exact for every
+frame this implementation emits — but **§8.7 lets a retransmission re-frame
+ranges freely**, so a range ending at the final size need not have carried
+the FIN. Slice 5's sent-packet map is where the answer actually lives, and
+slice 5 must either call `SendHalf::on_ack_range(range, fin)` directly or
+restore the flag to the `Connection` signature. Recorded rather than fixed
+now, because the right shape depends on §12's map, which does not exist.
