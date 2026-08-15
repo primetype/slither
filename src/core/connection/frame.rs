@@ -418,6 +418,14 @@ impl Ack {
         Ok(())
     }
 
+    /// The encoded length in bytes, type code included — §12.2's
+    /// packet-capacity truncation measures with this after every candidate
+    /// pair, because a `(gap, range)` pair's own width depends on its
+    /// values.
+    pub(crate) fn encoded_len(&self) -> usize {
+        varint_len(constants::FRAME_ACK) + self.body_len()
+    }
+
     fn body_len(&self) -> usize {
         varint_len(self.largest)
             + varint_len(self.ack_delay)

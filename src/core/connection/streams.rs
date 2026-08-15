@@ -42,6 +42,7 @@ use crate::error::{ReadError, WriteError};
 use super::ConnEvent;
 use super::flow::{Flow, Violation};
 use super::frame::{self, Frame, Packing, STREAM_FILL_QUANTUM};
+use super::recovery::SentFrame;
 use super::recv::{ReadOutcome, RecvHalf, RecvTombstone};
 use super::send::SendHalf;
 use super::stream_id::{Dir, Opener, StreamId};
@@ -148,6 +149,97 @@ struct Regenerate {
     max_data: bool,
     max_streams: [bool; 2],
     max_stream_data: BTreeSet<StreamRef>,
+}
+
+/// What one §8.5 packing pass took out of the stream state.
+///
+/// It serves **two** purposes, and they are the same information:
+///
+/// 1. §13.5's sent-packet record. [`Packed::sent_frames`] turns it into
+///    §8.7's frame identities, with ruling 113's FIN flag **carried** off
+///    the chunk that actually held it rather than inferred from the final
+///    size.
+/// 2. §14.5's undo log. The admission gate is evaluated *after* the
+///    plaintext is packed — a candidate's datagram size is not knowable
+///    before — so a packet the congestion window refuses must put back
+///    exactly what building it took out, and [`Streams::restore`] does that
+///    from this record.
+///
+/// Deriving the sent record from the *frames* instead would lose two things
+/// the identities need: a `StreamId` does not name a [`StreamRef`], and
+/// `Chunk::fresh` (ruling 98's marking test) is not recoverable from a
+/// `Frame::Stream` at all.
+#[derive(Debug, Default)]
+pub(crate) struct Packed {
+    max_data: bool,
+    max_streams: [bool; 2],
+    max_stream_data: Vec<StreamRef>,
+    resets: Vec<StreamRef>,
+    chunks: Vec<TakenChunk>,
+}
+
+/// One STREAM frame's worth of stream state that the fill removed.
+#[derive(Debug)]
+struct TakenChunk {
+    r: StreamRef,
+    range: std::ops::Range<u64>,
+    fin: bool,
+    /// **Ruling 98.** Whether this was a first transmission — the thing that
+    /// decides `seal` against `seal_quiet`, and the thing a `return_chunk`
+    /// must preserve so a refused first transmission is not silently
+    /// reclassified as a retransmission.
+    fresh: bool,
+}
+
+impl Packed {
+    /// Forget everything: the packet was sealed and committed.
+    pub(crate) fn clear(&mut self) {
+        self.max_data = false;
+        self.max_streams = [false; 2];
+        self.max_stream_data.clear();
+        self.resets.clear();
+        self.chunks.clear();
+    }
+
+    /// Whether anything at all was taken.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.max_data
+            && !self.max_streams.iter().any(|owed| *owed)
+            && self.max_stream_data.is_empty()
+            && self.resets.is_empty()
+            && self.chunks.is_empty()
+    }
+
+    /// §13.5's *"frame identities aboard"*, in §8.5's packing order.
+    ///
+    /// **May be empty**, and that is not a defect: a bare-PING PTO probe is
+    /// ack-eliciting and tracked (§13.5, §17.5) while carrying nothing that
+    /// re-queues.
+    pub(crate) fn sent_frames(&self) -> Vec<SentFrame> {
+        let mut out = Vec::new();
+        if self.max_data {
+            out.push(SentFrame::MaxData);
+        }
+        for dir in Dir::ALL {
+            if self.max_streams[dir.slot()] {
+                out.push(SentFrame::MaxStreams { dir });
+            }
+        }
+        for r in &self.max_stream_data {
+            out.push(SentFrame::MaxStreamData { r: *r });
+        }
+        for r in &self.resets {
+            out.push(SentFrame::ResetStream { r: *r });
+        }
+        for chunk in &self.chunks {
+            out.push(SentFrame::Stream {
+                r: chunk.r,
+                range: chunk.range.clone(),
+                fin: chunk.fin,
+            });
+        }
+        out
+    }
 }
 
 /// The four-space stream table.
@@ -622,9 +714,15 @@ impl Streams {
     /// Every identity is cleared only once its frame has been accepted, so a
     /// full packet defers rather than drops it. The **value** comes from the
     /// ledger at this moment, which is §8.7's *"freshest current value"*.
-    pub(crate) fn pack_control(&mut self, flow: &mut Flow, packing: &mut Packing) {
+    pub(crate) fn pack_control(
+        &mut self,
+        flow: &mut Flow,
+        packing: &mut Packing,
+        packed: &mut Packed,
+    ) {
         if self.owed.max_data && packing.control(Frame::MaxData(flow.recv_advertised())) {
             self.owed.max_data = false;
+            packed.max_data = true;
         }
         for dir in Dir::ALL {
             if !self.owed.max_streams[dir.slot()] {
@@ -637,6 +735,7 @@ impl Streams {
             };
             if packing.control(frame) {
                 self.owed.max_streams[dir.slot()] = false;
+                packed.max_streams[dir.slot()] = true;
             }
         }
 
@@ -658,6 +757,7 @@ impl Streams {
             };
             if packing.control(Frame::MaxStreamData(frame::MaxStreamData { id, max })) {
                 self.owed.max_stream_data.remove(&r);
+                packed.max_stream_data.push(r);
             }
         }
 
@@ -684,7 +784,9 @@ impl Streams {
                 error_code,
                 final_size,
             });
-            if !packing.control(frame) {
+            if packing.control(frame) {
+                packed.resets.push(r);
+            } else {
                 // Put the identity back: §8.7's regenerate class re-emits
                 // until acknowledged, and a full packet is not an ack.
                 if let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) {
@@ -700,7 +802,7 @@ impl Streams {
     /// Returns whether any **first-transmission** STREAM frame was packed —
     /// ruling 98's marking test, which belongs to the seal and not to the
     /// frame.
-    pub(crate) fn fill(&mut self, packing: &mut Packing) -> bool {
+    pub(crate) fn fill(&mut self, packing: &mut Packing, packed: &mut Packed) -> bool {
         let mut fresh_any = false;
         // One full rotation at most per call keeps this bounded even if a
         // half re-queues itself; the caller loops to build further packets.
@@ -744,6 +846,12 @@ impl Streams {
                     let frame = Frame::Stream(frame::Stream::new(id, at, chunk.data, fin));
                     if packing.fill(frame) {
                         fresh_any |= fresh;
+                        packed.chunks.push(TakenChunk {
+                            r,
+                            range: at..at + len,
+                            fin,
+                            fresh,
+                        });
                         if send.has_pending() {
                             requeue = true;
                         } else {
@@ -783,9 +891,116 @@ impl Streams {
                 .any(|s| s.send.as_ref().is_some_and(SendHalf::reset_pending))
     }
 
+    /// Put back everything one packing pass took — §14.5's refused packet.
+    ///
+    /// §14.5 gates the **send**, and the contract is that *"a packet that
+    /// does not fit is not sealed and its frames stay pending"*. The gate
+    /// cannot run earlier than this: `candidate_size` is the full datagram
+    /// (ruling 136) and is not knowable until the plaintext exists.
+    ///
+    /// The chunks go back through
+    /// [`return_chunk`](SendHalf::return_chunk) and **not** through
+    /// [`on_lost_range`](SendHalf::on_lost_range): a chunk the window
+    /// refused was never transmitted, so the loss path would reclassify a
+    /// first transmission as a retransmission and quiet a seal that ruling
+    /// 98 makes marking.
+    pub(crate) fn restore(&mut self, packed: &mut Packed) {
+        if packed.max_data {
+            self.owed.max_data = true;
+        }
+        for dir in Dir::ALL {
+            if packed.max_streams[dir.slot()] {
+                self.owed.max_streams[dir.slot()] = true;
+            }
+        }
+        for r in packed.max_stream_data.drain(..) {
+            self.owed.max_stream_data.insert(r);
+        }
+        for r in packed.resets.drain(..) {
+            if let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) {
+                send.on_reset_lost();
+            }
+            self.requeue(r);
+        }
+        // Reverse order so a half's own chunks unwind exactly as they were
+        // taken. `RangeSet` coalesces, so the result is order-independent —
+        // the reversal is for the `fin_sent` flag, which is not.
+        while let Some(chunk) = packed.chunks.pop() {
+            if let Some(send) = self.entries.get_mut(&chunk.r).and_then(|s| s.send.as_mut()) {
+                send.return_chunk(chunk.range, chunk.fin, chunk.fresh);
+            }
+            self.requeue(chunk.r);
+        }
+        packed.clear();
+    }
+
+    /// §8.7 `regenerate`: a lost RESET_STREAM re-queues its identity, and
+    /// the retransmission re-reads the **current** value.
+    pub(crate) fn on_reset_lost(&mut self, r: StreamRef) {
+        if let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) {
+            send.on_reset_lost();
+        }
+        self.requeue(r);
+    }
+
+    /// §8.7 `regenerate`: a lost MAX_DATA re-owes the identity. The
+    /// retransmission carries the **freshest** advertised value, not the
+    /// lost one.
+    pub(crate) fn owe_max_data(&mut self) {
+        self.owed.max_data = true;
+    }
+
+    /// §8.7 `regenerate`: a lost MAX_STREAM_DATA re-owes the identity.
+    ///
+    /// If the half has since been freed, `pack_control` drops the identity
+    /// on its next pass — there is nothing left for it to describe.
+    pub(crate) fn owe_max_stream_data(&mut self, r: StreamRef) {
+        self.owed.max_stream_data.insert(r);
+    }
+
+    /// §8.7 `regenerate`: a lost MAX_STREAMS re-owes the identity.
+    pub(crate) fn owe_max_streams(&mut self, dir: Dir) {
+        self.owed.max_streams[dir.slot()] = true;
+    }
+
+    /// Every send half's current write offset — §16.2's snapshot input.
+    ///
+    /// A half with no bytes written appears at offset 0, which
+    /// [`send_settled`](Self::send_settled) answers `true` for vacuously:
+    /// nothing was handed to the connection.
+    pub(crate) fn send_offsets(&self) -> Vec<(StreamRef, u64)> {
+        self.entries
+            .iter()
+            .filter_map(|(r, s)| s.send.as_ref().map(|send| (*r, send.write_offset())))
+            .collect()
+    }
+
+    /// §16.2's settled test for one `(stream, offset)` snapshot entry.
+    ///
+    /// A stream absent from the table, or whose send half has been freed,
+    /// is **settled**: a send half is freed only at `DataRecvd` or
+    /// `ResetRecvd` (§9.7), i.e. acknowledged or abandoned.
+    pub(crate) fn send_settled(&self, r: StreamRef, offset: u64) -> bool {
+        match self.entries.get(&r).and_then(|s| s.send.as_ref()) {
+            Some(send) => send.settled_to(offset),
+            None => true,
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // Internals
     // ═══════════════════════════════════════════════════════════════════
+
+    /// Put a half back in §8.5's rotation if it has anything owed.
+    fn requeue(&mut self, r: StreamRef) {
+        let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) else {
+            return;
+        };
+        if (send.has_pending() || send.reset_pending()) && !send.is_queued() {
+            send.set_queued(true);
+            self.rotation.push_back(r);
+        }
+    }
 
     fn alloc(&mut self) -> StreamRef {
         let r = StreamRef(self.next_ref);
@@ -1163,7 +1378,7 @@ mod tests {
         // §10.4: full closure of a peer-opened stream is what earns credit,
         // and a whole batch of it is what emits the frame (ruling 102).
         let mut packing = Packing::new();
-        streams.pack_control(&mut flow, &mut packing);
+        streams.pack_control(&mut flow, &mut packing, &mut Packed::default());
         assert!(
             packing.frames().contains(&Frame::MaxStreamsUni(
                 constants::INITIAL_MAX_STREAMS_UNI + batch
@@ -1207,7 +1422,7 @@ mod tests {
         // The index is still open: our send half lives, so §9.7's full
         // closure has not happened and no MAX_STREAMS credit is owed.
         let mut packing = Packing::new();
-        streams.pack_control(&mut flow, &mut packing);
+        streams.pack_control(&mut flow, &mut packing, &mut Packed::default());
         assert!(packing.frames().is_empty(), "not fully closed, no grant");
 
         // Arrivals are discarded — no re-open, no delivery, no further

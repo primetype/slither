@@ -34,9 +34,12 @@
 //! §8.2's structural failure keeps "the already-performed replay mark" and
 //! applies nothing else — so the mark happens before the parse, and stays.
 
+pub(crate) mod ack;
 pub(crate) mod close;
+pub(crate) mod congestion;
 pub(crate) mod flow;
 pub(crate) mod frame;
+pub(crate) mod recovery;
 pub(crate) mod recv;
 pub(crate) mod send;
 pub(crate) mod session;
@@ -68,9 +71,12 @@ use crate::constants;
 use crate::error::{ConnectionLost, ReadError, WriteError};
 use crate::packet::{Handshake, Inbound, classify};
 
+use self::ack::{AckAction, AckState};
 use self::close::{Closing, Lifecycle};
+use self::congestion::{Controller, NewReno};
 use self::flow::Flow;
 use self::frame::{Close, Frame, Packing, Structural};
+use self::recovery::{AckOutcome, Recovery, SentFrame, SentPacket};
 use self::session::Session;
 use self::timers::{TimerKind, Timers};
 
@@ -110,6 +116,14 @@ pub(crate) struct Connection<C: Handshake> {
     /// §18.1's cause, retained so the stream verbs can surface
     /// `ConnectionLost` after the one `Closed` event has gone out.
     lost: Option<ConnectionLost>,
+    /// §12.4's delayed-ACK policy — four scalars **alongside** §7.2's
+    /// window, never a second received-packet record (§12.2).
+    ack: AckState,
+    /// §13's sent-packet map, RTT estimator, and loss/PTO state.
+    recovery: Recovery,
+    /// §14's controller. NewReno is v1's one implementation (§14.1);
+    /// CUBIC and BBR are §19's, behind the same trait.
+    congestion: NewReno,
 }
 
 /// What a received, authenticated, window-fresh packet turned out to be.
@@ -140,6 +154,9 @@ impl<C: Handshake> Connection<C> {
             flow: Flow::new(),
             events: Vec::new(),
             lost: None,
+            ack: AckState::new(),
+            recovery: Recovery::new(),
+            congestion: NewReno::new(),
         }
     }
 
@@ -238,7 +255,7 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
-        let received = {
+        let (counter, prev_greatest, received) = {
             let Some(Inbound::Data {
                 header,
                 ad,
@@ -253,6 +270,15 @@ impl<C: Handshake> Connection<C> {
                 .as_mut()
                 .expect("checked immediately above, and nothing between takes it");
 
+            // §12.4's out-of-order trigger compares this counter against the
+            // window's greatest **before** the mark. Read after `open`, the
+            // greatest already includes this packet, the test
+            // `counter != prev_greatest + 1` is false for every packet, and
+            // the only surviving §12.4 trigger is the every-2nd counter —
+            // which no completion test can distinguish.
+            let prev_greatest = session.replay().greatest();
+            let counter = header.counter;
+
             // AEAD, then the window check, then the mark, then liveness —
             // all inside `open`, because the order is the whole of §7.2.
             let Some(plaintext) =
@@ -261,7 +287,7 @@ impl<C: Handshake> Connection<C> {
                 return;
             };
 
-            if plaintext.is_empty() {
+            let received = if plaintext.is_empty() {
                 // §3.4: "An empty plaintext … is the keepalive — it
                 // bypasses the frame layer entirely and is the only
                 // non-frame plaintext." Parsing it as zero frames would be
@@ -272,12 +298,14 @@ impl<C: Handshake> Connection<C> {
                     Ok(frames) => Received::Frames(frames),
                     Err(error) => Received::Structural(error),
                 }
-            }
+            };
+            (counter, prev_greatest, received)
         };
 
         // The packet is authenticated and window-fresh; the borrow of the
         // plaintext is over, so state may move now.
         self.sync_liveness_timer();
+        self.fold_ack_policy(now, counter, prev_greatest, &received);
 
         if self.lifecycle.is_live() {
             self.apply_live(now, received);
@@ -294,6 +322,16 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
+        // §13.4's probe is **planned** here and built by the pump below.
+        // Ruling 76 puts `AckDelay` *after* the loss/PTO evaluation
+        // precisely so *"the owed ACK rides any probe or retransmission
+        // that evaluation produced"* — and a probe sealed inside the `Pto`
+        // arm would already be on the wire by the time `AckDelay` set the
+        // flag. Planning it and sealing it in the same mutating call keeps
+        // §16.7 satisfied (nothing is deferred to `poll_output`) while
+        // making ruling 76's stated consequence actually happen.
+        let mut probe = false;
+
         for kind in self.timers.take_due(now).iter() {
             match kind {
                 // §7.4: no authenticated fresh receive for `DEAD_TIMEOUT`
@@ -303,16 +341,22 @@ impl<C: Handshake> Connection<C> {
                 // §15.2's linger expiry: drop all state. `Closed` was
                 // emitted at the death (ruling 81); only `Retired` is owed.
                 TimerKind::CloseLinger => self.drop_state(),
-                // Armed by no path in this slice. Each arrives with the
-                // section that defines it: §7.5 for `Contested`,
-                // `Keepalive` and `PersistentKeepalive`; §13 for `Loss` and
-                // `Pto`; §12.3 for `AckDelay`.
-                TimerKind::Contested
-                | TimerKind::Loss
-                | TimerKind::Pto
-                | TimerKind::AckDelay
-                | TimerKind::Keepalive
-                | TimerKind::PersistentKeepalive => {}
+                // §13.2's walk, run with no new acknowledgement.
+                TimerKind::Loss => {
+                    let outcome = self.recovery.on_loss_timeout(now);
+                    self.apply_ack_outcome(now, outcome);
+                }
+                // §13.3's firing. `pto_count` increments **here**, before
+                // the probe is built (ruling 139(a)).
+                TimerKind::Pto => {
+                    self.recovery.on_pto_timeout();
+                    probe = true;
+                }
+                // §12.4: the ACK becomes owed; the pump packs it.
+                TimerKind::AckDelay => self.ack.on_delay_expired(),
+                // Armed by no path in this slice: §7.5's three timers are
+                // slice 7's and arrive with the section that defines them.
+                TimerKind::Contested | TimerKind::Keepalive | TimerKind::PersistentKeepalive => {}
             }
 
             if self.lifecycle.is_dead() {
@@ -320,11 +364,10 @@ impl<C: Handshake> Connection<C> {
             }
         }
 
-        // A timer can free state (§15) but arms nothing that owes a frame
-        // in this slice. Pumping anyway keeps the invariant "every call
-        // carrying an instant leaves nothing owed" true of the whole
-        // surface rather than of most of it.
-        self.pump(now);
+        // §16.4's generation order: what the evaluation caused, then the
+        // packets it made us owe.
+        self.drain_events();
+        self.pump_inner(now, probe);
     }
 
     /// §16.4's `close`. §15.2's local close.
@@ -559,6 +602,194 @@ impl<C: Handshake> Connection<C> {
         self.pump(now);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // §12/§13/§14 — the reliability seam
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.2's snapshot: every byte handed to the connection at this
+    /// instant.
+    ///
+    /// *"Bytes written after the call do not extend it"* — which is why
+    /// this is a value taken now and not a predicate re-evaluated at each
+    /// poll. A snapshot re-read on every poll never terminates under a
+    /// writer loop, and §16.2 states the terminating case explicitly.
+    pub(crate) fn ack_snapshot(&self) -> AckSnapshot {
+        AckSnapshot(self.streams.send_offsets())
+    }
+
+    /// Whether every byte in `snap` is acknowledged **or abandoned by a
+    /// reset**.
+    ///
+    /// A stream absent from the table, or whose send half has been freed,
+    /// counts as settled: a send half is freed only at `DataRecvd` or
+    /// `ResetRecvd` (§9.7). An entry at offset 0 is settled vacuously.
+    ///
+    /// **FIN is deliberately not part of this.** §16.2 scopes the
+    /// connection-level snapshot to *"every byte handed to the
+    /// connection"*, and a connection-level `acked()` that also waited for
+    /// a FIN would never terminate on a stream the application intends to
+    /// keep open. `SendStream::acked()` is the verb that includes the FIN.
+    pub(crate) fn snapshot_settled(&self, snap: &AckSnapshot) -> bool {
+        snap.0
+            .iter()
+            .all(|(r, offset)| self.streams.send_settled(*r, *offset))
+    }
+
+    /// §14.5's sum over §13.5's map — ack-eliciting packets only.
+    #[cfg(test)]
+    pub(crate) fn bytes_in_flight(&self) -> u64 {
+        self.recovery.bytes_in_flight()
+    }
+
+    /// §14's congestion window, in bytes.
+    #[cfg(test)]
+    pub(crate) fn congestion_window(&self) -> u64 {
+        self.congestion.window()
+    }
+
+    /// §13.1's `smoothed_rtt` — `K_INITIAL_RTT` before any sample.
+    #[cfg(test)]
+    pub(crate) fn smoothed_rtt(&self) -> std::time::Duration {
+        self.recovery.rtt().smoothed_rtt()
+    }
+
+    /// §13's recovery state, for the unit tests that assert on it directly.
+    #[cfg(test)]
+    pub(crate) fn recovery(&self) -> &Recovery {
+        &self.recovery
+    }
+
+    /// §12.4's policy, folded once per authenticated, **window-fresh**
+    /// packet — §7.2: *"No replayed packet ever moves the endpoint or
+    /// refreshes liveness."*
+    ///
+    /// A duplicate that advanced the every-2nd counter would buy an
+    /// attacker one extra ACK per replayed packet: free reverse-path
+    /// amplification, and invisible to every test that does not count ACKs.
+    ///
+    /// Skipped once the connection is dying: §15.2's closing state emits
+    /// only CLOSE, and arming `AckDelay` there would announce a deadline
+    /// that fires with nothing to pack.
+    fn fold_ack_policy(
+        &mut self,
+        now: Instant,
+        counter: u64,
+        prev_greatest: Option<u64>,
+        received: &Received,
+    ) {
+        if !self.lifecycle.is_live() {
+            return;
+        }
+        let (ack_eliciting, frame_seen) = match received {
+            // §3.4's keepalive carries no frames, so it elicits nothing —
+            // and §12.3 reports `ack_delay = 0` when the window's largest
+            // is one, which is the whole reason `frame_seen` is carried.
+            Received::Keepalive => (false, false),
+            Received::Frames(frames) => (frame::packet_is_ack_eliciting(frames), true),
+            // §8.2: nothing from a structurally-broken packet is applied,
+            // and the connection is about to CLOSE. It is frame-bearing but
+            // elicits nothing.
+            Received::Structural(_) => (false, true),
+        };
+
+        match self
+            .ack
+            .on_recv(now, counter, prev_greatest, ack_eliciting, frame_seen)
+        {
+            AckAction::None => {}
+            AckAction::Now => self.timers.disarm(TimerKind::AckDelay),
+            AckAction::Arm(at) => self.timers.arm(TimerKind::AckDelay, at),
+        }
+    }
+
+    /// §12.5's processing of one received ACK.
+    fn on_ack_frame(&mut self, now: Instant, ack: &frame::Ack) {
+        let Some(highest_sealed) = self.next_counter().and_then(|next| next.checked_sub(1)) else {
+            // Nothing has ever been sealed, so every counter this frame
+            // names is above the highest sealed: §12.5 ignores it whole.
+            return;
+        };
+        let outcome = self.recovery.on_ack(now, ack, highest_sealed);
+        self.apply_ack_outcome(now, outcome);
+    }
+
+    /// Apply one §12.5 or §13.2 evaluation: §8.7's classes, then §14's
+    /// controller.
+    ///
+    /// Drains no events and pumps nothing — the caller does both, **once**,
+    /// so §16.4's generation order survives an ACK that resolves twenty
+    /// streams at one instant.
+    fn apply_ack_outcome(&mut self, now: Instant, outcome: AckOutcome) {
+        for frame in outcome.acked {
+            match frame {
+                SentFrame::Stream { r, range, fin } => {
+                    // Ruling 113: `fin` is carried off the map, never
+                    // re-derived — §8.7 lets a retransmission re-frame
+                    // ranges freely, so a frame ending at the final size
+                    // need not have carried the FIN.
+                    self.streams
+                        .on_ack_range(r, range, fin, &mut self.flow, &mut self.events);
+                }
+                SentFrame::ResetStream { r } => self.streams.on_reset_acked(r, &mut self.flow),
+                // §8.7's `regenerate` class: a credit frame is
+                // **superseded, not confirmed**. Its acknowledgement clears
+                // nothing — the identity was cleared when it was packed,
+                // and the value it carried is stale by construction.
+                SentFrame::MaxData
+                | SentFrame::MaxStreamData { .. }
+                | SentFrame::MaxStreams { .. } => {}
+            }
+        }
+
+        for frame in outcome.lost {
+            match frame {
+                SentFrame::Stream { r, range, fin } => self.streams.on_lost_range(r, range, fin),
+                SentFrame::ResetStream { r } => self.streams.on_reset_lost(r),
+                // The retransmission carries the **freshest** value, read
+                // off the ledger at pack time — never the lost one.
+                SentFrame::MaxData => self.streams.owe_max_data(),
+                SentFrame::MaxStreamData { r } => self.streams.owe_max_stream_data(r),
+                SentFrame::MaxStreams { dir } => self.streams.owe_max_streams(dir),
+            }
+        }
+
+        for (sent_time, bytes, app_limited) in outcome.ack_events {
+            self.congestion.on_ack(now, sent_time, bytes, app_limited);
+        }
+
+        // §14.3: **once per loss episode**, after the full lost-packet
+        // scan. `AckOutcome::congestion` being an `Option` rather than a
+        // `Vec` is the structural enforcement of that.
+        if let Some(event) = outcome.congestion {
+            self.congestion.on_congestion_event(
+                now,
+                event.sent_time,
+                event.is_persistent,
+                event.lost_bytes,
+            );
+        }
+    }
+
+    /// Re-derive §13's two deadlines from the sent-packet map.
+    ///
+    /// Both are **functions of the map**, exactly as §7.4's `Liveness`
+    /// deadline is a function of the receive clock, so they are
+    /// re-synchronised after every change rather than armed at each site.
+    /// §13.3's precondition — *"armed only while at least one ack-eliciting
+    /// packet is in the sent map"* — is then true by construction: an empty
+    /// map yields `None`, so an idle connection cannot self-sustain a probe
+    /// train at ~20 packets/s against the 10 s keepalive cadence, which is
+    /// the failure §13.3 names.
+    fn sync_recovery_timers(&mut self) {
+        if !self.lifecycle.is_live() {
+            return;
+        }
+        self.timers
+            .set(TimerKind::Loss, self.recovery.loss_deadline());
+        self.timers
+            .set(TimerKind::Pto, self.recovery.pto_deadline());
+    }
+
     /// §18.1's cause, once the connection has died. The verbs surface it
     /// rather than accepting work a dead connection can never do.
     fn lost(&self) -> Result<(), WriteError> {
@@ -602,13 +833,15 @@ impl<C: Handshake> Connection<C> {
             match frame {
                 // §8.4: no fields, no error cases, no effect.
                 Frame::Padding => {}
-                // Ack-eliciting, so §12.3 owes an ACK — which is slice 5.
-                // Nothing else: §13.4's probe accounting is slice 5 too.
+                // §8.3: ack-eliciting and nothing else. The ACK it owes was
+                // already folded into §12.4's policy by `fold_ack_policy`,
+                // which runs once per packet rather than once per frame —
+                // §12.4 counts *packets*, and a peer packing two PINGs into
+                // one datagram must not buy two ACKs.
                 Frame::Ping => {}
-                // Codec only in this slice. §12.4's processing — RTT
-                // sampling, the sent-packet map, the loss evaluation — is
-                // slice 5, and this arm is where it lands.
-                Frame::Ack(_) => {}
+                // §12.5's processing: the sent-packet map, the RTT sample,
+                // §13.2's loss evaluation and §14's controller.
+                Frame::Ack(ack) => self.on_ack_frame(now, &ack),
                 Frame::Stream(stream) => {
                     if let Err(violation) =
                         self.streams
@@ -829,6 +1062,22 @@ impl<C: Handshake> Connection<C> {
         self.lifecycle = Lifecycle::Dead;
         self.timers.disarm_all();
         self.scratch = Vec::new();
+
+        // §15.2: *"all stream, flow-control, recovery and congestion state
+        // may drop immediately"*. The recovery half is dropped here
+        // unconditionally — a sent map that outlives the session holds
+        // `SentPacket`s no ACK can ever arrive for, and §17.5's ceiling
+        // assumes it is gone.
+        //
+        // `streams` and `flow` are **not** dropped here. Ruling 133 splits
+        // them by path — the local closer frees them at once, the draining
+        // receiver retains them for `CLOSE_LINGER` — and the retaining half
+        // is what makes ruling 128's post-death drain implementable. That
+        // is 5b's, and freeing them here would break it before it is
+        // written. Reported in `IMPLEMENTATION-5a.md`.
+        self.recovery = Recovery::new();
+        self.congestion = NewReno::new();
+        self.ack = AckState::new();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -871,6 +1120,20 @@ impl<C: Handshake> Connection<C> {
     /// sentence is the only part no section states, and it follows from
     /// `seal`/`seal_quiet` being a per-seal choice.
     fn pump(&mut self, now: Instant) {
+        self.pump_inner(now, false);
+    }
+
+    /// [`pump`](Self::pump), optionally owing §13.4's probe.
+    ///
+    /// The two deadlines §13 owns are re-derived at the end, from the map
+    /// rather than from arming sites — see
+    /// [`sync_recovery_timers`](Self::sync_recovery_timers).
+    fn pump_inner(&mut self, now: Instant, probe: bool) {
+        self.pump_packets(now, probe);
+        self.sync_recovery_timers();
+    }
+
+    fn pump_packets(&mut self, now: Instant, mut probe: bool) {
         if !self.lifecycle.is_live() || self.session.is_none() {
             // §16.9: *"no frame is emitted before install (nothing sends
             // until a session exists)"*.
@@ -878,27 +1141,92 @@ impl<C: Handshake> Connection<C> {
         }
 
         // Bounded by construction: every iteration that transmits has moved
-        // stream bytes out of the pending set or cleared a regenerate
-        // identity, and one that does neither breaks below.
+        // stream bytes out of the pending set, cleared a regenerate
+        // identity or packed the owed ACK, and one that does none of those
+        // breaks below.
         loop {
+            let mut packed = streams::Packed::default();
             let mut packing = Packing::new();
-            self.streams.pack_control(&mut self.flow, &mut packing);
-            let marking = self.streams.fill(&mut packing);
+
+            // Stage 1 — §12.4: *"An owed ACK rides the next outgoing packet
+            // (packing order §8.5)"*.
+            let ack_packed = self.pack_ack(now, &mut packing);
+            // Stages 2 and 3 — credit grants and RESET_STREAM, then the
+            // STREAM fill.
+            self.streams
+                .pack_control(&mut self.flow, &mut packing, &mut packed);
+            let marking = self.streams.fill(&mut packing, &mut packed);
+            // Stage 4 — §13.4: *"A firing PTO sends one ack-eliciting
+            // packet: pending retransmittable frames oldest-first if any
+            // exist, else a bare PING."* The PING is owed only when the
+            // first three stages produced nothing that elicits.
+            if probe && !frame::packet_is_ack_eliciting(packing.frames()) {
+                packing.ping();
+            }
 
             if packing.frames().is_empty() {
                 break;
             }
+
+            let ack_eliciting = frame::packet_is_ack_eliciting(packing.frames());
+            let frames = packed.sent_frames();
             let plaintext = packing.into_plaintext();
+            // **[ruling 136]** The candidate's size is the **full
+            // datagram**, because §14.5 derives `INITIAL_WINDOW` at
+            // `MAX_DATAGRAM` = 1200 and `MAX_DATAGRAM` is the datagram: a
+            // window expressed in datagram units is spent in datagram
+            // units.
+            let size =
+                (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+
+            // §14.5's admission gate. **Exemptions, exhaustively**: PTO
+            // probes (§13.4 — a black-holed path with a full window must
+            // stay probeable); the contested-connection probe (§7.5, slice
+            // 7); and non-ack-eliciting control packets, which are never
+            // tracked in flight and never gated.
+            //
+            // The exemption is from **admission only** — the probe is still
+            // recorded below and still counts in `bytes_in_flight` (ruling
+            // 43, §17.5), or loss recovery would hold a packet in flight it
+            // could not see.
+            if ack_eliciting && !probe && !self.admits(size) {
+                // §14.5 gates the *send*: the frames stay pending and are
+                // re-planned when the window opens. Nothing was sealed, so
+                // §16.7's "on seal failure nothing moved" holds here too.
+                self.streams.restore(&mut packed);
+                // A pure ACK is not gated. If one was owed it still goes
+                // out, alone, rather than waiting on a window it does not
+                // consume.
+                if self.ack.is_owed() {
+                    self.transmit_pure_ack(now);
+                }
+                break;
+            }
+
+            // §14.5's `app_limited`, recorded at send time by **us** so a
+            // peer's ACK-timing games cannot un-set it.
+            //
+            // **[ruling 139(c)]** It is stamped on the packet that emptied
+            // the queue **while headroom remained** — we stopped because
+            // there was nothing more to send, not because the window
+            // closed. The alternative (only packets sent after the sender
+            // has already gone idle) lets a bulk sender holding the queue
+            // one packet ahead grow the window while effectively idle,
+            // which is the case §14.5 reasons about.
+            let app_limited = !self.streams.has_output()
+                && self.recovery.bytes_in_flight().saturating_add(size) < self.congestion.window();
 
             let Some(session) = self.session.as_mut() else {
                 break;
             };
-            // Every frame this slice packs is ack-eliciting (§8.3), so the
-            // death clock is armed either way; only `last_send` differs.
-            let sealed = if marking {
-                session.seal(now, &plaintext, true)
+            // §7.4's quiet set: retransmissions, credit frames,
+            // RESET_STREAM, pure ACKs and — §13.4 — PTO probes. Marking is
+            // a property of the **seal**, not of the frame, so a packet
+            // mixing a fresh STREAM frame with credit frames is marking.
+            let sealed = if marking && !probe {
+                session.seal(now, &plaintext, ack_eliciting)
             } else {
-                session.seal_quiet(now, &plaintext, true)
+                session.seal_quiet(now, &plaintext, ack_eliciting)
             };
             let sealed = match sealed {
                 Ok(sealed) => sealed,
@@ -909,6 +1237,11 @@ impl<C: Handshake> Connection<C> {
                     return;
                 }
             };
+            debug_assert_eq!(
+                sealed.datagram.len() as u64,
+                size,
+                "ruling 136: the gate's candidate size is the datagram it admitted"
+            );
             let to = session.established().anchor;
             self.outputs.push_back(ConnOutput::Transmit(Transmit {
                 to,
@@ -916,10 +1249,88 @@ impl<C: Handshake> Connection<C> {
             }));
             self.sync_liveness_timer();
 
-            if !self.streams.has_output() {
+            if ack_packed {
+                self.ack.on_ack_packed();
+                self.timers.disarm(TimerKind::AckDelay);
+            }
+
+            // §13.5: *"Non-ack-eliciting packets are never inserted."*
+            if ack_eliciting {
+                self.recovery.on_sent(SentPacket {
+                    counter: sealed.counter,
+                    time_sent: now,
+                    size,
+                    app_limited,
+                    // **[ruling 137]** Held at 0 until slice 7's roaming.
+                    path_gen: 0,
+                    frames,
+                });
+                self.congestion.on_sent(now, size);
+            }
+
+            // §13.4: **one** ack-eliciting packet per firing.
+            probe = false;
+
+            if !self.streams.has_output() && !self.ack.is_owed() {
                 break;
             }
         }
+    }
+
+    /// §8.5 stage 1 — the owed ACK, derived from §7.2's window (§12.2).
+    ///
+    /// `false` when none is owed, when nothing has been received, or when
+    /// not even the first block fits the packet — in which case the ACK
+    /// **stays owed** and rides the next one.
+    fn pack_ack(&mut self, now: Instant, packing: &mut Packing) -> bool {
+        if !self.ack.is_owed() {
+            return false;
+        }
+        let ack_delay_us = self.ack.ack_delay_us(now);
+        let Some(window) = self.session.as_ref().map(Session::replay) else {
+            return false;
+        };
+        let Some(frame) = ack::derive(window, ack_delay_us, packing.room()) else {
+            return false;
+        };
+        packing.ack(frame)
+    }
+
+    /// §12.4: *"if none is pending, a standalone ACK packet is generated."*
+    ///
+    /// Sealed `seal_quiet` (§7.4), **not** ack-eliciting — §12.4 says so in
+    /// terms, "no ACK-of-ACK loops" — never tracked for loss, and it
+    /// bypasses the congestion window (§14.5's third exemption).
+    fn transmit_pure_ack(&mut self, now: Instant) {
+        let mut packing = Packing::new();
+        if !self.pack_ack(now, &mut packing) {
+            return;
+        }
+        let plaintext = packing.into_plaintext();
+
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let Ok(sealed) = session.seal_quiet(now, &plaintext, false) else {
+            self.die(ConnectionLost::NonceExhausted);
+            return;
+        };
+        let to = session.established().anchor;
+        self.outputs.push_back(ConnOutput::Transmit(Transmit {
+            to,
+            data: sealed.datagram,
+        }));
+        self.ack.on_ack_packed();
+        self.timers.disarm(TimerKind::AckDelay);
+        self.sync_liveness_timer();
+    }
+
+    /// §14.5's admission gate: `bytes_in_flight + candidate_size <= cwnd`.
+    ///
+    /// **`<=`, not `<`.** At `cwnd = 12 000` and 1200-byte datagrams the
+    /// difference is nine admitted packets against ten.
+    fn admits(&self, size: u64) -> bool {
+        self.recovery.bytes_in_flight().saturating_add(size) <= self.congestion.window()
     }
 
     /// Re-derive the `Liveness` deadline from §7.4's clocks.
@@ -964,6 +1375,19 @@ impl<C: Handshake> Connection<C> {
             .push_back(ConnOutput::Event(ConnEvent::Closed(lost)));
     }
 }
+
+/// §16.2's acknowledgement snapshot — opaque, and taken at one instant.
+///
+/// *"every byte handed to the connection at this instant … Bytes written
+/// after the call do not extend it."* The snapshot is therefore a **value**:
+/// a `(stream, offset)` pair per live send half, frozen. Re-reading the
+/// streams' current offsets at each poll instead is the implementation that
+/// never terminates under a writer loop — the case §16.2 spells out.
+///
+/// Empty iff nothing had been written, in which case it is settled
+/// immediately.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AckSnapshot(Vec<(StreamRef, u64)>);
 
 /// One item of the connection core's drain. §16.4.
 ///
@@ -1141,6 +1565,38 @@ mod smoke {
                 ConnOutput::Timeout(_) => return (datagrams, events),
             }
         }
+    }
+
+    /// Shuttle datagrams **both ways** until neither core has anything left
+    /// to send, returning every event each produced.
+    ///
+    /// [`deliver`] cannot serve §12: it drains the receiver for its *events*
+    /// and discards its datagrams, so the ACK the receiver owes never
+    /// reaches the sender. The §12/§13 loop is a round trip by construction
+    /// and needs a round-trip fixture.
+    fn exchange(
+        a: &mut Connection<Suite>,
+        b: &mut Connection<Suite>,
+        now: Instant,
+    ) -> (Vec<ConnEvent>, Vec<ConnEvent>) {
+        let mut events_a = Vec::new();
+        let mut events_b = Vec::new();
+        for _ in 0..64 {
+            let (from_a, ea) = drain(a);
+            events_a.extend(ea);
+            let (from_b, eb) = drain(b);
+            events_b.extend(eb);
+            if from_a.is_empty() && from_b.is_empty() {
+                return (events_a, events_b);
+            }
+            for dgram in from_a {
+                b.handle_datagram(now, v4(1), &dgram);
+            }
+            for dgram in from_b {
+                a.handle_datagram(now, v4(2), &dgram);
+            }
+        }
+        panic!("the two cores never went quiet");
     }
 
     /// Hand every datagram `from` produced to `to`, and drain `to`.
@@ -1328,6 +1784,322 @@ mod smoke {
         assert!(
             n1 < 4_000,
             "§8.5 serves a quantum, not a whole stream: {n1}"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Slice 5's seam — §12 ↔ §13 ↔ §14, over two real cores
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The acceptance tests for §12, §13 and §14 are written independently
+    // by two blind authors (working rule 6) in `tests_ack.rs` and
+    // `tests_recovery.rs`, which this implementer never sees. These five
+    // exist for the same reason the four above do: the *seam* between the
+    // ACK derivation, the sent-packet map and the transmit pump has no
+    // other exercise, because each of the three is unit-testable against
+    // its own state and their junction is not.
+
+    /// The whole feedback loop this slice exists to close: the receiver
+    /// owes an ACK (§12.4), packs it (§12.2), the sender's map resolves it
+    /// (§12.5), and §9.7's `DataRecvd` is finally reachable.
+    ///
+    /// `StreamFinished` **cannot** fire without every one of those working,
+    /// which is what makes one assertion cover the seam.
+    #[test]
+    fn an_ack_drains_the_sent_map_and_completes_the_send_half() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, &vec![7u8; 8_000]).expect("write");
+        a.finish(now, r).expect("finish");
+        a.flush(now);
+        assert!(
+            a.bytes_in_flight() > 0,
+            "§13.5: an ack-eliciting packet is tracked the moment it is sealed"
+        );
+
+        // A → B: the data. B owes an ACK (§12.4 — the first ack-eliciting
+        // packet has no previous greatest, so it is immediate). B → A: it.
+        let (mut events, _) = exchange(&mut a, &mut b, now);
+
+        // §12.4, and this is the delayed-ACK policy being real rather than
+        // nominal: A's last packet is the 1st since B's previous ACK and
+        // arrived in order, so B owes nothing yet and `AckDelay` carries it.
+        // A build that ACKed every packet has an empty timer here and
+        // settles a step early — and passes every completion test.
+        let delayed = now + constants::MAX_ACK_DELAY;
+        assert_eq!(
+            b.timer(TimerKind::AckDelay),
+            Some(delayed),
+            "§12.4: the odd packet out waits on the timer"
+        );
+        assert!(
+            a.bytes_in_flight() > 0,
+            "…and until it fires, that packet is still in flight"
+        );
+
+        b.handle_timeout(delayed);
+        let (rest, _) = exchange(&mut a, &mut b, delayed);
+        events.extend(rest);
+
+        assert_eq!(
+            a.bytes_in_flight(),
+            0,
+            "§14.5: every acknowledged packet's bytes leave the flight"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ConnEvent::StreamFinished { r: got } if *got == r)),
+            "§9.3: `DataRecvd` is reached only by acknowledgement: {events:?}"
+        );
+    }
+
+    /// §12.4's two triggers are distinguishable, which is the whole point of
+    /// replacing the immediate-ACK-per-packet policy.
+    ///
+    /// An **in-order** first ack-eliciting packet must *not* draw an
+    /// immediate ACK; it arms `AckDelay` at exactly `MAX_ACK_DELAY`. A build
+    /// that kept the old policy passes every completion test and fails this.
+    #[test]
+    fn the_second_in_order_packet_draws_the_ack_the_first_only_arms_the_timer() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        // Counter 0 is out-of-order by §12.4's own vacuous clause (no
+        // previous greatest), so it draws an immediate ACK and seeds the
+        // state. From counter 1 onwards arrivals are in order.
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, b"first").expect("write");
+        let (first, _) = drain(&mut a);
+        b.handle_datagram(now, v4(1), &first[0]);
+        let (acks, _) = drain(&mut b);
+        assert_eq!(acks.len(), 1, "§12.4: the first arrival ACKs immediately");
+
+        a.write(now, r, b"second").expect("write");
+        let (second, _) = drain(&mut a);
+        b.handle_datagram(now, v4(1), &second[0]);
+        let (none, _) = drain(&mut b);
+        assert!(
+            none.is_empty(),
+            "§12.4: one in-order ack-eliciting packet owes nothing yet: {none:?}"
+        );
+        assert_eq!(
+            b.timer(TimerKind::AckDelay),
+            Some(now + constants::MAX_ACK_DELAY),
+            "§12.4: …it arms `AckDelay` at MAX_ACK_DELAY instead"
+        );
+
+        a.write(now, r, b"third").expect("write");
+        let (third, _) = drain(&mut a);
+        b.handle_datagram(now, v4(1), &third[0]);
+        let (ack, _) = drain(&mut b);
+        assert_eq!(ack.len(), 1, "§12.4: an ACK is owed after every 2nd");
+        assert_eq!(
+            b.timer(TimerKind::AckDelay),
+            None,
+            "packing the ACK disarms the delay"
+        );
+    }
+
+    /// §13.3's arming precondition, from **both** sides.
+    ///
+    /// A build that leaves `Pto` armed on an empty map self-sustains a probe
+    /// train at ~20 packets/s — §13.3 names that failure itself — and no
+    /// completion test can see it.
+    #[test]
+    fn the_pto_is_armed_only_while_something_is_in_flight() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+        assert_eq!(a.timer(TimerKind::Pto), None, "nothing in flight yet");
+
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, b"payload").expect("write");
+        a.flush(now);
+        assert!(
+            a.timer(TimerKind::Pto).is_some(),
+            "§13.3: armed while an ack-eliciting packet is outstanding"
+        );
+
+        let _ = exchange(&mut a, &mut b, now);
+        assert_eq!(a.bytes_in_flight(), 0);
+        assert_eq!(
+            a.timer(TimerKind::Pto),
+            None,
+            "§13.3: disarmed when the map empties"
+        );
+    }
+
+    /// §13.4's probe rescues a flight that §13.2 cannot even judge.
+    ///
+    /// With the only data packet lost outright, nothing has ever been
+    /// acknowledged, so `largest_acked` is `None` and §13.2's walk declares
+    /// nothing — **only the PTO can move this connection**. The probe is a
+    /// bare PING (§13.4's "else": the bytes are `unacked`, not *pending*),
+    /// it is tracked despite being gate-exempt (ruling 43, §17.5), and the
+    /// ACK it elicits is what finally lifts `largest_acked` above the lost
+    /// counter so §13.2's packet threshold can fire.
+    #[test]
+    fn a_firing_pto_probes_a_flight_loss_detection_cannot_yet_judge() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, b"payload").expect("write");
+        a.finish(now, r).expect("finish");
+        // Two datagrams, because §16.7 seals inside the call that triggers
+        // it: `write` sealed the bytes and `finish` sealed the FIN. Neither
+        // ever reaches B.
+        let (lost, _) = drain(&mut a);
+        assert_eq!(lost.len(), 2);
+
+        let deadline = a.timer(TimerKind::Pto).expect("§13.3 arms it");
+        let before = a.bytes_in_flight();
+        a.handle_timeout(deadline);
+        let (probes, _) = drain(&mut a);
+
+        assert_eq!(probes.len(), 1, "§13.4: **one** ack-eliciting packet");
+        assert!(
+            a.bytes_in_flight() > before,
+            "ruling 43: exempt from admission, never from accounting"
+        );
+
+        // The probe reaches B, which has seen nothing else. Its ACK carries
+        // a `largest` above the lost counter, and from there §13.2 does the
+        // rest without any further prompting.
+        b.handle_datagram(deadline, v4(1), &probes[0]);
+        let _ = exchange(&mut a, &mut b, deadline);
+
+        let claimed = b.accept(Dir::Uni).expect("the retransmission arrived");
+        let mut buf = [0u8; 16];
+        assert_eq!(b.read(deadline, claimed, &mut buf), Ok(Some(7)));
+        assert_eq!(&buf[..7], b"payload");
+        assert_eq!(
+            b.read(deadline, claimed, &mut buf),
+            Ok(None),
+            "ruling 113: the FIN was recorded on the packet that carried it, \
+             so the retransmission carries it too"
+        );
+    }
+
+    /// §14.5's admission gate and **ruling 134**, which are the same seam
+    /// seen from the two sides.
+    ///
+    /// `write()` accepts everything §10's credit admits — the window defers
+    /// the *seal*, never the acceptance — and the gate then holds the
+    /// surplus off the wire until an acknowledgement makes room. A build
+    /// that gated `write()` instead fails the first assertion; one that
+    /// gated on plaintext rather than the datagram (ruling 136) overshoots
+    /// the window by 30 bytes a packet and fails the third.
+    #[test]
+    fn the_window_defers_the_seal_and_never_the_acceptance() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r = a.open(Dir::Uni).expect("uni");
+        let payload = vec![9u8; 32 * 1024];
+        assert_eq!(
+            a.write(now, r, &payload).expect("write"),
+            payload.len(),
+            "ruling 134: `write()` stays a flow-control verb and the window \
+             is invisible to it"
+        );
+
+        let (sealed, _) = drain(&mut a);
+        let on_the_wire: u64 = sealed.iter().map(|d| d.len() as u64).sum();
+        assert!(
+            on_the_wire < payload.len() as u64,
+            "…and yet the window held most of it back"
+        );
+        assert_eq!(
+            on_the_wire,
+            a.bytes_in_flight(),
+            "ruling 136: what is in flight is what went on the wire, in \
+             datagram units"
+        );
+        assert!(
+            on_the_wire <= a.congestion_window(),
+            "§14.5: bytes_in_flight + candidate_size <= cwnd"
+        );
+        assert!(
+            on_the_wire + constants::MAX_DATAGRAM as u64 > a.congestion_window(),
+            "…and one more full datagram would not have fitted, so the gate \
+             really was what stopped the fill"
+        );
+
+        // The peer acknowledges, the window re-opens, and the rest follows
+        // with no further application involvement — the property the gate
+        // exists to provide.
+        let mut clock = now;
+        for _ in 0..64 {
+            let _ = exchange(&mut a, &mut b, clock);
+            if a.bytes_in_flight() == 0 {
+                break;
+            }
+            // §12.4 holds the odd packet's ACK on `AckDelay`; step to it.
+            clock += constants::MAX_ACK_DELAY;
+            a.handle_timeout(clock);
+            b.handle_timeout(clock);
+        }
+        assert_eq!(a.bytes_in_flight(), 0, "everything was acknowledged");
+
+        let claimed = b.accept(Dir::Uni).expect("the stream arrived");
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        while let Ok(Some(n)) = b.read(clock, claimed, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload, "every accepted byte was eventually sealed");
+    }
+
+    /// §16.2's snapshot settles on **acknowledgement**, not on writing.
+    ///
+    /// A build whose snapshot is "all streams' current offsets, re-read at
+    /// each poll" never terminates under a writer loop, and one that settles
+    /// at `write()` settles before the bytes have left.
+    #[test]
+    fn a_snapshot_settles_only_once_its_bytes_are_acknowledged() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        assert!(
+            a.snapshot_settled(&a.ack_snapshot()),
+            "§16.2: a connection with nothing written is settled at once"
+        );
+
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, &vec![3u8; 4_000]).expect("write");
+        a.flush(now);
+        let snap = a.ack_snapshot();
+        assert!(
+            !a.snapshot_settled(&snap),
+            "the bytes are in flight, not acknowledged"
+        );
+
+        // Bytes written *after* the call do not extend the snapshot (§16.2),
+        // so this second write must not keep it from settling.
+        a.write(now, r, &vec![4u8; 4_000]).expect("write");
+        a.flush(now);
+        let _ = exchange(&mut a, &mut b, now);
+        assert!(
+            a.snapshot_settled(&snap),
+            "§16.2: the snapshot covers what was handed over at the call"
         );
     }
 

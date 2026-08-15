@@ -212,10 +212,17 @@ impl SendHalf {
     /// Buffer as much of `data` as both credit levels allow.
     ///
     /// `conn_room` is the connection-level headroom the caller read off the
-    /// ledger — **slice 5's congestion seam (SPEC §14, ruling 130)**: "how
-    /// many bytes may I send right now" has
-    /// exactly one call site, so slice 5's congestion window inserts a
-    /// second bound there and not here.
+    /// ledger, and it is the **only** bound on acceptance.
+    ///
+    /// **[RATIFIED 2026/08/16 — ruling 134]** §14's congestion window does
+    /// **not** appear here, and this comment used to predict that it would.
+    /// `write()` accepts bytes the window cannot yet send: the window defers
+    /// the *seal*, never the acceptance, so `write()` stays a flow-control
+    /// verb and §10.6's credit remains the buffer's whole bound. The
+    /// alternative would have the shell's writer park on *window room*, a
+    /// condition no `ConnEvent` announces — `StreamWritable` is
+    /// credit-driven — so it would owe a new event, a new waker map and a
+    /// new wakeup path that no section describes.
     pub(crate) fn write(&mut self, data: &[u8], conn_room: u64) -> Result<usize, WriteError> {
         if self.fin || self.reset.is_some() {
             return Err(WriteError::Finished);
@@ -441,6 +448,26 @@ impl SendHalf {
         if fin {
             self.fin_sent = false;
         }
+    }
+
+    /// §16.2's settled test for one snapshot offset: is every byte below
+    /// `offset` acknowledged, **or abandoned by a reset**?
+    ///
+    /// §16.2 puts the reset arm in terms: *"or abandoned by a reset (§9.6:
+    /// an abandoned byte is never acknowledged, and waiting on one would
+    /// never terminate)"*. Without it `acked()` hangs for ever on a stream
+    /// the application reset.
+    ///
+    /// `offset == 0` is settled vacuously — the stream was opened and never
+    /// written, so nothing was handed to the connection.
+    ///
+    /// **The FIN is deliberately not part of this.** §16.2 scopes the
+    /// connection-level snapshot to *"every byte handed to the
+    /// connection"*; a snapshot that also waited for a FIN would never
+    /// terminate on a stream the application intends to keep open.
+    /// `SendStream::acked()` is the verb that includes the FIN.
+    pub(crate) fn settled_to(&self, offset: u64) -> bool {
+        self.reset.is_some() || offset == 0 || self.acked.covers(0..offset)
     }
 
     /// §9.6's RESET_STREAM acknowledged — `ResetRecvd`.

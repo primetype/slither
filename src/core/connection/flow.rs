@@ -227,6 +227,12 @@ impl Flow {
     // ── connection-level send ───────────────────────────────────────────
 
     /// How many more bytes we may queue at the connection level right now.
+    ///
+    /// **This is a byte ledger and §14.5's admission gate is not part of
+    /// it.** The gate is a per-packet **datagram-size** test evaluated in
+    /// `pump()` (§14.5, ruling 134); folding a packet-level bound into a
+    /// byte-level one is how a build ends up refusing bytes the peer's
+    /// credit admits.
     pub(crate) fn send_room(&self) -> u64 {
         self.send_max_data.saturating_sub(self.send_charged)
     }
