@@ -279,18 +279,22 @@ code compiles, but when its stories are paused-clock tests that pass.
 | 0 | **Ground** | branch + skeleton, `constants.rs`, `error.rs`, `varint.rs`, `Wire` + `UdpSocket` impl, `testutil` (`Network`, `FlakyWire`, `FlakyPolicy`, counting identity), the two-endpoint paused-clock fixture | — (closes S24's attestation gap) |
 | 1 | **Packets & the gate** | §2 suite decl, §3 headers via packtool, §3.5 sizes, §4 mac1, the length/type/version silent-drop gate (§3.1, exact for handshakes per ruling 65). `PROLOGUE` is *declared* here but only *binds* in slice 2: §5.1 folds it into the Noise transcript, so a mismatch fails the handshake **cryptographically** and is never a silent drop. **Golden-wire vectors land here** — 174/81/196/107 pinned as byte tests before any code can move them | S22 (partial) |
 | 2 | **Handshake & the ladder** | §5 driving (5 s + jitter, give-up 90 s), §6.1–6.3 typestate + intro queue, §17.1 guard, §17.2–17.4 tables, shell `Endpoint`/`Connecting`/staged handles | S2, S6, S7, S8, S9, S10, S21, S22, S29 |
-| 3 | **The walking skeleton** | §7.1–7.2 counter + replay window, §7.7 ratchet, §7.9, §8 frame codec with CLOSE/PING/ACK only, §15 CLOSE + teardown matrix, §16.4 poll contract on both cores, §16.5 timer table, §16.7 plan-seal-commit, the driver, `closed()` | S1, S23, S26, S27 (`closed()` half) |
+| 3a | **The connection core** *(cut 2026/08/15, round 12)* | §7.1–7.2 counter + replay window, **§7.4's liveness half** — the two seal paths, the arming rule, the install pin, the `Liveness` timer (moved from slice 7; §15.2 seals CLOSE with `seal_quiet`), §7.7 ratchet, §7.8–7.9, §8 frame codec with **PADDING/PING/ACK/CLOSE** (four, not three: PADDING is `0x00` in §8.3's ratified table and an unknown type is a `PROTOCOL_VIOLATION` kill), §15 CLOSE + the three post-mortem states + the code registry, §16.4 poll contract on `core::Connection`, §16.5 connection timers + equal-deadline order, §16.7 plan-seal-commit | S23, plus a named **S1 precursor** at core level |
+| 3b | **The shell** | the driver, **slice 2b's deferred `Endpoint`/`Connecting`/staged handles**, the `Connection` handle + `closed()` + the four accessors, ruling 53's two mechanisms, §16.2/§16.3/§16.8/§16.9/§16.10, ruling 49's `slither::io` trace | S1, S2, S26, S27 (`closed()` half), S29 |
 | 4 | **Streams** | §9.1–9.7 ids, implicit open, both halves, RESET_STREAM, GC; §10 flow control; §16.9 early sends + id-at-establishment | S12 (lossless), S13, S14, S17 |
 | 5 | **Reliability** | §12 ACK fused to the replay window + delayed ACK, §13 RFC 9002 (reuse v0.1 arithmetic), §14 NewReno, ruling 47's `acked()` / `flush()` | S12 (full, over `FlakyWire`), S28 |
 | 6 | **Sugar** | §9.8 messages + `MESSAGE_OVERFLOW` + the guarded overflow check, §11 datagrams + drop-oldest + counters | S15, S16, S30 |
-| 7 | **Mobility & contest** | §7.3 roaming + amplification budget, §7.4 liveness / `seal_quiet`, §7.5 keepalive + persistent keepalive + the contested probe, §5.4 / §6.4 / §6.6–6.8 replacement + tie-break + restart, `notified()` + `Notification` | S3, S4, S5, S11, S18, S19, S20, S27 (full) |
+| 7 | **Mobility & contest** | §7.3 roaming + amplification budget, §7.5 keepalive + persistent keepalive + the contested probe *(§7.4's liveness half moved to 3a — round 12)*, §5.4 / §6.4 / §6.6–6.8 replacement + tie-break + restart, `notified()` + `Notification` | S3, S4, S5, S11, S18, S19, S20, S27 (full) |
 | 8 | **Composability** | all of §3 above: `compat/{io,stream,codec,tower}.rs`, `BiStream`, the `io::Error` conversions, the no-prefetch pin | S25, and S31–S33 (drafted, §7) |
 | 9 | **Ship** | the five documentation obligations, Appendix B complete, all eight gates, MSRV 1.96, `cargo deny`, rustdoc `-D warnings`, bubble-engine cutover | — |
 
-**Slices 0–3 are the spine and 3 is the risk.** It is the first slice
-where both cores, the driver, and the handle seam exist together, and it
+**Slices 0–3 are the spine and 3b is the risk.** It is the slice where
+both cores, the driver, and the handle seam first exist together, and it
 is the layer three protocol-focused reviews never examined. Slices 4–7
-all build on it. Hence §5.
+all build on it. Hence §5. *(Round 12 cut slice 3 in two and the risk
+did not divide evenly with it: 3a is a sans-io state machine of the kind
+this project has already built twice, while every one of the seam
+review's five chartered targets is 3b's.)*
 
 Rough sizing, implementation plus tests, for planning only: slices 0–1
 ≈ 2k lines, slice 2 ≈ 3k, slice 3 ≈ 3k, slice 4 ≈ 3k, slice 5 ≈ 3k,
@@ -307,10 +311,13 @@ has survived every attack, and every recent defect has lived at the
 boundary where an application meets the transport.** The plan spends its
 review budget accordingly.
 
-- **After slice 3 — a seam review, before slices 4–7 build on it.**
+- **After slice 3b — a seam review, before slices 4–7 build on it.**
   Targets: the poll contract's drain discipline, `Retired` ordering,
   waker registration under `RefCell`, cancel-safety of every `async fn`,
   drop order across handles. Not a protocol review; those have been done.
+  *(Moved from "after slice 3" by round 12's cut: all five targets are
+  3b's, and reviewing them after a combined ~4 k-line slice would make
+  the frame codec, the replay window and the ratchet noise to carry.)*
 - **After slice 7 — an adversarial protocol review** of roaming,
   liveness and the contested probe against `FlakyWire` policies. This is
   where round 5's blocker lived and it is the densest state in the spec.

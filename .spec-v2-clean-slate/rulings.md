@@ -1079,6 +1079,15 @@ prose-derived values agree: 65, 0x07, 2, 2, 9/8, 64, 12 000, 2 400, 1 s,
 transcription is right, since a single reader checking their own work
 proves nothing.
 
+---
+
+## Round 11 — slices 1 and 2a (2026/08/14)
+
+*Header added 2026/08/15. Rulings 64–80 were appended under round 10's
+heading as they were made and the file lost its round boundary; the
+content below is unchanged. 64–67 came out of slice 1 (the wire, frozen
+by them); 68–80 out of slice 2a (the handshake and the staged ladder).*
+
 **Ruling 64 — the packet header is little-endian.** §3.1 said "all
 multi-byte header fields are big-endian" through every draft from v1
 onward. `grep -n -i endian` over `rulings.md` returns **nothing**: across
@@ -1537,3 +1546,111 @@ elsewhere. D5 had already found the block schematic in a second way (the
 output types must be generic over the suite). An API listing in a
 specification is the place where working rule 8 bites hardest: it looks
 exhaustive, it looks literal, and it is routinely neither.
+
+---
+
+## Round 12 — slice 3 planning (2026/08/15)
+
+Two rulings and three plan decisions, from the slice-3 planner's ten
+candidate rulings and five reported conflicts. The planner resolved none
+of them, which is the discipline working: every conflict below is stated
+with both sides.
+
+**Ruling 81 — `Retired` fires when the connection's state is dropped, not
+when its death is announced.** §16.4 said "every terminal `ConnOutput` —
+a `Closed(ConnectionLost)` event, **or** the completion of the close
+linger — is followed **within the same drain** by
+`ToEndpoint::Retired`", and `Retired`'s own contract is "drop the index
+route (**MUST**)". §15.2 needs that route **alive** for `CLOSE_LINGER`:
+the closing state replies to an authenticated, window-fresh inbound
+packet, and receiving requires the `receiver_index → Connection` route.
+Read literally, then, `close()` emits `Closed(LocallyClosed)`, `Retired`
+follows in the same drain, the route dies, and the linger is unreachable
+— **deleting what §15.2 calls "CLOSE's only reliability mechanism."**
+
+The amendment separates the two moments. `Closed(_)` is emitted at the
+death, so `close()` and `closed()` resolve when §16.2 promises rather
+than five seconds later; `Retired` follows the `CloseLinger` expiry on
+the closing and draining paths, and the `Closed` event within the same
+drain on every path that has no post-mortem — liveness, nonce
+exhaustion, `Replaced`, any teardown before a session exists.
+
+*Working rule 3's shape for the fourth time.* §15.2's prose makes a
+substantive protocol claim; §16.4's "within the same drain" is the
+code-like rule; the prose held the intent. The planner reported it
+rather than picking, and was right to.
+
+*What made it hard to see* is worth recording, because it is working
+rule 8 again from an unusual angle: §16.4's apposition is **already
+imprecise on its own terms** — "the completion of the close linger" is
+not a `ConnOutput`, and no such variant exists. A list that enumerates
+one thing of the stated type and one thing of a different type is
+signalling that its scope was never worked out, and six reviews read
+past it.
+
+*Carry.* Slice 2a's core reuses `ToEndpoint::Retired` as S29's
+cancellation signal — recorded there as a plan derivation, **not** a
+ratified rule (`.slices/02-handshake/OPEN-QUESTIONS.md`). `Retired`
+therefore carries two meanings today, and this ruling moves one of them.
+Slice 3b must either separate them or state why one variant is right for
+both.
+
+**Ruling 82 — the epoch size is config-supplied for tests.** S23 pins
+§7.7's ratchet at its 65 536-message boundary, and that boundary is
+otherwise unreachable in a test: crossing it honestly costs ≈ 131 k AEAD
+operations, and the counter setter that would shortcut it is
+`#[cfg(test)]` **inside hiss**, so no consumer can reach it. A
+configurable epoch pins the boundary *behaviour* while a separate
+constant test pins the *value* — independently, which is the stronger
+arrangement, because one test crossing a real boundary would pass just
+as well against a wrong constant.
+
+The schedule is security-relevant (it bounds how much traffic one key
+seals), so this carries **§16.6's test-only rule verbatim** rather than
+inventing a second policy: production uses `REKEY_EPOCH_MSGS`, and a
+build accepting a caller-chosen epoch must be feature-gated or
+documented as such. §16.6 ruled the identical shape for the RNG seed,
+which is why this is a precedent applied rather than a new judgement.
+
+### Plan decisions (no wire byte, no spec text)
+
+**Slice 3 is cut into 3a and 3b.** 3a is the connection core (§7.1–7.2,
+§7.7–7.9, the frame codec, §15's CLOSE and post-mortem states, §16.4's
+poll contract, §16.5's connection timers, §16.7); 3b is the shell (the
+driver, slice 2b's deferred `Endpoint`/`Connecting`/staged handles, the
+`Connection` handle, `closed()`, §16.2/§16.3/§16.8/§16.9/§16.10). The
+post-slice-3 seam review moves to after **3b** — all five of its
+chartered targets live there.
+
+The argument is mechanical, not aesthetic. **Working rule 6's
+test-author/implementer split cannot work across the combined slice**:
+3b's story tests must compile against a public shell API that does not
+exist when a combined slice starts, so either the test author blocks on
+the implementer or both are handed one API sketch — which is exactly the
+"one author making both wrong in a mutually consistent way" that rule 6
+exists to prevent. After the cut, 3a's surface is frozen and green
+before 3b's test author starts.
+
+*The cost, stated rather than dressed up:* 3a closes exactly one story
+(S23) and S1 — the maintainer's #1 — stays open through it. 3a closes a
+named **S1 precursor** at the core level instead, and it must be named a
+precursor: a name is not a pin (working rule 9), and calling it S1 would
+let 3b ship without the story test S1 actually asks for.
+
+**§7.4's liveness half moves from slice 7 into 3a.** §15.2 seals CLOSE
+with `seal_quiet`, which is §7.4's, which `PLAN.md` gave to slice 7 —
+so slice 3 could not build its own headline frame as specified. Moving
+the two seal paths, the death-clock arming rule, the install pin and the
+`Liveness` timer costs ≈ 60 lines and makes five stranded obligations
+reachable (§6.7, §17.1, §15.4's endpoint-dropped row, and Appendix B's
+S29 and `closed()` obligations). §7.5's keepalive, persistent keepalive
+and contested probe stay in slice 7. A plan/spec boundary error, settled
+by moving the boundary.
+
+**Slice 3a implements four frames, not three.** `PLAN.md`'s slice table
+said "§8 frame codec with CLOSE/PING/ACK only", but PADDING is `0x00` in
+§8.3's ratified table and §8.3 makes an unrecognised type "a structural
+failure — CLOSE with `PROTOCOL_VIOLATION`". Three frames would therefore
+**kill a connection on a legal packet**. PADDING lands in 3a, together
+with §3.4's empty-plaintext keepalive short-circuit. Not a spec question
+— the plan under-specified its own scope.

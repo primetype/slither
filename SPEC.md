@@ -2511,6 +2511,19 @@ is armed whether or not that sender ever marked (§7.4) — the session dies
 at `DEAD_TIMEOUT` with no epoch-specific machinery.
 **Implementations must not chase epochs.**
 
+**The epoch size is config-supplied for tests, `REKEY_EPOCH_MSGS`
+otherwise.** **[RATIFIED 2026/08/15 — ruling 82]** The boundary is
+otherwise unreachable in a test: it takes 65 536 seals to cross, and the
+counter setter that would shortcut it is `#[cfg(test)]` **inside hiss**,
+so no consumer can reach it. A configurable epoch therefore pins the
+boundary *behaviour* and a separate constant test pins the *value* —
+independently, which is the stronger arrangement, since a single test
+crossing a real boundary would pass just as well against a wrong
+constant. The schedule is security-relevant (it bounds how much traffic
+one key seals), so this carries **§16.6's test-only rule verbatim**: a
+production endpoint uses `REKEY_EPOCH_MSGS`, and a build that accepts a
+caller-chosen epoch must be feature-gated or documented as such.
+
 ### 7.8 One session per connection — nothing survives a handshake
 
 A connection has **exactly one session** for its whole life (§5.4). No
@@ -4519,13 +4532,29 @@ enum ToEndpoint {
   resolves `Connecting` with `Err(ConnectError::TimedOut)` and drops the
   never-established pending core. `handle_endpoint_event` carries
   `Install` only.
-- **`Retired` is a MUST**: every terminal `ConnOutput` — a
-  `Closed(ConnectionLost)` event, or the completion of the close linger —
-  is followed **within the same drain** by `ToEndpoint::Retired`, and the
-  shell delivers it to `handle_connection_event` **before** releasing the
-  connection's shell-side bookkeeping (else the index route and the
-  guard-entry pin leak for the endpoint's life). The
-  all-handles-dropped case is exempt (the driver simply stops).
+- **`Retired` is a MUST**, and it fires when the connection's state is
+  **actually dropped** — not when its death is announced.
+  **[AMENDED 2026/08/15 — ruling 81]** The two moments coincide on every
+  path with no post-mortem and are `CLOSE_LINGER` apart on every path
+  with one:
+  - **No linger** — liveness (§7.4), nonce exhaustion (§7.9),
+    `Replaced` (§5.4), or any teardown before a session exists:
+    `Closed(ConnectionLost)` is followed **within the same drain** by
+    `ToEndpoint::Retired`.
+  - **Closing or draining** (§15.2): `Closed(ConnectionLost)` is emitted
+    **at the death**, so `close()` and `closed()` resolve when §16.2 says
+    they do rather than five seconds later; `Retired` follows the
+    **`CloseLinger` expiry**. The linger must keep *receiving* — its
+    reply is owed only to an authenticated, window-fresh inbound packet,
+    and that reply rule is "CLOSE's only reliability mechanism" (§15.2) —
+    while `Retired` drops the `receiver_index` route that receiving
+    needs. Emitting it at the death would delete the mechanism.
+
+  In both cases the shell delivers `Retired` to
+  `handle_connection_event` **before** releasing the connection's
+  shell-side bookkeeping (else the index route and the guard-entry pin
+  leak for the endpoint's life). The all-handles-dropped case is exempt
+  (the driver simply stops).
 - **`Timeout(None)`** = drained and no deadline armed; `Timeout(Some(d))`
   = drained, next deadline `d`. Identical semantics for both cores.
 - **Output ordering within one drain preserves generation order** — a
