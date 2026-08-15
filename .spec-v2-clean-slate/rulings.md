@@ -1811,3 +1811,78 @@ hiss's `Eq` on it is deliberately **not** constant-time, documented as
 acceptable because the value is public. slither re-exports that property
 along with the type, and must say so where an application might reach
 for it to compare something secret.
+
+---
+
+## Round 15 — the seam review (2026/08/15)
+
+The review `PLAN.md` §5 chartered after slice 3b, run by two agents blind
+to each other on different models. **They disagreed on fact twice, and
+the disagreement is the most useful thing the review produced** — each
+time, the reviewer who was wrong had verified a *true* property that did
+not bear on the question. Recorded in full because the pattern will
+recur:
+
+- **C-B1.** Sonnet traced `core::Endpoint::accept()`'s
+  `statics.get(&peer_key).is_some()` guard and concluded the shell's
+  static-map mirror cannot diverge. The guard is real. It does not fire
+  in the interleaving that matters: when `AcceptChain` is processed
+  **first**, the core's own map is still empty for that peer.
+- **`deadline()`.** Sonnet verified `poll_output()` is idempotent *at*
+  `Timeout` — true — but never asked whether the cores **are** at
+  `Timeout` when `deadline()` runs. `transmit().await` is a yield point.
+
+*The general form:* **a verification is only as good as its
+applicability, and a true lemma about the wrong state proves nothing.**
+Two reviewers were worth their cost precisely here; one reviewer, either
+one, would have shipped a wrong verdict with a clean argument attached.
+
+**Ruling 90 — `core::Endpoint::connect()` splits into `mint_pending` and
+`start_attempt`, in slice 4.** Ruling 87 settled that the shell's
+`connect()` is synchronous, and justified it with "`connect()` performs
+no DH — §6.1's initiator costs are paid when msg1 is built". **That
+sentence describes a core factoring that does not exist**: slice 3a's
+`core::Endpoint::connect()` mints the pending *and* builds msg1, two DH,
+in one call. The ruling's conclusion survives — the shell routes the
+call through the driver, so the DH still lands there — but the price is
+a **shell-side mirror of the static map**, a second record of "one
+connection per static", which is a security invariant.
+
+The mirror is *correct* as built: it is an admission test, not an
+authority, and the core refuses anything it wrongly admits. It was
+nonetheless the root of the review's worst finding, because the shell
+had asserted the two maps could not disagree.
+
+Splitting the core verb deletes the mirror. `mint_pending` costs no DH,
+so the shell may call it synchronously and read the core's own map;
+`start_attempt` builds msg1 on the driver, where §6.2 requires it.
+**Scheduled for slice 4 rather than done now**: the current code is
+correct and freshly reviewed, slice 4 opens the connection core anyway,
+and re-opening a just-reviewed slice to remove a wart that is not a bug
+trades real risk for tidiness.
+
+*The lesson is about how I check my own rulings, and it is worth more
+than the ruling.* Ruling 87's rationale was verified against the **spec**
+and not against the **code**; ruling 89's was verified against **hiss**
+(`DatagramSend::session_id` is real) and not against **slither's own
+abstraction** (`Handshake::Seal` is an associated type with no bounds, so
+the method was unreachable and had to be added). Two rulings, one day
+apart, both right in conclusion and both carrying a rationale that named
+a mechanism that was not there. *A ruling's rationale is not reviewed by
+the act of ratifying its rule* — recorded once already, at ruling 64,
+about someone else's rationale. This is the same defect in mine.
+
+**Findings fixed at `9a26c15`**, each verified by executing its mutation
+rather than by argument: the false assertion (deleted — the divergence it
+forbade is legitimate and the `Err` branch beneath it was already S3a's
+answer); a panicking driver freezing the endpoint silently while the
+`LocalSet` swallowed the panic and the harness printed `ok`; `Driver::
+waiting` growing 132.3 bytes per cancelled `accept()` forever; and
+`deadline()` destroying a queued `Transmit`, a **silent CLOSE loss**.
+
+*Two of those four were unreachable from all 451 existing tests by
+construction*, and the reason is worth keeping: **`FlakyWire` models
+everything a network does and nothing a socket does.** A fabric that can
+lose, delay, duplicate and reorder cannot express "this send fails" or
+"this driver panics". The test suite's coverage was bounded by the
+fixture's imagination, not by the authors'.
