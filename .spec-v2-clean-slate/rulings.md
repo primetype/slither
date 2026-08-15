@@ -1366,3 +1366,72 @@ true of ruling 64's "two things this rule does not reach" (there were
 three) and of §2.3's `TAG` sitting beside `PK` as though both varied. **A
 list that is not exhaustive must say so**, because a reader cannot
 distinguish an omission from a decision.
+
+**Rulings 72–76 — slice 2a's queue, walked one at a time.** All five came
+out of agents refusing to resolve what the spec left open, and four are
+CLAUDE.md working rule 8's shape.
+
+**Ruling 72 — `IntroError::Local` and `ConnectError::Local`.** `Identity::
+open()` is fallible and §18.1 could not say "our own key hardware failed",
+so a locked enclave and a peer's unreadable msg1 both reported
+`Malformed`. The defect is **misattribution, not coarseness**: the two are
+opposite in every way that matters — one is the peer's fault and final,
+the other is ours and transient — and an application told the peer sent
+garbage may reasonably stop retrying, denylist, or alert, over a condition
+S21 treats as *expected*. It is §18.2's recurring shape a third time: the
+party who can fix the problem is handed evidence pointing elsewhere.
+Notably **the implementation already drew the distinction correctly** —
+hiss failure discards the chain, provider failure leaves it parked — and
+could not express it, which is what made this an error-taxonomy defect
+rather than a logic one. §18.1's closure exists to stop variants accreting
+*after release*; nothing has shipped, so the amendment is free now and a
+breaking change later.
+
+**Ruling 73 — orphan aging runs from pin release.** Ruling 70 named
+`TS_GUARD_ORPHAN_TTL` and did not notice the interval had two possible
+origins: the same defect one level down, **inside the fix for it**. Three
+readings converged on release, one of them *against its own
+implementation* — the implementer had built last-admission and wrote that
+the test author's textual case was better, since §17.1 defines an orphan
+as a dead-connection entry and an entry cannot age as an orphan before it
+is one. The fidelity reviewer supplied the consequence, and it is a
+security one: under last-admission a connection outliving the TTL carries
+`last_admitted` frozen at accept time, so at retirement the entry is
+already past its deadline and dies with **no orphan window at all** —
+deleting replay protection for the longest-lived connections at exactly
+the moment a captured initiation becomes replayable.
+
+**Rulings 74 and 75 — the core's verbs are idempotent and order-tolerant.**
+§16.4's verbs take `&mut self` and an `IntroId`, so unlike §6.2's
+`self`-consuming handles they can be called twice or out of order; the
+handle typestate makes both unreachable from an application, so these are
+robustness rules for the core alone. Both are resolved **in the direction
+that cannot perturb §6.1's ladder**: a repeat `read_identity()` returns
+the cached static at 0 DH without opening a provider, and `authenticate()`
+on a still-parked chain drives the skipped `es` to land on exactly 2
+cumulative. Because §6.1 prices *cumulatively*, the permissive answer
+costs precisely the ratified amount — the error variants the strict
+readings would have needed buy nothing and would have enlarged a taxonomy
+already being amended once.
+
+**Ruling 76 — §16.5's equal-deadline list is exhaustive, under a stated
+principle.** It ordered exactly one endpoint pair while **§16.4 declares
+generation order normative** — so the omission did not leave the other
+pairs free, it made §16.4's claim hollow wherever two timers collide.
+Mutation testing had already found the practical consequence: reversing
+the one specified pair is undetected, and cannot be forced by any test
+without controlling the jitter draw. Now governed by a principle rather
+than a list of instances — **a terminal outcome precedes a routine one,
+and state removal precedes emission** — giving give-up, intro expiry,
+orphan aging, retransmit, with the pre-existing rule as an instance of it.
+
+*Two observations from walking these five.* First, **ruling 73 dissolved
+part of ruling 76's problem before it was ruled**: with aging starting at
+release, a give-up that unpins an entry grants it a fresh window instead
+of exposing an expired one, so orphan-aging and give-up stopped
+interacting. Ordering questions can be answered by removing the
+interaction rather than by picking a winner. Second, three of these five
+were resolved *as already built* — the value of asking was not that the
+code changed but that the behaviour stopped being an accident. An
+unstated rule that happens to be implemented correctly is still unstated,
+and the next implementer gets no help from it.

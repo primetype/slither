@@ -1055,6 +1055,29 @@ The table prices `accept()`'s fast path; a **re-homed** `accept()` (§6.4)
 adds the admitted candidate's `es` + `ss` on top of the 4 — an
 application-driven spend.
 
+**[RATIFIED 2026/08/15 — rulings 74 and 75]** The core's verbs (§16.4)
+are keyed by `IntroId` and take `&mut self`, so unlike §6.2's
+`self`-consuming handles they **can** be called out of order or twice.
+The handle typestate makes both unreachable from an application; these
+rules are the core's, and they are chosen so that **no route can perturb
+the cumulative cost above**:
+
+- **`read_identity()` is idempotent.** A second call on an already
+  `Claimed` or `Proven` chain returns the revealed static and pays **0
+  DH** — it opens no provider. The ladder therefore holds under any number
+  of calls (ruling 74).
+- **`authenticate()` advances a still-parked chain**, driving the skipped
+  `es` itself and landing on exactly **2 DH cumulative**. §6.1 prices
+  stages cumulatively, so the permissive answer costs precisely the
+  ratified amount and no error need be invented (ruling 75).
+- **A structurally unreadable msg1 discards the chain.** `read_identity()`
+  returning `IntroError::Malformed` is definitive — 1 DH is spent, the
+  entry is destroyed, and its stage-0 slot is freed. This is what
+  distinguishes it from `IntroError::Local` (§18.1, ruling 72), where
+  *our own* provider failed, the chain is **left parked**, and a retry can
+  still succeed. Retaining a malformed chain would hand an attacker a
+  per-source slot for the price of unreadable bytes.
+
 Dropping the object at any stage is a **silent reject**: no msg2, nothing
 transmitted, the slot freed. The claimed static at `Claimed` is
 attacker-choosable (reaching it requires no secret), and the same
@@ -4538,8 +4561,17 @@ enum ToEndpoint {
 - **`handle_timeout` is idempotent**: each due timer is stopped before its
   logic runs, so spurious or repeated calls no-op. For `Loss`/`Pto` the
   idempotency additionally rests on synchronous sealing (§16.7).
-- **Equal-deadline priorities** (normative): give-up beats a same-instant
-  retransmit; per connection, loss detection beats PTO and exactly one of
+- **Equal-deadline priorities** (normative). **[RATIFIED 2026/08/15 —
+  ruling 76]** This list is **exhaustive**: every pair of deadlines that
+  can fall on one instant is ordered here, because §16.4 makes generation
+  order normative and an unordered pair would make that claim hollow
+  exactly where two timers collide. The governing principle, from which
+  the endpoint's cases follow: **a terminal outcome precedes a routine
+  one, and state removal precedes emission.** At the endpoint that gives,
+  in order — (1) handshake **give-up**, (2) **intro expiry**, (3)
+  **guard-orphan aging**, (4) **retransmit**. Give-up beating a
+  same-instant retransmit is an instance of the principle rather than a
+  special case. Per connection, loss detection beats PTO and exactly one of
   the two fires per evaluation; teardown collection (liveness,
   `CloseLinger` expiry, then `Contested`) precedes keepalive
   evaluation — a session already collected for teardown owes no
@@ -4816,6 +4848,18 @@ accepted (§6.4).
   entries by authenticating and dropping — every one of them costs a
   genuine tie-break admission or a genuine authenticated winner-side
   drop, both of which require the peer's key.
+**[RATIFIED 2026/08/15 — ruling 73]** An orphan's `TS_GUARD_ORPHAN_TTL`
+runs from the instant its **last pin is released**, not from its last
+successful admission. §17.1 defines an orphan as a *dead-connection*
+entry, so an entry cannot age **as an orphan** before it is one. Under
+last-admission a connection outliving the TTL has `last_admitted` frozen
+at accept time, so the moment it retires the entry is **already past its
+deadline** and dies at the next sweep with **no orphan window at all** —
+deleting the guard's replay protection precisely for the connections that
+held it longest, and precisely when a captured initiation could be
+replayed. Mitigation (iii) is untouched: LRU **recency** remains
+admission-only; it is the **aging clock** that starts at release.
+
 - All other entries (orphans — dead connections) live in a bounded LRU
   with timer aging:
 
@@ -5001,21 +5045,40 @@ exactly once; `Superseded` appears nowhere (§6.3), and
 `accept()` is a replacement (§6.4), so the variant is unreachable and
 deleted.
 
-- **`ConnectError::{AlreadyConnected, TimedOut}`** —
+- **`ConnectError::{AlreadyConnected, TimedOut, Local}`** —
   `AlreadyConnected`: §16.1 — returned by `connect()` itself, and also
   the resolution of an in-flight `Connecting` cancelled by a racing
   `accept()` on the same proven static when §6.7's comparison makes us
   the tie-break **loser** (§6.4's PENDING branch; as tie-break winner the
   `Connecting` is untouched and the `accept()` reports `Stale` instead);
   `TimedOut`: initial-connect give-up at
-  `HANDSHAKE_GIVEUP` (§5.5).
-- **`IntroError::{Expired, Internal, Malformed, EndpointDropped}`** —
+  `HANDSHAKE_GIVEUP` (§5.5); **`Local`** **[RATIFIED 2026/08/15 — ruling
+  72]**: *our own* `Identity::open()` failed — a locked or
+  biometrics-gated enclave, a hardware fault, a provider that is
+  momentarily unavailable. See the note below.
+- **`IntroError::{Expired, Internal, Malformed, Local, EndpointDropped}`** —
   `Expired`: the parked entry outlived `INTRO_TTL` (§6.3); `Internal`:
   the §6.5 interception — the initiation belonged to a pending outbound
   remote (a simultaneous open) and
   was consumed by the endpoint; the application learns no identity;
-  `Malformed`: the msg1 read fails structurally; `EndpointDropped`: the
-  driver stopped mid round-trip.
+  `Malformed`: the msg1 read fails structurally — **the peer's bytes are
+  at fault, and the chain is discarded** (1 DH is spent and the verdict is
+  definitive); **`Local`** **[RATIFIED 2026/08/15 — ruling 72]**: *our own*
+  provider failed, **the chain is left parked**, and a retry can still
+  succeed; `EndpointDropped`: the driver stopped mid round-trip.
+
+  **[RATIFIED 2026/08/15 — ruling 72]** `Local` exists because the two
+  failures above are opposite in every way that matters and were
+  previously indistinguishable. A structurally unreadable msg1 is the
+  peer's fault and is final; a locked enclave is *ours* and is transient.
+  Reporting the second as `Malformed` tells an application the remote peer
+  sent garbage, and an application may reasonably act on that — stop
+  retrying, denylist, alert an operator — over a condition S21 treats as
+  **expected**, not exceptional. It is §18.2's recurring shape: the party
+  who can fix the problem is handed evidence pointing at someone else.
+  §18.1's closure exists to stop variants accreting after release; nothing
+  has shipped, so this costs nothing now and would be a breaking change
+  later.
 - **`AuthError::{Replay, HandshakeFailed, Expired, EndpointDropped}`** —
   `Replay`: the automatic guard failure (§17.1); `HandshakeFailed`: the
   tail-tag death of a forged claim — **the only variant in the staged
