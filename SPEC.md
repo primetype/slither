@@ -6125,12 +6125,12 @@ rulings).**
 | `INITIAL_MAX_DATA` | 1 048 576 B (1 MiB) | §10.2 |
 | `INITIAL_MAX_STREAM_DATA` | 262 144 B (256 KiB) | §10.2 |
 | `INITIAL_MAX_STREAMS_BIDI` / `_UNI` | 32 / 128 (cumulative) | §10.2 |
-| `STREAMS_CREDIT_BATCH` | 8 | §10.4 |
+| `STREAMS_CREDIT_BATCH` | 8 | §10.4 — **receiver policy**, not a wire constant (ruling 103) |
 | credit re-grant threshold | ½ window consumed | §10.3 |
 | `MESSAGE_RECV_MAX` | = `INITIAL_MAX_STREAM_DATA` | §9.8 |
 | `MAX_DATAGRAM_PAYLOAD` | 1169 B (= `MAX_PLAINTEXT` − 1) | §11.2 |
 | `DATAGRAM_SEND_QUEUE` / `DATAGRAM_RECV_QUEUE` | 64 / 64 (count; drop-oldest, newest always accepted; ≈ 73 KiB worst case each) | §11.3 |
-| `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream | §10.6 |
+| `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream | §10.6 — receiver policy, **externally observable** (ruling 103) |
 | `CLOSE_REASON_MAX` | 256 B | §8.4 |
 | `CLOSE_LINGER` / close-reply rate | 5 s / ≤ 1 per s | §15.1 |
 | `MAX_ACK_RANGES` | 64 | §12.2 |
