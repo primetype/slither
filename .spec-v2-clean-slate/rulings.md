@@ -1736,3 +1736,78 @@ able to take unconditionally.
 Working rule 8 exactly: a stated construction (the varint cap) with a
 list of consequences that reads as exhaustive and is not. The twelfth
 instance across four slices, and still not a wrong value.
+
+---
+
+## Round 14 — slice 3b dispatch (2026/08/15)
+
+Three rulings, all raised by the slice-3 planner and left open through
+3a because they touch only the shell. **Taken by the assistant under an
+explicit instruction to proceed without check-ins**, each recorded with
+its reasoning so reversal is a ruling rather than an excavation. None
+touches a wire byte.
+
+**Ruling 87 — `connect()` is synchronous, and ruling 53's table hid
+it.** §16.2 declares `pub fn connect(…) -> Result<Connecting,
+ConnectError>` — not `async`. Ruling 53's seam table listed `connect`
+beside `accept` and §6.2's three staged verbs under "command channel +
+oneshot reply". A oneshot cannot be read from a non-`async` function
+without blocking, and §16.8 forbids blocking on that seam.
+
+Neither text is the bug on its face, so the question is which is
+load-bearing. §16.2's signature is: an `async connect()` would make
+`timeout(d, connect(..))` ambiguous about what is being timed, and
+ruling 50's whole idiom depends on the `Connecting` being the only
+future. Ruling 53's grouping is *not* load-bearing, because its stated
+reason does not apply — §6.2 requires **DH costs** on the driver task,
+and **`connect()` performs no DH**: §6.1's initiator costs are paid when
+msg1 is built, on the driver. The verb only mints the pending.
+
+So `connect` sends its command and returns, and §16.1's NONE/PENDING/LIVE
+test "at the instant of the call" is a synchronous read of the shared
+cell §16.8 already mandates for accessors. **The second-order gain is
+the better argument**: that same synchronous read makes ruling 50's
+cancellation-ordering MUST *structural* rather than a discipline. An
+immediate redial reads the cell `Connecting::drop` just wrote, with no
+dependence on the driver being scheduled in between — which on a paused
+clock with no await between drop and redial **it is not**, and which is
+exactly why Appendix B specifies that case.
+
+*The shape, again:* a table that groups by mechanism, with one row whose
+justification does not reach every member. Working rule 8's twelfth
+instance and the third in a table.
+
+**Ruling 88 — the coincident last-handle drop transmits nothing.**
+§16.2 says dropping the last handle to a `Connection` performs
+`close(NO_ERROR, "")`, and two sentences later that dropping every
+handle kills every connection silently. Both are true because the sets
+usually differ — one connection ending while the driver lives, versus
+the process letting go of everything. They coincide when the last
+`Connection` is also the last handle in the process, and the spec did
+not say which rule wins.
+
+**§15.4's endpoint-dropped row is unconditional, and it governs.** A
+synchronous `Drop` cannot await the driver, and the driver is already
+stopping; ruling 50 takes the identical position for `Connecting` ("an
+attempt that never completed has no session to close and no wire signal
+to send"); and the peer's cost is bounded at `DEAD_TIMEOUT`, which that
+row already accepts. S26 carries a `⚠ CHECK` marking this as drop-order
+sensitive and "the opposite of the obvious guess", so it is a
+documentation obligation as much as a behaviour.
+
+**Ruling 89 — `SessionId` is hiss's, re-exported.** It appeared exactly
+twice in 5 900 lines — once in §16.2's accessor signature, once in
+ruling 53's table — and was **never defined**. hiss derives it from the
+handshake hash; both peers of a session produce the same value; hiss's
+own documentation states it is a *public* channel-binding value intended
+for out-of-band comparison. That is exactly what §16.2's accessor is
+for. A slither wrapper would add a type to be kept equal to hiss's by
+hand, for nothing. Verified reachable from the seal half slither already
+holds (`DatagramSend::session_id`, `datagram.rs:250`), so nothing need be
+captured at install.
+
+*One property must be carried into the rustdoc rather than assumed:*
+hiss's `Eq` on it is deliberately **not** constant-time, documented as
+acceptable because the value is public. slither re-exports that property
+along with the type, and must say so where an application might reach
+for it to compare something secret.

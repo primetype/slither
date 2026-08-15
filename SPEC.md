@@ -3971,9 +3971,23 @@ impl Connection {
     // accessors (synchronous shared-cell reads, §16.8):
     pub fn remote_static(&self) -> PublicKey;
     pub fn remote_address(&self) -> SocketAddr;
-    pub fn session_id(&self) -> SessionId;
+    pub fn session_id(&self) -> SessionId;   // hiss's, re-exported (ruling 89)
     pub fn is_established(&self) -> bool;
 }
+
+/// `SessionId` is **`hiss::noise::SessionId`, re-exported**, not a
+/// slither type. **[RATIFIED 2026/08/15 — ruling 89]** It appeared
+/// exactly twice in this specification and was never defined. hiss
+/// derives it from the handshake hash, both peers of a session produce
+/// the same value, and its own documentation states it is a *public*
+/// channel-binding value meant for out-of-band comparison — which is
+/// precisely what an application logs it for, and what a
+/// short-authentication-string check needs. Minting a slither wrapper
+/// would add a type that must be kept equal to hiss's by hand, for no
+/// gain. It is reachable from the seal half slither already holds
+/// (`DatagramSend::session_id`), so nothing is captured at install.
+/// Note its `Eq` is **not** constant-time, by hiss's deliberate choice;
+/// it carries no secret and must not be used to compare one.
 
 /// The application-facing notification set — deliberately **not**
 /// `core::ConnEvent` (§16.4). Non-exhaustive: a later wire line may add
@@ -4186,6 +4200,21 @@ connection level (§10.3) — an abandoned stream never wedges the
 connection window. Dropping every handle stops the driver and every
 connection dies silently — nothing transmitted (§15.4).
 
+**Where those two rules coincide, nothing is transmitted.**
+**[RATIFIED 2026/08/15 — ruling 88]** They are usually different sets:
+"the last handle to a `Connection`" is one connection ending while other
+handles keep the driver alive, and "every handle" is the process letting
+go of everything. Dropping the last `Connection` **when it is also the
+last handle in the process** is both at once, and §15.4's
+endpoint-dropped row governs: no CLOSE is sealed. A synchronous `Drop`
+cannot await the driver, and the driver is already stopping; ruling 50
+takes the same position for the analogous `Connecting` case ("an
+attempt that never completed has no session to close and no wire signal
+to send"), and the peer's cost is bounded at `DEAD_TIMEOUT`, which that
+row already accepts. This is S26's `⚠ CHECK` — drop-order sensitive and
+the opposite of the obvious guess — and it belongs in the rustdoc beside
+S3a's.
+
 ### 16.3 Driver and handle lifetimes
 
 The shell is **one `!Send` driver task**, spawned with
@@ -4208,13 +4237,32 @@ built. The seam is now split by what each surface costs:
 
 | Surface | Mechanism |
 |---|---|
-| Endpoint verbs — `connect`, `accept`, and §6.2's three staged verbs | command channel + oneshot reply |
+| Endpoint verbs — `accept` and §6.2's three staged verbs | command channel + oneshot reply |
+| `connect` | command channel **send only**, plus a synchronous read of the shared cell for the NONE/PENDING/LIVE test. **[AMENDED 2026/08/15 — ruling 87]** |
 | Connection data path — `write`, `read`, `open_*`, `accept_*`, `send_message`, `recv_*`, `close`, `acked`, `notified` | shared cell (`Rc<RefCell<_>>`) with the driver, plus the blocked-readers / blocked-writers waker maps of §16.8 |
 | Accessors — `remote_static`, `remote_address`, `session_id`, `is_established` | reads of that same shared cell (§16.8, unchanged) |
 
 The endpoint verbs stay round-trips because §6.2 requires the DH costs to
 land **on the driver task**, and they are rare and already `async` in
-§16.2's signatures. The data path does not: the driver is `!Send` and
+§16.2's signatures.
+
+**`connect` is the exception, and ruling 53's table originally hid it**
+by listing it beside verbs that genuinely are `async`.
+**[AMENDED 2026/08/15 — ruling 87]** §16.2 declares
+`pub fn connect(…) -> Result<Connecting, ConnectError>` — **not
+`async`** — so `ConnectError::AlreadyConnected` is returned before any
+await, and a oneshot reply cannot be read from it without blocking,
+which §16.8 forbids. Nor does it need one: **`connect()` performs no
+DH.** §6.1's initiator costs are paid when msg1 is built, on the driver;
+the verb itself only mints the pending. So it sends its command and
+returns, and the NONE/PENDING/LIVE test §16.1 requires "at the instant
+of the call" is a synchronous read of the same shared cell §16.8 already
+mandates for the accessors. Both texts are satisfied; neither signature
+changes. The synchronous cell read is also what makes ruling 50's
+cancellation-ordering MUST **structural** rather than a discipline —
+`Connecting::drop` writes the static back to NONE in that cell, so an
+immediate redial with no clock advance between them reads what the drop
+just wrote. The data path does not: the driver is `!Send` and
 single-threaded, so a shared cell costs a refcount and a borrow flag,
 there is no lock and no contention to have. **Every mutating borrow ends
 by marking the connection dirty and waking the driver**, which drains
