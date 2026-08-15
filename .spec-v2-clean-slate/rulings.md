@@ -1484,3 +1484,56 @@ reports the peer as an **attacker**, and teaches an operator to distrust
 the one variant that must stay trustworthy. `authenticate()` can meet the
 fault because ruling 75 lets it drive a skipped `read_identity()`, so the
 two rulings interact: 75 widened the path, 72 fixed only part of it.
+
+**Rulings 79–80 — the last two open items from slice 2a.**
+
+**Ruling 79 — `Local` stays a unit variant; the provider's error rides
+`slither::io`.** Ruling 72 and 78's `Local` variants say *whose* fault it
+is and not *what* it was, and the detail cannot ride the variant:
+`ConnectError`/`IntroError`/`AuthError` derive `Clone, PartialEq, Eq` and
+are asserted `Send + Sync + 'static`, while `Identity::Error` is bounded
+only `core::error::Error + 'static` — **deliberately**, because S21's
+enclave provider is `!Send`. A `Box<dyn Error + Send + Sync>` needs bounds
+`Identity` does not have; an `Arc<dyn Error>` still breaks `Eq`.
+
+Resolved by splitting the audience, which is what §18.2 has been for
+throughout: **the party who can act gets the variant, the party who
+diagnoses gets the trace.** `slither::io` already exists for exactly this
+category — ruling 49 created it for local faults "the protocol never acts
+on", recorded so a post-mortem is answerable — so the provider's error
+joins it rather than minting a sixth target. Ruling 67's bar (adding a
+target is a protocol revision) is therefore not crossed: the target count
+stays five.
+
+*This is the third time the same split has resolved a question here* —
+ruling 49 (a 25 s death must be explicable), ruling 59 (the receiver of a
+mode-conflict reset learns nothing), and now this. Worth stating as the
+general rule: **when a fault is real but the application cannot act on the
+detail, the detail is a trace, not a variant.**
+
+**Ruling 80 — §16.4's `handle_connection_event` and `reject` take
+`now: Instant`.** Both are **mutating calls**, and CLAUDE.md's
+architecture invariant — carried from §16.4 itself — is that `now` is an
+argument on *every* mutating call and the cores never read a clock. The
+ratified block gave neither one. That is not a missing convenience: under
+ruling 73 both verbs stamp `orphaned_at`, and
+`handle_connection_event(Retired)` is **precisely** the retirement path
+ruling 73's security argument is about. So the two verbs that must know
+the time were the two not given it.
+
+The applying agent was right to refuse to change the signatures unruled
+(brief rule 2: the spec wins) and right to build a watermark instead —
+`last_now` + a per-entry provisional stamp + a first-observation floor.
+Its own first attempt at that was a plain forward stamp, and an
+independent test caught it as wrong. **That subtlety is the argument for
+deleting the mechanism, not for keeping it**: four pieces of coupled state
+whose only job is to reconstruct an instant the caller already held.
+
+*The generalisation, and it is uncomfortable.* §16.4's block was ratified
+with a stated invariant it does not satisfy, and the contradiction
+survived every review because reviews read the block as a **list of
+signatures** rather than as a claim measured against a rule stated
+elsewhere. D5 had already found the block schematic in a second way (the
+output types must be generic over the suite). An API listing in a
+specification is the place where working rule 8 bites hardest: it looks
+exhaustive, it looks literal, and it is routinely neither.

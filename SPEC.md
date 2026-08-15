@@ -4372,7 +4372,7 @@ impl<I: Identity> core::Endpoint<I> {
         -> Result<(ConnectionId, core::Connection), ConnectError>;
     fn handle_datagram(&mut self, now: Instant, src: SocketAddr, datagram: &[u8]) -> Disposition;
     fn handle_timeout(&mut self, now: Instant);                        // idempotent
-    fn handle_connection_event(&mut self, id: ConnectionId, ev: ToEndpoint);
+    fn handle_connection_event(&mut self, now: Instant, id: ConnectionId, ev: ToEndpoint);  // [ruling 80]
     fn poll_output(&mut self) -> EndpointOutput;                       // drain to Timeout
     // staged verbs (§6.2), by IntroId:
     fn read_identity(&mut self, id: IntroId) -> Result<PublicKey, IntroError>;
@@ -4380,7 +4380,7 @@ impl<I: Identity> core::Endpoint<I> {
         -> Result<(PublicKey, Timestamp), AuthError>;
     fn accept(&mut self, now: Instant, id: IntroId)
         -> Result<(ConnectionId, core::Connection), AcceptError>;
-    fn reject(&mut self, id: IntroId);
+    fn reject(&mut self, now: Instant, id: IntroId);   // [ruling 80]
     // stage-0 accessors (§6.1, §6.3) — [RATIFIED 2026/08/15, ruling 71]:
     fn intro_source(&self, id: IntroId) -> Option<SocketAddr>;
     fn intro_sender_index(&self, id: IntroId) -> Option<u32>;
@@ -5184,7 +5184,7 @@ ruling 44.)
 | `slither::replay` | replay-window rejections |
 | `slither::frames` | the frame layer's violation CLOSEs (post-AEAD structural failures and semantic violations, §8.2), the **datagram queue-overflow drop counters** (§11.5), and the **message-mode overflow reset** we emit — the stream, its final size, and the mode conflict that caused it (§9.8, ruling 59) |
 | `slither::roam` | endpoint moves (§7.3) |
-| `slither::io` | `Wire::send_to` failures, against the connection whose datagram it was, with the destination address and the underlying `io::Error` — a trace obligation and nothing more: the protocol never acts on a send failure (§16.3, §7.4) |
+| `slither::io` | `Wire::send_to` failures, against the connection whose datagram it was, with the destination address and the underlying `io::Error` — a trace obligation and nothing more: the protocol never acts on a send failure (§16.3, §7.4). **[RATIFIED 2026/08/15 — ruling 79]** Also **`Identity::open()` failures**, with the provider's own error and the verb that met it, behind the `Local` variants of §18.1 (rulings 72, 78) |
 
 The targets are operator-visible contract: renaming or dropping one is a
 protocol revision.
