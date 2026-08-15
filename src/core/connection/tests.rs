@@ -444,7 +444,7 @@ fn established_at_with_epoch(now: Instant, epoch: NonZeroU64) -> Fixture {
 fn accepted_at(now: Instant) -> Fixture {
     let (session, peer) = handshake(default_epoch());
     let our_index = session.our_index;
-    let conn = Connection::established([0x5au8; 32], session);
+    let conn = Connection::established(now, [0x5au8; 32], session);
     let mut f = Fixture {
         conn,
         peer,
@@ -1506,7 +1506,7 @@ mod exhaustion {
         let mut f = established_at(t);
         let before = f.next_counter();
 
-        f.conn.fail_next_seal_for_test();
+        f.conn.fail_next_seal();
         let d = f.close(t, 0, b"bye");
 
         assert_eq!(
@@ -2654,11 +2654,19 @@ mod seal_order {
         let _ = f.close(t, 0, b"");
         assert_eq!(f.next_counter(), 1);
 
-        // Rate-capped: inside the reply interval, nothing is sent …
+        // Ruling 83: the opening CLOSE is **not** a reply, so the rate clock
+        // is still unset here and this first reply is owed immediately. It is
+        // the reply that starts the clock.
         let dgram = f.peer.seal(&padding(1));
         let d = f.feed(t + Duration::from_millis(1), &dgram);
+        assert_eq!(d.transmits().len(), 1, "the first reply is not capped");
+        assert_eq!(f.next_counter(), 2, "and it burned exactly one counter");
+
+        // Rate-capped: inside the reply interval, nothing is sent …
+        let dgram = f.peer.seal(&padding(1));
+        let d = f.feed(t + Duration::from_millis(2), &dgram);
         assert!(d.transmits().is_empty(), "capped by §15.2's 1 Hz rule");
-        assert_eq!(f.next_counter(), 1, "… and nothing is sealed");
+        assert_eq!(f.next_counter(), 2, "… and nothing is sealed");
     }
 }
 
@@ -2764,17 +2772,27 @@ mod timer_table {
     use super::*;
     use crate::core::connection::timers::{TimerKind, Timers};
 
+    /// Integration shims (see the module note). IMPL-A's table is indexed by
+    /// `TimerKind` rather than holding named fields. Every helper here
+    /// **delegates** — none reimplements a decision under test.
     fn clear(t: &mut Timers, k: TimerKind) {
-        match k {
-            TimerKind::Liveness => t.liveness = None,
-            TimerKind::CloseLinger => t.close_linger = None,
-            TimerKind::Contested => t.contested = None,
-            TimerKind::Loss => t.loss = None,
-            TimerKind::Pto => t.pto = None,
-            TimerKind::AckDelay => t.ack_delay = None,
-            TimerKind::Keepalive => t.keepalive = None,
-            TimerKind::PersistentKeepalive => t.persistent_keepalive = None,
+        t.disarm(k);
+    }
+
+    /// The same table, built from an explicit arming list.
+    fn armed(pairs: &[(TimerKind, Instant)]) -> Timers {
+        let mut t = Timers::default();
+        for (k, at) in pairs {
+            t.arm(*k, *at);
         }
+        t
+    }
+
+    /// TEST-A modelled `due()` as the single highest-priority due timer.
+    /// IMPL-A returns the whole due set **in ruling 76's order**, so its
+    /// first element is that same timer.
+    fn first_due(t: &Timers, now: Instant) -> Option<TimerKind> {
+        t.due(now).iter().next()
     }
 
     /// §16.5: *"single min-deadline out."*
@@ -2783,21 +2801,25 @@ mod timer_table {
         let t = t0();
         let mut timers = Timers::default();
         assert_eq!(timers.next(), None, "nothing armed, no deadline");
-        assert_eq!(timers.due(t), None);
+        assert_eq!(first_due(&timers, t), None);
 
-        timers.close_linger = Some(t + Duration::from_secs(5));
-        timers.liveness = Some(t + Duration::from_secs(25));
+        timers.set(TimerKind::CloseLinger, Some(t + Duration::from_secs(5)));
+        timers.set(TimerKind::Liveness, Some(t + Duration::from_secs(25)));
         assert_eq!(
             timers.next(),
             Some(t + Duration::from_secs(5)),
             "the minimum, not the first field"
         );
 
-        timers.loss = Some(t + Duration::from_secs(1));
+        timers.set(TimerKind::Loss, Some(t + Duration::from_secs(1)));
         assert_eq!(timers.next(), Some(t + Duration::from_secs(1)));
-        assert_eq!(timers.due(t), None, "nothing is due before its deadline");
         assert_eq!(
-            timers.due(t + Duration::from_secs(1)),
+            first_due(&timers, t),
+            None,
+            "nothing is due before its deadline"
+        );
+        assert_eq!(
+            first_due(&timers, t + Duration::from_secs(1)),
             Some(TimerKind::Loss)
         );
     }
@@ -2822,19 +2844,18 @@ mod timer_table {
     #[test]
     fn the_ratified_equal_deadline_order_is_a_total_order() {
         let t = t0();
-        let mut timers = Timers {
-            liveness: Some(t),
-            close_linger: Some(t),
-            contested: Some(t),
-            loss: Some(t),
-            ack_delay: Some(t),
-            keepalive: Some(t),
-            persistent_keepalive: Some(t),
-            pto: None,
-        };
+        let mut timers = armed(&[
+            (TimerKind::Liveness, t),
+            (TimerKind::CloseLinger, t),
+            (TimerKind::Contested, t),
+            (TimerKind::Loss, t),
+            (TimerKind::AckDelay, t),
+            (TimerKind::Keepalive, t),
+            (TimerKind::PersistentKeepalive, t),
+        ]);
 
         let mut order = vec![];
-        while let Some(k) = timers.due(t) {
+        while let Some(k) = first_due(&timers, t) {
             order.push(k);
             clear(&mut timers, k);
         }
@@ -2857,12 +2878,8 @@ mod timer_table {
     #[test]
     fn loss_beats_pto_at_the_same_instant() {
         let t = t0();
-        let timers = Timers {
-            loss: Some(t),
-            pto: Some(t),
-            ..Timers::default()
-        };
-        assert_eq!(timers.due(t), Some(TimerKind::Loss));
+        let timers = armed(&[(TimerKind::Loss, t), (TimerKind::Pto, t)]);
+        assert_eq!(first_due(&timers, t), Some(TimerKind::Loss));
     }
 
     /// §16.5: *"`Liveness` beating `Contested` at the same instant is the
@@ -2871,13 +2888,12 @@ mod timer_table {
     #[test]
     fn liveness_beats_contested_and_close_linger() {
         let t = t0();
-        let timers = Timers {
-            liveness: Some(t),
-            contested: Some(t),
-            close_linger: Some(t),
-            ..Timers::default()
-        };
-        assert_eq!(timers.due(t), Some(TimerKind::Liveness));
+        let timers = armed(&[
+            (TimerKind::Liveness, t),
+            (TimerKind::Contested, t),
+            (TimerKind::CloseLinger, t),
+        ]);
+        assert_eq!(first_due(&timers, t), Some(TimerKind::Liveness));
     }
 
     /// §16.5: *"teardown collection … precedes keepalive evaluation — a
@@ -2885,13 +2901,12 @@ mod timer_table {
     #[test]
     fn teardown_collection_precedes_keepalive_evaluation() {
         let t = t0();
-        let timers = Timers {
-            close_linger: Some(t),
-            keepalive: Some(t),
-            persistent_keepalive: Some(t),
-            ..Timers::default()
-        };
-        assert_eq!(timers.due(t), Some(TimerKind::CloseLinger));
+        let timers = armed(&[
+            (TimerKind::CloseLinger, t),
+            (TimerKind::Keepalive, t),
+            (TimerKind::PersistentKeepalive, t),
+        ]);
+        assert_eq!(first_due(&timers, t), Some(TimerKind::CloseLinger));
     }
 
     /// §16.5: *"`AckDelay` fires after the loss/PTO evaluation at the same
@@ -2900,19 +2915,11 @@ mod timer_table {
     #[test]
     fn ack_delay_fires_after_the_loss_evaluation() {
         let t = t0();
-        let timers = Timers {
-            ack_delay: Some(t),
-            loss: Some(t),
-            ..Timers::default()
-        };
-        assert_eq!(timers.due(t), Some(TimerKind::Loss));
+        let timers = armed(&[(TimerKind::AckDelay, t), (TimerKind::Loss, t)]);
+        assert_eq!(first_due(&timers, t), Some(TimerKind::Loss));
 
-        let timers = Timers {
-            ack_delay: Some(t),
-            pto: Some(t),
-            ..Timers::default()
-        };
-        assert_eq!(timers.due(t), Some(TimerKind::Pto));
+        let timers = armed(&[(TimerKind::AckDelay, t), (TimerKind::Pto, t)]);
+        assert_eq!(first_due(&timers, t), Some(TimerKind::Pto));
     }
 
     /// A later deadline never pre-empts an earlier one, whatever the
@@ -2924,14 +2931,13 @@ mod timer_table {
     #[test]
     fn priority_breaks_ties_and_does_not_reorder_distinct_deadlines() {
         let t = t0();
-        let timers = Timers {
-            liveness: Some(t + Duration::from_secs(10)),
-            persistent_keepalive: Some(t),
-            ..Timers::default()
-        };
+        let timers = armed(&[
+            (TimerKind::Liveness, t + Duration::from_secs(10)),
+            (TimerKind::PersistentKeepalive, t),
+        ]);
         assert_eq!(timers.next(), Some(t));
         assert_eq!(
-            timers.due(t),
+            first_due(&timers, t),
             Some(TimerKind::PersistentKeepalive),
             "the lowest-priority timer is still the only due one"
         );

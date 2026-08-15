@@ -234,16 +234,26 @@ pub(crate) struct Close {
 }
 
 impl Close {
-    /// A CLOSE, with `reason` truncated to `CLOSE_REASON_MAX`.
+    /// A CLOSE, with `reason` truncated to `CLOSE_REASON_MAX` and `code`
+    /// capped at the varint maximum.
     ///
     /// §8.4: *"an implementation must not be able to **produce** the
     /// over-length case it must kill on receipt."* §16.2 truncates at the
     /// handle; truncating here as well means no path through the core can
     /// build one, including the handle-free core tests.
+    ///
+    /// The `code` cap is **ruling 86**, and it lives here rather than in
+    /// the encoder for one reason: it is the same rule as `reason`'s and
+    /// belongs beside it. §16.2's `close(code: u64, …)` takes a bare
+    /// `u64`, so a caller can hand it a value no varint encodes; §8.1's
+    /// stated-consequence list named ACK `largest`, stream offsets and
+    /// final sizes and **omitted this one** until ruling 86 added it.
+    /// Capping rather than refusing keeps `close()` infallible, which
+    /// §15.2's teardown requires.
     pub(crate) fn new(code: u64, reason: &[u8]) -> Self {
         let n = reason.len().min(constants::CLOSE_REASON_MAX);
         Self {
-            code,
+            code: code.min(VarInt::MAX_VALUE),
             reason: reason[..n].to_vec(),
         }
     }

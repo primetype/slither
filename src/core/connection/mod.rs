@@ -39,6 +39,13 @@ pub(crate) mod frame;
 pub(crate) mod session;
 pub(crate) mod timers;
 
+// Slice 3a's acceptance tests, written independently from `SPEC.md` and
+// `STORIES.md` by an author who never read this directory (working rule 6).
+// Declared here at integration rather than by the implementer, so that
+// neither agent could reach the other's file.
+#[cfg(test)]
+mod tests;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Instant;

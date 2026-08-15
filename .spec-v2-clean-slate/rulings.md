@@ -1654,3 +1654,85 @@ failure — CLOSE with `PROTOCOL_VIOLATION`". Three frames would therefore
 **kill a connection on a legal packet**. PADDING lands in 3a, together
 with §3.4's empty-plaintext keepalive short-circuit. Not a spec question
 — the plan under-specified its own scope.
+
+---
+
+## Round 13 — slice 3a integration (2026/08/15)
+
+Four rulings, all raised by the two blind slice-3a agents. **Three of the
+four were flagged by *both* agents independently**, which is the
+authorship split earning its cost: an implementer and a test author who
+cannot confer, both stopping at the same sentence, is evidence that the
+sentence is underdetermined rather than that one of them misread it.
+
+**Ruling 83 — the opening CLOSE is not a reply.** §15.2 caps CLOSE
+replies at one per second and never says whether `close()`'s own CLOSE
+starts that clock. IMPL-A anchored the clock on the first *reply*;
+TEST-A wrote one test assuming the opening CLOSE anchors it. It was the
+single failing test out of 82 when the two halves met.
+
+The cap governs **replies**, and §15.2 says a reply is owed only to "an
+authenticated, window-fresh inbound packet" — the opening CLOSE is not
+one. The decisive argument is purpose rather than grammar: §15.2 calls
+the reply rule "CLOSE's only reliability mechanism", and the case it
+exists for is a peer that **lost** the opening CLOSE. That peer's next
+packet arrives at an arbitrary moment; anchoring the clock on the
+opening CLOSE would make it wait up to a second to learn of a death it
+has already missed once. The cost of the other side is at most two
+CLOSEs in quick succession before the 1 Hz cap engages.
+
+*TEST-A had already identified this as a spec gap* and deliberately
+started its CLOSE-flood test at *t* + 2 s "so both readings agree" — and
+then wrote a second test that did depend on it, in another module,
+without noticing. Worth recording as a failure mode: **an author who
+finds a gap and routes one test around it does not thereby route them
+all around it.**
+
+**Ruling 84 — no `Retired` without a session.** Ruling 81, one day old,
+listed "any teardown before a session exists" among the no-linger paths
+that MUST emit `ToEndpoint::Retired`. But `Retired { our_index }` names
+the index route it exists to drop, and a connection that never installed
+a session never had one. The case is **not constructible**, and IMPL-A
+declined to widen a ratified enum shape to represent it. Correct:
+`Closed(ConnectionLost)` is emitted alone, there is nothing to retire,
+and the MUST protects against a leak that cannot occur.
+
+*Third time a ruling's blast radius has included the ruling itself* —
+64 mis-scoped its own rationale, 70 named a constant without noticing it
+had two possible origins (→ 73), and now 81 named a case it cannot
+build. The pattern is specific enough to state: **a ruling that
+enumerates cases should be checked against the type that carries them**,
+because an enumeration is written in prose and the constructor is not.
+
+**Ruling 85 — the liveness death lands *at* the deadline.** §7.4's rule
+was strict (`now − last_authenticated_recv > DEAD_TIMEOUT`) while §7.4's
+own prose says a session "dies at install + `DEAD_TIMEOUT`" and is
+"reaped by liveness in 25 s", and §16.5 says a deadline fires "no
+earlier than `D`". The comparison becomes `>=`.
+
+Working rule 3's shape for the fifth time, and the tell is mechanical
+this time: under the strict reading the timer fires at exactly `D`,
+finds the connection not-yet-dead, and must re-arm one nanosecond
+later — a formal rule that makes its own timer table do useless work is
+usually the half that is wrong.
+
+*Both agents flagged it and neither depended on it*: IMPL-A built the
+prose and said so; TEST-A asserted `D − 1 ns` and `D + 1 ns` only,
+leaving the disputed instant untested on purpose. Neither had to be
+right for the slice to land — which is what reporting rather than
+resolving buys.
+
+**Ruling 86 — the CLOSE `error_code` caps at 2⁶² − 1, at the producing
+side.** §8.1's "stated consequence" list named ACK `largest`, stream
+offsets and final sizes, and **omitted the one entry an application
+controls**: §16.2's `close(code: u64, …)` accepts a value no varint can
+encode. The cap goes where `reason`'s truncation already is, per §8.4's
+rule that an implementation "must not be able to *produce* the
+over-length case it must kill on receipt" — not in the encoder, where
+the decision would sit far from the identical rule it mirrors, and not
+as an error, because §15.2's teardown is a path an application must be
+able to take unconditionally.
+
+Working rule 8 exactly: a stated construction (the varint cap) with a
+list of consequences that reads as exhaustive and is not. The twelfth
+instance across four slices, and still not a wrong value.

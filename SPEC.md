@@ -1965,7 +1965,8 @@ the two sets deliberately differ.
 
 **The liveness anchor is the receive clock, armed by intent or by
 ack-eliciting output.** The connection is dead when
-`now − last_authenticated_recv > DEAD_TIMEOUT` **and** at least one
+`now − last_authenticated_recv >= DEAD_TIMEOUT` **[AMENDED 2026/08/15 —
+ruling 85; was `>`]** **and** at least one
 **arming** send has occurred since that last authenticated receive. A send
 arms the death deadline if **either** it is a marking send (a `seal` —
 fresh application intent, or the keepalive) **or** it carries any
@@ -2574,10 +2575,22 @@ A sender emits the minimal encoding; a receiver accepts any length (a
 non-minimal encoding is valid, as in QUIC). The cleartext packet header is
 **not** varint — fixed widths there (u32 index, u64 counter) keep
 classification and AD construction trivial. Stated consequence: varints
-cap at 2⁶² − 1, so ACK `largest` (§12.1) and stream offsets and final
-sizes (§9.5) cap there too. A connection would need > 4.6 × 10¹⁸ packets
+cap at 2⁶² − 1, so ACK `largest` (§12.1), stream offsets and final
+sizes (§9.5), **and the CLOSE `error_code` (§15.1)** cap there too. A
+connection would need > 4.6 × 10¹⁸ packets
 to reach the ACK bound — over 14 000 years at 10⁷ packets/s (§7.9) —
 unreachable, but the bound is explicit.
+
+**The CLOSE code is the one entry an application controls**, and it is
+the one the list omitted. **[AMENDED 2026/08/15 — ruling 86]** §16.2's
+`close(code: u64, reason)` accepts a `u64`, so a caller can hand it a
+value no varint encodes. It is **capped at 2⁶² − 1 where `reason` is
+truncated** — at the producing side, per §8.4's rule that "an
+implementation must not be able to *produce* the over-length case it
+must kill on receipt" — and not refused: `close()` stays infallible,
+because §15.2's teardown is a path an application must be able to take
+unconditionally. No application code in §15.3's registry is within
+10¹⁷ of the cap, so nothing legitimate is reshaped by it.
 
 ### 8.2 The frame stream: parse-then-apply
 
@@ -3789,7 +3802,14 @@ reserved cleartext close packet type (`0x04`) stays dead.
   observed the cleartext index could mint — and is sent **to the
   session's endpoint address** (the closing state does not roam; never
   to the triggering packet's source). Replies are capped at one CLOSE
-  per second; at linger expiry (`CloseLinger` timer, §16.5), drop all
+  per second, and **the opening CLOSE is not a reply**
+  **[RATIFIED 2026/08/15 — ruling 83]**: the rate clock is unset at
+  `close()`, so the first reply owed to an inbound packet is sent at
+  once. The cap governs *replies*, and the reply exists so a peer that
+  **lost** the opening CLOSE learns of the death — anchoring the clock
+  on that opening CLOSE would delay recovery by up to a second in
+  exactly the case the mechanism is for. At linger expiry
+  (`CloseLinger` timer, §16.5), drop all
   state. The linger's reply rule
   is CLOSE's only reliability mechanism — CLOSE is not ack-eliciting and
   is never retransmitted by loss detection. A CLOSE **received** while
@@ -4537,10 +4557,16 @@ enum ToEndpoint {
   **[AMENDED 2026/08/15 — ruling 81]** The two moments coincide on every
   path with no post-mortem and are `CLOSE_LINGER` apart on every path
   with one:
-  - **No linger** — liveness (§7.4), nonce exhaustion (§7.9),
-    `Replaced` (§5.4), or any teardown before a session exists:
-    `Closed(ConnectionLost)` is followed **within the same drain** by
-    `ToEndpoint::Retired`.
+  - **No linger** — liveness (§7.4), nonce exhaustion (§7.9), or
+    `Replaced` (§5.4): `Closed(ConnectionLost)` is followed **within the
+    same drain** by `ToEndpoint::Retired`.
+  - **No session, so no `Retired`** — a teardown before a session is
+    installed emits `Closed(ConnectionLost)` **alone**.
+    **[AMENDED 2026/08/15 — ruling 84]** `Retired { our_index }` names
+    the index route it exists to drop, and a connection that never
+    installed a session never had one: there is nothing to retire and no
+    leak the MUST prevents. Ruling 81's first draft listed this case,
+    which is not constructible.
   - **Closing or draining** (§15.2): `Closed(ConnectionLost)` is emitted
     **at the death**, so `close()` and `closed()` resolve when §16.2 says
     they do rather than five seconds later; `Retired` follows the
