@@ -3303,3 +3303,26 @@ it was discoverable by reading code: the implementation matched the
 contract, the contract matched ruling 118, and ruling 118 had a clean
 argument attached. It took an author who had never seen any of them
 writing down what an application would actually do.
+
+**Addendum to ruling 123 — the debt was already paid, and better than I
+specified.** Ruling 123 said I would add the two frame-level assertions
+to `src/core/connection/tests_streams.rs` myself at integration. Checking
+before writing them: **both already exist.**
+`a_max_stream_data_arrives_at_exactly_half_a_window_read_and_not_before`
+is §10.3's re-grant frame count, and
+`the_stream_fill_serves_pending_streams_round_robin` is §8.5's fill.
+
+The second is worth reading, because it **declines** the assertion
+`PLAN.md` §11.2 asked for. §11.2 wanted "some packet carries frames for
+both streams"; the test's doc says that is not asserted, because §8.5
+makes the quantum implementation-defined and **a quantum of one packet is
+legal and would fail it** — *"an assertion a conforming build can fail is
+a flake, not a pin."* It measures interleaving as *each stream's frames
+appearing before the other stream's last frame*, which a sequential fill
+cannot have and any legal quantum does.
+
+That is working rule 9 applied in the harder direction. The rule's usual
+failure is an assertion too weak to separate the broken build; this is an
+assertion too **strong** — one that separates the broken build *and* some
+correct ones. Both are failures of the same question, *what exactly does
+this separate*, and only the weak form had a rule written for it.
