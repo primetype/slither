@@ -4156,14 +4156,47 @@ impl SendStream {
     pub async fn finish(&mut self) -> Result<(), WriteError>;
     pub async fn acked(&mut self) -> Result<(), WriteError>;   // delivery confirmation (ruling 47)
     pub fn reset(&mut self, error_code: u64);
-    pub fn id(&self) -> Option<StreamId>;   // None before establishment (§16.9)
+    pub fn id(&self) -> Option<StreamId>;   // see the id() note below (ruling 116)
 }
 impl RecvStream {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ReadError>;
-        // Ok(None) = FIN reached, all data delivered
-    pub fn id(&self) -> Option<StreamId>;   // None before establishment (§16.9)
+        // Ok(None) = FIN reached, all data delivered — NOT a reset (ruling 121)
+    pub fn id(&self) -> Option<StreamId>;   // see the id() note below (ruling 116)
+}
+impl BiStream {                                  // ruling 96; join's shape is ruling 120
+    pub fn split(self) -> (SendStream, RecvStream);
+    pub fn join(send: SendStream, recv: RecvStream)
+        -> Result<Self, (SendStream, RecvStream)>;   // Err = not the same stream
+    pub fn id(&self) -> Option<StreamId>;
 }
 ```
+
+**[RATIFIED 2026/08/15 — ruling 116]** *What `id()`'s `Option` holds
+open.* It was annotated "None before establishment (§16.9)", and ruling
+116 removes that cause: no application handle exists before
+establishment, so a handle's id is known from birth. The `Option`
+**stays**, and the handle **caches** its id. Caching is not an
+optimisation — the core's `stream_id(r)` is deliberately *not* monotone,
+because a fully closed stream's entry is freed (§9.7), so an uncached
+`id()` would answer `None` again after the stream ended. That would
+contradict `remote_static()`'s keeps-answering property for no gain.
+The `Option` is retained because removing it is a breaking change to save
+a `match`, and re-adding it when a later line publishes a
+pre-establishment route would be breaking again.
+
+**[RATIFIED 2026/08/15 — ruling 121]** *`Ok(None)` means the FIN, and
+only the FIN.* A stream the peer reset surfaces `Err(ReadError::Reset)`,
+and that outcome is **sticky at the handle**: every subsequent `read`
+re-reports it. Without stickiness an application that logs the reset and
+retries its loop reads a clean end-of-stream on the next call, and §9.6's
+abandoned data is presented as a complete transfer — data loss reported
+as success.
+
+**[RATIFIED 2026/08/15 — ruling 119]** *An empty `buf` is `Ok(Some(0))`,
+not a wait.* `read` with a zero-length buffer returns immediately without
+consulting the connection, mirroring ruling 110's rule that a zero-length
+`write` is `Ok(0)`. `Pending` keeps exactly one meaning at this surface:
+*there is work to wait for*.
 
 `open_bi`/`open_uni` wait for MAX_STREAMS allowance when the cumulative
 limit is exhausted (§10.4), woken by `StreamsAvailable` (§16.4); `write`
@@ -4223,13 +4256,30 @@ event surface.
   healthy connection it never resolves,
   which is what makes it the `select!` arm of a long-running loop.
 - **`notified()`** claims **one** `Notification`, in the same **pull
-  model** as `accept_bi`, `recv_message` and `recv_datagram` (§16.4): the
+  model** as `accept_bi`, `recv_message` and `recv_datagram` (§16.4) —
+  but see ruling 118 below for how far the *post-death* half of that
+  model reaches: the
   connection retains what has not been claimed and the verb hands over
   exactly one, so a notification is never dropped on the floor between an
   application's two visits. It resolves `Err(ConnectionLost)` once the
   connection has ended **and** its unclaimed notifications have been
   drained — a notification generated before the death is not lost to the
   death. It is cancel-safe: a dropped future has claimed nothing.
+
+**[RATIFIED 2026/08/15 — ruling 118]** *The drain-then-report rule is
+`notified()`'s alone; it does not carry to the stream and payload
+claims.* `accept_bi`, `accept_uni`, `recv_message` and `recv_datagram`
+report `ConnectionLost` **immediately** once the connection has ended,
+with nothing drained first. The reason is structural rather than a
+preference: **§15.2 lets `close()` drop stream, recovery and congestion
+state immediately**, so by the time the death is observable there is
+nothing left to hand over — draining would return a handle on which every
+`read` fails, satisfying "never dropped on the floor" in letter while
+delivering nothing. A `Notification` is different in exactly the way that
+matters: it is a fact about the connection, complete in itself, and it
+survives the event it describes. This sentence previously said only "the
+same pull model", and a list of four verbs was read as ranging over a
+rule that fits one of them.
 
 **Retention is one slot per kind**, which is what keeps the notification
 state O(1) per connection and lets it need no queue bound at all
@@ -4412,6 +4462,20 @@ not send on socket clones. The `Wire` trait seam (real socket or
 `testutil::FlakyWire`)
 is the driver's I/O boundary. The driver lives while any handle lives;
 dropping every handle stops it, and every session dies silently with it.
+
+**[AMENDED 2026/08/15 — ruling 115]** *The list above enumerates thin
+clients, not driver-keeping handles, and the two sets are not equal.*
+**Staged objects are in it and do not keep the driver alive** — ruling
+62 makes a staged object's verb "a round-trip to a driver it does not
+keep alive", which is why `IntroError`, `AuthError` and `AcceptError`
+each carry `EndpointDropped` and `ConnectError` does not. What decides
+membership is ruling 62's test — *a future or handle that changes
+protocol state when dropped is a handle; one that does not, is not* —
+and by that test `Endpoint`, `Connecting`, `Connection`, `SendStream`,
+`RecvStream` and `BiStream` keep the driver alive, while staged objects
+and a `closed()` future do not. A stream handle qualifies twice over: its
+`Drop` emits RESET_STREAM or retires a receive half, and a `Drop` that
+must put a frame on the wire needs a driver to put it there.
 
 **How a handle reaches the core — split by cost.** **[RATIFIED
 2026/08/14 — ruling 53]** This paragraph previously said "thin
@@ -4959,8 +5023,16 @@ policy or a oneshot reply that cannot block the driver. The accessors are
 **synchronous reads of a shared cell the driver updates** — never driver
 round-trips. Per-stream wakers key the shell's blocked-readers/
 blocked-writers maps (the quinn pattern): a stream verb that would wait
-parks its waker under its `StreamId` and is woken by the matching
-`ConnEvent`. The driver never performs a blocking send toward a handle.
+parks its waker under its `StreamRef` and is woken by the matching
+`ConnEvent`. **[AMENDED 2026/08/15 — ruling 117]** This sentence said
+`StreamId`, which ruling 95 had already made unbuildable when it keyed
+the four stream-naming `ConnEvent`s by `StreamRef`; the token was not
+swept. A `StreamId` is fixed by an opener parity that §6.7's tie-break
+can **invert**, so a map keyed by it would need rekeying at every install
+and a park that straddled one would look up a key that no longer exists.
+`StreamRef` is the only key stable for the life of the stream, and it
+stays the key even though ruling 116 removes the pre-establishment case
+that first motivated it. The driver never performs a blocking send toward a handle.
 The shell is deadlock-free by construction. One class is exempt from the
 non-blocking drop policy by prohibition: **reliable data is never
 droppable** — stream bytes, messages, and claim-pending receive state
@@ -4986,6 +5058,23 @@ and `id()` returns `None` until the connection is established (§16.2). On
 install the core maps its internal indices onto the parity the outcome
 dictates, in open order — the on-wire IDs are identical whichever
 resolution the race takes.
+
+**[AMENDED 2026/08/15 — ruling 116]** *This section is a guarantee about
+the **core**, and the v1 application surface publishes no route to the
+window it describes.* §16.2 hands out a `Connection` only once the
+session is installed, so an application cannot open or write a stream
+before establishment, and it is not an oversight that it cannot. **The
+window is crossed inside the core, and that crossing is real**: §6.7's
+tie-break and §6.4's replacement both install a session underneath a
+connection core that already holds queued sends, which is where "pump on
+whichever session installs" earns its keep and where ruling 95's
+`StreamRef` is exercised. What an application-visible route would buy is
+**one task wake-up and not one round trip** — this section itself forbids
+emitting a frame before install, so the handshake costs the same either
+way — and it would cost the totality of `session_id()`, which §16.2
+declares without an `Option` and ruling 89 derives from a handshake hash
+that does not yet exist. Publishing such a route on a later wire line is
+additive; it is deliberately not on this one.
 
 ### 16.10 Kernel-free drivability
 

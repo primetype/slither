@@ -48,7 +48,8 @@ pub(crate) fn now() -> std::time::Instant {
 /// This is §16.8's "quinn pattern" in its smallest useful form: slice 3
 /// needs it only for `closed()` and `accept()`, and slice 4's per-stream
 /// blocked-readers / blocked-writers maps are the same type keyed by
-/// `StreamId`.
+/// [`StreamRef`](crate::core::StreamRef) — **not** `StreamId`, which a
+/// tie-break can renumber at install (§16.8, ruling 117).
 #[derive(Debug, Default)]
 pub(crate) struct Wakers {
     next: u64,

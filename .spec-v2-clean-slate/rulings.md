@@ -2794,3 +2794,229 @@ the FIN. Slice 5's sent-packet map is where the answer actually lives, and
 slice 5 must either call `SendHalf::on_ack_range(range, fin)` directly or
 restore the flag to the `Connection` signature. Recorded rather than fixed
 now, because the right shape depends on §12's map, which does not exist.
+
+---
+
+## Round 20 — slice 4b planning: the shell stream surface (2026/08/15)
+
+The 4b planner returned seven open questions and five conflicts. The
+largest — that §16.9's early sends have **no reachable handle** — is a
+finding about the ratified public surface, not about slice 4, and it is
+ruled here rather than carried.
+
+**Ruling 115 — a stream handle *is* a handle: `SendStream`, `RecvStream`
+and `BiStream` count for §16.3's driver lifetime and for ruling 88.**
+Each acquires on construction and releases on drop, exactly as
+`Connection` does, and the driver lives while any of them lives.
+
+The planner recommended this and reached it partly from §16.3:4409, which
+enumerates *"`Endpoint`, staged objects, `Connection`, and stream
+handles"* as thin clients and then says *"the driver lives while any
+handle lives"*. **That argument does not hold, and it is worth saying
+why**, because the conclusion is right for a different reason. **Staged
+objects are in that same list and are explicitly excluded**: ruling 62
+says a staged object's verb is *"a round-trip to a driver it does not
+keep alive"*, which is what makes `IntroError`'s `EndpointDropped`
+correct rather than an omission. So §16.3:4409's enumeration is **not** a
+list of things that keep the driver alive, and reading the next sentence
+as ranging over it proves too much.
+
+The authority is ruling 62's **test**, which was written to be applied:
+
+> A future that changes protocol state when dropped is a handle; one that
+> does not, is not.
+
+Dropping a `SendStream` puts RESET_STREAM on the wire. Dropping a
+`RecvStream` retires the receive half, sets ruling 93's tombstone and
+trues up the flow-control ledger. Both change protocol state, and neither
+resembles the `closed()` future that *"owns nothing and merely
+observes"*. The test settles it without needing the list.
+
+The consequence that decides it independently: **a `Drop` that must emit
+a frame needs a driver to emit it.** Under the alternative, dropping the
+last `Connection` fires §16.2's `close(NO_ERROR, "")` underneath a live
+`SendStream`, and that stream's RESET_STREAM is silently lost — in the
+*ordinary* shape of a task that owns a stream and has let the connection
+handle go. Ruling 88 then governs the genuinely-last drop, and nothing is
+transmitted, which is already the ratified answer for that case.
+
+**§16.3 is amended**: the four-item list at 4409 gains a sentence saying
+what it does and does not enumerate. This is defect class 1 in the
+maintainer's own text — *a stated construction with an unstated or
+contradicted scope* — and it is the second time a §16 list has been read
+as exhaustive when it was not (ruling 71 was the first).
+
+**Ruling 116 — §16.9's early sends are a guarantee about the *core*. The
+shell exposes no pre-establishment handle in wire v1, and this is
+deliberate.**
+
+The planner's conflict C-B is real. §16.9 says queued work before
+establishment is *"ordinary work"*, §6.7 says *"queued sends … live in
+the connection core's stream state and pump on whichever session
+installs"*, and §16.2 annotates `id()` as `None` *"before establishment"*
+— three texts that presuppose an application holding something it can
+write to before a session exists. **The shipped shell hands out no such
+thing**: `Driver::establish` constructs the `Connection` only on
+`ConnEvent::Established`, and the accept path reaches one only after
+§6.2's stage 3. I checked both.
+
+Three reasons the shell is right and the prose overreached.
+
+1. **It buys no wire latency.** §16.9 itself forbids emitting a frame
+   before install — *"no frame is emitted before install (nothing sends
+   until a session exists)"*. The handshake RTT is identical either way.
+   What an early handle buys is that the application need not await
+   `Connecting` before writing: **one task wake-up**, not one round trip.
+2. **A pre-establishment `Connection` falsifies a ratified accessor.**
+   §16.2 declares `session_id(&self) -> SessionId` — **total**, no
+   `Option`, no `Result` — and ruling 89 defines it as hiss's value
+   *derived from the handshake hash*. Before the handshake completes
+   there is no such value. The shipped handle captures it at
+   construction, which is what lets it keep answering after §15.2's
+   linger has dropped the session. Making a total accessor fallible to
+   buy a task wake-up inverts the trade.
+3. **The core half is load-bearing and stays.** §6.7's tie-break and
+   slice 7's replacement both install a session *underneath a connection
+   core that already holds queued sends*. That crossing is real, is
+   reachable, and is what `StreamRef` exists for — ruling 95's "stable
+   across install" property is exercised there, not at first contact.
+
+So §16.9 keeps its mechanism and loses its implied audience. **§16.9 is
+amended** to state that the pre-establishment window is crossed *inside*
+the core — by a tie-break's `Install` and by a replacement — and that no
+route to it is published on the v1 application surface. A later line may
+add one; adding it is additive.
+
+**`id()` keeps its `Option`, and the handle caches.** Two parts. The
+handle caches the id the first time the core answers `Some`, because the
+core's `stream_id(r)` is **not monotone** — `Streams::after_half_freed`
+removes the entry, so an uncached `id()` answers `None` again once the
+stream fully closes, which is reachable in slice 4 for a peer-opened uni
+stream read to EOF. That would be the opposite of `remote_static()`'s
+keeps-answering property, for the same reason. And the `Option` itself
+stays even though a cached id at a post-establishment handle is **always
+`Some` in v1**: removing it is a breaking change to a ratified surface to
+save a `match`, and re-adding it when a pre-establishment route lands
+would be breaking again. §16.2's annotation is amended to name what the
+`Option` is actually holding open.
+
+**Ruling 117 — the shell's waker maps are keyed by `StreamRef`, not
+`StreamId`.** §16.8 says *"parks its waker under its `StreamId`"*
+(SPEC.md:4962). Ruling 95 already converted the four stream-naming
+`ConnEvent`s to `StreamRef` on the grounds that *"the shell could not
+match a wakeup to its waker before establishment"*. §16.8 was not swept,
+and neither was the doc comment at `src/shell/shared.rs:48–51`, nor
+ruling 107's own summary phrase.
+
+Note what ruling 116 does **not** do to this. One might think that if
+there is no pre-establishment handle, `StreamId` is available whenever
+the shell parks, and §16.8 could stand. It cannot, for a reason that
+survives 116: §6.7's tie-break and slice 7's replacement install a
+session under a core holding live streams, and a `StreamId` is fixed by
+an opener parity that a tie-break can **invert**. A waker map keyed by
+`StreamId` would have to be rekeyed at every install, and a park that
+straddled one would look up a key that no longer exists. `StreamRef` is
+the only key that is stable for the life of the stream. **Three texts are
+swept**, and this is working rule 4 again — grep for the rationale, not
+only the token.
+
+**Ruling 118 — `accept_bi`/`accept_uni` report `ConnectionLost`
+immediately after death; they do not drain first.** §16.2:4225 puts
+`accept_bi` in *"the same pull model"* as `notified()`, and §16.2:4230
+gives `notified()` a drain-then-report rule. That rule does **not**
+carry, and the reason is structural rather than a preference: **§15.2
+lets `close()` drop stream, recovery and congestion state immediately**,
+so after death there is nothing left to hand over. The pull model's
+promise — *"a notification is never dropped on the floor between an
+application's two visits"* — protects a payload that outlives the visit.
+A stream's does not outlive the close.
+
+The planner reached the same answer by a weaker route (a drained handle
+would be inert because `core::Connection::read` refuses after death).
+That is true and is the *consequence*; §15.2 is the *cause*, and stating
+the cause is what keeps someone from later "fixing" `read` and reopening
+the question. **§16.2's pull-model paragraph is amended** to say which
+verbs it ranges over — defect class 1 once more.
+
+**Ruling 119 — an empty `buf` short-circuits `read` to `Ok(Some(0))`
+without touching the core**, mirroring ruling 110's rule for a
+zero-length `write`. Ruling 110 exists because a shell that forwards an
+empty write *"parks forever on an empty write of its own making"*. `read`
+has the identical trap and had no ruling: the core's `Ok(Some(0))` means
+"no data available", so a shell handed an empty `buf`, forwarding it, and
+parking on the result waits for data it has nowhere to put. Short-
+circuiting keeps `Pending` as the single meaning of "wait" at the handle,
+and keeps the two conventions symmetrical. **It also protects the
+distinction that a blind test author has already guessed wrong once**:
+`Ok(Some(0))` = park, `Ok(None)` = end of stream (round 18).
+
+**Ruling 120 — `BiStream::join(send, recv) -> Result<BiStream,
+(SendStream, RecvStream)>`.** Ruling 96 named `join` and gave it no
+signature; §16.2 never mentions it, so what bounds its arguments — same
+stream? same connection? — was unstated. It checks that both halves name
+the same `StreamRef` on the same `ConnectionId` and hands the pair back
+unchanged on mismatch. No new error type, so §18.1 stays closed (ruling
+61). The rejected alternative is a `debug_assert`, under which a release
+build holds a `BiStream` whose halves are different streams, whose `id()`
+is a lie, and whose `Drop` resets a stream the caller never named. Ruling
+44's precedent governs: *rejection is a `Result`, never a panic*, for
+anything reachable across an FFI boundary.
+
+**Ruling 121 — `ReadError::Reset` is sticky at the handle; the core is
+unchanged.** `Streams::read` retires the receive half **and then**
+returns `Err(Reset(code))`, so the next `read` on that `StreamRef` finds
+no half and returns `Ok(None)` — which §16.2:4163 documents as *"FIN
+reached, all data delivered"*, false of a stream whose data §9.6
+abandoned. An application that logs the reset and retries its loop reads
+a clean end-of-stream, and **data loss is presented as success**.
+
+The handle latches its terminal outcome and re-reports it. The core keeps
+its per-call honesty ("this half is gone"), which is correct for its only
+consumer. Recorded with its scope: if the core ever acquires a second
+consumer, this wart bites there too, and the guard is in the shell.
+**§16.2's `Ok(None)` annotation is amended** to state what it excludes.
+
+**Ruling 122 — three low-cost questions, taken as recommended.**
+(a) The `poll_*` forms are **`pub(crate)`**, matching `poll_close` and
+`poll_closed`; slice 8's `compat/` is in-crate and reaches them, and
+promotion later is additive while publishing a `key: u64` parameter now
+is not. (b) **`SendStream::acked()` is absent from 4b, not stubbed** —
+`src/shell/mod.rs:40–43` already rules that §16.2's verbs *"arrive with
+the slices that define them and are absent rather than stubbed"*, and
+`acked()` needs `ConnEvent::StreamFinished`, which slice 4 never fires.
+Its module doc names slice 5. It is listed rather than assumed because
+ruling 107's contents list omits it, and an omission is invisible until
+someone builds against it (ruling 71). (c) The maps are
+**`BTreeMap<StreamRef, Wakers>`**, not bare `Waker`s: `Wakers::take_all`
+is `#[must_use]`, which makes finding F10's borrow-then-wake ordering the
+only spelling the type permits rather than a rule a caller must remember.
+
+**Ruling 123 — two assertions `PLAN.md` §11.2/§11.4 assign to 4b are
+unreachable from `tests/` and belong to 4a's in-crate file.** Packet-level
+interleaving and MAX_STREAM_DATA frame counts require reading *frames*;
+`testutil::Tap` yields **sealed datagrams**. The 4b story tests use the
+planner's behavioural substitutes, and I add the two frame-level tests to
+`src/core/connection/tests_streams.rs` **myself, at integration** — that
+file is on no 4b agent's path and a blind agent editing 3 489 lines of
+someone else's tests is working rule 6's hazard wearing a different hat.
+Recorded so the boundary moves once, deliberately, instead of being
+discovered by a blind test author at compile time.
+
+### What this round says about the process
+
+Nine of the ten agents that have declined an instruction were right; the
+4b planner makes ten of eleven. It refused to treat its own brief's
+phrasing — "per-`StreamRef` waker maps" — as authority to edit §16.8,
+ruling 107 or a doc comment, and put the three edits where a maintainer
+would see them instead. **The brief was right and the planner still
+should not have acted on it**, which is the distinction working rule 5
+was written to protect.
+
+Two of this round's nine rulings correct a rationale rather than a rule
+(115's list, 118's cause), and **both were reached by checking a citation
+rather than accepting it** — working rule 12's question, *what state did
+the argument assume*, applied to an agent's argument instead of a
+reviewer's. Ruling 115 is the more instructive: the planner's conclusion
+was right, its evidence was a list, and the list has an exception sitting
+inside it that would have been inherited as reasoning by everyone
+downstream.
