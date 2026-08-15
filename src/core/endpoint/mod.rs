@@ -104,6 +104,17 @@ struct Pending<I: Identity> {
     give_up_at: Instant,
     /// §5.5 rule 3: one completion attempt per retransmit interval.
     attempt_spent: bool,
+    /// Whether this pending actually took a §17.1 pin.
+    ///
+    /// A pin **never creates an entry**, so a dial to a static nobody has
+    /// recorded takes none. Releasing unconditionally would then decrement
+    /// a pin somebody else took later — on §5.4's PENDING row that is a
+    /// staged mid-state's pin, and stripping it lets §17.1's "never evicted
+    /// while a staged mid-state exists" fail silently, aging the entry out
+    /// at `TS_GUARD_ORPHAN_TTL`. Pin and release must agree, so the answer
+    /// is carried rather than assumed. (The staged path already does this
+    /// via `guard_pin: Option<Vec<u8>>`; this is the same discipline.)
+    guard_pinned: bool,
 }
 
 /// §16.4's endpoint core.
@@ -336,6 +347,7 @@ impl<I: Identity> Endpoint<I> {
             next_retransmit: now,
             give_up_at: now + constants::HANDSHAKE_GIVEUP,
             attempt_spent: false,
+            guard_pinned: false,
         };
 
         self.statics.insert(
@@ -353,7 +365,7 @@ impl<I: Identity> Endpoint<I> {
         // entry — and a pin never creates one, so for a static we have
         // only ever dialled this is a no-op, which is exactly §17.1's
         // "we hold no entry at all".
-        self.guard.pin(&key);
+        pending.guard_pinned = self.guard.pin(&key);
 
         self.start_attempt(now, &mut pending);
         self.pendings.insert(conn, pending);
@@ -419,7 +431,9 @@ impl<I: Identity> Endpoint<I> {
             self.indices.remove_pending(index);
         }
         self.statics.remove(&pending.remote_static_bytes);
-        self.guard.unpin(&pending.remote_static_bytes);
+        if pending.guard_pinned {
+            self.guard.unpin(&pending.remote_static_bytes);
+        }
         Some(pending)
     }
 

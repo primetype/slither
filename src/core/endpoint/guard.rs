@@ -55,7 +55,14 @@ use crate::core::Timestamp;
 #[derive(Debug, Clone)]
 pub(crate) struct GuardEntry {
     /// The greatest initiation timestamp recorded for this static.
-    pub(crate) greatest: Timestamp,
+    ///
+    /// `None` means **an entry that exists only to hold a pin**: its record
+    /// was reverted by mitigation (i) while something else still pinned it,
+    /// so the entry cannot be removed but must not keep the value. §17.1
+    /// says the record "drops with the chain", not merely that an unpinned
+    /// entry is deleted — so this case has to be representable, or a
+    /// second pin turns authenticate-then-drop back into an orphan mint.
+    pub(crate) greatest: Option<Timestamp>,
     /// Live connections + in-flight pendings + staged mid-states.
     pub(crate) pins: u32,
     /// §6.6/§6.7's `HANDSHAKE_GIVEUP` extension past the connection's
@@ -99,7 +106,9 @@ impl GuardEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct GuardUndo {
     key: Vec<u8>,
-    previous: Option<(Timestamp, Instant)>,
+    /// Outer `None` = no entry existed before the record. Inner `None` =
+    /// an entry existed holding no record (a pin-only entry).
+    previous: Option<(Option<Timestamp>, Instant)>,
 }
 
 /// §17.1's guard.
@@ -111,14 +120,14 @@ pub(crate) struct TimestampGuard {
 impl TimestampGuard {
     /// The recorded greatest timestamp for a static, if any.
     pub(crate) fn greatest(&self, key: &[u8]) -> Option<Timestamp> {
-        self.entries.get(key).map(|e| e.greatest)
+        self.entries.get(key).and_then(|e| e.greatest)
     }
 
     /// Whether `candidate` would pass — **strictly** greater, vacuously
     /// true where nothing is recorded.
     pub(crate) fn admits(&self, key: &[u8], candidate: Timestamp) -> bool {
         match self.entries.get(key) {
-            Some(entry) => candidate > entry.greatest,
+            Some(entry) => entry.greatest.is_none_or(|g| candidate > g),
             None => true,
         }
     }
@@ -131,14 +140,14 @@ impl TimestampGuard {
         let previous = self.entries.get(key).map(|e| (e.greatest, e.last_admitted));
         match self.entries.get_mut(key) {
             Some(entry) => {
-                entry.greatest = candidate;
+                entry.greatest = Some(candidate);
                 entry.last_admitted = now;
             }
             None => {
                 self.entries.insert(
                     key.to_vec(),
                     GuardEntry {
-                        greatest: candidate,
+                        greatest: Some(candidate),
                         pins: 0,
                         exempt_until: None,
                         last_admitted: now,
@@ -173,7 +182,18 @@ impl TimestampGuard {
                     .entries
                     .get(&undo.key)
                     .is_some_and(|entry| entry.pins > 0);
-                if !still_pinned {
+                if still_pinned {
+                    // The entry cannot be removed — something else pins it —
+                    // but §17.1's "its record drops with the chain" is about
+                    // the RECORD, so the value goes even though the entry
+                    // stays. Without this, a second pin (another chain for
+                    // the same static, or a concurrent dial) makes the
+                    // authenticate-then-drop flood mint orphans after all,
+                    // which is the exact attack mitigation (i) forbids.
+                    if let Some(entry) = self.entries.get_mut(&undo.key) {
+                        entry.greatest = None;
+                    }
+                } else {
                     self.entries.remove(&undo.key);
                 }
             }
@@ -193,8 +213,15 @@ impl TimestampGuard {
 
     /// Release a pin taken by [`pin`](Self::pin).
     pub(crate) fn unpin(&mut self, key: &[u8]) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.pins = entry.pins.saturating_sub(1);
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        entry.pins = entry.pins.saturating_sub(1);
+        // A pin-only entry (record already reverted) has nothing left to
+        // protect once its last pin goes, and leaving it would be an orphan
+        // with no record — pure bookkeeping the LRU would then have to age.
+        if entry.pins == 0 && entry.greatest.is_none() && entry.exempt_until.is_none() {
+            self.entries.remove(key);
         }
     }
 
