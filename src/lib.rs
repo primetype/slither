@@ -163,7 +163,7 @@ pub use hiss::noise::SessionId;
 // here to be publicly *reachable* — `WallClock::now()` returns a
 // [`Timestamp`], and a public signature naming an unreachable type is a
 // rustdoc break, not merely a lint.
-pub use crate::core::{ConnectionId, IntroId, Timestamp};
+pub use crate::core::{ConnectionId, Dir, IntroId, StreamId, Timestamp};
 
 /// The `hiss` slither was built against, re-exported so the version you
 /// must match is findable.

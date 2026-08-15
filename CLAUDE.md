@@ -194,6 +194,20 @@ the spec rounds.
    test-writing against it would have found them. When a whole class of
    fault is absent from the results, suspect the harness before the
    authors.
+14. **An isolated agent sees a commit, not a working tree — cut its
+   worktree from a commit that contains its brief's inputs, and name that
+   commit in the brief.** Worktree isolation fixed slice 3b's blindness
+   leak and introduced this in doing it. Slice 4a's test author was cut at
+   `fdf5972`; `CONTRACT-4a.md`, which its brief calls *binding*, was
+   uncommitted at that moment and landed at `74fa5f2`. It reconstructed
+   the API for ten minutes and was rescued only because an unrelated
+   mid-flight message revealed the file existed. Two of its guesses were
+   **semantic**: an event field name, and **no `Ok(Some(0))`/`Ok(None)`
+   distinction for `read` at all** — the convention whose inversion hangs
+   a reader forever on a finished stream. Without that accident, 73 tests
+   would have been written against a guessed API and the integration would
+   have read as a design disagreement rather than a missing file. **Commit
+   the brief's inputs before dispatching, not after.**
 
 ## Release gates (hard rules)
 
@@ -208,6 +222,7 @@ is fixed, not deferred to "the next patch."
 | Lints | `cargo clippy --all-features --all-targets -- -D warnings` | zero warnings |
 | Docs | `cargo doc --no-deps` and `--all-features`, `RUSTDOCFLAGS=-D warnings` | no broken intra-doc links |
 | Tests | `cargo test` **and** `cargo test --all-features` | all pass |
+| Release tests | `cargo test --release --all-features` | all pass |
 | Wire pins | the golden-wire and size/constant tests (run under `cargo test`) | byte-identical |
 | MSRV | `cargo +<MSRV> check --all-features --all-targets` | passes on the declared MSRV |
 | Supply chain | `cargo deny check` | clean |

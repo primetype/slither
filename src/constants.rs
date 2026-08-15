@@ -225,25 +225,69 @@ pub const STREAM_FLAG_MASK: u64 = 0x07;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Flow control (§10.2, §10.3, §10.4, §10.6)
+//
+// **[RATIFIED 2026/08/15 — ruling 103]** These are *three kinds of thing*
+// and §10.2's table groups them as one. Each constant below says which kind
+// it is, because the kind decides what changing it costs:
+//
+// - **wire constant** — unnegotiated, so both ends must assume the same
+//   value; changing one corrupts the peer's accounting immediately. A red
+//   pin in `tests/spec_constants.rs` needs a ruling, not an updated
+//   expectation.
+// - **receiver policy, invisible** — two peers running different values
+//   interoperate perfectly and neither can tell. A local tuning knob.
+// - **receiver policy, observable** — still policy, but a peer *can* tell,
+//   because behaviour past one receiver's ceiling differs from behaviour
+//   past another's. Shipped ratified-but-revisitable, and a tolerance.
+//
+// No value and no location moves: moving them is wire-pin churn for
+// nothing. Only the kind is stated.
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Initial connection-level receive credit, in bytes. §10.2.
+///
+/// **Wire constant** (ruling 103).
 pub const INITIAL_MAX_DATA: u64 = 1_048_576;
 
 /// Initial per-stream receive credit, in bytes. §10.2.
+///
+/// **Wire constant** (ruling 103).
 pub const INITIAL_MAX_STREAM_DATA: u64 = 262_144;
 
 /// Initial **cumulative** bidirectional stream allowance. §10.2.
+///
+/// **Wire constant** (ruling 103).
 pub const INITIAL_MAX_STREAMS_BIDI: u64 = 32;
 
 /// Initial **cumulative** unidirectional stream allowance. §10.2.
+///
+/// **Wire constant** (ruling 103).
 pub const INITIAL_MAX_STREAMS_UNI: u64 = 128;
 
 /// Closed streams that must accumulate before a MAX_STREAMS is sent. §10.4.
+///
+/// **Receiver policy, invisible** (ruling 103) — §10.2's own next clause
+/// calls later credit *"receiver policy"*, and this is when a receiver
+/// *chooses* to advertise. It is **not** an initial window and not
+/// wire-relevant at all.
+///
+/// **[RATIFIED 2026/08/15 — ruling 102]** §10.4's *two* triggers both use
+/// this constant: *"when ≥ `STREAMS_CREDIT_BATCH` grants are unadvertised,
+/// **or** when the peer's remaining allowance drops to ≤ 8"* — the second is
+/// written as a literal and is the same value. There is no second constant,
+/// and no code path here writes a bare `8`.
 pub const STREAMS_CREDIT_BATCH: u64 = 8;
 
 /// Re-grant credit once this fraction of the window is consumed — the
 /// divisor, so `2` means "half the window". §10.3.
+///
+/// **Receiver policy, invisible** — by the same argument as
+/// [`STREAMS_CREDIT_BATCH`]: two peers re-granting at different fractions
+/// interoperate perfectly, and neither can observe the other's. Ruling 103
+/// classifies §10.2's five rows and §10.6's ceiling and does **not** reach
+/// this one, which sits in §10.3's named-constants table beside them; the
+/// classification is stated here so the next person to tune it knows which
+/// kind of change it is. See `.slices/04-streams/IMPLEMENTATION-4a.md`.
 pub const CREDIT_REGRANT_DIVISOR: u64 = 2;
 
 /// The largest message the receiver will reassemble, in bytes. §9.8.
@@ -253,6 +297,14 @@ pub const CREDIT_REGRANT_DIVISOR: u64 = 2;
 pub const MESSAGE_RECV_MAX: u64 = 262_144;
 
 /// Distinct out-of-order chunks the reassembler will hold per stream. §10.6.
+///
+/// **Receiver policy, observable** (ruling 103) — the third kind, and the
+/// one §10.2's table has no row for. A peer that fragments past one
+/// receiver's ceiling is killed and past another's is not, so it is
+/// externally visible without being a wire constant. It is a **tolerance**,
+/// which is also why §10.5's *"There is no tolerance band; the limits are
+/// exact"* is true of the two violations §10.5 lists and false of this, the
+/// third (ruling 104).
 pub const REASSEMBLY_CHUNKS_MAX: usize = 1024;
 
 // ═══════════════════════════════════════════════════════════════════════

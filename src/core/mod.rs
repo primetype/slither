@@ -56,7 +56,11 @@ pub use self::endpoint::IntroId;
 
 // Same reason as `packet`'s: the driver that consumes these is slice 3b.
 #[allow(unused_imports)]
-pub(crate) use self::connection::{ConnEvent, ConnOutput, Connection};
+pub(crate) use self::connection::{ConnEvent, ConnOutput, Connection, StreamRef, StreamsExhausted};
+// §9.1's two public types. They live in the `pub(crate)` core and are
+// re-exported from `lib.rs` beside `ConnectionId`/`IntroId`/`Timestamp`
+// (ruling 101).
+pub use self::connection::{Dir, StreamId};
 // §16.5's named timers. Re-exported because the driver arms nothing itself
 // — it only announces `Timeout(next)` — but names them in its trace and in
 // its tests, and a second path to the same enum is a second place to get

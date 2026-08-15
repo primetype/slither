@@ -421,35 +421,57 @@ fn message_recv_max() {
 
 // ---------------------------------------------------------------------
 // §10.2 / §10.3 / §10.4 / §10.6 — flow control and stream limits
+//
+// **[RATIFIED 2026/08/15 — ruling 103]** These pins are three kinds of
+// thing and this file's uniform treatment used to imply one. Marked, and
+// **no asserted value changes** — the point of the ruling is that moving one
+// would be wire-pin churn for nothing:
+//
+//   * the four initial windows are **wire constants**: unnegotiated, so a
+//     red here needs a ruling, not an updated expectation;
+//   * `STREAMS_CREDIT_BATCH` and `CREDIT_REGRANT_DIVISOR` are **receiver
+//     policy, invisible** — two peers running different values interoperate
+//     perfectly. A red here is a *tuning* decision, and does not need a
+//     ratification round;
+//   * `REASSEMBLY_CHUNKS_MAX` is **receiver policy, observable** — still
+//     policy, but a peer can tell, because being killed past one receiver's
+//     ceiling and not past another's is externally visible. Shipped
+//     ratified-but-revisitable, and a tolerance.
 // ---------------------------------------------------------------------
 
 #[test]
 fn initial_max_data() {
     // SPEC.md §10.2 / Named constants: INITIAL_MAX_DATA = 1 048 576 B (1 MiB).
+    // Kind: **wire constant** (ruling 103).
     assert_eq!(INITIAL_MAX_DATA, 1_048_576);
 }
 
 #[test]
 fn initial_max_stream_data() {
     // SPEC.md §10.2 / Named constants: INITIAL_MAX_STREAM_DATA = 262 144 B (256 KiB).
+    // Kind: **wire constant** (ruling 103).
     assert_eq!(INITIAL_MAX_STREAM_DATA, 262_144);
 }
 
 #[test]
 fn initial_max_streams_bidi() {
     // SPEC.md §10.2 / Named constants: INITIAL_MAX_STREAMS_BIDI / _UNI = 32 / 128 (cumulative).
+    // Kind: **wire constant** (ruling 103).
     assert_eq!(INITIAL_MAX_STREAMS_BIDI, 32);
 }
 
 #[test]
 fn initial_max_streams_uni() {
     // SPEC.md §10.2 / Named constants: INITIAL_MAX_STREAMS_BIDI / _UNI = 32 / 128 (cumulative).
+    // Kind: **wire constant** (ruling 103).
     assert_eq!(INITIAL_MAX_STREAMS_UNI, 128);
 }
 
 #[test]
 fn streams_credit_batch() {
     // SPEC.md §10.4 / Named constants: STREAMS_CREDIT_BATCH = 8.
+    // Kind: **receiver policy, invisible** (ruling 103) — and §10.4's two
+    // triggers are both this one constant (ruling 102).
     assert_eq!(STREAMS_CREDIT_BATCH, 8);
 }
 
@@ -457,12 +479,17 @@ fn streams_credit_batch() {
 fn credit_regrant_divisor() {
     // SPEC.md §10.3 / Named constants: "credit re-grant threshold | ½ window
     // consumed". Not given a bare literal; the divisor implied by "half" is 2.
+    // Kind: **receiver policy, invisible** — ruling 103 classifies §10.2's
+    // five rows and §10.6's ceiling and does not reach this one; it is the
+    // same kind as STREAMS_CREDIT_BATCH by the same argument.
     assert_eq!(CREDIT_REGRANT_DIVISOR, 2);
 }
 
 #[test]
 fn reassembly_chunks_max() {
     // SPEC.md §10.6 / Named constants: REASSEMBLY_CHUNKS_MAX = 1024 stored discontiguous ranges per stream.
+    // Kind: **receiver policy, observable** (ruling 103) — a tolerance, and
+    // the §10 violation §10.5 omits (ruling 104).
     assert_eq!(REASSEMBLY_CHUNKS_MAX, 1024);
 }
 

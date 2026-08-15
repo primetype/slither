@@ -103,12 +103,21 @@ impl<C: Handshake> Connection<C> {
     pub(crate) fn open(&mut self, dir: Dir) -> Result<StreamRef, StreamsExhausted>;
     pub(crate) fn write(&mut self, now: Instant, r: StreamRef, data: &[u8])
         -> Result<usize, WriteError>;
-    pub(crate) fn finish(&mut self, r: StreamRef) -> Result<(), WriteError>;
+    pub(crate) fn finish(&mut self, now: Instant, r: StreamRef) -> Result<(), WriteError>;
     pub(crate) fn reset(&mut self, now: Instant, r: StreamRef, error_code: u64);
-    pub(crate) fn read(&mut self, r: StreamRef, buf: &mut [u8])
+    pub(crate) fn read(&mut self, now: Instant, r: StreamRef, buf: &mut [u8])
         -> Result<Option<usize>, ReadError>;
-    pub(crate) fn accept(&mut self, dir: Dir) -> Option<StreamRef>;
+    /// **Ruling 109.** §16.2's `RecvStream::drop` calls this; ruling 93
+    /// and its amendment are its whole semantics.
+    pub(crate) fn abandon_recv(&mut self, now: Instant, r: StreamRef);
+    pub(crate) fn accept(&mut self, dir: Dir) -> Option<StreamRef>;   // FIFO, ruling 112
     pub(crate) fn stream_id(&self, r: StreamRef) -> Option<StreamId>;
+
+    /// **Ruling 113.** Uncalled from the wire until slice 5 wires §12 to
+    /// them; `pub(crate)` on `Connection` so 4a's tests can reach the GC
+    /// and watermark logic at all.
+    pub(crate) fn on_ack_range(&mut self, now: Instant, r: StreamRef, range: Range<u64>);
+    pub(crate) fn on_lost_range(&mut self, now: Instant, r: StreamRef, range: Range<u64>);
 
     /// **Ruling 94.** Total bytes of reassembly **capacity** currently
     /// allocated across every receive half. Test-visible on purpose:
@@ -127,7 +136,7 @@ same ones and §16.2 specifies only the `async` surface:**
 | Call | Value | Means |
 |---|---|---|
 | `write` | `Ok(n)`, `n > 0` | `n` bytes buffered |
-| `write` | `Ok(0)` | **blocked** by stream or connection credit; the shell parks |
+| `write` | `Ok(0)` | **blocked** by stream or connection credit; the shell parks — **but only for a non-empty input** (ruling 110: a zero-length write is a no-op that also returns `Ok(0)`, and parking on it waits for credit that would not help) |
 | `write` | `Err(WriteError::Finished)` | `finish()`/`reset()` already called |
 | `write` | `Err(WriteError::ConnectionLost(_))` | connection is gone |
 | `read` | `Ok(Some(n))`, `n > 0` | `n` bytes drained from the contiguous prefix |
@@ -139,6 +148,14 @@ same ones and §16.2 specifies only the `async` surface:**
 `Ok(Some(0))` versus `Ok(None)` is the distinction the shell turns into
 "park" versus "EOF". Getting it backwards hangs a reader forever on a
 finished stream, which is why it is written down rather than inferred.
+
+**Rulings 108–113 amend this section after dispatch.** `read`, `finish`
+and `abandon_recv` carry `now` because §10.3 makes consumption advance
+credit and §16.7 makes sealing synchronous *inside the mutating call* —
+`poll_output()` has no instant and ruling 80 forbids the core inventing
+one. `final_size` on `reset()` is the end offset of the highest byte
+**actually transmitted** (ruling 111), not the accepted-but-unsealed
+total.
 
 **`open()` before establishment is legal** (§16.9) and returns a usable
 `StreamRef`. `write()` on it is legal. `stream_id()` on it is `None`.

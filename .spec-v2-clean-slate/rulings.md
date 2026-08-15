@@ -2497,3 +2497,190 @@ constants-table grouping, what the omitted violation does to the
 sentence that closes the section. The defect class is not merely
 frequent; it is *recursive*, and a hunt for it is itself a construction
 with a scope worth asking about.
+
+## Round 18 — slice 4a's blind test author reports (2026/08/15)
+
+Seventy-three tests written from the spec in an isolated worktree, against
+an implementation their author never saw. The report found **three defects
+in the contract I wrote** and two spec ambiguities. Every one is real.
+Recorded here as rulings so 4b and slice 5 inherit decisions rather than
+the arguments.
+
+**Ruling 108 — `read`, `finish` and `abandon_recv` take `now: Instant`.**
+§16.4 gives `read(id, buf)` and `finish(id)` no instant, and my contract
+copied that. But `read()` is a **mutating** call — it drains the
+contiguous prefix — and §10.3 makes **consumption** the thing that
+advances credit, so a read can cross the re-grant trigger and owe a
+MAX_STREAM_DATA or MAX_DATA. §16.7 settles what happens next in terms:
+
+> Sealing — commit included — executes **within the mutating call that
+> triggers it** (`handle_timeout`, `handle_datagram`, the application
+> surface), never lazily inside `poll_output()`.
+
+`poll_output()` carries no instant, `seal_quiet` requires one because
+credit frames are ack-eliciting and arm the death clock (§7.4), and ruling
+80 forbids the core inventing one from a clock. So the instant must arrive
+on the verb. The three ways out the author enumerated are not equal: (2)
+deferring the seal contradicts §16.7 and would make a credit frame's
+emission time depend on unrelated traffic; (3) caching the last observed
+`now` seals with a stale `last_send`, which §7.4's liveness accounting
+then reads. Only (1) is consistent with rules already ratified.
+
+`finish` queues a FIN-bearing STREAM frame — the marking `seal` (§7.4) —
+and `abandon_recv`'s true-up can both cross §10.3's threshold and fully
+close a peer-opened uni stream, which owes a MAX_STREAMS grant (§10.4).
+Same argument, same conclusion.
+
+**This is ruling 80's defect a fourth time and ruling 92's a second, in
+the same API listing.** Ruling 92 already recorded that ruling 80's own
+generalisation — an API listing looks exhaustive and literal and is
+routinely neither — reaches further than ruling 80 applied it. It reached
+here too, and ruling 92 did not check. **The general form, which is now
+worth stating once instead of rediscovering per verb: in a sans-io core
+whose sealing is synchronous, `now` belongs on every verb that can emit a
+frame, and "can this emit?" is a question about §10 and §9.7's
+consequences, not about what the verb is named.** `read` looks like a
+reader; it is a credit-advancing, frame-emitting mutation.
+
+*Found the way the previous three were:* an independent author checking
+the contract against `CLAUDE.md`'s stated invariant — "`now: Instant` is
+an argument on every mutating call" — rather than against the listing.
+
+**Ruling 109 — `abandon_recv(&mut self, now, r)` is the verb ruling 93
+specifies and ruling 95 omitted.** Rulings 93 and its amendment both
+legislate core behaviour "on abandoning the receive half", and no verb in
+§16.4 or in my contract performs it; the shell's `RecvStream::drop` has
+nothing to call. Ruling 95 counted "eleven sites" for the `StreamRef`
+key — five verbs, `accept`, `stream_id`, four events — and this is a
+twelfth, with `on_ack_range`/`on_lost_range` (ruling 113) making fourteen.
+
+**Ruling 95's count has now been wrong twice**, each time discovered by
+building against it rather than by reading it: once by me while applying
+it, once by the test author while writing to it. Its own amendment
+observed that it was "written in the round that observes this class is
+recursive" — and then undercounted again in the amendment. The lesson is
+not to count more carefully. It is that **a count in a ruling is a claim
+about a listing, and the only thing that checks a listing is compiling
+against it.**
+
+The name is the test author's guess, kept deliberately: seven of its tests
+call it, and adopting the guess costs one shim line where renaming costs
+seven edits and a reconciliation.
+
+**Ruling 110 — a zero-length `write` is a no-op returning `Ok(0)`, and
+`Ok(0)` means *blocked* only for a non-empty input.** The contract made
+`Ok(0)` mean "blocked by credit; the shell parks", and a zero-length write
+returns `Ok(0)` under any natural implementation — parking a writer that
+has nothing to wait for, since no credit arrival will ever unblock it.
+Not hypothetical: ruling 100 makes empty STREAM frames legitimate protocol
+elements, and §16.2's `AsyncWrite` is handed empty buffers by ordinary
+`tokio::io` combinators. The shell knows its own buffer length, so the
+check belongs there and costs one condition. Documented on `write`.
+
+**Ruling 111 — RESET_STREAM's `final_size` is the end offset of the
+highest byte actually *transmitted*.** §9.6 read "the number of bytes the
+stream would have carried (the end offset of the highest byte sent, or 0
+if none)" — and the phrase and its own parenthetical disagree the moment
+`reset()` follows a `write()` that congestion control has not yet
+released, which is ordinary operation, not an edge case. Ruling 56's
+"accepted bytes are already in send state" pulls the other way.
+
+Only "transmitted" is consistent with both neighbours. Pending bytes were
+never on the wire, so counting them pins a final size the receiver can
+never reach — and §8.4 makes a FIN or data conflicting with a pinned final
+size a `FINAL_SIZE_ERROR`, so the receiver would be holding a stream it
+can never complete. In-flight bytes *may already have arrived*, so **not**
+counting them would make legitimately-received data exceed the final size
+and kill an honest peer's connection. The window between the two readings
+is exactly the accepted-but-unsealed set. §9.6 amended.
+
+**Ruling 112 — `accept(dir)` claims in FIFO open order.** §9.2 opens a
+*run* of indices from one frame and ruling 99 fixed the event count;
+neither says which stream a claim returns. Working rule 8's shape, and it
+matters because an application will assume ascending order — the natural
+assumption, and what QUIC implementations do — while relying on nothing.
+FIFO in open order matches `recv_message`'s "oldest complete unclaimed"
+and keeps §9.8's second claim verb drawing from the same supply in a
+defined order. Decided now rather than at 4b, so no example bakes in an
+order the core does not promise.
+
+**Ruling 113 — `on_ack_range`/`on_lost_range` surface on `Connection`,
+and two of ruling 97's four watermarks are scheduled debt, not coverage.**
+My contract §5 asserted that defining these on the send half in slice 4
+"is what makes GC and watermark logic testable now". The author checked
+and it does not: they sit on a type the contract never surfaces, with no
+path from a `Connection`, so nothing in 4a can call them. **Working rule
+11's shape in a contract rather than a ruling** — a rationale naming a
+mechanism that does not connect to the thing it claims to enable.
+
+They become `pub(crate)` verbs on `Connection`, taking `now` (an ACK can
+complete a send half, fully close a stream, and owe a MAX_STREAMS grant),
+still uncalled from the wire until slice 5 wires §12 to them.
+
+The consequence the author traced from it must be recorded rather than
+silently carried: a locally-opened stream fully closes only on
+acknowledgement, so **the local-bidi and local-uni watermarks cannot
+advance in 4a at all, and a build maintaining only the two peer-opened
+watermarks passes all 73 tests.** Ruling 97's H3 warning is undefended by
+anything writable here. Ruling 97's named test is correspondingly
+*reduced* — it pins legality-before-limit and legality-before-flow-control,
+not legality-before-watermark — and says so in its own doc comment, which
+is the difference between a reduced test and a name that is not a pin.
+
+**Owed to slice 5**, three tests: legality-before-watermark on a closed
+local-uni index; "credit for a fully-closed stream is a valid no-op"
+(§8.4) on a stream we can send on; and a locally-opened watermark
+advancing at all. Plus §10.4's "closing streams we opened must not inflate
+the peer's allowance" (RFC 9000 §4.6's scope rule), unreachable for the
+same reason. **Owed to slice 7**: ruling 98's STREAM-retransmission row —
+the only row where one frame type takes two different seals, and so the
+one most likely to be got wrong — and ruling 105's loss-driven tombstone
+variant.
+
+### Two process defects, one of them mine and new
+
+**The worktree was cut one commit before its own brief's inputs.**
+`CONTRACT-4a.md` — the file the brief calls binding — did not exist at
+`fdf5972`, the commit the test author's worktree was created from; it
+landed on `main` at `74fa5f2`. The author spent ten minutes reconstructing
+the API from `PLAN.md` and Round 17, and was rescued only because an
+unrelated mid-flight message about ruling 93 revealed the file existed, at
+which point it read the contract out of `main` with `git show`.
+
+Two of its reconstructed guesses were **semantic, not cosmetic**:
+`ConnEvent::StreamReadable { stream: … }` against the contract's
+`{ r: … }`, and **no `Ok(Some(0))`/`Ok(None)` distinction for `read` at
+all** — the latter being precisely the convention whose inversion hangs a
+reader forever on a finished stream. Had that message not gone out for an
+unrelated reason, 73 tests would have been written against a guessed API
+and the integration would have looked like a disagreement about design
+rather than a missing file.
+
+**Worktree isolation solved the blindness leak of slice 3b and introduced
+a new failure mode in doing it: the isolated agent sees a *commit*, not a
+working tree.** Uncommitted brief inputs do not travel. This is now
+working rule 14.
+
+**§11.8's release-mode requirement has no gate.** `PLAN.md` §11.8 requires
+the arithmetic test to run in release as well as debug, because
+`debug_assert`-based overflow checks compile out — and FIXES-3b §4 is the
+precedent where a bug cost only in release. A `#[test]` cannot select its
+profile, so this is a CI obligation, and `CLAUDE.md`'s gate table did not
+have one. Added: `cargo test --release`.
+
+### What the report says about the arrangement
+
+The author declined the brief's instruction to use
+`#[tokio::test(start_paused = true)]`, on the grounds that a sans-io core
+takes `now` as an argument and has no virtual time to pause — the
+attribute would attach a runtime nothing awaits. It is right, it matches
+`src/core/connection/tests.rs`'s existing practice, and it flagged the
+deviation rather than making it silently. **Eight agents have now declined
+an instruction and all eight were right.**
+
+It also declined to write two tests it could have written: ruling 102's
+(the ruling itself says no test can separate the readings, so a test would
+have produced a name that is not a pin) and conflict C-b's (the correct
+behaviour was undecided, and writing a test would have resolved it
+silently). **Not writing a test is the harder call and the right one**,
+and both refusals are recorded in its report with the reason.

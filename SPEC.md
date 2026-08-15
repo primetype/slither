@@ -2992,8 +2992,14 @@ is no message-size ceiling beyond flow control. Rules:
 `reset(error_code)` abandons a send half abruptly: pending and in-flight
 data for the stream stop being retransmitted, and RESET_STREAM
 `{ stream_id, error_code, final_size }` is emitted (regenerated until
-acknowledged), where `final_size` is the number of bytes the stream would
-have carried (the end offset of the highest byte sent, or 0 if none),
+acknowledged), where `final_size` is **the end offset of the highest byte
+this endpoint has actually transmitted for the stream, or 0 if none**
+(**[RATIFIED 2026/08/15 — ruling 111]**: bytes `write()` has accepted but
+that have never been sealed onto the wire are *not* counted — this
+sentence previously read "the number of bytes the stream would have
+carried", which disagrees with its own parenthetical the moment a
+`reset()` follows a `write()` that congestion control has not yet
+released, i.e. in ordinary operation),
 **truing up the receiver's connection-level flow-control accounting**:
 the receiver counts the full `final_size` against `MAX_DATA` consumption
 exactly as if the bytes had arrived (§10.1), so both ends agree on

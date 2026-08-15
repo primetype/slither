@@ -40,4 +40,14 @@ _(pending)_
   Key deltas from the plan: ruling 98 (seal table — §7.4 governs; RESET_STREAM
   is quiet, STREAM retransmission is quiet), ruling 93 (true-up = highest
   stream-level limit ever advertised).
+- Read `PLAN.md` §2–§5 (237–725), §6 (726–796), §8 (861–1290), §9 (1291–1527),
+  §12 (1783–1935).
+- Read the existing tree: `src/core/connection/{mod,frame}.rs` in full,
+  `session.rs` seal surface, `src/core/mod.rs` (Role/Install/Transmit),
+  `src/constants.rs` §8.3/§8.4/§10 blocks, `src/error.rs`
+  `WriteError`/`ReadError`, `src/lib.rs` re-export block.
+- **Contract amendment received mid-work** (§4a, ruling 93's two tombstone
+  mechanisms). Re-read `CONTRACT-4a.md` lines 170–254. Design updated before
+  any code was written: `recv_abandoned` per-half tombstone **plus** watermark
+  advance only where the abandonment fully closes the stream.
 

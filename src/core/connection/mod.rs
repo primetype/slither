@@ -35,8 +35,13 @@
 //! applies nothing else — so the mark happens before the parse, and stays.
 
 pub(crate) mod close;
+pub(crate) mod flow;
 pub(crate) mod frame;
+pub(crate) mod recv;
+pub(crate) mod send;
 pub(crate) mod session;
+pub(crate) mod stream_id;
+pub(crate) mod streams;
 pub(crate) mod timers;
 
 // Slice 3a's acceptance tests, written independently from `SPEC.md` and
@@ -51,13 +56,20 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::constants;
-use crate::error::ConnectionLost;
+use crate::error::{ConnectionLost, ReadError, WriteError};
 use crate::packet::{Handshake, Inbound, classify};
 
 use self::close::{Closing, Lifecycle};
+use self::flow::Flow;
 use self::frame::{Close, Frame, Packing, Structural};
 use self::session::Session;
 use self::timers::{TimerKind, Timers};
+
+// §9.1's two public types (ruling 101). Fully `pub` so `core::mod.rs` can
+// re-export them out of the `pub(crate)` core — a `pub(crate) use` here
+// would make the outer re-export E0365.
+pub use self::stream_id::{Dir, StreamId};
+pub(crate) use self::streams::{StreamRef, Streams, StreamsExhausted};
 
 use super::{EstablishedSession, Install, Role, ToEndpoint, Transmit};
 
@@ -79,6 +91,16 @@ pub(crate) struct Connection<C: Handshake> {
     /// **[ruling 106]** `None` until the install; §9.1's stream-ID parity
     /// reads it, and the core cannot derive it (§6.6 step 4).
     role: Option<Role>,
+    /// §9's four ID spaces and both halves of every open stream.
+    streams: Streams,
+    /// §10's two credit ledgers and the cumulative stream limits.
+    flow: Flow,
+    /// Events generated while a packet is being applied, drained into
+    /// `outputs` before the transmits they cause (§16.4's generation order).
+    events: Vec<ConnEvent>,
+    /// §18.1's cause, retained so the stream verbs can surface
+    /// `ConnectionLost` after the one `Closed` event has gone out.
+    lost: Option<ConnectionLost>,
 }
 
 /// What a received, authenticated, window-fresh packet turned out to be.
@@ -105,6 +127,10 @@ impl<C: Handshake> Connection<C> {
             closed_emitted: false,
             scratch: Vec::new(),
             role: None,
+            streams: Streams::new(),
+            flow: Flow::new(),
+            events: Vec::new(),
+            lost: None,
         }
     }
 
@@ -284,6 +310,12 @@ impl<C: Handshake> Connection<C> {
                 break;
             }
         }
+
+        // A timer can free state (§15) but arms nothing that owes a frame
+        // in this slice. Pumping anyway keeps the invariant "every call
+        // carrying an instant leaves nothing owed" true of the whole
+        // surface rather than of most of it.
+        self.pump(now);
     }
 
     /// §16.4's `close`. §15.2's local close.
@@ -341,6 +373,188 @@ impl<C: Handshake> Connection<C> {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // §9/§10 — the stream surface (§16.4)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// **[ruling 106]** The role fixed at install. `None` before it.
+    pub(crate) fn role(&self) -> Option<Role> {
+        self.role
+    }
+
+    /// §16.4's `open`.
+    ///
+    /// Legal **before establishment** (§16.9): the returned [`StreamRef`] is
+    /// usable at once, `write()` on it is ordinary work, and
+    /// [`stream_id`](Self::stream_id) is `None` until a session installs.
+    pub(crate) fn open(&mut self, dir: Dir) -> Result<StreamRef, StreamsExhausted> {
+        self.streams.open(dir, &self.flow)
+    }
+
+    /// §16.9's accessor: the wire id, once establishment has fixed parity.
+    pub(crate) fn stream_id(&self, r: StreamRef) -> Option<StreamId> {
+        self.streams.stream_id(r)
+    }
+
+    /// §16.4's `accept`: claim one peer-opened stream of `dir`.
+    pub(crate) fn accept(&mut self, dir: Dir) -> Option<StreamRef> {
+        self.streams.accept(dir)
+    }
+
+    /// §16.4's `write`. `Ok(0)` means **blocked** by stream or connection
+    /// credit — the shell parks; it is not end-of-stream.
+    ///
+    /// **`Ok(0)` means blocked only for a non-empty input.** `write(now, r,
+    /// &[])` is a no-op that also returns `Ok(0)`, so a shell must check its
+    /// own buffer length before parking, or it parks forever on an empty
+    /// write of its own making.
+    pub(crate) fn write(
+        &mut self,
+        now: Instant,
+        r: StreamRef,
+        data: &[u8],
+    ) -> Result<usize, WriteError> {
+        self.lost()?;
+        let n = self.streams.write(r, data, &mut self.flow)?;
+        self.pump(now);
+        Ok(n)
+    }
+
+    /// §16.4's `finish`: no more data, and the FIN pins the final size.
+    ///
+    /// Takes `now` because it emits — a FIN-bearing STREAM frame, on the
+    /// **marking** `seal` (§7.4, ruling 98) — and §16.7 puts sealing *"within
+    /// the mutating call that triggers it"*, never lazily inside
+    /// `poll_output()`, which has no instant.
+    pub(crate) fn finish(&mut self, now: Instant, r: StreamRef) -> Result<(), WriteError> {
+        self.lost()?;
+        self.streams.finish(r)?;
+        self.pump(now);
+        Ok(())
+    }
+
+    /// §16.4's `reset` — §9.6's sender-emitted RESET_STREAM.
+    pub(crate) fn reset(&mut self, now: Instant, r: StreamRef, error_code: u64) {
+        self.streams.reset(r, error_code);
+        self.pump(now);
+    }
+
+    /// §16.4's `read`: drain the contiguous prefix.
+    ///
+    /// `Ok(Some(0))` is **no data available** — the shell parks. `Ok(None)`
+    /// is end of stream. Getting the two backwards hangs a reader forever on
+    /// a finished stream.
+    ///
+    /// Takes `now` because it emits, for **two** independent reasons. §10.3
+    /// makes consumption drive credit, so a read that crosses the re-grant
+    /// threshold owes a MAX_STREAM_DATA and possibly a MAX_DATA; and a read
+    /// that reaches the final size **retires the half** (§9.7), which for a
+    /// peer-opened uni stream fully closes the stream and owes a MAX_STREAMS
+    /// (§10.4). The second reason stands even if §10.3's re-grant never
+    /// fires.
+    pub(crate) fn read(
+        &mut self,
+        now: Instant,
+        r: StreamRef,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, ReadError> {
+        if let Some(lost) = self.lost.clone() {
+            return Err(ReadError::ConnectionLost(lost));
+        }
+        let out = self.streams.read(r, buf, &mut self.flow);
+        self.pump(now);
+        out
+    }
+
+    /// Abandon a receive half — §16.2's dropped `RecvStream`.
+    ///
+    /// **[RATIFIED 2026/08/15 — ruling 93]** It retires **at once**: the
+    /// half is freed, the connection-level contribution is trued up to the
+    /// highest stream-level limit ever advertised, and the index is
+    /// tombstoned by the mechanism its space requires — §9.2's watermark for
+    /// a peer-opened uni stream, whose receive half is the only half this
+    /// endpoint holds, and a per-half discard for a bidi stream, whose send
+    /// half is still live.
+    ///
+    /// Takes `now` because the true-up can cross §10.3's threshold and can
+    /// fully close a peer-opened uni stream, which grants MAX_STREAMS
+    /// (§10.4).
+    pub(crate) fn abandon_recv(&mut self, now: Instant, r: StreamRef) {
+        self.streams.abandon_recv(r, &mut self.flow);
+        self.pump(now);
+    }
+
+    /// **Ruling 94.** Total bytes of reassembly **capacity** currently
+    /// allocated across every receive half.
+    pub(crate) fn reassembly_capacity(&self) -> u64 {
+        self.streams.reassembly_capacity()
+    }
+
+    /// Emit anything owed on the wire.
+    ///
+    /// **Additive**, and after the `now` correction it is a convenience
+    /// rather than a necessity: every verb that can owe a frame now seals
+    /// inside itself (§16.7). Kept because the two-core tests use it to make
+    /// "nothing further is owed" assertable.
+    pub(crate) fn flush(&mut self, now: Instant) {
+        self.pump(now);
+    }
+
+    /// §12's ACK application for one stream range. **Uncalled from the
+    /// wire** in slice 4 (§12.4's seam); slice 5 wires §12 to it.
+    ///
+    /// Takes `now` because an ACK can complete a send half, fully close a
+    /// stream and owe a MAX_STREAMS grant (§10.4).
+    ///
+    /// Whether the acknowledged frame carried the **FIN** is inferred from
+    /// `range.end == final_size`, because the signature carries no flag.
+    /// That is exact for every frame this implementation emits — the FIN
+    /// rides the frame that ends the stream and nothing else — but §8.7 lets
+    /// a retransmission re-frame ranges freely, so slice 5 should carry the
+    /// flag explicitly off its sent-packet map rather than re-derive it here.
+    /// See the implementation report.
+    pub(crate) fn on_ack_range(&mut self, now: Instant, r: StreamRef, range: std::ops::Range<u64>) {
+        let fin = self.frame_carried_fin(r, &range);
+        self.streams
+            .on_ack_range(r, range, fin, &mut self.flow, &mut self.events);
+        self.drain_events();
+        self.pump(now);
+    }
+
+    /// §13's loss detection for one stream range: it returns to the pending
+    /// set and is re-framed on a fresh counter (§8.7 `ranges`). **Uncalled
+    /// from the wire** in slice 4 (§12.5's seam).
+    pub(crate) fn on_lost_range(
+        &mut self,
+        now: Instant,
+        r: StreamRef,
+        range: std::ops::Range<u64>,
+    ) {
+        let fin = self.frame_carried_fin(r, &range);
+        self.streams.on_lost_range(r, range, fin);
+        self.pump(now);
+    }
+
+    fn frame_carried_fin(&self, r: StreamRef, range: &std::ops::Range<u64>) -> bool {
+        self.streams.final_size(r) == Some(range.end)
+    }
+
+    /// §9.6's RESET_STREAM acknowledged. **Uncalled from the wire** in slice
+    /// 4.
+    pub(crate) fn on_reset_acked(&mut self, now: Instant, r: StreamRef) {
+        self.streams.on_reset_acked(r, &mut self.flow);
+        self.pump(now);
+    }
+
+    /// §18.1's cause, once the connection has died. The verbs surface it
+    /// rather than accepting work a dead connection can never do.
+    fn lost(&self) -> Result<(), WriteError> {
+        match self.lost.clone() {
+            Some(lost) => Err(WriteError::ConnectionLost(lost)),
+            None => Ok(()),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Receive
     // ═══════════════════════════════════════════════════════════════════
 
@@ -381,6 +595,39 @@ impl<C: Handshake> Connection<C> {
                 // sampling, the sent-packet map, the loss evaluation — is
                 // slice 5, and this arm is where it lands.
                 Frame::Ack(_) => {}
+                Frame::Stream(stream) => {
+                    if let Err(violation) =
+                        self.streams
+                            .on_stream_frame(&stream, &mut self.flow, &mut self.events)
+                    {
+                        self.kill(now, violation);
+                        return;
+                    }
+                }
+                Frame::ResetStream(reset) => {
+                    if let Err(violation) =
+                        self.streams
+                            .on_reset_stream(&reset, &mut self.flow, &mut self.events)
+                    {
+                        self.kill(now, violation);
+                        return;
+                    }
+                }
+                Frame::MaxData(max) => {
+                    let raised = self.flow.on_max_data(max);
+                    self.streams.on_max_data(raised, &mut self.events);
+                }
+                Frame::MaxStreamData(grant) => {
+                    if let Err(violation) =
+                        self.streams
+                            .on_max_stream_data(grant.id, grant.max, &mut self.events)
+                    {
+                        self.kill(now, violation);
+                        return;
+                    }
+                }
+                Frame::MaxStreamsBidi(max) => self.on_max_streams(Dir::Bi, max),
+                Frame::MaxStreamsUni(max) => self.on_max_streams(Dir::Uni, max),
                 Frame::Close(close) => {
                     // §15.2: surface `PeerClosed`, emit **nothing**, hold a
                     // drain for `CLOSE_LINGER`, then drop all state.
@@ -397,6 +644,51 @@ impl<C: Handshake> Connection<C> {
                     break;
                 }
             }
+        }
+
+        // §16.4's generation order: the events a packet caused, then the
+        // packet its arrival made us owe.
+        self.drain_events();
+        self.pump(now);
+    }
+
+    /// §10.4's MAX_STREAMS: monotone-max, and `StreamsAvailable` only when
+    /// the limit actually moved — a value at or below the current one is a
+    /// valid no-op (§8.4) and must wake nobody.
+    fn on_max_streams(&mut self, dir: Dir, max: u64) {
+        if self.flow.on_max_streams(dir, max) {
+            self.events.push(ConnEvent::StreamsAvailable { dir });
+        }
+    }
+
+    /// §8.2's semantic class: one CLOSE with the violation's §15.3 code.
+    fn kill(&mut self, now: Instant, violation: flow::Violation) {
+        let code = violation.code();
+        tracing::warn!(
+            target: "slither::frames",
+            error = %violation,
+            code,
+            "semantic violation in the frame stream; closing"
+        );
+        // Ruling 99's *"emits **zero** events"* is delivered by the check
+        // **order**, not by discarding afterwards: the limit check runs
+        // before the opens it would authorise, so the offending frame never
+        // generated one. Whatever earlier frames in the same packet
+        // legitimately generated is kept and drained first — §8.2 discards a
+        // packet's effects only on the *structural* path.
+        self.drain_events();
+        self.enter_closing(
+            now,
+            code,
+            b"",
+            ConnectionLost::ProtocolViolation { code },
+        );
+    }
+
+    /// Move the packet's events into the drain, in generation order.
+    fn drain_events(&mut self) {
+        for event in self.events.drain(..) {
+            self.outputs.push_back(ConnOutput::Event(event));
         }
     }
 
@@ -537,10 +829,88 @@ impl<C: Handshake> Connection<C> {
     fn install(&mut self, now: Instant, session: EstablishedSession<C>, role: Role) {
         self.installed = true;
         self.role = Some(role);
+        self.streams.set_role(role);
         self.session = Some(Session::install(now, session));
         self.sync_liveness_timer();
         self.outputs
             .push_back(ConnOutput::Event(ConnEvent::Established));
+        // §16.9: early opens and writes are *ordinary work* that pumps when
+        // a session installs. Nothing was emitted before now because there
+        // was nothing to seal with.
+        self.pump(now);
+    }
+
+    /// §8.5's plan-seal-commit, run until nothing more is owed (§16.7).
+    ///
+    /// # Ruling 98's seal table, which is §7.4's and not the plan's
+    ///
+    /// | Frame | Seal | Ack-eliciting |
+    /// |---|---|---|
+    /// | STREAM, **first transmission** | `seal` (marking) | yes |
+    /// | STREAM, **retransmission** | `seal_quiet` | yes |
+    /// | **RESET_STREAM** | `seal_quiet` | yes |
+    /// | MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS_BIDI / MAX_STREAMS_UNI | `seal_quiet` | yes |
+    ///
+    /// §7.4 (`SPEC.md:1953–1958`) enumerates the quiet set and RESET_STREAM
+    /// is **in** it — the plan's table put it on the marking `seal` "by
+    /// omission from §10.3", which is backwards and would have deferred
+    /// keepalives forever. `session.rs`'s `seal_quiet` doc comment has
+    /// quoted the correct set since slice 3a.
+    ///
+    /// Marking is a property of the **seal**, not of the frame, so a packet
+    /// mixing a fresh STREAM frame with credit frames is marking. That last
+    /// sentence is the only part no section states, and it follows from
+    /// `seal`/`seal_quiet` being a per-seal choice.
+    fn pump(&mut self, now: Instant) {
+        if !self.lifecycle.is_live() || self.session.is_none() {
+            // §16.9: *"no frame is emitted before install (nothing sends
+            // until a session exists)"*.
+            return;
+        }
+
+        // Bounded by construction: every iteration that transmits has moved
+        // stream bytes out of the pending set or cleared a regenerate
+        // identity, and one that does neither breaks below.
+        loop {
+            let mut packing = Packing::new();
+            self.streams.pack_control(&mut self.flow, &mut packing);
+            let marking = self.streams.fill(&mut packing);
+
+            if packing.frames().is_empty() {
+                break;
+            }
+            let plaintext = packing.into_plaintext();
+
+            let Some(session) = self.session.as_mut() else {
+                break;
+            };
+            // Every frame this slice packs is ack-eliciting (§8.3), so the
+            // death clock is armed either way; only `last_send` differs.
+            let sealed = if marking {
+                session.seal(now, &plaintext, true)
+            } else {
+                session.seal_quiet(now, &plaintext, true)
+            };
+            let sealed = match sealed {
+                Ok(sealed) => sealed,
+                Err(_) => {
+                    // §7.9: the only reachable seal failure is nonce
+                    // exhaustion, and it is terminal.
+                    self.die(ConnectionLost::NonceExhausted);
+                    return;
+                }
+            };
+            let to = session.established().anchor;
+            self.outputs.push_back(ConnOutput::Transmit(Transmit {
+                to,
+                data: sealed.datagram,
+            }));
+            self.sync_liveness_timer();
+
+            if !self.streams.has_output() {
+                break;
+            }
+        }
     }
 
     /// Re-derive the `Liveness` deadline from §7.4's clocks.
@@ -580,6 +950,7 @@ impl<C: Handshake> Connection<C> {
             return;
         }
         self.closed_emitted = true;
+        self.lost = Some(lost.clone());
         self.outputs
             .push_back(ConnOutput::Event(ConnEvent::Closed(lost)));
     }
@@ -605,14 +976,370 @@ pub(crate) enum ConnOutput {
 }
 
 /// A connection event. §16.4.
+///
+/// The stream-naming variants are keyed by [`StreamRef`] and **not** by
+/// [`StreamId`] — **ruling 95's amendment**. If they keyed by the wire id,
+/// the shell could not match a wakeup to its waker before establishment,
+/// which is exactly when §16.9 says work is in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnEvent {
     /// The session is installed; the shell resolves `Connecting`.
     Established,
+    /// A peer-opened stream is claimable through `accept(dir)`.
+    ///
+    /// **[RATIFIED 2026/08/15 — ruling 99]** **One per newly-opened
+    /// stream.** §9.2's implicit open of index 5 opens six streams and emits
+    /// six events; `accept(dir)` returns one stream per call, so one event
+    /// for six would force the shell to loop `accept()` until `None` on
+    /// every wake or lose five — a lost-wakeup that manifests only under the
+    /// reordering the tests inject. A frame above §10.4's cumulative limit
+    /// emits **zero** and kills the connection, which is what bounds the
+    /// burst.
+    StreamOpened {
+        /// Which direction became claimable.
+        dir: Dir,
+    },
+    /// MAX_STREAMS credit arrived and actually raised the limit (§10.4).
+    StreamsAvailable {
+        /// The direction whose allowance grew.
+        dir: Dir,
+    },
+    /// A read would now return something other than "no data".
+    StreamReadable {
+        /// The stream.
+        r: StreamRef,
+    },
+    /// Stream or connection credit arrived for a blocked writer (§10.3).
+    StreamWritable {
+        /// The stream.
+        r: StreamRef,
+    },
+    /// The send half is fully acknowledged — §9.7's `DataRecvd`.
+    ///
+    /// **Never fires in slice 4**: reaching `DataRecvd` needs §12's ACK
+    /// processing, which is slice 5. That is the slice boundary, not a
+    /// defect.
+    StreamFinished {
+        /// The stream.
+        r: StreamRef,
+    },
+    /// The peer reset the stream (§9.6).
+    StreamReset {
+        /// The stream.
+        r: StreamRef,
+        /// The peer's application code.
+        error_code: u64,
+    },
     /// The connection ended, with §18.1's cause. Emitted **once**.
     ///
     /// Not `Copy`, and neither is [`ConnOutput`] any more:
     /// `ConnectionLost::PeerClosed` carries the peer's reason phrase, which
     /// is `Vec<u8>` because §8.4 carries it as bytes.
     Closed(ConnectionLost),
+}
+
+/// A two-core smoke check for the §9/§10 machinery.
+///
+/// **Not the slice's acceptance tests** — those are written independently by
+/// the test author (working rule 6) and live in a file this implementer
+/// never touches. This exists because the transmit pump, the codec and the
+/// receive path have no other in-file exercise: everything else in the four
+/// new modules is unit-testable against its own state, and the *seam between
+/// them* is not.
+///
+/// It builds two real `Connection`s over one real hiss handshake and hands
+/// each one the other's datagrams, so every assertion here is a wire
+/// assertion.
+#[cfg(test)]
+mod smoke {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::num::NonZeroU64;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::constants::{PROLOGUE, REKEY_EPOCH_MSGS};
+    use crate::identity::Identity;
+    use crate::packet::ReferenceSuite;
+    use crate::testutil::CountingIdentity;
+
+    type Suite = ReferenceSuite;
+    type Id = CountingIdentity<Suite>;
+
+    fn v4(a: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, a)), 4000 + a as u16)
+    }
+
+    /// Both halves of one real IK handshake, as two `EstablishedSession`s.
+    fn sessions() -> (EstablishedSession<Suite>, EstablishedSession<Suite>) {
+        let epoch = NonZeroU64::new(REKEY_EPOCH_MSGS).expect("nonzero");
+        let a: Id = CountingIdentity::seeded([7u8; 32]);
+        let b: Id = CountingIdentity::seeded([9u8; 32]);
+        let b_pub = *b.public_static();
+        let (ap, ask) = a.open().expect("identity opens");
+        let (bp, bsk) = b.open().expect("identity opens");
+
+        let init = <Suite as Handshake>::initiator(ap, PROLOGUE, b_pub);
+        let (msg1, sent) = <Suite as Handshake>::write_msg1(
+            init,
+            ask,
+            &[0u8; crate::constants::MSG1_PAYLOAD_LEN],
+        )
+        .expect("msg1");
+        let resp = <Suite as Handshake>::responder(bp, PROLOGUE, bsk).expect("responder");
+        let (_claimed, mid) = <Suite as Handshake>::read_msg1_intro(resp, &msg1).expect("intro");
+        let (_payload, read) = <Suite as Handshake>::complete(mid).expect("complete");
+        let (msg2, b_transport) = <Suite as Handshake>::write_msg2(read).expect("msg2");
+        let a_transport = <Suite as Handshake>::read_msg2(sent, &msg2).expect("read msg2");
+
+        let (a_seal, a_open) = <Suite as Handshake>::into_datagram(a_transport, epoch);
+        let (b_seal, b_open) = <Suite as Handshake>::into_datagram(b_transport, epoch);
+
+        (
+            EstablishedSession {
+                seal: a_seal,
+                open: a_open,
+                our_index: 0x1111_1111,
+                peer_index: 0x2222_2222,
+                anchor: v4(2),
+            },
+            EstablishedSession {
+                seal: b_seal,
+                open: b_open,
+                our_index: 0x2222_2222,
+                peer_index: 0x1111_1111,
+                anchor: v4(1),
+            },
+        )
+    }
+
+    /// Two established `Connection`s over one real IK handshake: `a` is
+    /// §6.7's initiator, `b` the acceptor, so §9.1's parity is directly
+    /// assertable.
+    fn pair(now: Instant) -> (Connection<Suite>, Connection<Suite>) {
+        let (a_session, b_session) = sessions();
+        (
+            Connection::established(now, [1u8; 32], a_session, Role::Initiator),
+            Connection::established(now, [2u8; 32], b_session, Role::Responder),
+        )
+    }
+
+    /// Drain one core to `Timeout`, returning what it produced.
+    fn drain(conn: &mut Connection<Suite>) -> (Vec<Vec<u8>>, Vec<ConnEvent>) {
+        let mut datagrams = Vec::new();
+        let mut events = Vec::new();
+        loop {
+            match conn.poll_output() {
+                ConnOutput::Transmit(t) => datagrams.push(t.data),
+                ConnOutput::Event(e) => events.push(e),
+                ConnOutput::ToEndpoint(_) => {}
+                ConnOutput::Timeout(_) => return (datagrams, events),
+            }
+        }
+    }
+
+    /// Hand every datagram `from` produced to `to`, and drain `to`.
+    fn deliver(
+        from: &mut Connection<Suite>,
+        to: &mut Connection<Suite>,
+        now: Instant,
+        src: SocketAddr,
+    ) -> Vec<ConnEvent> {
+        let (datagrams, _) = drain(from);
+        let mut events = Vec::new();
+        for dgram in datagrams {
+            to.handle_datagram(now, src, &dgram);
+            events.extend(drain(to).1);
+        }
+        events
+    }
+
+    /// §9.1's parity, end to end: the initiator's first bidi stream is id 0
+    /// and the acceptor's is id 1 — and both cores agree.
+    #[test]
+    fn stream_id_parity_comes_from_the_installed_role() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let ra = a.open(Dir::Bi).expect("first bidi");
+        let rb = b.open(Dir::Bi).expect("first bidi");
+        assert_eq!(a.stream_id(ra).map(StreamId::as_u64), Some(0));
+        assert_eq!(b.stream_id(rb).map(StreamId::as_u64), Some(1));
+        assert_eq!(a.role(), Some(Role::Initiator));
+        assert_eq!(b.role(), Some(Role::Responder));
+
+        let ua = a.open(Dir::Uni).expect("first uni");
+        let ub = b.open(Dir::Uni).expect("first uni");
+        assert_eq!(a.stream_id(ua).map(StreamId::as_u64), Some(2));
+        assert_eq!(b.stream_id(ub).map(StreamId::as_u64), Some(3));
+    }
+
+    /// A write on one core arrives, in order, as a read on the other — the
+    /// whole of §9.5's happy path through the real codec and the real AEAD.
+    #[test]
+    fn bytes_written_on_one_core_are_read_on_the_other() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r = a.open(Dir::Uni).expect("uni");
+        assert_eq!(a.write(now, r, b"hello world").expect("write"), 11);
+        a.finish(now, r).expect("finish");
+        a.flush(now);
+
+        let events = deliver(&mut a, &mut b, now, v4(1));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ConnEvent::StreamOpened { dir: Dir::Uni })),
+            "the peer's first frame opens the stream: {events:?}"
+        );
+
+        let claimed = b.accept(Dir::Uni).expect("one claimable uni stream");
+        assert_eq!(
+            b.stream_id(claimed).map(StreamId::as_u64),
+            a.stream_id(r).map(StreamId::as_u64),
+            "both ends name the stream identically"
+        );
+
+        let mut buf = [0u8; 64];
+        assert_eq!(b.read(now, claimed, &mut buf), Ok(Some(11)));
+        assert_eq!(&buf[..11], b"hello world");
+        assert_eq!(b.read(now, claimed, &mut buf), Ok(None), "FIN is end of stream");
+    }
+
+    /// §9.6's reset crosses the wire and surfaces as `ReadError::Reset`.
+    #[test]
+    fn a_reset_crosses_the_wire_and_surfaces_to_the_reader() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r = a.open(Dir::Uni).expect("uni");
+        a.write(now, r, b"partial").expect("write");
+        let _ = deliver(&mut a, &mut b, now, v4(1));
+        let claimed = b.accept(Dir::Uni).expect("claimable");
+
+        a.reset(now, r, 42);
+        let events = deliver(&mut a, &mut b, now, v4(1));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ConnEvent::StreamReset { error_code: 42, .. })),
+            "{events:?}"
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(b.read(now, claimed, &mut buf), Err(ReadError::Reset(42)));
+    }
+
+    /// A payload larger than one packet's plaintext is carried by more than
+    /// one packet and reassembles whole.
+    #[test]
+    fn a_multi_packet_write_reassembles() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let payload: Vec<u8> = (0..8_000u32).map(|i| (i % 251) as u8).collect();
+        let r = a.open(Dir::Uni).expect("uni");
+        assert_eq!(a.write(now, r, &payload), Ok(payload.len()));
+        a.finish(now, r).expect("finish");
+        a.flush(now);
+
+        let (datagrams, _) = drain(&mut a);
+        assert!(
+            datagrams.len() > 1,
+            "8 000 bytes does not fit one MAX_PLAINTEXT packet"
+        );
+        for dgram in datagrams {
+            b.handle_datagram(now, v4(1), &dgram);
+            let _ = drain(&mut b);
+        }
+
+        let claimed = b.accept(Dir::Uni).expect("claimable");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(Some(n)) = b.read(now, claimed, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload);
+    }
+
+    /// §8.5's round-robin: two streams with data pending both make progress
+    /// inside one fill pass, rather than one starving the other.
+    #[test]
+    fn the_fill_serves_streams_round_robin() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(now);
+        let _ = drain(&mut a);
+        let _ = drain(&mut b);
+
+        let r1 = a.open(Dir::Uni).expect("uni");
+        let r2 = a.open(Dir::Uni).expect("uni");
+        a.write(now, r1, &vec![1u8; 4_000]).expect("write");
+        a.write(now, r2, &vec![2u8; 4_000]).expect("write");
+        a.flush(now);
+
+        let (datagrams, _) = drain(&mut a);
+        let first = &datagrams[0];
+        b.handle_datagram(now, v4(1), first);
+        let _ = drain(&mut b);
+
+        let s1 = b.accept(Dir::Uni).expect("first stream");
+        let s2 = b.accept(Dir::Uni).expect("second stream");
+        let mut buf = [0u8; 4096];
+        let n1 = b.read(now, s1, &mut buf).expect("read").expect("data");
+        let n2 = b.read(now, s2, &mut buf).expect("read").expect("data");
+        assert!(
+            n1 > 0 && n2 > 0,
+            "one packet carried both streams: {n1} and {n2}"
+        );
+    }
+
+    /// §16.9: a stream opened before establishment keeps its handle across
+    /// the install, writes queued early leave once a session exists, and the
+    /// wire id appears only afterwards.
+    ///
+    /// **Ruling 95's trap**, from the other side: a core that returned an
+    /// internal index *typed as* `StreamId` and remapped at install would
+    /// pass "open early" and "write late" separately and fail exactly this.
+    #[test]
+    fn an_early_opened_stream_keeps_its_handle_across_install() {
+        let now = Instant::now();
+        let (a_session, b_session) = sessions();
+
+        let mut a: Connection<Suite> = Connection::connecting([3u8; 32]);
+        let r = a.open(Dir::Uni).expect("open before establishment");
+        assert_eq!(a.stream_id(r), None, "§16.9: no id until established");
+        assert_eq!(a.write(now, r, b"queued").expect("write"), 6);
+        a.finish(now, r).expect("finish");
+        let (datagrams, _) = drain(&mut a);
+        assert!(datagrams.is_empty(), "§16.9: nothing sends before install");
+
+        a.handle_endpoint_event(
+            now,
+            Install {
+                session: a_session,
+                role: Role::Initiator,
+            },
+        );
+        assert_eq!(
+            a.stream_id(r).map(StreamId::as_u64),
+            Some(2),
+            "the same handle now names initiator-uni index 0"
+        );
+
+        let mut b = Connection::established(now, [4u8; 32], b_session, Role::Responder);
+        let _ = drain(&mut b);
+        let _ = deliver(&mut a, &mut b, now, v4(1));
+
+        let claimed = b.accept(Dir::Uni).expect("the early write arrived");
+        let mut buf = [0u8; 16];
+        assert_eq!(b.read(now, claimed, &mut buf), Ok(Some(6)));
+        assert_eq!(&buf[..6], b"queued");
+    }
 }

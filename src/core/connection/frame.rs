@@ -44,12 +44,24 @@ use std::ops::RangeInclusive;
 use crate::constants;
 use crate::varint::{self, VarInt};
 
+use super::stream_id::StreamId;
+
+/// §8.5's round-robin quantum — *"one quantum per stream per fill pass, the
+/// quantum size **implementation-defined**"*.
+///
+/// It lives here and **not** in [`crate::constants`] on purpose: a value in
+/// that table is asserted by `tests/spec_constants.rs`, which would turn an
+/// implementation-defined choice into a wire pin by accident. 1 KiB is a
+/// little under one packet's plaintext, so a single stream still fills a
+/// packet in one pass while two streams alternate within one.
+pub(super) const STREAM_FILL_QUANTUM: usize = 1024;
+
 /// A parsed frame. §8.3, §8.4.
 ///
-/// The eight types slice 3 does not implement are **absent rather than
+/// The types this build does not implement are **absent rather than
 /// stubbed**, following this module tree's precedent: a variant is a claim
-/// that the layer can produce and consume the thing, and these arrive with
-/// the sections that define them (§9, §10, §11, §12).
+/// that the layer can produce and consume the thing. Slice 4 adds §9's and
+/// §10's six; §11's DATAGRAM arrives with slice 6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Frame {
     /// `0x00` — a single byte, no fields, any number anywhere. §8.4.
@@ -58,6 +70,18 @@ pub(crate) enum Frame {
     Ping,
     /// `0x02` — §12's acknowledgement. Codec only in this slice.
     Ack(Ack),
+    /// `0x04` — §9.6's abrupt abandonment of a send half.
+    ResetStream(ResetStream),
+    /// `0x08`–`0x0f` — §9.5's labelled byte range.
+    Stream(Stream),
+    /// `0x10` — §10.3's connection-level credit grant.
+    MaxData(u64),
+    /// `0x11` — §10.3's stream-level credit grant.
+    MaxStreamData(MaxStreamData),
+    /// `0x12` — §10.4's cumulative bidirectional stream allowance.
+    MaxStreamsBidi(u64),
+    /// `0x13` — §10.4's cumulative unidirectional stream allowance.
+    MaxStreamsUni(u64),
     /// `0x1c` — §15's teardown signal.
     Close(Close),
 }
@@ -69,6 +93,12 @@ impl Frame {
             Frame::Padding => constants::FRAME_PADDING,
             Frame::Ping => constants::FRAME_PING,
             Frame::Ack(_) => constants::FRAME_ACK,
+            Frame::ResetStream(_) => constants::FRAME_RESET_STREAM,
+            Frame::Stream(stream) => stream.type_code(),
+            Frame::MaxData(_) => constants::FRAME_MAX_DATA,
+            Frame::MaxStreamData(_) => constants::FRAME_MAX_STREAM_DATA,
+            Frame::MaxStreamsBidi(_) => constants::FRAME_MAX_STREAMS_BIDI,
+            Frame::MaxStreamsUni(_) => constants::FRAME_MAX_STREAMS_UNI,
             Frame::Close(_) => constants::FRAME_CLOSE,
         }
     }
@@ -83,14 +113,26 @@ impl Frame {
         match self {
             Frame::Padding | Frame::Ping => 1,
             Frame::Ack(ack) => 1 + ack.body_len(),
+            Frame::ResetStream(reset) => 1 + reset.body_len(),
+            Frame::Stream(stream) => 1 + stream.body_len(),
+            Frame::MaxData(max) | Frame::MaxStreamsBidi(max) | Frame::MaxStreamsUni(max) => {
+                1 + varint_len(*max)
+            }
+            Frame::MaxStreamData(grant) => 1 + grant.body_len(),
             Frame::Close(close) => 1 + close.body_len(),
         }
     }
 
+    /// Whether this frame extends to the end of the plaintext — §8.5's
+    /// *"at most one … per packet, in final position"*.
+    pub(crate) fn extends_to_end(&self) -> bool {
+        matches!(self, Frame::Stream(s) if !s.len_present)
+    }
+
     /// Append this frame's wire encoding to `out`. §8.4.
     ///
-    /// The type code is a varint like every other field (§8.1), and all
-    /// four of this slice's codes are below 64, so each occupies one byte.
+    /// The type code is a varint like every other field (§8.1), and every
+    /// code in §8.3's table is below 64, so each occupies one byte.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         varint::encode(
             VarInt::new(self.type_code()).expect("§8.3's type codes are all far below 2⁶² − 1"),
@@ -99,8 +141,216 @@ impl Frame {
         match self {
             Frame::Padding | Frame::Ping => {}
             Frame::Ack(ack) => ack.encode_body(out),
+            Frame::ResetStream(reset) => reset.encode_body(out),
+            Frame::Stream(stream) => stream.encode_body(out),
+            Frame::MaxData(max) | Frame::MaxStreamsBidi(max) | Frame::MaxStreamsUni(max) => {
+                put_varint(*max, out)
+            }
+            Frame::MaxStreamData(grant) => grant.encode_body(out),
             Frame::Close(close) => close.encode_body(out),
         }
+    }
+}
+
+/// §8.4's RESET_STREAM: `type(0x04) ‖ stream_id ‖ error_code ‖ final_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResetStream {
+    /// The stream being abandoned.
+    pub(crate) id: StreamId,
+    /// §9.6's application code.
+    pub(crate) error_code: u64,
+    /// The number of bytes the stream would have carried.
+    pub(crate) final_size: u64,
+}
+
+impl ResetStream {
+    fn body_len(&self) -> usize {
+        varint_len(self.id.as_u64()) + varint_len(self.error_code) + varint_len(self.final_size)
+    }
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        put_varint(self.id.as_u64(), out);
+        put_varint(self.error_code, out);
+        put_varint(self.final_size, out);
+    }
+
+    fn parse_body(buf: &[u8]) -> Result<(ResetStream, usize), Structural> {
+        let mut cursor = Cursor::new(buf);
+        let id = StreamId::from_u64(cursor.varint()?);
+        let error_code = cursor.varint()?;
+        let final_size = cursor.varint()?;
+        Ok((
+            ResetStream {
+                id,
+                error_code,
+                final_size,
+            },
+            cursor.consumed(),
+        ))
+    }
+}
+
+/// §8.4's STREAM frame — the labelled byte range of §9.5.
+///
+/// The three flag bits are carried explicitly rather than derived, so a
+/// parse-then-encode round trip is byte-identical for any frame a peer sent:
+/// `OFF` with an offset of zero is legal and distinguishable from `¬OFF`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stream {
+    /// The stream this range belongs to.
+    pub(crate) id: StreamId,
+    /// The offset of the first byte.
+    pub(crate) offset: u64,
+    /// Whether the `OFF` bit is set. Implied by `offset != 0`, but a sender
+    /// may set it for offset zero.
+    pub(crate) off_present: bool,
+    /// Whether the `LEN` bit is set. When clear the data extends to the end
+    /// of the plaintext.
+    pub(crate) len_present: bool,
+    /// §9.5: FIN pins the final size as this frame's end offset.
+    pub(crate) fin: bool,
+    /// The bytes.
+    pub(crate) data: Vec<u8>,
+}
+
+impl Stream {
+    /// A frame this implementation emits: `LEN` always present, `OFF` only
+    /// when it carries information.
+    ///
+    /// slither never emits the `¬LEN` form. §8.5 bounds it (*"at most
+    /// one"*) rather than requiring it, and the one or two bytes it saves
+    /// are not worth a stage-ordering hazard that only misfires once slice 6
+    /// adds a second fill contributor. [`Packing`] still enforces the rule,
+    /// so slice 6 inherits it rather than rebuilding it.
+    pub(crate) fn new(id: StreamId, offset: u64, data: Vec<u8>, fin: bool) -> Self {
+        Self {
+            id,
+            offset,
+            off_present: offset != 0,
+            len_present: true,
+            fin,
+            data,
+        }
+    }
+
+    /// The type code with §8.4's three flag bits applied.
+    pub(crate) fn type_code(&self) -> u64 {
+        let mut ty = constants::FRAME_STREAM_BASE;
+        if self.off_present {
+            ty |= constants::STREAM_OFF;
+        }
+        if self.len_present {
+            ty |= constants::STREAM_LEN;
+        }
+        if self.fin {
+            ty |= constants::STREAM_FIN;
+        }
+        ty
+    }
+
+    /// The end offset — §9.5's *"`offset + data length`"*.
+    ///
+    /// Saturating; the sum is bounded by [`parse`]'s structural check that
+    /// `offset + length` does not exceed 2⁶² − 1.
+    pub(crate) fn end(&self) -> u64 {
+        self.offset.saturating_add(self.data.len() as u64)
+    }
+
+    fn body_len(&self) -> usize {
+        varint_len(self.id.as_u64())
+            + if self.off_present {
+                varint_len(self.offset)
+            } else {
+                0
+            }
+            + if self.len_present {
+                varint_len(self.data.len() as u64)
+            } else {
+                0
+            }
+            + self.data.len()
+    }
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        put_varint(self.id.as_u64(), out);
+        if self.off_present {
+            put_varint(self.offset, out);
+        }
+        if self.len_present {
+            put_varint(self.data.len() as u64, out);
+        }
+        out.extend_from_slice(&self.data);
+    }
+
+    /// Parse a STREAM body. `ty` carries the flags.
+    fn parse_body(ty: u64, buf: &[u8]) -> Result<(Stream, usize), Structural> {
+        let off_present = ty & constants::STREAM_OFF != 0;
+        let len_present = ty & constants::STREAM_LEN != 0;
+        let fin = ty & constants::STREAM_FIN != 0;
+
+        let mut cursor = Cursor::new(buf);
+        let id = StreamId::from_u64(cursor.varint()?);
+        let offset = if off_present { cursor.varint()? } else { 0 };
+        let data = if len_present {
+            let len = cursor.varint()?;
+            let len = usize::try_from(len).map_err(|_| Structural::LengthOverrun)?;
+            cursor.bytes(len)?.to_vec()
+        } else {
+            // §8.4: *"the data extends to the end of the plaintext, and the
+            // frame must be the packet's final frame."* Consuming the rest
+            // is what makes the second clause hold by construction — see
+            // this module's docs on the sender-side rule it really is.
+            let rest = cursor.rest().to_vec();
+            cursor.advance(rest.len());
+            rest
+        };
+
+        // §8.4: *"`offset + length` exceeding 2⁶² − 1"* is structural. Every
+        // downstream comparison in §9/§10 is then inside the varint domain.
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end <= VarInt::MAX_VALUE)
+            .ok_or(Structural::StreamOffsetOverflow)?;
+        let _ = end;
+
+        Ok((
+            Stream {
+                id,
+                offset,
+                off_present,
+                len_present,
+                fin,
+                data,
+            },
+            cursor.consumed(),
+        ))
+    }
+}
+
+/// §8.4's MAX_STREAM_DATA: `type(0x11) ‖ stream_id ‖ max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaxStreamData {
+    /// The stream the grant applies to.
+    pub(crate) id: StreamId,
+    /// The absolute limit.
+    pub(crate) max: u64,
+}
+
+impl MaxStreamData {
+    fn body_len(&self) -> usize {
+        varint_len(self.id.as_u64()) + varint_len(self.max)
+    }
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        put_varint(self.id.as_u64(), out);
+        put_varint(self.max, out);
+    }
+
+    fn parse_body(buf: &[u8]) -> Result<(MaxStreamData, usize), Structural> {
+        let mut cursor = Cursor::new(buf);
+        let id = StreamId::from_u64(cursor.varint()?);
+        let max = cursor.varint()?;
+        Ok((MaxStreamData { id, max }, cursor.consumed()))
     }
 }
 
@@ -312,6 +562,13 @@ pub(crate) enum Structural {
     /// CLOSE's `reason_len` exceeded `CLOSE_REASON_MAX`.
     #[error("CLOSE reason_len {0} exceeds CLOSE_REASON_MAX")]
     CloseReasonTooLong(u64),
+    /// A STREAM frame's `offset + length` exceeded 2⁶² − 1. §8.4.
+    #[error("a STREAM frame's offset + length exceeds 2⁶² − 1")]
+    StreamOffsetOverflow,
+    /// MAX_STREAMS' `max` exceeded 2⁶⁰ — unrepresentable as a stream index.
+    /// §8.4. The boundary is `>`, not `≥`.
+    #[error("MAX_STREAMS max {0} exceeds 2⁶⁰")]
+    MaxStreamsTooLarge(u64),
 }
 
 /// §8.2's parse phase: the **whole** plaintext, applying nothing.
@@ -340,14 +597,45 @@ pub(crate) fn parse(plaintext: &[u8]) -> Result<Vec<Frame>, Structural> {
                 cursor.advance(used);
                 Frame::Ack(ack)
             }
+            constants::FRAME_RESET_STREAM => {
+                let (reset, used) = ResetStream::parse_body(cursor.rest())?;
+                cursor.advance(used);
+                Frame::ResetStream(reset)
+            }
+            ty @ constants::FRAME_STREAM_BASE..=constants::FRAME_STREAM_MAX => {
+                let (stream, used) = Stream::parse_body(ty, cursor.rest())?;
+                cursor.advance(used);
+                Frame::Stream(stream)
+            }
+            constants::FRAME_MAX_DATA => Frame::MaxData(cursor.varint()?),
+            constants::FRAME_MAX_STREAM_DATA => {
+                let (grant, used) = MaxStreamData::parse_body(cursor.rest())?;
+                cursor.advance(used);
+                Frame::MaxStreamData(grant)
+            }
+            constants::FRAME_MAX_STREAMS_BIDI | constants::FRAME_MAX_STREAMS_UNI => {
+                let max = cursor.varint()?;
+                // §8.4's one structural error for MAX_STREAMS. The boundary
+                // is `>`, not `≥`: §10.4's *"opening stream index `i`
+                // requires cumulative limit > `i`"* makes 2⁶⁰ exactly the
+                // limit that admits the largest representable index.
+                if max > super::stream_id::MAX_STREAMS_CEILING {
+                    return Err(Structural::MaxStreamsTooLarge(max));
+                }
+                if ty == constants::FRAME_MAX_STREAMS_BIDI {
+                    Frame::MaxStreamsBidi(max)
+                } else {
+                    Frame::MaxStreamsUni(max)
+                }
+            }
             constants::FRAME_CLOSE => {
                 let (close, used) = Close::parse_body(cursor.rest())?;
                 cursor.advance(used);
                 Frame::Close(close)
             }
             // Everything else — §8.3's `0x05` reserved row, the types
-            // slices 4–6 add, and any code outside the table — is §8.2's
-            // unknown type. Slices 4–6 add arms above; they do not widen
+            // slice 6 adds, and any code outside the table — is §8.2's
+            // unknown type. Slice 6 adds arms above; it does not widen
             // this one.
             other => return Err(Structural::UnknownType(other)),
         };
@@ -448,6 +736,14 @@ pub(crate) struct Packing {
     used: usize,
     budget: usize,
     stage: Stage,
+    /// §8.5's *"at most one extends-to-end frame … per packet, in final
+    /// position"*.
+    ///
+    /// **§12.3's seam:** the rule is a property of the **stage**, not of
+    /// STREAM. Slice 6 adds DATAGRAM as a second contributor to the same
+    /// stage; a check living in the stream fill loop would be duplicated
+    /// there, and the duplicate would be the one that drifts.
+    extends_to_end: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -466,6 +762,7 @@ impl Packing {
             used: 0,
             budget: constants::MAX_PLAINTEXT,
             stage: Stage::Ack,
+            extends_to_end: false,
         }
     }
 
@@ -479,9 +776,42 @@ impl Packing {
         self.push(Stage::Control, frame)
     }
 
+    /// Stage 3 — the STREAM and DATAGRAM fill (§8.5).
+    pub(crate) fn fill(&mut self, frame: Frame) -> bool {
+        self.push(Stage::Fill, frame)
+    }
+
     /// Stage 4 — PING last, if a probe still owes ack-eliciting content.
     pub(crate) fn ping(&mut self) -> bool {
         self.push(Stage::Ping, Frame::Ping)
+    }
+
+    /// Bytes still available under §8.6's budget.
+    pub(crate) fn room(&self) -> usize {
+        self.budget.saturating_sub(self.used)
+    }
+
+    /// The largest STREAM payload that still fits, given the frame's fixed
+    /// fields. `None` when not even an empty frame fits.
+    ///
+    /// Written here because the length varint's own width depends on the
+    /// payload length it describes — the one place in the codec where a
+    /// field's size is a function of the value it precedes.
+    pub(crate) fn stream_payload_room(&self, id: StreamId, offset: u64) -> Option<usize> {
+        let fixed = 1
+            + varint_len(id.as_u64())
+            + if offset != 0 { varint_len(offset) } else { 0 };
+        let avail = self.room().checked_sub(fixed)?;
+        // The smallest `len` varint that admits its own payload wins, and
+        // trying them in increasing width yields the largest payload.
+        for width in [1usize, 2, 4, 8] {
+            if let Some(payload) = avail.checked_sub(width) {
+                if varint_len(payload as u64) <= width {
+                    return Some(payload);
+                }
+            }
+        }
+        None
     }
 
     /// The frames planned so far, in packing order.
@@ -511,10 +841,17 @@ impl Packing {
         );
         self.stage = stage;
 
+        // §8.5: an extends-to-end frame is final, so nothing may follow it,
+        // and there is at most one.
+        if self.extends_to_end {
+            return false;
+        }
+
         let len = frame.encoded_len();
         if self.used + len > self.budget {
             return false;
         }
+        self.extends_to_end = frame.extends_to_end();
         self.used += len;
         self.frames.push(frame);
         true
