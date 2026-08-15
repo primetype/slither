@@ -1929,7 +1929,8 @@ fn authenticate_then_reject_clears_the_record_even_when_another_chain_pins_the_e
     // but a **second pin** on the entry a key-holder just wrote (§17.1's
     // bounded exception).
     let chain_b = b.feed(t, v4(31, 2), &train[0]).one_intro().0;
-    b.ep.read_identity(chain_b).expect("a real msg1 is readable");
+    b.ep.read_identity(chain_b)
+        .expect("a real msg1 is readable");
     let _ = b.drain();
 
     // Drop A. The entry survives — B pins it — but the RECORD must not.
@@ -2001,18 +2002,18 @@ fn a_claimed_chain_creates_no_guard_entry() {
 /// inbound chain for that same static then creates one, and cancelling the
 /// dial must leave it and its record untouched.
 ///
-/// **What this cannot reach, stated so it is not mistaken for coverage.**
-/// The pin *count* is not observable at this API, and the one consequence
-/// of an over-release — the entry aging out early — is masked by ruling
-/// 70's alias. `TS_GUARD_ORPHAN_TTL == INTRO_TTL`, and the only pin holder
-/// that can co-exist with a cancelled dial for the same static is a staged
-/// mid-state (§16.1 forbids LIVE and PENDING together, and slice 2a
-/// refuses `accept()` on both rows), whose own expiry reverts its
-/// provisional record at exactly the instant the wrongly-unpinned entry
-/// would have aged out. The two clocks are the same clock, so both the
-/// fixed and the broken core answer `None` after it. Distinguishing them
-/// needs the pin count exposed — a `pins(&self, key: &[u8]) -> u32` beside
-/// `greatest` would do it in one assertion.
+/// **Why the oracle is [`Endpoint::guard_pins`] and not behaviour.** The
+/// over-release leaves *no behavioural trace at all*, and ruling 70's
+/// alias is the reason. `TS_GUARD_ORPHAN_TTL == INTRO_TTL`; the only pin
+/// holder that can co-exist with a cancelled dial for the same static is a
+/// staged mid-state (§16.1 forbids LIVE and PENDING together, and slice 2a
+/// refuses `accept()` on both rows); and that mid-state's own expiry
+/// reverts its provisional record at exactly the instant the
+/// wrongly-unpinned entry would have aged out. The two clocks are one
+/// clock, so a fixed core and a broken core give the same answer to every
+/// question the protocol surface can ask. The count is the only place they
+/// differ, which is why it is asserted at all three steps below rather
+/// than once at the end.
 #[test]
 fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
     let t = t0();
@@ -2027,6 +2028,11 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
         None,
         "a dial created a guard entry — every §17.1 write site is inbound and post-ss"
     );
+    assert_eq!(
+        a.ep.guard_pins(b.canonical()),
+        0,
+        "a dial took a pin on a static we hold no entry for"
+    );
 
     // (2) The simultaneous-open shape: an inbound initiation from that
     //     same static reaches Proven. *That* is the key-holder write which
@@ -2036,12 +2042,23 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
     let (_chain, admitted) = ladder_to_proven(&mut a, at, b.addr, &inbound);
     let ts = admitted.expect("we hold no entry for a static we dialled, so this passes vacuously");
     assert_eq!(a.ep.greatest(b.canonical()), Some(ts));
+    assert_eq!(
+        a.ep.guard_pins(b.canonical()),
+        1,
+        "the mid-state's pin is the only one: the in-flight dial must not have \
+         acquired one retroactively when the entry appeared"
+    );
 
     // (3) End the dial. It never pinned this entry and never wrote this
     //     record, so it may disturb neither.
-    a.ep
-        .handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
+    a.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
     let _ = a.drain();
+    assert_eq!(
+        a.ep.guard_pins(b.canonical()),
+        1,
+        "cancelling the dial released a pin it never took — §17.1's \
+         \"never evicted while a staged mid-state exists\" is now silently broken"
+    );
     assert_eq!(
         a.ep.greatest(b.canonical()),
         Some(ts),
@@ -2479,6 +2496,51 @@ fn the_retransmit_interval_is_five_seconds_plus_bounded_jitter_and_never_grows()
     assert!(
         max - min <= RETRANSMIT_JITTER_MAX,
         "the spread between intervals exceeds the jitter band: {min:?}..{max:?}"
+    );
+}
+
+/// §5.5 step 2 arms the retransmit at "`RETRANSMIT_BASE` + **uniform
+/// jitter** ≤ `RETRANSMIT_JITTER_MAX`". The draw is part of the rule, not
+/// a decoration on it: fixed retransmit phases across an endpoint's
+/// pendings synchronise, and the jitter is what breaks that up.
+///
+/// [`the_retransmit_interval_is_five_seconds_plus_bounded_jitter_and_never_grows`]
+/// bounds the band from **above**, and a core that dropped the jitter
+/// entirely — every interval exactly `RETRANSMIT_BASE` — satisfies that
+/// bound for free. That is the same shape as comparing whole packets to
+/// test the ephemeral: an upper bound a degenerate implementation meets
+/// trivially. So presence is asserted here, from below.
+///
+/// Two mutations, two assertions, in increasing subtlety. A core with
+/// **no** jitter fails the first. A core that draws the offset **once**
+/// and reuses it for every attempt passes the first and fails the second.
+#[test]
+fn the_retransmit_jitter_is_drawn_afresh_for_every_attempt() {
+    let t = t0();
+    let (mut a, b) = pair(t);
+    let (_conn, d) = a.connect(t, b.addr, &b.public_static);
+
+    let mut prev = t;
+    let mut due = d.deadline.expect("a pending arms a retransmit");
+    let mut gaps = Vec::new();
+    for _ in 0..12 {
+        gaps.push(due - prev);
+        let d = a.timeout(due);
+        prev = due;
+        due = d.deadline.expect("armed");
+    }
+
+    assert!(
+        gaps.iter().any(|g| *g > RETRANSMIT_BASE),
+        "all {} intervals were exactly RETRANSMIT_BASE — §5.5 step 2's jitter \
+         is never drawn: {gaps:?}",
+        gaps.len()
+    );
+    assert!(
+        gaps.iter().any(|g| *g != gaps[0]),
+        "all {} intervals were identical — the jitter is drawn once and reused \
+         rather than per attempt: {gaps:?}",
+        gaps.len()
     );
 }
 
