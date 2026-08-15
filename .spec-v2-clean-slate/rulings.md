@@ -1886,3 +1886,75 @@ everything a network does and nothing a socket does.** A fabric that can
 lose, delay, duplicate and reorder cannot express "this send fails" or
 "this driver panics". The test suite's coverage was bounded by the
 fixture's imagination, not by the authors'.
+
+---
+
+## Round 16 — ruling 90 applied (2026/08/15)
+
+**Amendment to ruling 90.** Its rationale — "`mint_pending` costs no DH,
+so the shell may call it synchronously and read the core's own map" — is
+true and sufficient for `connect()`, and **silent about
+`Connecting::drop`, which must become a synchronous core call too**. With
+the mirror deleted, a redial's admission test is `mint_pending` reading
+the core's map; a `Retired` still delivered on the driver is one command
+later than that test, and ruling 50's MUST — the cancellation ordered
+ahead of any endpoint verb issued after the drop returns, *with no clock
+advance* — fails. Verified by mutation: deferring it reds
+`a_cancelled_dial_frees_the_static_with_no_clock_advance`,
+`s29_cancel_then_immediate_redial` and
+`s29_retry_loop_replaces_rather_than_accumulates` — three tests, two
+files, two authors. The verb is 0 DH, so §6.2 permits the handle to call
+it; that permission is the mechanism the rationale should have named.
+
+*This is rulings 87 and 89's shape — a stated construction with an
+unstated scope — occurring **inside the ruling written to fix that
+shape**.* Ruling 64 recorded that a rationale is not reviewed by the act
+of ratifying its rule. Third instance in my own text, and the first in a
+ruling whose subject *is* the defect. Working rule 11 was written after
+87 and 89 and did not prevent 90; the rule says to check the rationale
+against the code, and the omission here is not a false claim but an
+**absent** one, which reading the code does not surface. *Amended rule
+11 accordingly: also ask what else the mechanism you are naming has to
+be true of.*
+
+Two scope questions ruling 90 left open, settled as implemented:
+`connect` is **deleted, not kept as a wrapper** (§16.4's API list needs
+the two names in its place), and `start_attempt` is a **no-op for an
+unknown `ConnectionId`** — a reachable case, not defensive coding, since
+ruling 50's cancel can retire the pending before the `Connect` command
+is processed. That is why a dial cancelled before the driver runs now
+spends 0 DH and puts nothing on the wire.
+
+**Ruling 91 — §6.5 and §6.6 move from slice 7 into slice 4.** Ruling 90
+turned `read_identity() → connect() → accept()` on one peer — §6.4's
+"ordinary API ordering" — from *completes immediately* into *both sides
+`TimedOut` at 90 s* unless the application drops its `Connecting` and
+re-accepts. Measured at both ends, not inferred.
+
+The split did not create that; it **exposed** it. The old path bought
+convergence by assigning over local state, which §6.4 forbids in terms
+("never over local state"), and was **silently non-conformant** — and
+the state it produced is not even representable in the core's map:
+restoring the mirror's behaviour detonates `StaticMap::insert`'s own
+`§16.1: one session per peer static` assertion, which it escaped only
+because the mirror kept the row out of the map the assertion guards.
+
+So the fault is not the split but the **absence of §6.5's routing and
+§6.6's internal tie-break completion**, without which neither side's
+kept pending can finish. *The real question was never when the split
+lands; it is when §6.6 lands.* Slice 4 already opens the endpoint core
+for ruling 90, so the context is loaded now and will not be again until
+slice 7. The honest cost is scope on the largest slice in the plan,
+which is already cut 4a/4b for size.
+
+*A correction I owe the record.* I proposed two reasons the interim
+state was acceptable — that the kept pendings would converge on §6.7's
+tie-break, and that the old behaviour was ruling 35's "mutually dark"
+failure. **Both are wrong, and the applying agent proved it by
+measurement**: §6.5 and §6.6 being slice 7 is exactly why nothing
+converges, and the old install was always paired with a *refusal* of the
+connect, so no msg1 of ours was ever in flight and §6.4's divergence
+case did not arise. The verdict survives on other grounds — loud failure
+over silent non-conformance — but not on the grounds I gave. *An
+orchestrator's reasoning is not evidence, and an agent that adopts it
+instead of checking it has been made useless.*

@@ -170,7 +170,11 @@ the spec rounds.
    became ruling 90. **Ruling 64 already recorded that a rationale is not
    reviewed by the act of ratifying its rule.** These are the same defect
    in the maintainer's own text. Before a rationale ships, open the file
-   it describes.
+   it describes — **and ask what else the mechanism you are naming has to
+   be true of.** This rule was written after 87 and 89 and still did not
+   prevent 90, whose defect is an **absent** clause rather than a false
+   one: reading the code confirms what the rationale says and cannot
+   surface what it fails to say.
 12. **A verification is only as good as its applicability: a true lemma
    about the wrong state proves nothing.** The seam review ran two agents
    blind to each other, and they disagreed on fact twice. Both times the
