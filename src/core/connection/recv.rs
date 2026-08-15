@@ -145,20 +145,16 @@ impl RecvHalf {
     ///
     /// The connection-level bound is the caller's: the ledger is consulted
     /// exactly once per frame, after the frame is known otherwise legal.
-    pub(crate) fn check_stream(
-        &self,
-        offset: u64,
-        len: u64,
-        fin: bool,
-    ) -> Result<u64, Violation> {
+    pub(crate) fn check_stream(&self, offset: u64, len: u64, fin: bool) -> Result<u64, Violation> {
         let end = offset.checked_add(len).ok_or(Violation::FinalSize)?;
 
-        if let Some(pinned) = self.final_size {
-            // §9.5: data beyond a pinned final size, or a second pin that
-            // disagrees.
-            if end > pinned || (fin && end != pinned) {
-                return Err(Violation::FinalSize);
-            }
+        // §9.5: data beyond a pinned final size, or a second pin that
+        // disagrees.
+        if self
+            .final_size
+            .is_some_and(|pinned| end > pinned || (fin && end != pinned))
+        {
+            return Err(Violation::FinalSize);
         }
         // §9.5: a FIN pinning a size below already-received data.
         if fin && end < self.high_water {
@@ -181,10 +177,8 @@ impl RecvHalf {
         if final_size < self.high_water {
             return Err(Violation::FinalSize);
         }
-        if let Some(pinned) = self.final_size {
-            if pinned != final_size {
-                return Err(Violation::FinalSize);
-            }
+        if self.final_size.is_some_and(|pinned| pinned != final_size) {
+            return Err(Violation::FinalSize);
         }
         if final_size > self.credit.advertised() {
             return Err(Violation::FlowControl);
@@ -340,10 +334,11 @@ impl RecvTombstone {
     /// (C6 already makes it depend on it once).
     pub(crate) fn check_stream(&self, offset: u64, len: u64, fin: bool) -> Result<(), Violation> {
         let end = offset.checked_add(len).ok_or(Violation::FinalSize)?;
-        if let Some(pinned) = self.final_size {
-            if end > pinned || (fin && end != pinned) {
-                return Err(Violation::FinalSize);
-            }
+        if self
+            .final_size
+            .is_some_and(|pinned| end > pinned || (fin && end != pinned))
+        {
+            return Err(Violation::FinalSize);
         }
         if fin && end < self.high_water {
             return Err(Violation::FinalSize);
@@ -359,10 +354,8 @@ impl RecvTombstone {
         if final_size < self.high_water {
             return Err(Violation::FinalSize);
         }
-        if let Some(pinned) = self.final_size {
-            if pinned != final_size {
-                return Err(Violation::FinalSize);
-            }
+        if self.final_size.is_some_and(|pinned| pinned != final_size) {
+            return Err(Violation::FinalSize);
         }
         if final_size > self.limit {
             return Err(Violation::FlowControl);
@@ -421,7 +414,12 @@ impl Reassembly {
 
     /// Insert a received range, coalescing with everything it overlaps or
     /// touches.
-    fn insert(&mut self, mut offset: u64, mut data: &[u8], read_offset: u64) -> Result<(), Violation> {
+    fn insert(
+        &mut self,
+        mut offset: u64,
+        mut data: &[u8],
+        read_offset: u64,
+    ) -> Result<(), Violation> {
         // Bytes already delivered are duplicates: §9.5 delivers each byte
         // exactly once, and re-storing them would let a peer re-charge
         // memory it has already been credited for.

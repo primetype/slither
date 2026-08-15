@@ -430,7 +430,10 @@ mod tests {
     fn the_connection_bound_uses_checked_arithmetic() {
         let mut flow = Flow::new();
         flow.charge_recv(1_000);
-        assert_eq!(flow.check_recv_charge(u64::MAX), Err(Violation::FlowControl));
+        assert_eq!(
+            flow.check_recv_charge(u64::MAX),
+            Err(Violation::FlowControl)
+        );
         assert_eq!(
             flow.check_recv_charge(constants::INITIAL_MAX_DATA),
             Err(Violation::FlowControl)

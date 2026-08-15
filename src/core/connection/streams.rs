@@ -39,12 +39,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::error::{ReadError, WriteError};
 
+use super::ConnEvent;
 use super::flow::{Flow, Violation};
 use super::frame::{self, Frame, Packing, STREAM_FILL_QUANTUM};
 use super::recv::{ReadOutcome, RecvHalf, RecvTombstone};
 use super::send::SendHalf;
 use super::stream_id::{Dir, Opener, StreamId};
-use super::ConnEvent;
 use crate::core::Role;
 
 /// The core's stream handle key — stable across install, unlike a wire
@@ -588,10 +588,12 @@ impl Streams {
             .entries
             .get_mut(&r)
             .expect("an open index has a table entry");
-        if let Some(send) = stream.send.as_mut() {
-            if send.on_max_stream_data(max) {
-                events.push(ConnEvent::StreamWritable { r });
-            }
+        if stream
+            .send
+            .as_mut()
+            .is_some_and(|send| send.on_max_stream_data(max))
+        {
+            events.push(ConnEvent::StreamWritable { r });
         }
         Ok(())
     }
@@ -603,10 +605,8 @@ impl Streams {
             return;
         }
         for (r, stream) in self.entries.iter_mut() {
-            if let Some(send) = stream.send.as_mut() {
-                if send.unblock() {
-                    events.push(ConnEvent::StreamWritable { r: *r });
-                }
+            if stream.send.as_mut().is_some_and(SendHalf::unblock) {
+                events.push(ConnEvent::StreamWritable { r: *r });
             }
         }
     }
@@ -929,5 +929,408 @@ impl Streams {
                 self.owed.max_streams[dir.slot()] = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants;
+    use crate::core::connection::frame::Packing;
+
+    /// A table that has installed as the **acceptor**, so the peer is §9.1's
+    /// connection initiator and opens the `Initiator` spaces.
+    fn acceptor() -> (Streams, Flow) {
+        let mut streams = Streams::new();
+        streams.set_role(Role::Responder);
+        (streams, Flow::new())
+    }
+
+    fn peer_uni(index: u64) -> StreamId {
+        StreamId::new(index, Dir::Uni, Opener::Initiator)
+    }
+
+    fn peer_bidi(index: u64) -> StreamId {
+        StreamId::new(index, Dir::Bi, Opener::Initiator)
+    }
+
+    fn stream_frame(id: StreamId, offset: u64, data: &[u8], fin: bool) -> frame::Stream {
+        frame::Stream::new(id, offset, data.to_vec(), fin)
+    }
+
+    fn opened(events: &[ConnEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ConnEvent::StreamOpened { .. }))
+            .count()
+    }
+
+    /// **[ruling 99]** §9.2 opens `N` *"and every lower-numbered
+    /// not-yet-open stream of that space"*, and each one gets its **own**
+    /// event: `accept(dir)` returns one stream per call, so one event for six
+    /// would force the shell to loop until `None` or lose five.
+    #[test]
+    fn an_implicit_open_of_six_streams_emits_six_stream_opened_events() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(5), 0, b"x", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("index 5 is inside the uni limit");
+        assert_eq!(opened(&events), 6);
+
+        // And all six are claimable, FIFO in open order.
+        for index in 0..6u64 {
+            let r = streams.accept(Dir::Uni).expect("claimable");
+            assert_eq!(streams.stream_id(r).map(StreamId::index), Some(index));
+        }
+        assert_eq!(streams.accept(Dir::Uni), None);
+    }
+
+    /// **[ruling 99 + 97]** The limit check runs *before* the opens it would
+    /// authorise, so a frame above §10.4's cumulative limit emits **zero**
+    /// events and kills the connection. An implementation that opened first
+    /// and validated after would emit 129 of them.
+    #[test]
+    fn a_frame_above_the_cumulative_limit_emits_zero_events() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        let over = constants::INITIAL_MAX_STREAMS_UNI; // index == limit is one too far
+        assert_eq!(
+            streams.on_stream_frame(
+                &stream_frame(peer_uni(over), 0, b"x", false),
+                &mut flow,
+                &mut events
+            ),
+            Err(Violation::StreamLimit)
+        );
+        assert_eq!(opened(&events), 0);
+        assert_eq!(streams.accept(Dir::Uni), None);
+
+        // Two-sided: one below the limit is legal (H12).
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(over - 1), 0, b"x", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("index limit-1 is legal");
+        assert_eq!(opened(&events), over as usize);
+    }
+
+    /// **[ruling 97]** Legality wins over the watermark and over the limit:
+    /// for a locally-opened uni stream the peer may *never* send STREAM, and
+    /// the answer is a total function of the id and the role.
+    #[test]
+    fn a_stream_frame_on_a_local_uni_space_is_a_state_error() {
+        let (mut streams, mut flow) = acceptor();
+        let ours = streams.open(Dir::Uni, &flow).expect("our uni stream");
+        let id = streams.stream_id(ours).expect("established");
+
+        let mut events = Vec::new();
+        assert_eq!(
+            streams.on_stream_frame(&stream_frame(id, 0, b"x", false), &mut flow, &mut events),
+            Err(Violation::StreamState)
+        );
+
+        // And an index in that space we never opened is *also* a state
+        // error, not a limit error: the limit bounds the peer's opens, and
+        // this is not the peer's space.
+        let never = StreamId::new(99, Dir::Uni, Opener::Responder);
+        assert_eq!(
+            streams.on_stream_frame(&stream_frame(never, 0, b"x", false), &mut flow, &mut events),
+            Err(Violation::StreamState)
+        );
+        assert_eq!(opened(&events), 0);
+    }
+
+    /// **[ruling 100]** An empty, FIN-less STREAM frame opens its stream.
+    /// Its "no-op" is about the data, not the open.
+    #[test]
+    fn an_empty_finless_stream_frame_opens_its_stream() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(0), 0, b"", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("legal");
+        assert_eq!(opened(&events), 1);
+        let r = streams.accept(Dir::Uni).expect("the empty frame opened it");
+        // …and it delivered no bytes, pinned no final size, consumed no
+        // credit.
+        assert_eq!(streams.reassembly_capacity(), 0);
+        assert_eq!(flow.recv_charged(), 0);
+        let mut buf = [0u8; 4];
+        assert_eq!(streams.read(r, &mut buf, &mut flow), Ok(Some(0)));
+    }
+
+    /// §9.2's tombstone, and Appendix B's obligation discharged by an
+    /// **injected duplicate** (ruling 105): a frame naming a fully-closed
+    /// index is inert — ACKed, never re-opened, no phantom `StreamOpened`.
+    #[test]
+    fn a_duplicate_frame_for_a_freed_stream_is_inert() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        let frame = stream_frame(peer_uni(0), 0, b"hi", true);
+        streams
+            .on_stream_frame(&frame, &mut flow, &mut events)
+            .expect("legal");
+        let r = streams.accept(Dir::Uni).expect("claimable");
+        let mut buf = [0u8; 8];
+        assert_eq!(streams.read(r, &mut buf, &mut flow), Ok(Some(2)));
+        assert_eq!(
+            streams.read(r, &mut buf, &mut flow),
+            Ok(None),
+            "read to final"
+        );
+
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(&frame, &mut flow, &mut events)
+            .expect("§9.2: processed as acknowledged");
+        assert_eq!(opened(&events), 0, "no phantom StreamOpened");
+        assert_eq!(streams.accept(Dir::Uni), None, "never re-opened");
+    }
+
+    /// **[ruling 93]** The true-up value is the highest stream-level limit
+    /// ever advertised, **not** the high-water mark — which leaks credit
+    /// permanently and re-creates the wedge at smaller amplitude.
+    #[test]
+    fn abandonment_trues_up_to_the_stream_window_not_the_high_water_mark() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(0), 0, &[0u8; 1_000], false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("legal");
+        let r = streams.accept(Dir::Uni).expect("claimable");
+        assert_eq!(flow.recv_window().consumed(), 0);
+
+        streams.abandon_recv(r, &mut flow);
+        assert_eq!(
+            flow.recv_window().consumed(),
+            constants::INITIAL_MAX_STREAM_DATA,
+            "the high-water mark (1 000) would leak the rest for the connection's life"
+        );
+    }
+
+    /// **[ruling 93, as amended]** Mechanism one: a **peer-opened uni**
+    /// stream's receive half is the only half this endpoint holds, so
+    /// abandoning it fully closes the stream — the watermark advances and
+    /// the peer earns a MAX_STREAMS grant.
+    #[test]
+    fn abandoning_a_peer_opened_uni_half_advances_the_watermark_and_grants_credit() {
+        let (mut streams, mut flow) = acceptor();
+        let batch = constants::STREAMS_CREDIT_BATCH;
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(batch - 1), 0, b"x", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("legal");
+
+        for _ in 0..batch {
+            let r = streams.accept(Dir::Uni).expect("claimable");
+            streams.abandon_recv(r, &mut flow);
+        }
+
+        // Later frames for those indices are inert by §9.2's watermark.
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_uni(0), 0, b"x", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("watermarked and inert");
+        assert_eq!(opened(&events), 0);
+        assert_eq!(streams.accept(Dir::Uni), None);
+
+        // §10.4: full closure of a peer-opened stream is what earns credit,
+        // and a whole batch of it is what emits the frame (ruling 102).
+        let mut packing = Packing::new();
+        streams.pack_control(&mut flow, &mut packing);
+        assert!(
+            packing.frames().contains(&Frame::MaxStreamsUni(
+                constants::INITIAL_MAX_STREAMS_UNI + batch
+            )),
+            "{:?}",
+            packing.frames()
+        );
+        // The same batch also trued up 8 stream windows at the connection
+        // level, which crosses §10.3's threshold — that MAX_DATA rides the
+        // same packet and is `seal_quiet` like the rest (ruling 98).
+        assert!(
+            packing
+                .frames()
+                .iter()
+                .any(|f| matches!(f, Frame::MaxData(_))),
+            "{:?}",
+            packing.frames()
+        );
+    }
+
+    /// **[ruling 93, as amended]** Mechanism two: a **bidi** stream's send
+    /// half is still live, so abandoning the receive half does *not* fully
+    /// close it. The watermark must not advance — that would resurrect the
+    /// stream on the next frame and re-charge the cumulative limit against
+    /// freed state — and the per-half tombstone is what makes arrivals
+    /// inert while still running the stream-level bound.
+    #[test]
+    fn abandoning_a_bidi_recv_half_tombstones_the_half_and_not_the_index() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_bidi(0), 0, b"abc", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("legal");
+        let r = streams.accept(Dir::Bi).expect("claimable");
+        streams.abandon_recv(r, &mut flow);
+
+        // The index is still open: our send half lives, so §9.7's full
+        // closure has not happened and no MAX_STREAMS credit is owed.
+        let mut packing = Packing::new();
+        streams.pack_control(&mut flow, &mut packing);
+        assert!(packing.frames().is_empty(), "not fully closed, no grant");
+
+        // Arrivals are discarded — no re-open, no delivery, no further
+        // connection-level charge…
+        let charged = flow.recv_charged();
+        let mut events = Vec::new();
+        streams
+            .on_stream_frame(
+                &stream_frame(peer_bidi(0), 3, b"def", false),
+                &mut flow,
+                &mut events,
+            )
+            .expect("discarded, not an error");
+        assert_eq!(opened(&events), 0, "the index was never resurrected");
+        assert!(events.is_empty(), "delivered nowhere: {events:?}");
+        assert_eq!(flow.recv_charged(), charged, "no further credit consumed");
+        assert_eq!(streams.reassembly_capacity(), 0);
+
+        // …but the stream-level bound still runs, against the frozen limit.
+        // Without it an abandoned half is an unbounded sink.
+        assert_eq!(
+            streams.on_stream_frame(
+                &stream_frame(
+                    peer_bidi(0),
+                    constants::INITIAL_MAX_STREAM_DATA,
+                    b"x",
+                    false
+                ),
+                &mut flow,
+                &mut events
+            ),
+            Err(Violation::FlowControl)
+        );
+    }
+
+    /// §12.7: *"credit frames never open streams"*. A receiver that lazily
+    /// created an entry here would hand a peer unbounded allocation at four
+    /// bytes per stream — and it is the natural implementation if the ledger
+    /// is a map with an `entry().or_default()`.
+    #[test]
+    fn max_stream_data_never_opens_a_stream() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+
+        // For a stream in **our** space that we have not opened: §8.4's
+        // `STREAM_STATE_ERROR`.
+        let ours = StreamId::new(0, Dir::Bi, Opener::Responder);
+        assert_eq!(
+            streams.on_max_stream_data(ours, 1_000, &mut events),
+            Err(Violation::StreamState)
+        );
+        // For a uni stream the peer opened, which we cannot send on at all.
+        assert_eq!(
+            streams.on_max_stream_data(peer_uni(0), 1_000, &mut events),
+            Err(Violation::StreamState)
+        );
+        // For a stream in the peer's bidi space the peer has not opened:
+        // inert, and **no entry is created**.
+        streams
+            .on_max_stream_data(peer_bidi(7), 1_000, &mut events)
+            .expect("inert");
+        assert_eq!(streams.accept(Dir::Bi), None);
+        assert_eq!(streams.reassembly_capacity(), 0);
+        let _ = &mut flow;
+    }
+
+    /// **[ruling 94]** §10.6's memory bound, asserted on allocated
+    /// **capacity** and not on bytes received: an eager per-stream allocator
+    /// receives few bytes and would pass a bytes-received assertion for
+    /// free, while costing 32 MiB against 1 MiB of credit.
+    #[test]
+    fn reassembly_capacity_stays_within_the_connection_window() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        let per_stream = 64usize;
+        let count = constants::INITIAL_MAX_STREAMS_UNI;
+        for index in 0..count {
+            streams
+                .on_stream_frame(
+                    &stream_frame(peer_uni(index), 0, &vec![7u8; per_stream], false),
+                    &mut flow,
+                    &mut events,
+                )
+                .expect("inside every limit");
+        }
+        assert_eq!(opened(&events), count as usize);
+        assert_eq!(
+            streams.reassembly_capacity(),
+            count * per_stream as u64,
+            "capacity is what arrived"
+        );
+        assert!(
+            streams.reassembly_capacity() <= constants::INITIAL_MAX_DATA,
+            "§10.6: the connection window is the memory bound"
+        );
+        assert!(
+            streams.reassembly_capacity() < count * constants::INITIAL_MAX_STREAM_DATA,
+            "an eager allocator would be 32x this"
+        );
+    }
+
+    /// §10.5's connection-level bound is enforced across streams, not just
+    /// within one: the per-stream windows sum to 32 MiB and the connection
+    /// window is 1 MiB.
+    #[test]
+    fn the_connection_bound_binds_before_the_stream_bound_across_streams() {
+        let (mut streams, mut flow) = acceptor();
+        let mut events = Vec::new();
+        let chunk = constants::INITIAL_MAX_STREAM_DATA;
+        let mut index = 0u64;
+        loop {
+            let outcome = streams.on_stream_frame(
+                &stream_frame(peer_uni(index), 0, &vec![0u8; chunk as usize], false),
+                &mut flow,
+                &mut events,
+            );
+            match outcome {
+                Ok(()) => index += 1,
+                Err(v) => {
+                    assert_eq!(v, Violation::FlowControl);
+                    break;
+                }
+            }
+            assert!(index < 16, "the 1 MiB connection window must bind first");
+        }
+        assert_eq!(index, constants::INITIAL_MAX_DATA / chunk);
     }
 }

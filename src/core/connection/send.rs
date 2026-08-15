@@ -450,10 +450,8 @@ impl SendHalf {
 
     /// A lost RESET_STREAM re-queues its identity (§8.7 `regenerate`).
     pub(crate) fn on_reset_lost(&mut self) {
-        if let Some(reset) = self.reset.as_mut() {
-            if !reset.acked {
-                reset.pending = true;
-            }
+        if let Some(reset) = self.reset.as_mut().filter(|r| !r.acked) {
+            reset.pending = true;
         }
     }
 
@@ -525,7 +523,7 @@ impl RangeSet {
             end = end.max(self.ranges[j].end);
             j += 1;
         }
-        self.ranges.splice(i..j, [start..end]);
+        self.ranges.splice(i..j, std::iter::once(start..end));
     }
 
     /// Remove a range, splitting whatever it cuts.

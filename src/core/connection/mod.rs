@@ -677,12 +677,7 @@ impl<C: Handshake> Connection<C> {
         // legitimately generated is kept and drained first — §8.2 discards a
         // packet's effects only on the *structural* path.
         self.drain_events();
-        self.enter_closing(
-            now,
-            code,
-            b"",
-            ConnectionLost::ProtocolViolation { code },
-        );
+        self.enter_closing(now, code, b"", ConnectionLost::ProtocolViolation { code });
     }
 
     /// Move the packet's events into the drain, in generation order.
@@ -1079,12 +1074,9 @@ mod smoke {
         let (bp, bsk) = b.open().expect("identity opens");
 
         let init = <Suite as Handshake>::initiator(ap, PROLOGUE, b_pub);
-        let (msg1, sent) = <Suite as Handshake>::write_msg1(
-            init,
-            ask,
-            &[0u8; crate::constants::MSG1_PAYLOAD_LEN],
-        )
-        .expect("msg1");
+        let (msg1, sent) =
+            <Suite as Handshake>::write_msg1(init, ask, &[0u8; crate::constants::MSG1_PAYLOAD_LEN])
+                .expect("msg1");
         let resp = <Suite as Handshake>::responder(bp, PROLOGUE, bsk).expect("responder");
         let (_claimed, mid) = <Suite as Handshake>::read_msg1_intro(resp, &msg1).expect("intro");
         let (_payload, read) = <Suite as Handshake>::complete(mid).expect("complete");
@@ -1204,7 +1196,11 @@ mod smoke {
         let mut buf = [0u8; 64];
         assert_eq!(b.read(now, claimed, &mut buf), Ok(Some(11)));
         assert_eq!(&buf[..11], b"hello world");
-        assert_eq!(b.read(now, claimed, &mut buf), Ok(None), "FIN is end of stream");
+        assert_eq!(
+            b.read(now, claimed, &mut buf),
+            Ok(None),
+            "FIN is end of stream"
+        );
     }
 
     /// §9.6's reset crosses the wire and surfaces as `ReadError::Reset`.
@@ -1271,32 +1267,53 @@ mod smoke {
 
     /// §8.5's round-robin: two streams with data pending both make progress
     /// inside one fill pass, rather than one starving the other.
+    ///
+    /// The contention has to be *built*: §16.7 makes `write` seal
+    /// synchronously, so two sequential writes on a live connection never
+    /// contend — the first has already gone out. Writing **before the
+    /// install** (§16.9) queues both and makes the install's pump the first
+    /// fill pass that sees two ready streams.
     #[test]
     fn the_fill_serves_streams_round_robin() {
         let now = Instant::now();
-        let (mut a, mut b) = pair(now);
-        let _ = drain(&mut a);
-        let _ = drain(&mut b);
+        let (a_session, b_session) = sessions();
+        let mut a: Connection<Suite> = Connection::connecting([5u8; 32]);
 
         let r1 = a.open(Dir::Uni).expect("uni");
         let r2 = a.open(Dir::Uni).expect("uni");
         a.write(now, r1, &vec![1u8; 4_000]).expect("write");
         a.write(now, r2, &vec![2u8; 4_000]).expect("write");
-        a.flush(now);
+        assert!(drain(&mut a).0.is_empty(), "§16.9: nothing before install");
+
+        a.handle_endpoint_event(
+            now,
+            Install {
+                session: a_session,
+                role: Role::Initiator,
+            },
+        );
+
+        let mut b = Connection::established(now, [6u8; 32], b_session, Role::Responder);
+        let _ = drain(&mut b);
 
         let (datagrams, _) = drain(&mut a);
-        let first = &datagrams[0];
-        b.handle_datagram(now, v4(1), first);
+        b.handle_datagram(now, v4(1), &datagrams[0]);
         let _ = drain(&mut b);
 
         let s1 = b.accept(Dir::Uni).expect("first stream");
-        let s2 = b.accept(Dir::Uni).expect("second stream");
+        let s2 = b
+            .accept(Dir::Uni)
+            .expect("the second stream shares the packet");
         let mut buf = [0u8; 4096];
         let n1 = b.read(now, s1, &mut buf).expect("read").expect("data");
         let n2 = b.read(now, s2, &mut buf).expect("read").expect("data");
         assert!(
             n1 > 0 && n2 > 0,
             "one packet carried both streams: {n1} and {n2}"
+        );
+        assert!(
+            n1 < 4_000,
+            "§8.5 serves a quantum, not a whole stream: {n1}"
         );
     }
 

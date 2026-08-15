@@ -798,17 +798,16 @@ impl Packing {
     /// payload length it describes — the one place in the codec where a
     /// field's size is a function of the value it precedes.
     pub(crate) fn stream_payload_room(&self, id: StreamId, offset: u64) -> Option<usize> {
-        let fixed = 1
-            + varint_len(id.as_u64())
-            + if offset != 0 { varint_len(offset) } else { 0 };
+        let fixed = 1 + varint_len(id.as_u64()) + if offset != 0 { varint_len(offset) } else { 0 };
         let avail = self.room().checked_sub(fixed)?;
         // The smallest `len` varint that admits its own payload wins, and
         // trying them in increasing width yields the largest payload.
         for width in [1usize, 2, 4, 8] {
-            if let Some(payload) = avail.checked_sub(width) {
-                if varint_len(payload as u64) <= width {
-                    return Some(payload);
-                }
+            if avail
+                .checked_sub(width)
+                .is_some_and(|p| varint_len(p as u64) <= width)
+            {
+                return Some(avail - width);
             }
         }
         None
