@@ -176,7 +176,7 @@ and do report if you find one unimplementable.**
 
 | # | Rule |
 |---|---|
-| **93** | Dropping a receive half **retires it at once** — freed, tombstoned at the watermark, connection-credit trued up in the same step. The true-up value is the **highest stream-level limit ever advertised** for that half, *not* the highest received offset. |
+| **93** | Dropping a receive half **retires it at once** — freed, tombstoned, connection-credit trued up in the same step. The true-up value is the **highest stream-level limit ever advertised** for that half, *not* the highest received offset. **Amended (see below): two tombstone mechanisms, not one.** |
 | **94** | Reassembly: coalesce-on-insert, `REASSEMBLY_CHUNKS_MAX` = 1024, **allocate lazily**. Total capacity across all streams stays inside the connection window. |
 | **95** | `StreamRef` keys eleven sites: the five verbs, `accept`, `stream_id`, and the four stream-naming `ConnEvent`s. |
 | **97** | Receive-path order: **legality → watermark → limit → final size → flow control.** The limit check runs *before* the implicit opens it would authorise. |
@@ -191,6 +191,27 @@ and do report if you find one unimplementable.**
 | **106** | `Install` carries the role. **Stream-ID parity comes from `Connection::role()`, never from "I was created by `connect()`."** |
 
 ---
+
+### 4a. Ruling 93's amendment — abandonment needs **two** tombstone mechanisms
+
+Added after dispatch. Full text in Round 17 under ruling 93, and in
+`SPEC.md` §16.2.
+
+| Space | On abandoning the receive half | Later STREAM frames for it |
+|---|---|---|
+| **peer-opened uni** | it is the only half this endpoint holds ⇒ the stream is **fully closed** (§9.7): the watermark advances and the peer earns a MAX_STREAMS grant (§10.4) | inert by §9.2's **watermark** rule |
+| **bidi** (either opener) | our **send half is still live** ⇒ **not** fully closed: the watermark does **not** advance and the index stays in the open set | **not** watermark no-ops and **not** implicit opens — discarded by §16.2's own "arrivals for it are discarded" |
+
+In both cases the frames are ACKed, delivered nowhere, and consume no
+further credit, because §10.3's true-up is absolute and that stream's
+contribution already sits at its maximum. **The stream-level
+`FLOW_CONTROL_ERROR` check still runs** against the frozen advertised
+limit — that is what stops an abandoned half becoming an unbounded sink.
+
+**Watermark alone resurrects an abandoned bidi receive half on the next
+frame**, re-charging the cumulative limit against freed state.
+**Per-half tombstone alone never advances the uni watermark**, so the
+peer never gets its MAX_STREAMS credit back. Both are needed.
 
 ## 5. What slice 4a must NOT build
 
