@@ -63,9 +63,9 @@ use super::*;
 
 use crate::config::{Config, WallClock};
 use crate::constants::{
-    HANDSHAKE_GIVEUP, INIT_PACKET_LEN, INTRO_MAX_PER_SOURCE, INTRO_QUEUE_CAP, INTRO_TTL, MAC1_LEN,
-    PKT_DATA, PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP, RESP_PACKET_LEN, RETRANSMIT_BASE,
-    RETRANSMIT_JITTER_MAX, TS_GUARD_ORPHAN_TTL, VERSION,
+    HANDSHAKE_GIVEUP, INIT_HEADER_LEN, INIT_PACKET_LEN, INTRO_MAX_PER_SOURCE, INTRO_QUEUE_CAP,
+    INTRO_TTL, MAC1_LEN, PKT_DATA, PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP, RESP_PACKET_LEN,
+    RETRANSMIT_BASE, RETRANSMIT_JITTER_MAX, STATIC_PUBLIC_LEN, TS_GUARD_ORPHAN_TTL, VERSION,
 };
 use crate::error::{AcceptError, AuthError, ConnectError, IntroError};
 use crate::identity::{Identity, PublicKeyOf};
@@ -331,6 +331,26 @@ fn forged_init(responder: &Ep, sender_index: u32, filler: u8) -> Vec<u8> {
 /// offset 2 (ruling 64).
 fn init_sender_index(dgram: &[u8]) -> u32 {
     u32::from_le_bytes(dgram[2..6].try_into().expect("init header"))
+}
+
+/// The **cleartext ephemeral public key** inside a HandshakeInit.
+///
+/// Noise IK msg1 is `e ‖ ENCRYPTED(s) ‖ ENCRYPTED(payload)`, and `e` is
+/// sent in the clear, so it is the leading `STATIC_PUBLIC_LEN` octets of
+/// the Noise message — `[INIT_HEADER_LEN, INIT_HEADER_LEN +
+/// STATIC_PUBLIC_LEN)` of the datagram. `constants.rs` pins that
+/// decomposition as a compile-time assertion
+/// (`IK_MSG1_LEN == STATIC_PUBLIC_LEN + (STATIC_PUBLIC_LEN +
+/// AEAD_TAG_LEN) + (MSG1_PAYLOAD_LEN + AEAD_TAG_LEN)`), so this offset
+/// cannot drift without the build going red first.
+///
+/// Isolating the region matters: comparing **whole packets** across two
+/// attempts proves nothing about the ephemeral, because §5.5 also mints a
+/// fresh `sender_index` and a fresh timestamp for every attempt — three
+/// reasons for the bytes to differ, and a test that names one of them
+/// while observing all three cannot fail for the reason it claims.
+fn msg1_ephemeral(dgram: &[u8]) -> &[u8] {
+    &dgram[INIT_HEADER_LEN..INIT_HEADER_LEN + STATIC_PUBLIC_LEN]
 }
 
 /// §3.3's `sender_index` (offset 2) and `receiver_index` (offset 6), both
@@ -1869,6 +1889,177 @@ fn authenticate_then_reject_restores_a_prior_value() {
     );
 }
 
+/// **Regression — the two-pin sibling of
+/// [`authenticate_then_reject_leaves_the_guard_empty`].**
+///
+/// §17.1 mitigation (i) says the rejected chain's record "**drops with the
+/// chain**". That is a statement about the *record*, not about the entry,
+/// and the two come apart the moment anything else pins the entry: a
+/// second staged chain for the same static holds a pin, the entry
+/// therefore survives the drop, and a revert that only deletes *unpinned*
+/// entries lets the admitted value survive with it.
+///
+/// The cost of getting it wrong is the exact flood mitigation (i) exists
+/// to forbid — with a second pin held, authenticate-then-drop mints a
+/// durable orphan for a handful of DH, and §17.1's honesty clause prices
+/// flushing the whole `TS_GUARD_ORPHAN_CAP` tier on the assumption that it
+/// cannot.
+///
+/// The **single**-pin case passes either way, so the whole of the defect
+/// lives in the difference between that test and this one. Asserted twice:
+/// through the record directly, and through the admission behaviour that
+/// actually matters.
+#[test]
+fn authenticate_then_reject_clears_the_record_even_when_another_chain_pins_the_entry() {
+    let t = t0();
+    let (mut a, mut b) = pair(t);
+    let train = msg1_train(&mut a, t, &b, 2);
+
+    // Chain A authenticates: the key-holder write that creates the entry
+    // and records train[1]'s timestamp.
+    let (chain_a, admitted) = ladder_to_proven(&mut b, t, v4(31, 1), &train[1]);
+    let ts = admitted.expect("the first admission passes vacuously");
+    assert_eq!(
+        b.ep.greatest(a.canonical()),
+        Some(ts),
+        "authenticate did not record the timestamp"
+    );
+
+    // Chain B reaches Claimed and stops there: no guard check, no record,
+    // but a **second pin** on the entry a key-holder just wrote (§17.1's
+    // bounded exception).
+    let chain_b = b.feed(t, v4(31, 2), &train[0]).one_intro().0;
+    b.ep.read_identity(chain_b).expect("a real msg1 is readable");
+    let _ = b.drain();
+
+    // Drop A. The entry survives — B pins it — but the RECORD must not.
+    b.ep.reject(chain_a);
+    let _ = b.drain();
+    assert_eq!(
+        b.ep.greatest(a.canonical()),
+        None,
+        "the record outlived the chain that wrote it because a second pin held the entry"
+    );
+
+    // The property that matters: the very same initiation is admissible
+    // again, so the authenticate-then-drop minted no orphan.
+    let (_id, again) = ladder_to_proven(&mut b, t, v4(31, 3), &train[1]);
+    assert!(
+        again.is_ok(),
+        "authenticate-then-drop minted an orphan while a second chain pinned the entry: {again:?}"
+    );
+}
+
+/// §17.1: for a staged mid-state "the pin **never creates an entry** — a
+/// bounded exception to §6.1's nothing-durable rule, flipping a bit on an
+/// entry a key-holder already wrote".
+///
+/// This is the rule every pin-accounting bug is measured against, and it
+/// is §6.1's "nothing durable may be keyed on the **claimed** static"
+/// applied to the guard: reaching `Claimed` costs 1 DH and proves
+/// nothing, so if it could mint a guard entry an attacker would write
+/// durable per-static state for any public key they care to name.
+#[test]
+fn a_claimed_chain_creates_no_guard_entry() {
+    let t = t0();
+    let (mut a, mut b) = pair(t);
+    let train = msg1_train(&mut a, t, &b, 2);
+
+    // Reach Claimed and stop. train[1] is the *newer* initiation.
+    let id = b.feed(t, v4(32, 1), &train[1]).one_intro().0;
+    b.ep.read_identity(id).expect("a real msg1 is readable");
+    let _ = b.drain();
+    assert_eq!(b.dhs.get(), 1, "Claimed is one DH");
+    assert_eq!(
+        b.ep.greatest(a.canonical()),
+        None,
+        "reaching Claimed wrote a guard entry for an unproven, attacker-choosable static"
+    );
+
+    // Behaviourally: nothing was recorded, so the OLDER initiation is
+    // still admissible. Had `Claimed` recorded train[1], this would be a
+    // Replay.
+    let (_id, older) = ladder_to_proven(&mut b, t, v4(32, 2), &train[0]);
+    assert!(
+        older.is_ok(),
+        "an older initiation was refused, so Claimed recorded something: {older:?}"
+    );
+}
+
+/// **Regression — a pin is never *released* that was never *taken*.**
+///
+/// §17.1's write sites are all post-`ss` reads of an **inbound** msg1, so
+/// "for a static we only ever dialled we hold **no entry at all**"; and a
+/// pin never creates one. Dialling a static nobody has recorded therefore
+/// takes **no** pin, and the release when that dial ends must be
+/// conditional on the take. An unconditional release decrements whatever
+/// pin exists by then — and on §5.4's **PENDING** row (simultaneous open)
+/// that is a **staged mid-state's**, so §17.1's "never evicted while a
+/// staged mid-state exists" fails silently.
+///
+/// This test walks the defect's own path: the dial creates no entry, an
+/// inbound chain for that same static then creates one, and cancelling the
+/// dial must leave it and its record untouched.
+///
+/// **What this cannot reach, stated so it is not mistaken for coverage.**
+/// The pin *count* is not observable at this API, and the one consequence
+/// of an over-release — the entry aging out early — is masked by ruling
+/// 70's alias. `TS_GUARD_ORPHAN_TTL == INTRO_TTL`, and the only pin holder
+/// that can co-exist with a cancelled dial for the same static is a staged
+/// mid-state (§16.1 forbids LIVE and PENDING together, and slice 2a
+/// refuses `accept()` on both rows), whose own expiry reverts its
+/// provisional record at exactly the instant the wrongly-unpinned entry
+/// would have aged out. The two clocks are the same clock, so both the
+/// fixed and the broken core answer `None` after it. Distinguishing them
+/// needs the pin count exposed — a `pins(&self, key: &[u8]) -> u32` beside
+/// `greatest` would do it in one assertion.
+#[test]
+fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
+    let t = t0();
+    let (mut a, mut b) = pair(t);
+
+    // (1) Dial a static we hold nothing for. §17.1: no entry to pin, so
+    //     no pin is taken — the defect's precondition.
+    let (conn, d) = a.connect(t, b.addr, &b.public_static);
+    let index = init_sender_index(&d.one_transmit().1);
+    assert_eq!(
+        a.ep.greatest(b.canonical()),
+        None,
+        "a dial created a guard entry — every §17.1 write site is inbound and post-ss"
+    );
+
+    // (2) The simultaneous-open shape: an inbound initiation from that
+    //     same static reaches Proven. *That* is the key-holder write which
+    //     creates the entry, and it takes the mid-state's pin.
+    let inbound = real_msg1(&mut b, t, &a);
+    let at = t + Duration::from_secs(1);
+    let (_chain, admitted) = ladder_to_proven(&mut a, at, b.addr, &inbound);
+    let ts = admitted.expect("we hold no entry for a static we dialled, so this passes vacuously");
+    assert_eq!(a.ep.greatest(b.canonical()), Some(ts));
+
+    // (3) End the dial. It never pinned this entry and never wrote this
+    //     record, so it may disturb neither.
+    a.ep
+        .handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
+    let _ = a.drain();
+    assert_eq!(
+        a.ep.greatest(b.canonical()),
+        Some(ts),
+        "cancelling the dial destroyed a record it never wrote"
+    );
+
+    // Behaviourally, and at the far edge of the mid-state's life: the
+    // record is still enforced, so a replay of that same initiation is
+    // still refused.
+    let alive = at + INTRO_TTL - Duration::from_nanos(1);
+    let _ = a.timeout(alive);
+    let (_id, replay) = ladder_to_proven(&mut a, alive, v4(33, 1), &inbound);
+    assert!(
+        matches!(replay, Err(AuthError::Replay)),
+        "the entry lost its record while a staged mid-state still pinned it (§17.1): {replay:?}"
+    );
+}
+
 /// §17.1: "For a static we **only ever dialled** we hold **no entry at
 /// all** — every §17.1 write site is a post-`ss` read of an *inbound*
 /// msg1, and a `connect()` completed by msg2 writes nothing … every
@@ -2226,11 +2417,21 @@ fn every_retransmit_mints_a_fresh_index_and_a_fresh_ephemeral() {
     indices.dedup();
     assert_eq!(indices.len(), before, "an index was reused across attempts");
 
-    for w in packets.windows(2) {
-        assert_ne!(
-            w[0], w[1],
-            "two attempts carried identical bytes — the ephemeral was reused"
-        );
+    // The ephemeral, on its own. Comparing whole packets would prove
+    // nothing here — the index and the timestamp differ per attempt too —
+    // so the region §5.2 puts the ephemeral in is compared directly, and
+    // **pairwise** rather than adjacently: a rotating pool of two keys
+    // passes an adjacent-only check and is exactly as broken as reusing
+    // one.
+    let ephemerals: Vec<&[u8]> = packets.iter().map(|p| msg1_ephemeral(p)).collect();
+    for (i, e) in ephemerals.iter().enumerate() {
+        for (j, f) in ephemerals.iter().enumerate().skip(i + 1) {
+            assert_ne!(
+                e, f,
+                "attempts {i} and {j} share an ephemeral public key — \
+                 §5.5 step 2 requires a fresh ephemeral for every initiation"
+            );
+        }
     }
 }
 

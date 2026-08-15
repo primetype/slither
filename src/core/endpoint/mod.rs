@@ -186,6 +186,35 @@ impl<I: Identity> Endpoint<I> {
         &self.our_static_bytes
     }
 
+    /// §17.1's recorded greatest initiation timestamp for a peer static.
+    ///
+    /// `None` covers both "no entry" and "an entry holding no record" — a
+    /// pin-only entry left behind by mitigation (i)'s revert. The two are
+    /// deliberately indistinguishable here because they are
+    /// indistinguishable to the protocol: neither refuses any timestamp.
+    pub(crate) fn greatest(&self, peer_static: &[u8]) -> Option<Timestamp> {
+        self.guard.greatest(peer_static)
+    }
+
+    /// §17.1's live pin count for a peer static.
+    ///
+    /// Exists for one reason, stated plainly: the pin **count** is otherwise
+    /// unobservable, and an over-release — a pending releasing a pin it
+    /// never took — has no other consequence a test can reach. Its one
+    /// visible effect is early aging, and ruling 70's own alias masks that:
+    /// `TS_GUARD_ORPHAN_TTL == INTRO_TTL`, so the only pin holder that can
+    /// coexist with a cancelled dial for the same static is a staged
+    /// mid-state, whose expiry reverts its provisional record at exactly
+    /// the instant the wrongly-unpinned entry would have aged out. A
+    /// correct core and a broken one answer identically at every otherwise
+    /// observable moment.
+    ///
+    /// So this is not convenience: without it that regression cannot be
+    /// written at all.
+    pub(crate) fn guard_pins(&self, peer_static: &[u8]) -> u32 {
+        self.guard.pins(peer_static)
+    }
+
     /// §17.4's `replacement_basis` for a peer static.
     ///
     /// `None` — this endpoint holds no connection for that static.

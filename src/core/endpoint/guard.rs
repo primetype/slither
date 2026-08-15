@@ -123,6 +123,12 @@ impl TimestampGuard {
         self.entries.get(key).and_then(|e| e.greatest)
     }
 
+    /// The live pin count for a static: connections + pendings +
+    /// mid-states. `0` for an absent entry.
+    pub(crate) fn pins(&self, key: &[u8]) -> u32 {
+        self.entries.get(key).map_or(0, |e| e.pins)
+    }
+
     /// Whether `candidate` would pass — **strictly** greater, vacuously
     /// true where nothing is recorded.
     pub(crate) fn admits(&self, key: &[u8], candidate: Timestamp) -> bool {
