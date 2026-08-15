@@ -113,3 +113,88 @@ S29's core-side cancellation reuses `ToEndpoint::Retired`).
 Both are honest guesses that the spec does not settle. **If either is
 wrong, the test is the thing that changes** — which is the point of
 having written them down.
+
+---
+
+## D. Raised by the implementer
+
+### D1. §18.1 has no variant for a *local* provider failure — ranked first
+
+`Identity::open()` is fallible. `ConnectError` (2 variants) and
+`IntroError` (4) cannot express "our own key hardware failed". §18.1's
+taxonomy is closed (ruling 61 reserved `Stopped` on `WriteError` and
+nothing else), so the implementer could not invent one.
+
+**What it does today:** `connect`/retransmit skip the attempt and the dial
+ends at the defined `TimedOut`; `read_identity` returns
+`IntroError::Malformed` and leaves the chain parked. `EndpointDropped` was
+considered and rejected as worse — an application would tear down its
+whole accept loop over a transient enclave lock.
+
+**Why this is the top item.** **A local hardware fault is currently
+reported as if the peer's msg1 were malformed.** That is a wrong
+attribution, not merely a coarse one, and it lands precisely on S21 — the
+Secure Enclave story, where `open()` failing because the device is locked
+or the key is biometrics-gated is an *expected* runtime condition, not a
+defect. An operator debugging it is told the remote peer is sending
+garbage.
+
+It is also §18.2's shape twice over: the party that can fix the problem
+(the local host) is handed evidence pointing at the peer. Ruling 49 and
+ruling 59 both turned on exactly that.
+
+**Provisional:** as implemented, because the alternative is inventing a
+variant in a closed taxonomy. **Recommend** adding
+`IntroError::Local`/`ConnectError::Local` (or a `slither::io`-style trace
+obligation, which needs no variant and no API change) — but that is a
+§18.1 amendment and yours to rule.
+
+### D2. Orphan-aging origin — the two agents disagree, and I think the test author is right
+
+Extends A3. The implementer ages from **last admission**; the test author
+argued **pin release**. The implementer, having seen neither the other's
+file nor its reasoning, wrote: *"their textual case is better — §17.1
+defines orphans as dead-connection entries, so one cannot age as an orphan
+before it is one."*
+
+It did not implement pin-release because doing so needs an `orphaned_at`
+set when pins hit zero, threading `now` into `unpin()`, which is adjacent
+to mitigation (iii) and it declined to touch that unruled.
+
+**The two collapse in every flow slice 2a can reach**, so no test
+distinguishes them today and nothing is currently wrong. They diverge for
+any connection that outlives its admission — i.e. every real one.
+
+**Provisional:** last admission (as built). **Recommend** pin release.
+
+### D3. `authenticate()` on a still-parked chain
+
+The spec does not say what the core does when `authenticate()` is called
+on a chain that never had `read_identity()` run. Implemented as:
+**advance through the missing `es`**, because §6.1 prices the verb at 2 DH
+*cumulative*, so the total is exactly the ratified cost and no error need
+be invented. Reasonable; unstated. Pairs with A1.
+
+### D4. §17.1's pin moment — plan and spec disagreed; spec won
+
+Plan §7.2 pinned at `authenticate()`. §17.1 says pinned "while a staged
+mid-state exists" and explicitly addresses the "merely claimed until
+`authenticate()`" case, which puts it at `read_identity()`. Implemented at
+`read_identity()`, per the spec. **No ruling needed** — recorded because
+the plan is now wrong at §7.2 and should be corrected rather than left to
+mislead slice 3.
+
+### D5. §16.4's Rust block is schematic, not literal
+
+`EndpointOutput` / `Install` / `EstablishedSession` / `Connection` must be
+generic over the suite — the seal and open halves are
+`DatagramSend<IK>` / `DatagramRecv<IK>`. Made `<C: Handshake>`. Forced by
+the type system; recorded so §16.4's block is not read as a literal
+signature by a later slice.
+
+### D6. `SoftwareIdentity` is bound to `Curve = P256`
+
+hiss exposes no generic private-key import seam and `PrivateKey` is not
+`Clone`, so per-handshake re-import is forced, and re-import is
+curve-specific. Cipher and hash stay generic. A second *curve* identity
+needs its own type. Constraint from upstream, not a choice.
