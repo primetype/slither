@@ -187,14 +187,37 @@ pub struct EstablishedSession<C: Handshake> {
     pub anchor: SocketAddr,
 }
 
+/// Which end of the handshake this connection turned out to be (§6.7).
+///
+/// **[RATIFIED 2026/08/15 — ruling 106]** Fixed at establishment and for
+/// the connection's life; §9.1's stream-ID parity reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// We wrote msg1 and completed on msg2.
+    Initiator,
+    /// We wrote msg2 — including §6.6 step 4, where we had dialled.
+    Responder,
+}
+
 /// The one endpoint→connection event (§16.4).
 ///
-/// Carries the session and nothing else: with the rekey swap deleted (§7.6)
-/// there is exactly one install per connection, so no discriminator
-/// distinguishes them and none is carried.
+/// With the rekey swap deleted (§7.6) there is exactly one install per
+/// connection, so no discriminator distinguishes them and none is carried.
 pub struct Install<C: Handshake> {
     /// The completed session.
     pub session: EstablishedSession<C>,
+    /// **[RATIFIED 2026/08/15 — ruling 106]** The role, which the connection
+    /// core cannot derive.
+    ///
+    /// §6.6 step 4 admits a peer that **dialled** as the *responder*, so a
+    /// core inferring "I was created by `connect()`, therefore I am the
+    /// initiator" is wrong on exactly that path — and silently: both ends
+    /// still agree on every stream they open themselves, and disagree only
+    /// on §9.1's parity. It cannot be recovered afterwards from hiss, since
+    /// ruling 89 leaves [`Handshake::Seal`](crate::packet::Handshake::Seal)
+    /// an associated type with no bounds. The endpoint is the only party
+    /// that knows the tie-break's outcome, so the endpoint states it.
+    pub role: Role,
 }
 
 /// The one connection→endpoint event (§16.4).

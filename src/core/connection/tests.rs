@@ -60,7 +60,7 @@ use crate::constants::{
     FRAME_STREAM_MAX, MAX_ACK_RANGES, MAX_DATAGRAM, MAX_PLAINTEXT, PKT_DATA, PROLOGUE,
     REKEY_EPOCH_MSGS, REPLAY_WINDOW, VERSION,
 };
-use crate::core::{EstablishedSession, Install, ToEndpoint, Transmit};
+use crate::core::{EstablishedSession, Install, Role, ToEndpoint, Transmit};
 use crate::error::ConnectionLost;
 use crate::identity::Identity;
 use crate::packet::{Handshake, ReferenceSuite};
@@ -417,7 +417,13 @@ fn established_at_with_epoch(now: Instant, epoch: NonZeroU64) -> Fixture {
     let (session, peer) = handshake(epoch);
     let our_index = session.our_index;
     let mut conn = Connection::connecting([0x5au8; 32]);
-    conn.handle_endpoint_event(now, Install { session });
+    conn.handle_endpoint_event(
+        now,
+        Install {
+            session,
+            role: Role::Initiator,
+        },
+    );
     let mut f = Fixture {
         conn,
         peer,
@@ -444,7 +450,7 @@ fn established_at_with_epoch(now: Instant, epoch: NonZeroU64) -> Fixture {
 fn accepted_at(now: Instant) -> Fixture {
     let (session, peer) = handshake(default_epoch());
     let our_index = session.our_index;
-    let conn = Connection::established(now, [0x5au8; 32], session);
+    let conn = Connection::established(now, [0x5au8; 32], session, Role::Responder);
     let mut f = Fixture {
         conn,
         peer,
@@ -661,7 +667,13 @@ mod poll_contract {
         // handle_endpoint_event
         let (session, mut peer) = handshake(default_epoch());
         let mut conn = Connection::connecting([1u8; 32]);
-        conn.handle_endpoint_event(t, Install { session });
+        conn.handle_endpoint_event(
+            t,
+            Install {
+                session,
+                role: Role::Initiator,
+            },
+        );
         let _ = drain_bare(&mut conn);
 
         // handle_datagram, with something that opens …
@@ -759,7 +771,13 @@ mod poll_contract {
         assert!(conn.session().is_none(), "no session before the install");
         assert_eq!(conn.sub_seed(), &[0xa5u8; 32], "§16.6's sub-seed is held");
 
-        conn.handle_endpoint_event(t, Install { session });
+        conn.handle_endpoint_event(
+            t,
+            Install {
+                session,
+                role: Role::Initiator,
+            },
+        );
         let d = drain_bare(&mut conn);
 
         let established = d

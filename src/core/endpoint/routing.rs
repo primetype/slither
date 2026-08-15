@@ -80,7 +80,9 @@ use std::time::Instant;
 
 use crate::constants;
 use crate::core::endpoint::handshake as framing;
-use crate::core::{ConnectionId, EndpointOutput, EstablishedSession, Install, Timestamp, Transmit};
+use crate::core::{
+    ConnectionId, EndpointOutput, EstablishedSession, Install, Role, Timestamp, Transmit,
+};
 use crate::error::ConnectError;
 use crate::identity::{Identity, PublicKeyOf};
 use crate::packet::{Handshake, Mac1Key};
@@ -553,6 +555,9 @@ impl<I: Identity> Endpoint<I> {
                     peer_index,
                     anchor: src,
                 },
+                // §6.6 step 4: we dialled and lost the tie-break, so we
+                // wrote msg2 and install as the **responder** (ruling 106).
+                role: Role::Responder,
             },
         ));
     }

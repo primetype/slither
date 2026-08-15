@@ -71,8 +71,8 @@ use rand_core::{Rng, SeedableRng};
 use crate::config::Config;
 use crate::constants;
 use crate::core::{
-    Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession, Install, Timestamp,
-    ToEndpoint, Transmit,
+    Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession, Install, Role,
+    Timestamp, ToEndpoint, Transmit,
 };
 use crate::error::ConnectError;
 use crate::identity::{Identity, PublicKeyOf};
@@ -753,7 +753,14 @@ impl<I: Identity> Endpoint<I> {
         // the one that writes `Some(t)`.
         self.statics.promote(&key, None);
 
-        self.emit(EndpointOutput::ToConnection(conn, Install { session }));
+        // §16.4 ruling 106: msg2 completed a dial we initiated.
+        self.emit(EndpointOutput::ToConnection(
+            conn,
+            Install {
+                session,
+                role: Role::Initiator,
+            },
+        ));
     }
 
     /// §7.7's epoch size, for hiss's ratcheting datagram split.

@@ -59,7 +59,7 @@ use self::frame::{Close, Frame, Packing, Structural};
 use self::session::Session;
 use self::timers::{TimerKind, Timers};
 
-use super::{EstablishedSession, Install, ToEndpoint, Transmit};
+use super::{EstablishedSession, Install, Role, ToEndpoint, Transmit};
 
 /// A connection's core state machine. §16.4.
 pub(crate) struct Connection<C: Handshake> {
@@ -76,6 +76,9 @@ pub(crate) struct Connection<C: Handshake> {
     /// The receive-path plaintext buffer, owned here so the session can be
     /// borrowed again while the frames are being applied.
     scratch: Vec<u8>,
+    /// **[ruling 106]** `None` until the install; §9.1's stream-ID parity
+    /// reads it, and the core cannot derive it (§6.6 step 4).
+    role: Option<Role>,
 }
 
 /// What a received, authenticated, window-fresh packet turned out to be.
@@ -101,6 +104,7 @@ impl<C: Handshake> Connection<C> {
             timers: Timers::new(),
             closed_emitted: false,
             scratch: Vec::new(),
+            role: None,
         }
     }
 
@@ -115,9 +119,10 @@ impl<C: Handshake> Connection<C> {
         now: Instant,
         sub_seed: [u8; 32],
         session: EstablishedSession<C>,
+        role: Role,
     ) -> Self {
         let mut conn = Self::connecting(sub_seed);
-        conn.install(now, session);
+        conn.install(now, session, role);
         conn
     }
 
@@ -176,7 +181,7 @@ impl<C: Handshake> Connection<C> {
             // would resurrect it, and §16.4 emits `Closed` once.
             return;
         }
-        self.install(now, ev.session);
+        self.install(now, ev.session, ev.role);
     }
 
     /// §16.4's `handle_datagram`.
@@ -529,8 +534,9 @@ impl<C: Handshake> Connection<C> {
     // Internals
     // ═══════════════════════════════════════════════════════════════════
 
-    fn install(&mut self, now: Instant, session: EstablishedSession<C>) {
+    fn install(&mut self, now: Instant, session: EstablishedSession<C>, role: Role) {
         self.installed = true;
+        self.role = Some(role);
         self.session = Some(Session::install(now, session));
         self.sync_liveness_timer();
         self.outputs

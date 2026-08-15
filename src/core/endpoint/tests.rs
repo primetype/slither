@@ -59,7 +59,7 @@ use crate::constants::{
     HANDSHAKE_GIVEUP, INIT_PACKET_LEN, MAC1_LEN, PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP,
     RESP_PACKET_LEN, RETRANSMIT_BASE, RETRANSMIT_JITTER_MAX, TS_GUARD_ORPHAN_TTL, VERSION,
 };
-use crate::core::{ConnectionId, Disposition, EndpointOutput, Timestamp};
+use crate::core::{ConnectionId, Disposition, EndpointOutput, Role, Timestamp};
 use crate::error::{AcceptError, AuthError, ConnectError, IntroError};
 use crate::identity::{Identity, PublicKeyOf};
 use crate::packet::mac::Mac1Key;
@@ -108,6 +108,18 @@ impl Drained {
             .iter()
             .filter_map(|o| match o {
                 EndpointOutput::ToConnection(id, _) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **[ruling 106]** The role each `Install` carries. Added at slice-4
+    /// integration, not by this file's author.
+    fn install_roles(&self) -> Vec<Role> {
+        self.outs
+            .iter()
+            .filter_map(|o| match o {
+                EndpointOutput::ToConnection(_, ev) => Some(ev.role),
                 _ => None,
             })
             .collect()
@@ -1363,6 +1375,53 @@ fn the_internal_tie_break_takes_opposite_branches_in_the_two_key_orders() {
     assert_eq!(l.transmits().len(), 1, "larger static ⇒ loser ⇒ msg2");
     assert_eq!(l.installs().len(), 1, "larger static ⇒ loser ⇒ Install");
     assert!(w.installs().is_empty(), "the winner installs nothing here");
+}
+
+/// **[RATIFIED 2026/08/15 — ruling 106]** §6.6 step 4 installs a peer that
+/// **dialled** as the **responder**, and §6.7 fixes that "for the life of the
+/// connection: stream-ID parity (§9.1) is fixed by this outcome."
+///
+/// The two `Install` routes must therefore carry **opposite** roles: a msg2
+/// completion is the initiator, a lost tie-break's admission is the
+/// responder — on a connection `connect()` created, which is what makes the
+/// obvious inference wrong.
+///
+/// **Mutation caught:** a connection core deriving its role from "I was
+/// created by `connect()`". Every single-route test passes under it, and so
+/// does every test in this file that predates ruling 106, because both ends
+/// still agree on the parity of every stream they open *themselves*. It
+/// diverges only on the streams the **peer** opens, and only on this one
+/// path — a silent, half-of-one-route defect that no §6 test can see and
+/// that slice 4's stream tests would have blamed on §9.1.
+#[test]
+fn the_tie_break_loser_installs_as_responder_and_a_msg2_completion_as_initiator() {
+    let now = t0();
+
+    // §6.6 step 4: we dialled, lost, and admit the inbound.
+    let (mut l_local, mut l_peer) = sides(now, false);
+    let (_c, l_msg1) = crossing(now, &mut l_local, &mut l_peer);
+    let l = l_local.feed(now, l_peer.addr, &l_msg1);
+    assert_eq!(
+        l.install_roles(),
+        vec![Role::Responder],
+        "§6.6 step 4: a dialling peer that loses the tie-break installs as responder"
+    );
+
+    // The ordinary route: our msg1, their staged accept, their msg2, our
+    // completion. The responder walks §6's ladder rather than answering
+    // msg1 directly, so the msg2 comes out of `accept`, not out of `feed`.
+    let (mut a, mut b) = sides(now, true);
+    let msg1 = real_msg1(&mut a, now, &b);
+    let (id, _) = b.feed(now, a.addr, &msg1).one_intro();
+    b.ep.authenticate(now, id).expect("genuine msg1");
+    b.ep.accept(now, id).expect("NONE static, fresh accept");
+    let msg2 = b.drain().one_transmit().1;
+    let d = a.feed(now, b.addr, &msg2);
+    assert_eq!(
+        d.install_roles(),
+        vec![Role::Initiator],
+        "a dial completed by msg2 installs as initiator"
+    );
 }
 
 /// §6.6 step 1: "a forged claim of a pending static dies here at the msg1

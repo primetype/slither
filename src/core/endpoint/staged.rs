@@ -36,7 +36,7 @@ use std::time::Instant;
 use crate::constants;
 use crate::core::endpoint::handshake as framing;
 use crate::core::{
-    Connection, ConnectionId, EndpointOutput, EstablishedSession, Timestamp, Transmit,
+    Connection, ConnectionId, EndpointOutput, EstablishedSession, Role, Timestamp, Transmit,
 };
 use crate::error::{AcceptError, AuthError, IntroError};
 use crate::identity::{Identity, PublicKeyOf};
@@ -701,7 +701,11 @@ impl<I: Identity> Endpoint<I> {
         // `now` is the install instant: §7.4 pins both liveness clocks to
         // it and starts the death deadline already armed, which is what
         // makes "a half-open session is reaped by liveness in 25 s" a fact.
-        Ok((conn, Connection::established(now, sub_seed, session)))
+        // We wrote msg2 on the staged-accept ladder: responder (ruling 106).
+        Ok((
+            conn,
+            Connection::established(now, sub_seed, session, Role::Responder),
+        ))
     }
 
     /// §16.4's `reject`. Infallible, and it **emits nothing**: §6.1 makes
