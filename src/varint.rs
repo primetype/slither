@@ -32,11 +32,6 @@
 //! crate-private keeps the overflow condition internal. Widening
 //! `pub(crate)` to `pub` later is not a breaking change; the reverse is.
 
-// Slice 0 ships the codec; its callers are the frame layer, which lands in
-// a later slice. Until then every function below is reachable only from
-// this module's own tests. Remove this when the frame codec lands.
-#![allow(dead_code)]
-
 /// A QUIC variable-length integer (RFC 9000 §16), byte-identical. §8.1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct VarInt(u64);
@@ -67,6 +62,12 @@ impl VarInt {
     /// In `const` position an out-of-range `v` is a **compile error**;
     /// that is the intended use. Called at run time it panics, so prefer
     /// [`VarInt::new`] for any value that is not a literal.
+    // Slice 3's frame codec took the module-wide `dead_code` allow off:
+    // every other item here now has a caller. This one waits for the first
+    // varint *literal* on the wire — §9.5's stream flags and §10.3's
+    // credit grants, slices 4 and 5 — so it says so on its own line rather
+    // than hiding behind a blanket allow.
+    #[allow(dead_code)]
     pub(crate) const fn from_const(v: u64) -> VarInt {
         assert!(
             v <= Self::MAX_VALUE,

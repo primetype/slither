@@ -16,6 +16,7 @@
 //! can drive it (S21).
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,6 +58,7 @@ impl WallClock for SystemClock {
 pub struct Config {
     intro_queue_cap: usize,
     intro_max_per_source: usize,
+    epoch_size: NonZeroU64,
     clock: Rc<dyn WallClock>,
 }
 
@@ -65,6 +67,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("intro_queue_cap", &self.intro_queue_cap)
             .field("intro_max_per_source", &self.intro_max_per_source)
+            .field("epoch_size", &self.epoch_size)
             .finish_non_exhaustive()
     }
 }
@@ -74,13 +77,23 @@ impl Default for Config {
         Self {
             intro_queue_cap: constants::INTRO_QUEUE_CAP,
             intro_max_per_source: constants::INTRO_MAX_PER_SOURCE,
+            epoch_size: Config::DEFAULT_EPOCH_SIZE,
             clock: Rc::new(SystemClock),
         }
     }
 }
 
 impl Config {
-    /// The defaults: §6.3's ratified caps and a `SystemTime` clock.
+    /// §7.7's ratified epoch size: `REKEY_EPOCH_MSGS` messages per epoch.
+    ///
+    /// The production value, and the only one a shipped build uses.
+    pub const DEFAULT_EPOCH_SIZE: NonZeroU64 = match NonZeroU64::new(constants::REKEY_EPOCH_MSGS) {
+        Some(n) => n,
+        None => panic!("REKEY_EPOCH_MSGS is nonzero"),
+    };
+
+    /// The defaults: §6.3's ratified caps, §7.7's epoch size and a
+    /// `SystemTime` clock.
     pub fn new() -> Self {
         Self::default()
     }
@@ -96,6 +109,27 @@ impl Config {
     #[must_use]
     pub fn with_intro_max_per_source(mut self, cap: usize) -> Self {
         self.intro_max_per_source = cap;
+        self
+    }
+
+    /// Override §7.7's epoch size — **a test-only facility**
+    /// (**ruling 82**).
+    ///
+    /// §7.7's ratchet schedule is a pure function of the counter, so **both
+    /// peers must pass the same value** or they disagree about which key
+    /// opens which packet. Production uses
+    /// [`REKEY_EPOCH_MSGS`](crate::constants::REKEY_EPOCH_MSGS), which is
+    /// what [`Config::default`] supplies; this exists so a test can observe
+    /// an epoch boundary without performing 65 536 seals to reach one.
+    ///
+    /// It carries §16.6's rule for the RNG seed verbatim: a build that
+    /// accepts a caller-chosen epoch must be **feature-gated or documented
+    /// as test-only**, and this is that documentation. Nothing in slither
+    /// calls it outside tests, and a deployment that does has changed a
+    /// ratified security parameter.
+    #[must_use]
+    pub fn with_epoch_size(mut self, epoch_size: NonZeroU64) -> Self {
+        self.epoch_size = epoch_size;
         self
     }
 
@@ -116,8 +150,39 @@ impl Config {
         self.intro_max_per_source
     }
 
+    /// §7.7's epoch size, for hiss's ratcheting datagram split.
+    pub fn epoch_size(&self) -> NonZeroU64 {
+        self.epoch_size
+    }
+
     /// The injected wall clock.
     pub fn clock(&self) -> &dyn WallClock {
         &*self.clock
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ruling 82 splits the boundary behaviour from the constant, so the
+    /// constant needs its own pin: a `Config` nobody configured ratchets on
+    /// §7.7's ratified schedule.
+    #[test]
+    fn the_default_epoch_size_is_rekey_epoch_msgs() {
+        assert_eq!(
+            Config::new().epoch_size().get(),
+            constants::REKEY_EPOCH_MSGS
+        );
+        assert_eq!(
+            Config::DEFAULT_EPOCH_SIZE.get(),
+            constants::REKEY_EPOCH_MSGS
+        );
+    }
+
+    #[test]
+    fn the_epoch_size_override_takes_effect() {
+        let config = Config::new().with_epoch_size(NonZeroU64::new(8).unwrap());
+        assert_eq!(config.epoch_size().get(), 8);
     }
 }

@@ -649,7 +649,7 @@ impl<I: Identity> Endpoint<I> {
             return;
         };
 
-        let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, Self::epoch_size());
+        let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, self.epoch_size());
 
         // §5.5 rule 5: our receiver index is our own `sender_index`; the
         // peer's is the response's. §5.5 rule 4: the anchor is the address
@@ -674,11 +674,13 @@ impl<I: Identity> Endpoint<I> {
 
     /// §7.7's epoch size, for hiss's ratcheting datagram split.
     ///
-    /// The ratchet schedule itself is §7.7 and lands in slice 3; this is
-    /// the one parameter the split call needs today, and it is the ratified
-    /// constant rather than a placeholder.
-    fn epoch_size() -> NonZeroU64 {
-        NonZeroU64::new(constants::REKEY_EPOCH_MSGS).expect("REKEY_EPOCH_MSGS is nonzero")
+    /// Config-supplied (**ruling 82**), defaulting to `REKEY_EPOCH_MSGS`.
+    /// The override is a **test-only** facility and
+    /// [`Config::with_epoch_size`](crate::Config::with_epoch_size) says so
+    /// in the terms §16.6 uses for the RNG seed; the ratchet itself is
+    /// hiss's, and nothing in this crate inspects or drives an epoch.
+    fn epoch_size(&self) -> NonZeroU64 {
+        self.config.epoch_size()
     }
 
     // ═══════════════════════════════════════════════════════════════════

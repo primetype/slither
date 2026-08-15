@@ -404,6 +404,29 @@ macro_rules! channel {
             ) {
                 transport.into_datagram_with_epoch(epoch_size)
             }
+
+            fn next_counter(seal: &::hiss::noise::DatagramSend<IK>) -> u64 {
+                seal.next_counter()
+            }
+
+            fn seal(
+                seal: &mut ::hiss::noise::DatagramSend<IK>,
+                ad: &[u8],
+                plaintext: &[u8],
+                out: &mut [u8],
+            ) -> ::core::result::Result<(u64, usize), ::hiss::noise::HandshakeError> {
+                seal.encrypt_next(ad, plaintext, out)
+            }
+
+            fn open(
+                open: &mut ::hiss::noise::DatagramRecv<IK>,
+                counter: u64,
+                ad: &[u8],
+                ciphertext: &[u8],
+                out: &mut [u8],
+            ) -> ::core::result::Result<usize, ::hiss::noise::HandshakeError> {
+                open.decrypt_at(counter, ad, ciphertext, out)
+            }
         }
 
         // slither's §2.3 arithmetic against hiss's own computed sizes, for

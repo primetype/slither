@@ -144,4 +144,44 @@ pub trait Handshake: Channel {
         transport: Self::Transport,
         epoch_size: NonZeroU64,
     ) -> (Self::Seal, Self::Open);
+
+    /// The counter the next **successful** [`seal`](Handshake::seal) will
+    /// use — Appendix A.2's `next_counter()`, routed through the suite.
+    ///
+    /// §3.4 makes the 14-byte Data header the AEAD associated data, so the
+    /// header — which carries the counter — must be built *before* the
+    /// seal. This is the accessor that makes that possible without
+    /// mirroring hiss-owned state. A failed seal leaves it unchanged, and
+    /// at `u64::MAX` it returns the counter that will never be used (§7.9).
+    fn next_counter(seal: &Self::Seal) -> u64;
+
+    /// Seal one Data packet's plaintext (§7.1).
+    ///
+    /// `ad` is the 14 header bytes verbatim (§3.4); `out` must have room
+    /// for `plaintext.len() + AEAD_TAG_LEN`. Returns the counter the packet
+    /// was sealed under — simultaneously the AEAD nonce, the packet number
+    /// and the epoch selector — and the bytes written. **On any error the
+    /// counter does not advance and nothing is written**, which is what
+    /// §16.7's "on seal failure nothing moved" rests on.
+    fn seal(
+        seal: &mut Self::Seal,
+        ad: &[u8],
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<(u64, usize), HandshakeError>;
+
+    /// Open one Data packet at the counter its header carried (§7.2).
+    ///
+    /// Takes `&mut` because the §7.7 epoch ratchet commits on success.
+    /// **No replay rejection happens here** — hiss imposes neither
+    /// monotonicity nor uniqueness, by design, so §7.2's window is the
+    /// caller's duty and is strictly post-AEAD. On an error `out` holds
+    /// unauthenticated bytes that must not be read.
+    fn open(
+        open: &mut Self::Open,
+        counter: u64,
+        ad: &[u8],
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, HandshakeError>;
 }

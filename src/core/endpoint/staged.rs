@@ -530,7 +530,7 @@ impl<I: Identity> Endpoint<I> {
             self.discard_chain(now, id);
             return Err(AcceptError::Stale);
         };
-        let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, Self::epoch_size());
+        let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, self.epoch_size());
 
         // mac1 on the response is keyed on the **recipient's** static —
         // the initiator's, which the `ss` has just proven they hold.
@@ -569,7 +569,10 @@ impl<I: Identity> Endpoint<I> {
             peer_index,
             anchor,
         };
-        Ok((conn, Connection::established(sub_seed, session)))
+        // `now` is the install instant: §7.4 pins both liveness clocks to
+        // it and starts the death deadline already armed, which is what
+        // makes "a half-open session is reaped by liveness in 25 s" a fact.
+        Ok((conn, Connection::established(now, sub_seed, session)))
     }
 
     /// §16.4's `reject`. Infallible, and it **emits nothing**: §6.1 makes

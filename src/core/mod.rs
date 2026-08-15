@@ -54,9 +54,15 @@ use crate::packet::{Handshake, Msg1Payload};
 // would make that re-export illegal (E0365).
 pub use self::endpoint::IntroId;
 
-// Same reason as `packet`'s: the driver that consumes these is slice 3.
+// Same reason as `packet`'s: the driver that consumes these is slice 3b.
 #[allow(unused_imports)]
 pub(crate) use self::connection::{ConnEvent, ConnOutput, Connection};
+// §16.5's named timers. Re-exported because the driver arms nothing itself
+// — it only announces `Timeout(next)` — but names them in its trace and in
+// its tests, and a second path to the same enum is a second place to get
+// ruling 76's order wrong.
+#[allow(unused_imports)]
+pub(crate) use self::connection::timers::TimerKind;
 #[allow(unused_imports)]
 pub(crate) use self::endpoint::Endpoint;
 
