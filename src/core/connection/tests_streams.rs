@@ -2318,15 +2318,20 @@ mod sealing {
         let packets = s.packets(&d);
 
         let all: Vec<Wire> = packets.iter().flatten().cloned().collect();
+        // PADDING and — since slice 5 — §12's ACK are filtered out of the
+        // precondition. Both are `seal_quiet` (§7.4), so neither can defer
+        // a keepalive and neither weakens what this test pins: the
+        // assertion still fails if the credit frame is absent, which is the
+        // "asserts nothing" case the precondition exists to catch.
         assert_eq!(
             all.iter()
-                .filter(|f| !matches!(f, Wire::Padding))
+                .filter(|f| !matches!(f, Wire::Padding | Wire::Ack { .. }))
                 .cloned()
                 .collect::<Vec<_>>(),
             vec![Wire::MaxStreamsUni(
                 INITIAL_MAX_STREAMS_UNI + STREAMS_CREDIT_BATCH
             )],
-            "the fixture must produce a credit-only packet or this test \
+            "the fixture must produce a credit-bearing packet or this test \
              asserts nothing — {all:?}"
         );
 
@@ -2604,17 +2609,25 @@ mod packing {
 mod slice_boundary {
     use super::*;
 
-    /// `CONTRACT-4a.md` §5: with no ACK processing a send half can never
-    /// reach `DataRecvd`, so `StreamFinished` **never fires** in slice 4.
+    /// **Inverted at slice 5's integration.** In slice 4 this asserted that
+    /// `StreamFinished` **never** fires, because with no ACK processing a
+    /// send half could not reach `DataRecvd` (`CONTRACT-4a.md` §5). §12
+    /// landed, so the boundary this test was named for has moved and the
+    /// assertion moves with it: the event now fires **once the peer's ACK
+    /// arrives**, on the sending side only.
     ///
-    /// Mutation caught: the collapsed implementation the contract warns
-    /// about by name — **freeing the send half on send instead of on
-    /// acknowledgement**. That build fires `StreamFinished` here, and it
-    /// would make slice 5's loss-recovery tests pass for free while
-    /// dropping every byte that needed retransmitting. This is the only
-    /// place in 4a where that mutation is visible at all.
+    /// Keeping it — rather than deleting a test whose premise expired — is
+    /// what makes it the foundation ruling 47's `SendStream::acked()`
+    /// stands on in 5b.
+    ///
+    /// Mutation caught, and it is the same mutation as before, still
+    /// visible from this one place: **freeing the send half on send
+    /// instead of on acknowledgement.** That build fires `StreamFinished`
+    /// on side A *before* any ACK returns, so the assertion that side B
+    /// sees none — B sent nothing and can have nothing acknowledged — is
+    /// what separates it, together with the fact that A's fires at all.
     #[test]
-    fn a_send_half_never_reports_finished_because_slice_four_has_no_acks() {
+    fn a_send_half_reports_finished_once_the_peer_acknowledges() {
         let t = t0();
         let mut p = Pair::installed_at(t);
 
@@ -2631,9 +2644,9 @@ mod slice_boundary {
 
         assert_eq!(
             da.count_events(|e| matches!(e, ConnEvent::StreamFinished { .. })),
-            0,
-            "§9.3: `DataRecvd` needs every byte acknowledged, and §12 is \
-             slice 5 — a build firing this has freed on send"
+            1,
+            "§9.3 with §12: every byte and the FIN acknowledged, so the send \
+             half reaches `DataRecvd` exactly once"
         );
         assert_eq!(
             db.count_events(|e| matches!(e, ConnEvent::StreamFinished { .. })),

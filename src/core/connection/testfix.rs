@@ -106,6 +106,21 @@ pub(crate) enum Wire {
     },
     MaxStreamsBidi(u64),
     MaxStreamsUni(u64),
+    /// §8.4's ACK. Added at slice 5's integration: this decoder was written
+    /// when the core could not emit one, and its fallback arm treated the
+    /// type byte as a slice-boundary violation. That was right in slice 4
+    /// and became a **fixture that had aged out** the moment §12 landed —
+    /// CLAUDE.md working rule 15's residue, and a nastier instance than the
+    /// `Cargo.toml` one, because the tree still *compiles*: nothing fails
+    /// until the tests run, and the panic message accuses the wrong party.
+    Ack {
+        largest: u64,
+        ack_delay: u64,
+        /// `(gap, range)` pairs after the first block, in §12.1's
+        /// descending order.
+        ranges: Vec<(u64, u64)>,
+        first_range: u64,
+    },
 }
 
 /// Pull one varint, advancing the cursor. Panics on truncation — a
@@ -181,9 +196,29 @@ pub(crate) fn parse_frames(pt: &[u8]) -> Vec<Wire> {
             t if t == FRAME_MAX_STREAMS_UNI => {
                 out.push(Wire::MaxStreamsUni(take_varint(pt, &mut at)));
             }
+            t if t == crate::constants::FRAME_ACK => {
+                let largest = take_varint(pt, &mut at);
+                let ack_delay = take_varint(pt, &mut at);
+                let range_count = take_varint(pt, &mut at);
+                let first_range = take_varint(pt, &mut at);
+                let mut ranges = Vec::with_capacity(range_count as usize);
+                for _ in 0..range_count {
+                    let gap = take_varint(pt, &mut at);
+                    let len = take_varint(pt, &mut at);
+                    ranges.push((gap, len));
+                }
+                out.push(Wire::Ack {
+                    largest,
+                    ack_delay,
+                    ranges,
+                    first_range,
+                });
+            }
             other => panic!(
-                "slice 4 emitted frame type {other:#x}, which §8.3 does not \
-                 place in this slice"
+                "the core emitted frame type {other:#x}, which §8.3 does not \
+                 place in any slice built so far — if this is a frame a new \
+                 slice legitimately emits, this decoder has aged out and the \
+                 arm belongs here (working rule 15), not in the caller"
             ),
         }
     }

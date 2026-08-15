@@ -393,6 +393,22 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         settle().await;
         pair.net.heal_path(pair.a.addr, pair.b.addr);
 
+        // **Slice 5 changed what "a permanent gap" costs to build.** §13's
+        // loss detection is *connection*-level: once B acknowledges anything
+        // three counters above the blackholed packets, A declares them lost
+        // and retransmits — so stream B's own traffic would repair stream
+        // A's hole, and this test would read a whole 10 530 bytes while
+        // claiming a gap. That is not a defect; it is §13 working.
+        //
+        // Blocking the **ACK path** instead keeps the gap genuinely open:
+        // with no ACK returning, A never learns anything was lost, and
+        // `settle()` only yields — it does not advance the paused clock —
+        // so neither the `Loss` timer nor the PTO fires either. The hole
+        // persists for exactly the window under test, deterministically,
+        // and A→B data keeps flowing. Healed at the end, where recovery is
+        // then allowed to finish the job.
+        pair.net.block_path(pair.b.addr, pair.a.addr);
+
         // Lands beyond the hole: buffered by the reassembler, undeliverable
         // for ever, because slice 4 never retransmits chunk 2.
         write_all(&mut a1, &chunk3, "A chunk 3 (past the gap)").await;
@@ -432,26 +448,30 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         assert_same_bytes(&a_got, &chunk1, "A's prefix before the gap");
 
         // A is now parked at the hole. Hold the future across B's traffic.
-        let mut stalled_buf = [0u8; 1024];
-        let mut stalled = pin!(r1.read(&mut stalled_buf));
-        assert!(
-            poll_once(stalled.as_mut()).await.is_pending(),
-            "§9.5: chunk 3 sits past a permanent hole and must not be delivered \
+        // Scoped, so `r1` is free again for the recovery read at the end —
+        // a `pin!` temporary borrows for the rest of its enclosing block.
+        {
+            let mut stalled_buf = [0u8; 1024];
+            let mut stalled = pin!(r1.read(&mut stalled_buf));
+            assert!(
+                poll_once(stalled.as_mut()).await.is_pending(),
+                "§9.5: chunk 3 sits past a permanent hole and must not be delivered \
              out of order"
-        );
+            );
 
-        // ── the head-of-line question, asked with A held open ───────────
-        let b_got = read_to_end(&mut r2, "B while A is stalled").await;
-        assert_same_bytes(&b_got, &chunk_b, "B's contents while A is stalled");
+            // ── the head-of-line question, asked with A held open ───────────
+            let b_got = read_to_end(&mut r2, "B while A is stalled").await;
+            assert_same_bytes(&b_got, &chunk_b, "B's contents while A is stalled");
 
-        assert!(
-            poll_once(stalled.as_mut()).await.is_pending(),
-            "A must still be stalled after B completed — if A resolved here, \
+            assert!(
+                poll_once(stalled.as_mut()).await.is_pending(),
+                "A must still be stalled after B completed — if A resolved here, \
              the two streams share reassembly state"
-        );
-        // `stalled` is left to fall out of scope: `drop`ping a
-        // `Pin<&mut _>` releases nothing (the `pin!` temporary outlives it)
-        // and trips `clippy::drop_non_drop`.
+            );
+            // `stalled` is left to fall out of scope: `drop`ping a
+            // `Pin<&mut _>` releases nothing (the `pin!` temporary outlives it)
+            // and trips `clippy::drop_non_drop`.
+        };
 
         // The connection itself is untouched by a permanently stalled stream.
         let mut ca_closed = pin!(ca.closed());
@@ -463,6 +483,37 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         assert!(
             poll_once(cb_closed.as_mut()).await.is_pending(),
             "§9: a gap in one stream is not a connection error"
+        );
+
+        // **And now §13 is allowed to do its job.** Healing the ACK path
+        // lets A learn its middle chunk was lost, retransmit it, and
+        // complete — which is the other half of what slice 5 added, and
+        // what makes the stall above a *stall* rather than a permanent
+        // loss. Asserting it here also stops the test passing against a
+        // build that never recovers: under slice 4 this read would hang,
+        // and `within` fails rather than hangs.
+        pair.net.heal_path(pair.b.addr, pair.a.addr);
+        settle().await;
+
+        // Exactly the two remaining chunks — **not** `read_to_end`: stream A
+        // is never `finish()`ed in this test, so there is no FIN to reach and
+        // a read-to-EOF would hang after delivering every byte correctly.
+        let want_rest = chunk2.len() + chunk3.len();
+        let mut a_rest = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while a_rest.len() < want_rest {
+            match within(r1.read(&mut buf), "A after recovery").await {
+                Ok(Some(n)) => a_rest.extend_from_slice(&buf[..n]),
+                other => panic!("§13: the retransmission must arrive, got {other:?}"),
+            }
+        }
+        let mut want_a = chunk1.clone();
+        want_a.extend_from_slice(&chunk2);
+        want_a.extend_from_slice(&chunk3);
+        assert_same_bytes(
+            &[&a_got[..], &a_rest[..]].concat(),
+            &want_a,
+            "§13: the blackholed chunk is retransmitted and the stream completes",
         );
     })
     .await;

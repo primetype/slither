@@ -3563,3 +3563,131 @@ from `PLAN.md`'s slice-7 row and the test goes green exactly when slice
 produced ruling 130, and ruling 130 is what moves two further debts into
 this slice. **The instruction was wrong, and confirming it would have
 carried three errors forward silently.**
+
+---
+
+## Round 24 — slice 5a integration (2026/08/16)
+
+Three agents, 109 blind tests, **both test files compiled on first
+contact** with no name, type or arity mismatch. Ten reds, none of them a
+defect in the implementation.
+
+**Ruling 141 — §13.2's time threshold is `>=`, reversing ruling 139(f).**
+
+I ruled six hours earlier that §13.2's *"sent **more than** `loss_delay`"*
+governs over v0.1's `>=`. That was wrong against **§13.2's own next
+sentence**: the `Loss` timer arms at `time_sent + loss_delay`, so at the
+firing instant the packet's age *equals* `loss_delay` and a strict `>` is
+false. The walk the firing triggers declares nothing and re-arms at the
+same instant.
+
+The implementer showed it is worse than a wasted timer: the re-arm goes
+through `sync_recovery_timers`, so `poll_output` announces a deadline at
+or before `now`, the shell schedules an immediate wake, and **the pair
+spins**. Under `>` that is *every* firing, so a connection on a lossy
+path **livelocks its driver** — a failure no functional test sees,
+because every byte still arrives.
+
+Two things about how this was found. It is **ruling 131's own defect
+arriving by a second route**, three paragraphs from where ruling 131 had
+just corrected the first, in the same round — I fixed one instance of
+"arms a timer that fires and declares nothing" and created another the
+same morning. And **v0.1 was right**: ruling 139(f) overruled it on the
+one point where its `>=` was correct, and correct *because* of a §13.2
+sentence I did not read alongside the one I was ruling on.
+
+The blind test author found it, wrote its tests to the ruling anyway, and
+flagged the pair as *"the first to revisit if the ruling moves"*. It
+moved. Those two tests are now `a_packet_exactly_loss_delay_old_is_lost`
+and **`the_loss_timer_firing_at_its_own_deadline_declares_the_packet`** —
+the livelock guard, and the strongest form of the finding.
+
+**Ruling 142 — the blind §12 author's `counters()` helper contradicted
+its own expectations, and the expectations were right.** Four tests
+failed on ordering. `counters()` flattens each ACK block with
+`out.extend(b)` over a `RangeInclusive`, which walks **ascending**, while
+every expected literal in the file is written in the ACK's **descending**
+order. One `.rev()` fixed all four. Worth recording because it is the
+inverse of the usual test defect: the *assertions* were verified against
+§12.1 and correct; the *instrument* that read them was not. A blind
+author's expectations are the valuable artefact — its helpers are just
+code, and get no more trust than any other code.
+
+**Ruling 143 — ruling 116's id cache fills eagerly, not lazily.** Ruling
+116 said the handle caches "the first time the core answers `Some`". §12
+made that too late: an ACK can fully close a locally-opened stream,
+`Streams::after_half_freed` removes the entry, and a handle whose *first*
+`id()` call happens after that answers `None` for ever. **Ruling 116's own
+doc comment predicts this non-monotonicity** — it simply gave the cache a
+scope one event too short. Every handle is constructed while its stream
+exists, so there is exactly one instant at which the answer is guaranteed
+available. It is now filled there.
+
+Found by the implementer, in a file it was not allowed to touch
+(`src/shell/stream.rs` is 5b's), reported with the one-line fix and the
+decisive experiment — *reading `id()` once before the stream is freed
+makes the test pass* — rather than reaching across the boundary.
+
+**Ruling 144 — four tests from earlier slices had their premises expire,
+and expiry is not deletion.**
+
+- `a_ping_is_accepted_and_answered_with_nothing_in_slice_3a` and
+  `padding_may_appear_anywhere_around_other_frames` asserted
+  `transmits().is_empty()`. §12 makes an ack-eliciting arrival owe an ACK.
+  The assertion is **narrowed, not dropped**: every transmit is now opened
+  and required to decode to ACK or PADDING only. A bare
+  `transmits().len() <= 1` would have passed a build that answered a PING
+  with a CLOSE.
+- `a_max_streams_only_packet_does_not_defer_the_keepalive` demanded a
+  *credit-only* packet. ACK now rides along, and ACK is `seal_quiet`
+  (§7.4), so the property is untouched; the precondition filters ACK
+  beside PADDING and still fails if the credit frame is absent.
+- `a_send_half_never_reports_finished_because_slice_four_has_no_acks` was
+  named for a boundary that has moved. **Inverted rather than deleted**,
+  to `a_send_half_reports_finished_once_the_peer_acknowledges` — and it
+  keeps the same mutation in its sights, "freeing the send half on send
+  instead of on acknowledgement", separated now by side B seeing no such
+  event. It is the foundation ruling 47's `acked()` stands on in 5b.
+
+**Ruling 145 — S13's stalled-stream test needed a new mechanism, and the
+new one is better.** Its premise was *"slice 4 has no loss recovery, so
+the gap is permanent"*. §13 repairs the gap — **and repairs it via the
+sibling stream**, because loss detection is *connection*-level: B's own
+traffic pushes A's blackholed packets three counters below `largest_acked`
+and they are retransmitted. So the test read a contiguous 10 530 bytes
+while claiming a hole.
+
+Blocking the **ACK path** (`b → a`) instead keeps the gap genuinely open
+under slice 5: with no ACK returning, A never learns anything was lost,
+and `settle()` only yields — it does not advance the paused clock — so
+neither the `Loss` timer nor the PTO fires. The hole persists for exactly
+the window under test, deterministically, while A→B data keeps flowing.
+The test now proves head-of-line independence **under an active
+loss-recovery regime**, which is strictly more than it proved before, and
+then heals the path and asserts the retransmission arrives.
+
+*One correction inside that work, mine:* I first wrote the recovery half
+as `read_to_end`, which hung — stream A is never `finish()`ed in that
+test, so there is no FIN to reach. The diagnostic said `7020 bytes` —
+exactly chunk 2 plus chunk 3 — which is the recovery working perfectly
+and the assertion being wrong. **Every byte arrived; only my expectation
+of an EOF did not.**
+
+### What this round says about the process
+
+**Three consecutive slices with zero implementation defects from the
+blind split.** 4a: three test defects, two spec conflicts. 4b: one test
+defect, one test against ratified text, one overturned ruling. 5a: one
+ruling of mine reversed, one blind helper wrong against its own correct
+expectations, one cache scope too short, four expired premises, one
+fixture aged out.
+
+The defects are now **entirely** upstream of the code — in rulings,
+contracts, helpers and fixtures. Two consequences worth stating. The
+documents are the least-reviewed artefact in the project and have been
+for three slices. And **"expired premise" is now a recognisable category
+of its own**: seven tests across two slices have had a boundary move
+under them, and in every case the right action was to narrow or invert
+the assertion rather than delete the test — because the mutation each was
+built to catch is usually still live, just newly reachable by a different
+route.

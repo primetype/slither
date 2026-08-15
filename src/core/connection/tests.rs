@@ -1602,8 +1602,17 @@ mod codec {
         );
     }
 
-    /// Deliver `frames` to a fresh connection and assert it survives with
-    /// nothing said.
+    /// Deliver `frames` to a fresh connection and assert it survives,
+    /// saying nothing **beyond the ACK §12 owes**.
+    ///
+    /// This asserted `transmits().is_empty()` until slice 5. That was right
+    /// while §12 did not exist and became false the moment it did: an
+    /// ack-eliciting arrival now owes an ACK, and §12.4 emits it at once
+    /// for the second such packet or an out-of-order one. The assertion is
+    /// **narrowed rather than dropped** — what these tests are for is that
+    /// a PADDING/PING/unknown-shaped arrival produces nothing *else*, and
+    /// that survives §12 intact. A bare `transmits().len() <= 1` would not:
+    /// it would pass a build that answered a PING with a CLOSE.
     fn assert_harmless(frames: &[u8], what: &str) {
         let t = t0();
         let mut f = established_at(t);
@@ -1613,11 +1622,15 @@ mod codec {
             "§8: {what} must not kill the connection, got {:?}",
             d.outs
         );
-        assert!(
-            d.transmits().is_empty(),
-            "§8: {what} owes no output in slice 3a, got {:?}",
-            d.transmits()
-        );
+        for tr in d.transmits() {
+            let pt = f.peer.open(&tr.data);
+            for frame in parse_frames(&pt) {
+                assert!(
+                    matches!(frame, PeerFrame::Ack { .. } | PeerFrame::Padding),
+                    "§8: {what} owes nothing but §12's ACK, got {frame:?}"
+                );
+            }
+        }
         assert!(f.conn.is_established());
     }
 

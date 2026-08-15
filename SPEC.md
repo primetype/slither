@@ -3690,9 +3690,17 @@ been acknowledged **and** either:
 
 - **packet threshold**: it is `K_PACKET_THRESHOLD` = 3 or more counters
   below the largest acknowledged; or
-- **time threshold**: it was sent more than
+- **time threshold**: it was sent
   `loss_delay = max(9/8 · max(smoothed_rtt, latest_rtt), K_GRANULARITY)`
-  before the acknowledgment arrived.
+  or more before the acknowledgment arrived.
+  **[AMENDED 2026/08/16 — ruling 141]** This read "more than
+  `loss_delay`", a strict `>`, which contradicts the arming rule two
+  sentences below: the `Loss` timer arms at `time_sent + loss_delay`, so
+  at the firing instant a packet's age *equals* `loss_delay` and a strict
+  comparison declares nothing. The walk then re-arms at the same instant
+  and the driver spins — ruling 131's "a timer that fires and declares
+  nothing", reached by a second route in this same section. The
+  comparison is inclusive, as RFC 9002 §6.1.2 has it.
 
 Survivors inside the threshold arm the `Loss` timer at
 `time_sent + loss_delay` (**minimum across those survivors**).

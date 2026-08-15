@@ -176,7 +176,15 @@ impl<S: Handshake> SendStream<S> {
             r,
             key,
             local_end: LocalEnd::Live,
-            id: Cell::new(None),
+            // **Filled eagerly, not lazily — ruling 143.** Ruling 116 said
+            // "cached the first time the core answers `Some`", which is too
+            // late: §12's ACK can fully close a locally-opened stream, and
+            // `Streams::after_half_freed` then removes the entry, so a
+            // handle whose *first* `id()` call happens after that answers
+            // `None` for ever. Every handle is constructed while its stream
+            // exists, so there is exactly one instant at which the answer is
+            // guaranteed available, and this is it.
+            id: Cell::new(cell.core.as_ref().and_then(|c| c.stream_id(r))),
         }
     }
 
@@ -487,7 +495,15 @@ impl<S: Handshake> RecvStream<S> {
             r,
             key,
             ended: None,
-            id: Cell::new(None),
+            // **Filled eagerly, not lazily — ruling 143.** Ruling 116 said
+            // "cached the first time the core answers `Some`", which is too
+            // late: §12's ACK can fully close a locally-opened stream, and
+            // `Streams::after_half_freed` then removes the entry, so a
+            // handle whose *first* `id()` call happens after that answers
+            // `None` for ever. Every handle is constructed while its stream
+            // exists, so there is exactly one instant at which the answer is
+            // guaranteed available, and this is it.
+            id: Cell::new(cell.core.as_ref().and_then(|c| c.stream_id(r))),
         }
     }
 
