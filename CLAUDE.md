@@ -110,16 +110,6 @@ the spec rounds.
    per-packet race as any fresh initiator", which park-time ordering
    inverts exactly. Report the conflict; do not silently pick one. Every
    agent that has reported rather than resolved has been right.
-8. **A list in the spec is read as exhaustive whether or not it says so.**
-   §16.4's core API omitted the stage-0 accessors and the omission was
-   invisible until someone built against it (ruling 71); ruling 64 said
-   "two things this rule does not reach" when there were three; §2.3 wrote
-   `TAG` beside `PK` as though both varied per suite (ruling 68). Seven
-   rulings across two slices share this one shape — **a stated
-   construction with an unstated or contradicted scope**. It is the most
-   productive defect class this project has. Hunt it deliberately: when
-   the spec introduces a symbol, a parameter or a list, ask what bounds
-   it, and whether the text says.
 4. **Grep for the rationale, not only the token.** A verification that
    greps for a changed value will miss prose still arguing the position
    you reversed. This happened, and shipped a self-contradicting section.
@@ -142,6 +132,32 @@ the spec rounds.
    looks like from the outside.
 7. **Do not report a gate as green without running it.** Paste the
    command and its output.
+8. **A list in the spec is read as exhaustive whether or not it says so.**
+   §16.4's core API omitted the stage-0 accessors and the omission was
+   invisible until someone built against it (ruling 71); ruling 64 said
+   "two things this rule does not reach" when there were three; §2.3 wrote
+   `TAG` beside `PK` as though both varied per suite (ruling 68). Seven
+   rulings across two slices share this one shape — **a stated
+   construction with an unstated or contradicted scope**. It is the most
+   productive defect class this project has. Hunt it deliberately: when
+   the spec introduces a symbol, a parameter or a list, ask what bounds
+   it, and whether the text says.
+9. **A bound is only a test if the degenerate case violates it.** An
+   upper bound that the collapsed implementation satisfies for free
+   asserts nothing. Slice 2a produced two: "these two packets differ"
+   passed a core reusing one ephemeral, because the sender index differs
+   anyway; and "no interval exceeds base + jitter" passed a core with no
+   jitter at all. Both were named for the property they failed to pin —
+   **a name is not a pin**. Ask what the *broken* version would do, and
+   assert from the side that separates them: not all intervals equal, not
+   just none too large. This is distinct from slice 1's one-sided
+   boundary (`LEN` and `LEN-1` tested, `LEN+1` not), and both are worth
+   checking for.
+10. **Commit before mutating.** Mutation testing reverts with
+   `git checkout <file>`, which silently discards *any* uncommitted work
+   in that file — including edits made for a different reason. I lost two
+   accessors this way mid-review. Either commit first, or revert
+   surgically.
 
 ## Release gates (hard rules)
 

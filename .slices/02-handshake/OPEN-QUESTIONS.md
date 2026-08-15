@@ -198,3 +198,61 @@ hiss exposes no generic private-key import seam and `PrivateKey` is not
 `Clone`, so per-handshake re-import is forced, and re-import is
 curve-specific. Cipher and hash stay generic. A second *curve* identity
 needs its own type. Constraint from upstream, not a choice.
+
+---
+
+## E. Confirmed by mutation testing (28 mutations, isolated worktree)
+
+**Verdict: ADEQUATE WITH GAPS.** Everything else — the DH ladder, both
+ruling-69 eviction sites *independently*, every cap boundary in both
+directions, the guard's strict-inequality admission, mitigation (i)
+including the exact release-order bug, rulings 70 and 71, and the poll
+contract's drain and min-deadline invariants — is caught by specific
+named assertions, often from several angles.
+
+Two gaps were found. **One is now closed**; the other is A4 and is yours.
+
+### E1. Jitter presence and per-attempt freshness — CLOSED
+
+Dropping the retransmit jitter entirely was undetected: the bounds test
+asserted no interval *exceeds* `RETRANSMIT_BASE + RETRANSMIT_JITTER_MAX`,
+which a constant-interval core satisfies for free. Closed by
+`the_retransmit_jitter_is_drawn_afresh_for_every_attempt`, with two
+assertions — and the second is the test author's own addition and the
+better half: a core that draws the offset **once** and reuses it passes
+"at least one interval exceeds base" and fails "not all intervals equal".
+A single draw hoisted out of the attempt builder leaves every pending on
+an identical phase, which is most of what the jitter is for.
+
+Both mutations verified caught, each by that test alone.
+
+### E2. The give-up / retransmit tie-break at an equal instant — **this is A4**
+
+Reversing "give-up beats a same-instant retransmit" is undetected, and
+the test file's own comment already concedes the case cannot be forced
+without controlling the jitter draw. **This is not a test gap.** It is
+§16.5's equal-deadline ordering list, which orders exactly one endpoint
+pair and leaves intro-expiry vs retransmit and orphan-aging vs give-up
+unordered — though their outputs differ (`HandshakeFailed` vs nothing).
+
+Per working rule 8, that list reads as exhaustive. If it is meant to be,
+it should say so; if not, the two open pairs need an order. Until then
+no test can legitimately pin the behaviour, because the spec does not
+say what it is.
+
+## F. Verified by re-mutation, not asserted
+
+Every fix below was confirmed by re-applying its bug and watching the
+named test fail — the tree was committed first, then reverted after.
+
+| Property | Mutation | Caught by |
+|---|---|---|
+| Fresh ephemeral per handshake | frozen sub-seed in `Identity::open()` | `every_retransmit_mints_a_fresh_index_and_a_fresh_ephemeral`, **alone** |
+| §17.1 pin over-release | unconditional `unpin` in `drop_pending` | `cancelling_a_dial_does_not_release_a_pin_it_never_took` |
+| §17.1 record survives a revert | empty `still_pinned` branch | `authenticate_then_reject_clears_the_record_even_when_another_chain_pins_the_entry` |
+| Jitter present | `span = 1` | `the_retransmit_jitter_is_drawn_afresh_for_every_attempt` |
+| Jitter drawn per attempt | constant non-zero jitter | same test, second assertion |
+
+The ephemeral result is the one that matters: **before** the test author's
+fix, that mutation was caught only *incidentally* by six unrelated tests
+and **not** by the test named for it. A name is not a pin.
