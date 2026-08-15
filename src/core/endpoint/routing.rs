@@ -1284,131 +1284,193 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     /// §6.4:1436's "ordinary API ordering" — `read_identity()` →
-    /// `connect()` → `accept()` against one static — **completes**, and it
-    /// completes in **both key orders**.
+    /// `connect()` → `accept()` against one static — **completes**, in
+    /// **both key orders**, with **no clock advance at all**.
     ///
-    /// This is the number ruling 91 exists for. Before §6.5 and §6.6, this
-    /// scenario left both dials unresolved and both peers reported
-    /// `TimedOut` at `HANDSHAKE_GIVEUP`; the bound below is therefore the
-    /// give-up itself — the run is driven past 90 s of virtual time and
-    /// must find the connection already established and **no**
-    /// `HandshakeFailed(TimedOut)` at either end.
+    /// This is the number ruling 91 exists for. Before §6.5 and §6.6 the
+    /// same scenario left both dials unresolved and both peers reported
+    /// `ConnectError::TimedOut` at `HANDSHAKE_GIVEUP`, measured at both
+    /// ends. Three separate things are asserted, and each fails a
+    /// different broken core:
     ///
-    /// Both orders are run because the two peers take *different* code
-    /// paths and only one of them is the interesting one on any given run:
-    /// the endpoint holding the chain reaches §6.4's PENDING branch, and
-    /// its peer reaches §6.6's internal one. Which is which is decided by
-    /// §6.7's comparison, so running one order tests one pair of branches.
+    /// 1. **Both sides resolve**, which the interim
+    ///    unconditional-`Stale` core fails outright;
+    /// 2. **at `t`**, with the pump advancing no clock — which a core that
+    ///    relied on the peer's ~5 s retransmit to be caught by the eager
+    ///    path would fail, and which is what §6.4's PENDING branch is
+    ///    *for*: §6.5's interception "cannot fire on a chain the
+    ///    application already holds";
+    /// 3. and the run is then driven **past `HANDSHAKE_GIVEUP`**, where
+    ///    neither peer may report `TimedOut` — the regression's own
+    ///    signature.
+    ///
+    /// Both orders are run because the two peers take **different** code
+    /// paths and which peer takes which is decided by §6.7's comparison:
+    /// the endpoint holding the chain reaches §6.4's PENDING branch, its
+    /// peer reaches §6.6's internal one, and one run exercises one pair.
     #[test]
     fn the_ordinary_api_ordering_completes_in_both_key_orders() {
         for chain_holder_is_smaller in [true, false] {
             let t = t0();
             let (small, large) = ordered_pair(t);
-            // `a` is the peer that holds the chain and runs
-            // `read_identity() → connect() → accept()`.
+            // `a` holds the chain and runs `read_identity()` →
+            // `connect()` → `accept()`; `b` is the peer dialling into it.
             let (mut a, mut b) = if chain_holder_is_smaller {
                 (small, large)
             } else {
                 (large, small)
+            };
+            let order = if chain_holder_is_smaller {
+                "chain holder is the tie-break WINNER"
+            } else {
+                "chain holder is the tie-break LOSER"
             };
 
             // B dials A, so A has a chain to walk.
             let (b_dial, out) = b.dial(t, a.addr, &a.pk);
             let msg1 = out.transmits[0].data.clone();
 
-            // A: read_identity → connect → accept, exactly §6.4:1436's
-            // ordering. The chain is staged while A's row for B is NONE.
+            // §6.4:1436's ordering, exactly. The chain is staged while A's
+            // row for B is NONE, and `connect()` makes it PENDING before
+            // `accept()` runs.
             let drained = a.feed(t, b.addr, &msg1);
             let (id, _src) = drained.intros[0];
             a.ep.read_identity(id).expect("readable");
             a.ep.authenticate(t, id).expect("authenticates");
             let (a_dial, dial_out) = a.dial(t, b.addr, &b.pk);
             let accepted = a.ep.accept(t, id);
-            let mut pending_to_b: Vec<Transmit> = dial_out.transmits;
             let after_accept = a.drain();
-            pending_to_b.extend(after_accept.transmits);
 
-            let mut a_resolved = !after_accept.installs.is_empty() || accepted.is_ok();
+            // A's dial is resolved either by the accept returning an
+            // established connection (§6.4's loser side, which cancels the
+            // dial with `AlreadyConnected`) or, on the winner side, by the
+            // `Install` its own outbound earns once B loses §6.6's
+            // comparison.
+            let mut a_resolved = accepted.is_ok();
             let mut b_resolved = false;
-            let mut timed_out: Vec<(&'static str, ConnectionId, ConnectError)> = Vec::new();
+            let mut timed_out: Vec<(&str, ConnectionId, ConnectError)> = Vec::new();
+
+            let mut to_b: Vec<Vec<u8>> = dial_out
+                .transmits
+                .iter()
+                .chain(after_accept.transmits.iter())
+                .map(|t| t.data.clone())
+                .collect();
             for (conn, why) in after_accept.failed {
-                if why == ConnectError::TimedOut {
-                    timed_out.push(("A", conn, why));
-                } else {
-                    // §6.4's loser side resolves the dial `AlreadyConnected`
-                    // and hands the application the accepted connection
-                    // instead. That is a resolution, not a timeout.
-                    assert_eq!(why, ConnectError::AlreadyConnected);
-                    assert_eq!(conn, a_dial);
+                match why {
+                    ConnectError::AlreadyConnected => {
+                        assert_eq!(conn, a_dial, "{order}: only the dial is cancelled");
+                        assert!(accepted.is_ok(), "{order}: §6.4's loser side installs");
+                    }
+                    other => timed_out.push(("A", conn, other)),
                 }
             }
 
-            // Pump both cores to quiescence, then push past the give-up.
-            let mut pending_to_a: Vec<Transmit> = Vec::new();
-            let mut now = t;
-            for round in 0..8 {
-                for transmit in std::mem::take(&mut pending_to_b) {
-                    let d = b.feed(now, a.addr, &transmit.data);
+            // **No clock advance.** The pump is purely event-driven at `t`:
+            // no `handle_timeout`, so no retransmit exists to rescue it,
+            // and no application-side `accept()` on B either — if this
+            // converges, §6.5 and §6.6 converged it.
+            let mut to_a: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..4 {
+                for datagram in std::mem::take(&mut to_b) {
+                    let d = b.feed(t, a.addr, &datagram);
                     b_resolved |= !d.installs.is_empty();
                     for (conn, why) in d.failed {
-                        if why == ConnectError::TimedOut {
-                            timed_out.push(("B", conn, why));
-                        }
+                        timed_out.push(("B", conn, why));
                     }
-                    pending_to_a.extend(d.transmits);
-                    for (id, _src) in d.intros {
-                        // §6.5's false-negative backstop is the
-                        // application's: B drains its queue and accepts.
-                        if b.ep.authenticate(now, id).is_ok() {
-                            b_resolved |= b.ep.accept(now, id).is_ok();
-                            let extra = b.drain();
-                            pending_to_a.extend(extra.transmits);
-                        }
-                    }
+                    to_a.extend(d.transmits.iter().map(|t| t.data.clone()));
                 }
-                for transmit in std::mem::take(&mut pending_to_a) {
-                    let d = a.feed(now, b.addr, &transmit.data);
+                for datagram in std::mem::take(&mut to_a) {
+                    let d = a.feed(t, b.addr, &datagram);
                     a_resolved |= !d.installs.is_empty();
                     for (conn, why) in d.failed {
-                        if why == ConnectError::TimedOut {
-                            timed_out.push(("A", conn, why));
-                        }
+                        timed_out.push(("A", conn, why));
                     }
-                    pending_to_b.extend(d.transmits);
+                    to_b.extend(d.transmits.iter().map(|t| t.data.clone()));
                 }
-                if pending_to_a.is_empty() && pending_to_b.is_empty() {
-                    // Quiescent. Now run past `HANDSHAKE_GIVEUP`, which is
-                    // where the regression reported itself.
-                    if round > 0 {
-                        break;
-                    }
-                }
-                now += Duration::from_millis(1);
             }
 
-            now = t + crate::constants::HANDSHAKE_GIVEUP + Duration::from_secs(1);
+            assert!(
+                a_resolved,
+                "{order}: A's `read_identity() → connect() → accept()` never resolved, \
+                 with no clock advanced — this is ruling 91's regression"
+            );
+            assert!(b_resolved, "{order}: B's dial never resolved");
+
+            // Past the give-up, which is where the regression reported
+            // itself. Nothing may surface here.
+            let past = t + crate::constants::HANDSHAKE_GIVEUP + Duration::from_secs(1);
             for (side, node) in [("A", &mut a), ("B", &mut b)] {
-                let d = node.timeout(now);
-                for (conn, why) in d.failed {
+                for (conn, why) in node.timeout(past).failed {
                     timed_out.push((side, conn, why));
                 }
             }
-
             assert!(
                 timed_out.is_empty(),
-                "ruling 91's regression: a dial reached HANDSHAKE_GIVEUP — {timed_out:?}"
-            );
-            assert!(
-                a_resolved,
-                "A's side of `read_identity() → connect() → accept()` never resolved \
-                 (chain holder smaller: {chain_holder_is_smaller})"
-            );
-            assert!(
-                b_resolved,
-                "B's dial never resolved (chain holder smaller: {chain_holder_is_smaller})"
+                "{order}: a dial reached HANDSHAKE_GIVEUP — {timed_out:?}"
             );
             let _ = (a_dial, b_dial);
         }
+    }
+
+    /// **Working rule 8, decided and pinned:** a pending is a pending from
+    /// `mint_pending`, before `start_attempt` has put an msg1 on the wire.
+    ///
+    /// Ruling 90 split the dial in two, and §6.5 predates the split: it
+    /// says "the dialled addresses of all **in-flight outbound
+    /// initiations**", §6.7 says "an **in-flight outbound pending**", and
+    /// §6.4's PENDING branch says "if an **in-flight outbound initiation**
+    /// exists". Those three named one set before ruling 90 and now
+    /// straddle a window the shell can observe — §16.2's `connect()` is
+    /// synchronous while `start_attempt` lands on the driver a command
+    /// later.
+    ///
+    /// **The reading taken is §17.4's**: the hint set *is* "the pending
+    /// tables' dialled addresses", and a `mint_pending` row has one. The
+    /// argument is not the wording but the consequence — the same row
+    /// answers §16.1's admission test (ruling 90 made it the only map),
+    /// §6.5's probed set, and §6.4's PENDING branch, and §6.6 requires
+    /// those last two to "never disagree". Reading it the other way makes
+    /// a static PENDING for admission and NONE for routing at the same
+    /// instant.
+    ///
+    /// **It is observable**, which is why this is a test and not a
+    /// comment: under the other reading the crossing msg1 below parks as
+    /// an `Intro` and converges one round-trip later instead.
+    #[test]
+    fn a_minted_pending_is_already_a_pending_outbound_remote() {
+        let t = t0();
+        let (mut small, mut large) = ordered_pair(t);
+
+        // `mint_pending` **only** — ruling 90's first half, no msg1.
+        let (dial, _connection) = large
+            .ep
+            .mint_pending(t, small.addr, small.pk)
+            .expect("the static is NONE");
+        let quiet = large.drain();
+        assert!(
+            quiet.transmits.is_empty(),
+            "ruling 90: `mint_pending` puts nothing on the wire"
+        );
+        assert_eq!(
+            large.ep.hints(),
+            vec![small.addr],
+            "§17.4: the hint set is the pending tables' dialled addresses"
+        );
+
+        // The crossing msg1 arrives inside the window.
+        let crossing = lone_msg1(&mut small, t, &large);
+        let drained = large.feed(t, small.addr, &crossing);
+
+        assert!(
+            drained.intros.is_empty(),
+            "§6.5: a PENDING static's initiation **must** enter the internal path"
+        );
+        assert_eq!(
+            drained.installs,
+            vec![dial],
+            "§6.6 step 4 completes the dial that had not yet transmitted"
+        );
     }
 
     /// §16.1, at the end of the same scenario: **exactly one connection

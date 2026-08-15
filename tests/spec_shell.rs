@@ -1348,60 +1348,36 @@ async fn accept_vs_connect_race_reaches_6_4s_pending_branch() {
                 accepted.map(|_| "Ok(Connection)"),
             );
 
+            // ── §6.5 and §6.6, landed (ruling 91) ────────────────────
+            // §6.4's "the pending is **left in place**" is no longer
+            // separately observable *here*, and that is the boundary
+            // moving rather than a gap: the `join!` above drives the
+            // driver, so by the time this line runs the kept pending has
+            // already been answered. What the shell can still see is the
+            // consequence — the refusal resolves the dial with **nothing**,
+            // and the dial then completes on its own. The instantaneous
+            // form ("refused, not failed, still running") is pinned in the
+            // core, where no driver turn intervenes:
+            // `core::endpoint::routing::tests::
+            // the_pending_branch_winner_refuses_and_keeps_its_record`.
+            let dialled = Box::pin(dialled);
+            // A's msg1 reaches B from the address B dialled, so §6.5's hint
+            // check fires, the eager read finds A's static among B's pending
+            // outbound remotes, and §6.6 runs: B is the larger static, loses
+            // §6.7's comparison, cancels its pending and installs as
+            // responder. B's own `Connecting` is resolved by that admission
+            // (§6.6 step 4), and A's by the msg2 it writes.
+            //
+            // **No clock is advanced.** §6.4:1436 promises this ordering
+            // completes, not that it recovers a retransmit later.
+            let b_dial = Box::pin(b_dial);
             settle().await;
-
-            let mut dialled = Box::pin(dialled);
-            assert!(
-                poll_once(dialled.as_mut()).await.is_pending(),
-                "the winner keeps its pending (§6.4): our own outbound is still \
-                 running after the refusal, not resolved by it",
-            );
-
-            // ── INTERIM BOUNDARY — slice 7 (§6.5/§6.6) must turn this red ──
-            // Neither side can finish on its own. A's msg1 reaches B, but B
-            // has no hint check and no internal tie-break yet, so it parks
-            // the msg1 as an ordinary introduction instead of losing §6.7's
-            // comparison and installing as responder. Both trains just run.
-            let mut b_dial = Box::pin(b_dial);
-            tokio::time::advance(Duration::from_secs(20)).await;
-            settle().await;
-            assert!(
-                poll_once(dialled.as_mut()).await.is_pending()
-                    && poll_once(b_dial.as_mut()).await.is_pending(),
-                "with §6.6's internal tie-break unimplemented, four retransmit \
-                 intervals resolve neither dial. When slice 7 lands it, B loses the \
-                 comparison and installs as responder — delete this block and assert \
-                 the completion instead",
-            );
-
-            // ── The recovery an application has meanwhile ────────────
-            // Dropping the `Connecting` returns the static to NONE in the
-            // core's own map, synchronously (ruling 50) — so the very next
-            // introduction from B takes §6.4's NONE path and installs.
-            drop(dialled);
-            tokio::time::advance(Duration::from_secs(7)).await;
-            settle().await;
-
-            let a_to_b = {
-                let intro = a
-                    .ep()
-                    .accept()
-                    .await
-                    .expect("B is still retransmitting, so a fresh Intro must surface");
-                let claimed = intro.read_identity().await.expect("read_identity");
-                let proven = claimed.authenticate().await.expect("authenticate");
-                proven.accept().await.expect(
-                    "the static went back to NONE when the `Connecting` dropped, so \
-                     this accept takes §6.4's NONE path. `Stale` here means the \
-                     retirement was deferred to the driver instead of performed in \
-                     `Connecting::drop` (ruling 50, ruling 90)",
-                )
-            };
-
-            settle().await;
+            let a_to_b = dialled
+                .await
+                .expect("A's dial completes: B lost §6.7's tie-break and answered it");
             let b_to_a = b_dial
                 .await
-                .expect("B's dial completed when A finally accepted its chain");
+                .expect("B's dial is completed by its own tie-break admission (§6.6 step 4)");
 
             // S3a at the shell seam: the static is LIVE now, and a dial to
             // it is refused synchronously — from the same one map.

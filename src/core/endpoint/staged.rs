@@ -378,16 +378,29 @@ impl<I: Identity> Endpoint<I> {
                     // fault, and this is what `HandshakeFailed` is for.
                     IntroError::Malformed => AuthError::HandshakeFailed,
                     // Neither is reachable **from here**, and the reasons
-                    // differ. `EndpointDropped` is the driver stopping, which
-                    // the core cannot report. `Internal` is §6.5 step 4's
-                    // interception, which belongs to the `read_identity()`
-                    // verb and not to ruling 75's drive of the same `es`:
-                    // §18.1 has an `IntroError::Internal` and **no
-                    // `AuthError::Internal`**, so a chain authenticated
-                    // straight from `Parked` is not intercepted — it reaches
-                    // the identical comparison at `accept()`, by §6.4's
-                    // PENDING branch. Either way, answer with the lifecycle
-                    // variant rather than the security one.
+                    // differ.
+                    //
+                    // `EndpointDropped` is the driver stopping, which the
+                    // core cannot report.
+                    //
+                    // `Internal` is §6.5 step 4's interception, and it is
+                    // the **core's**, not the shell's — this comment used
+                    // to say otherwise and was wrong twice over. It is
+                    // unreachable here for two independent reasons, and
+                    // only the second is temporary: (1) §6.5 attaches the
+                    // interception to the `read_identity()` **verb**, not
+                    // to ruling 75's drive of the same `es` from this one,
+                    // and §18.1 settles that there is an
+                    // `IntroError::Internal` and **no
+                    // `AuthError::Internal`** — a closed taxonomy, so a
+                    // chain authenticated straight from `Parked` is not
+                    // intercepted and reaches the identical comparison at
+                    // `accept()` by §6.4's PENDING branch; (2) step 4 is
+                    // unimplemented in this build for want of a `now` on
+                    // `read_identity` — see `routing.rs`.
+                    //
+                    // Either way, answer with the lifecycle variant rather
+                    // than the security one.
                     IntroError::Internal | IntroError::EndpointDropped => AuthError::Expired,
                 })?;
         }

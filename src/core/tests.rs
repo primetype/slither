@@ -2043,7 +2043,12 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
     //     creates the entry, and it takes the mid-state's pin.
     let inbound = real_msg1(&mut b, t, &a);
     let at = t + Duration::from_secs(1);
-    let (_chain, admitted) = ladder_to_proven(&mut a, at, b.addr, &inbound);
+    // From an address A never dialled: §6.5 sends a crossing msg1 that
+    // arrives at the **dialled** address to §6.6's internal tie-break,
+    // where no staged mid-state is ever created. The shape this test needs
+    // — a dial and a staged mid-state coexisting on one static — survives
+    // §6.5 only through the hint check's false negative.
+    let (_chain, admitted) = ladder_to_proven(&mut a, at, v4(2, 3), &inbound);
     let ts = admitted.expect("we hold no entry for a static we dialled, so this passes vacuously");
     assert_eq!(a.ep.greatest(b.canonical()), Some(ts));
     assert_eq!(
@@ -2107,9 +2112,13 @@ fn a_dialled_static_holds_no_guard_entry() {
     let peer_b = b.public_static;
     let (_conn, _d) = a.connect(t, b.addr, &peer_b);
 
-    // B dials A with a far older timestamp; A receives it.
+    // B dials A with a far older timestamp; A receives it **from an
+    // address A never dialled**, so §6.5's hint check misses and the
+    // initiation takes the ordinary staged path. Delivering it from
+    // `b.addr` would be a simultaneous open, which §6.5 routes to the
+    // internal tie-break — a different rule, and not this test's.
     let msg1_from_b = real_msg1(&mut b, t, &a);
-    let (_id, r) = ladder_to_proven(&mut a, t, b.addr, &msg1_from_b);
+    let (_id, r) = ladder_to_proven(&mut a, t, v4(2, 3), &msg1_from_b);
     assert!(
         r.is_ok(),
         "the dial wrote a guard entry for a static we only dialled: {r:?}"

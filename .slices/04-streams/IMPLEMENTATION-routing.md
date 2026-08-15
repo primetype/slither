@@ -351,3 +351,97 @@ is the streams track's) and reported for it: this work is what makes the case
 reachable.
 
 ## 11. Implementation log
+
+### Built (files I own)
+- **`src/core/endpoint/routing.rs`** (new): §6.5 steps 2–3 (`route_initiation`,
+  `is_hinted`, `pending_outbound_remote`, `eager_read`, `demote`), §6.6 entire
+  (`internal_tiebreak`), and the three pieces both routes share
+  (`wins_tiebreak`, `record_tiebreak_timestamp`, `extend_guard_exemption`,
+  `cancel_pending_losing_tiebreak`). Plus 12 inline tests.
+- **`src/core/endpoint/mod.rs`**: `handle_datagram`'s Init arm calls
+  `route_initiation`; `drop_pending` and `handle_connection_event` arm §17.1's
+  extension before releasing the pin; `promote` gains the basis; doc comments at
+  :26-40 and :247 rewritten.
+- **`src/core/endpoint/staged.rs`**: §6.4's PENDING branch, both sides
+  (`keep_winner_side_record` + `cancel_pending_losing_tiebreak`); `guard_exempt`
+  threaded to the install; the `IntroError::Internal` comment corrected.
+- **`src/core/endpoint/tables.rs`**: `guard_exempt` on `StaticEntry`;
+  `promote(key, basis)`; `arm_guard_exemption`; `remove_by_connection` returns
+  the row.
+- **`src/core/endpoint/guard.rs`** (**not on my owned list — see report**):
+  one additive method, `extend_exemption(key, until)`. §17.1's `exempt_until`
+  was shaped for exactly this and the module doc promised "slice 7 adds a call
+  rather than a migration"; this is that call.
+
+### Red
+- `src/core/tests.rs::a_dialled_static_holds_no_guard_entry`
+- `src/core/tests.rs::cancelling_a_dial_does_not_release_a_pin_it_never_took`
+- `tests/spec_shell.rs::accept_vs_connect_race_reaches_6_4s_pending_branch`
+
+## 12/13. Mutations, executed (not claimed)
+
+**Mutation 1 — §6.4's PENDING branch reverted to the interim unconditional
+`Stale`** (`src/core/endpoint/staged.rs`, restored from a file copy):
+
+```
+routing::tests::the_pending_branch_winner_refuses_and_keeps_its_record ... FAILED
+routing::tests::the_pending_branch_loser_cancels_its_dial_and_installs  ... FAILED
+routing::tests::the_ordinary_api_ordering_completes_in_both_key_orders  ... FAILED
+  panicked: chain holder is the tie-break LOSER: A's `read_identity() →
+  connect() → accept()` never resolved, with no clock advanced
+```
+
+**Mutation 2 — §6.5 steps 2-3 removed, everything parks**
+(`src/core/endpoint/routing.rs`, restored from a file copy):
+
+```
+routing::tests::the_ordinary_api_ordering_completes_in_both_key_orders ... FAILED
+  panicked: chain holder is the tie-break WINNER: A's `read_identity() →
+  connect() → accept()` never resolved, with no clock advanced
+```
+
+**The two mutations red opposite key orders.** That is the coordinator's
+correction, measured: §6.5/§6.6 close the peer side and §6.4's PENDING branch
+closes the accepting side, and **neither alone closes the ordering**. Both files
+restored; `git diff --stat` clean of the mutations afterwards.
+
+## 12. DH ladder — measured with `DhCounter`, asserted exactly
+
+Every number below is an `assert_eq!(node.dhs.get(), N)` in
+`routing.rs`'s test module, on a `CountingIdentity` whose provider counts one
+per `DhProvider::dh` call. §6.1's ladder is **unmoved**.
+
+| Path | DH | Test |
+|---|---|---|
+| `src` ∉ hints → park | **0** | `an_unhinted_initiation_parks_at_zero_dh` |
+| established peer's address → park | **0** | `an_established_connection_contributes_no_hint` |
+| eager, claim ∉ pending remotes → demote | **1** (`es`) | `a_demoted_initiation_carries_its_paid_mid_state` |
+| …then `read_identity()` on it | **1** (0 incremental) | same |
+| …then `authenticate()` | **2** | same |
+| …then `accept()` | **4** | same |
+| eager → §6.6 step 1 tag death | **2** (`es`,`ss`) | `a_forgery_cannot_cancel_a_pending` |
+| eager → §6.6 step 3 winner | **2** | `the_tiebreak_winner_drops_the_inbound_and_records_it` |
+| eager → §6.6 step 4 admit | **4** (`+ee`,`+se`) | `the_tiebreak_loser_cancels_its_pending_and_installs_as_responder` |
+
+§6.6's completion adds **no unaccounted DH**: the internal route's 4 is §6.1's
+own `accept()` price for the same four operations, and §6.5 states the extra
+`ss` openly as the membership-timing oracle's cost.
+
+## 13. The regression, measured — **closed in both key orders, at `now`**
+
+`routing::tests::the_ordinary_api_ordering_completes_in_both_key_orders`, both
+orders, **no clock advanced during the exchange**, then driven past
+`HANDSHAKE_GIVEUP + 1 s` with no `TimedOut` at either end.
+
+| | before (RULING-90.md §15) | after |
+|---|---|---|
+| A dial | `Err(TimedOut)` at 90 s | resolved at `t` |
+| B dial | `Err(TimedOut)` at 90 s | resolved at `t` |
+| recovery needed | drop the `Connecting`, re-accept | none |
+| sessions | 0 | exactly 1 (`exactly_one_side_responds` pins the basis asymmetry) |
+
+## 14. Red tests and the diffs — all three verified by running them
+
+See §12/13 above for the mutations. The three diffs were applied to file copies,
+run green (313 lib / 12 spec_shell), captured, and the originals restored;
+`git diff --stat` clean on all three afterwards.
