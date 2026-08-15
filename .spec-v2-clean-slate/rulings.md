@@ -2010,3 +2010,33 @@ caught one. That is an argument for keeping the blind authors even where
 they look redundant, and against the intuition that a ruling the
 maintainer has just reasoned through carefully needs less checking than
 one they have not.
+
+**Ruling 92 — §16.4's `read_identity` gains `now: Instant`.** It is the
+one staged verb without it (`SPEC.md:4459`), while `authenticate` and
+`accept` beside it both carry one. §6.5 step 4 cannot be implemented
+without it: §6.6 steps 3 and 4 each record a §17.1 guard entry, which
+needs the instant, and ruling 80 forbids the core reading a clock to
+invent one.
+
+**This is ruling 80's defect a third time, and the reason it survived
+ruling 80 is worth stating.** At slice 2a `read_identity` genuinely did
+not need `now` — an agent confirmed that *structurally* rather than by
+assertion, tracing that its only entry-**removing** path could not reach
+a verb requiring the instant. That was correct then. §6.5 step 4 makes it
+an entry-**recording** verb, and the earlier proof does not survive the
+change of role. So this is not an oversight repeated; it is a proof whose
+premise expired. **Ruling 80's own generalisation — that an API listing
+looks exhaustive and literal and is routinely neither — reaches this, and
+ruling 80 did not.**
+
+Precedent-following rather than novel: identical change, identical
+reason, to a sibling of the two verbs ruling 80 already fixed, and there
+is no alternative that does not put a clock read in a core forbidden to
+have one. Cost is one shell call site plus ~30 mechanical call sites in
+`src/core/tests.rs`.
+
+*How it was found.* Two of the independent test author's 35 blind tests
+failed on integration, and **both failures had one root cause** — this
+gap — which the implementer had already reported as a blocker from the
+other side, without either agent seeing the other's work. Thirty-three
+passed unedited against an implementation written blind to them.

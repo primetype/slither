@@ -49,6 +49,13 @@
 //! [`poll_output`]: Endpoint::poll_output
 
 pub(crate) mod guard;
+
+// §6.5/§6.6's acceptance tests, written independently from `SPEC.md` by an
+// author working in an isolated git worktree, blind to this directory
+// (working rule 6). Declared at integration so neither agent could reach
+// the other's file.
+#[cfg(test)]
+mod tests;
 pub(crate) mod handshake;
 pub(crate) mod intro_queue;
 pub(crate) mod routing;
