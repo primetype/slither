@@ -163,8 +163,12 @@ pub struct Transmit {
 pub struct EstablishedSession<C: Handshake> {
     /// The sealing half of hiss's datagram pair.
     pub seal: C::Seal,
-    /// The opening half. Stateless in hiss, so replay rejection is
-    /// slither's duty (§7.2) — not this slice's.
+    /// The opening half. **Stateful** — `into_datagram_with_epoch` gives a
+    /// `DatagramRecv` that tracks the §7.7 epoch, so opening takes `&mut`.
+    /// What it does *not* track is order: `decrypt_at` enforces neither
+    /// monotonicity nor uniqueness and will open one counter repeatedly, by
+    /// design, because replay rejection is the caller's duty. That makes it
+    /// slither's (§7.2) — not this slice's.
     pub open: C::Open,
     /// Our session index: the value peers put in a Data header's
     /// `receiver_index` to route to us.
