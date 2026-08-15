@@ -70,6 +70,39 @@
 //! Every driver-side removal is stamp-checked, because a cancel-and-redial
 //! installs a **newer** attempt under the same key before the driver has
 //! processed the older one's death.
+//!
+//! ## The mirror is allowed to lag, and §16.1 says so
+//!
+//! This map is a **synchronous admission test**, not a second authority.
+//! The core is the authority, and the two are allowed to disagree for the
+//! width of one command: §16.1 keeps a staged chain in progress out of
+//! `connect()`'s list on purpose — "until `authenticate()` the chain's
+//! static is merely claimed, and §6.1 forbids keying anything durable on an
+//! unproven claim" — and holds the invariant at the other end of the race,
+//! at §6.7's comparison in `accept()`. So `[AcceptChain(K), Connect(K)]` in
+//! the queue is a legal state in which the mirror says NONE and the core
+//! is about to say `AlreadyConnected`.
+//!
+//! The lag is only ever in the benign direction — the mirror admits a
+//! connect the core will refuse — and [`Driver::command_connect`]'s `Err`
+//! branch is S3a's ratified answer to it. There was a `debug_assert!` there
+//! claiming the disagreement was impossible; it turned a legal outcome into
+//! a dead endpoint in every debug build, and it is gone. See
+//! `s3a_accept_ahead_of_connect_resolves_already_connected` in
+//! `tests/spec_shell.rs`.
+//!
+//! # Stopping
+//!
+//! [`Driver::stop`] runs from [`Driver`]'s `Drop`, so it runs on an unwind
+//! as well as on the ordinary exit. That is not defensive decoration: this
+//! task is spawned with `spawn_local` and its `JoinHandle` is dropped, so a
+//! panic here is **silent**, and without the guard it also left every
+//! `closed()` future and every in-flight `Connecting` parked for ever
+//! behind accessors that kept answering from a cell nobody would write
+//! again. Read `stop`'s docs before adding a new kind of waiter: the rule
+//! is that anything parked on the *cell* side of §16.3's seam must be
+//! resolved there explicitly, because only the `oneshot`-backed verbs
+//! unblock themselves.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -171,12 +204,42 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         let mut buf = [0u8; constants::MAX_DATAGRAM];
 
         loop {
-            // 1. Everything the cores want done, and the I/O for it. This
-            //    is where §16.4's drain contract is discharged.
+            // 1. Everything the cores want done. This is where §16.4's
+            //    drain contract is discharged.
             let outgoing = self.serve();
+
+            // 2. The next deadline, read **here** — after the drain and
+            //    before the first yield of the iteration.
+            //
+            //    §16.4 makes `poll_output()`'s terminal `Timeout`
+            //    "simultaneously the drain sentinel and the next-deadline
+            //    announcement", and `poll_output` **pops**. So reading a
+            //    deadline is a pure read only while the queue is provably
+            //    empty, and the only thing that establishes that is a drain
+            //    with no yield after it. `transmit()` below is a yield —
+            //    `Wire::send_to` is an application-supplied `async fn`, and
+            //    a real socket returns `Pending` whenever its send buffer
+            //    is full — and §16.3 (ruling 53) puts `close()` on the
+            //    *handle* side of the seam, so a `close()` landing during
+            //    that yield queues a `Transmit` on a core the driver has
+            //    already drained. Reading the deadline after the yield
+            //    popped that datagram and discarded it: a silently lost
+            //    CLOSE and 25 s of `DEAD_TIMEOUT` for the peer.
+            //
+            //    Reading it here cannot go stale in a way that matters:
+            //    **every** handle-side core mutation ends by sending a
+            //    command (`Connection::close_now` → `Command::Dirty`,
+            //    `Connecting::drop` → `Cancel`, `Endpoint::connect` →
+            //    `Connect`), and the command arm is `biased` first, so a
+            //    mutation during the yield wins the `select!` immediately
+            //    and the loop recomputes rather than sleeping on the old
+            //    value. `sleep_until` is absolute, so a long send does not
+            //    shift it either.
+            let deadline = self.deadline();
+
             self.transmit(outgoing).await;
 
-            // 2. §16.3: "dropping every handle stops it, and every session
+            // 3. §16.3: "dropping every handle stops it, and every session
             //    dies silently with it." Checked **after** the I/O above,
             //    so a CLOSE sealed by a legitimate last-handle-to-*this*-
             //    connection drop still reaches the wire. Ruling 88's
@@ -192,9 +255,8 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 break;
             }
 
-            // 3. Nothing left to do: wait for the next thing that could
+            // 4. Nothing left to do: wait for the next thing that could
             //    change that.
-            let deadline = self.deadline();
             let event = {
                 let Self { wire, commands, .. } = &mut self;
                 tokio::select! {
@@ -207,7 +269,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
 
             match event {
                 Event::Command(Some(command)) => self.handle_command(command),
-                // Unreachable while a handle lives, and step 2 broke the
+                // Unreachable while a handle lives, and step 3 broke the
                 // loop if none does.
                 Event::Command(None) => break,
                 Event::Received(Ok((len, src))) => {
@@ -230,7 +292,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             }
         }
 
-        self.shutdown();
+        // No `self.stop()` here, deliberately: [`Driver`]'s `Drop` is the
+        // **one** stop path, and `self` is dropped on the next line. That
+        // is what makes the stop run on an unwind as well — see the `Drop`
+        // impl at the bottom of this file.
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -266,6 +331,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
 
         self.release_dead();
         self.prune_ready();
+        self.prune_waiting();
         self.dispatch_intros();
         out
     }
@@ -294,6 +360,39 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         let state = self.shell.state.borrow();
         self.ready
             .retain(|ready| state.endpoint.intro_source(ready.id).is_some());
+    }
+
+    /// Drop `accept()` callers whose future was dropped.
+    ///
+    /// [`prune_ready`](Self::prune_ready)'s **dual**, and it runs on the
+    /// same terms — unconditionally, once per drain — for the same §10.6
+    /// reason. `waiting` is bounded by the number of *live* `accept()`
+    /// futures, which is application concurrency; a **cancelled** one leaves
+    /// a dead `oneshot::Sender` behind, and a dead sender is exactly the
+    /// unbounded intermediate queue §10.6 forbids.
+    ///
+    /// The canonical cancellation idiom is what produces them —
+    ///
+    /// ```text
+    /// loop {
+    ///     tokio::select! {
+    ///         intro = endpoint.accept() => { … }
+    ///         _ = &mut shutdown => break,
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// — or `timeout(d, ep.accept())`, and every losing iteration leaves
+    /// one. [`dispatch_intros`](Self::dispatch_intros) prunes too, but only
+    /// from the front and only while an introduction is available to hand
+    /// out, so an endpoint that is never dialled never prunes there at all.
+    /// That was the gap: the pruning was written on the side that has an
+    /// introduction to deliver rather than on the side that accumulates.
+    ///
+    /// `is_closed()` is monotone — a receiver that is gone stays gone — so
+    /// this can never discard a caller that is still waiting.
+    fn prune_waiting(&mut self) {
+        self.waiting.retain(|reply| !reply.is_closed());
     }
 
     /// Drain the endpoint core (§16.4).
@@ -382,23 +481,6 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         match event {
             ConnEvent::Established => self.establish(id, cell),
             ConnEvent::Closed(lost) => Self::latch(cell, lost),
-        }
-    }
-
-    /// Ruling 46's latch: set once, read for ever.
-    ///
-    /// §16.4 emits `Closed` exactly once per connection and the core
-    /// `debug_assert!`s it, so the `is_none()` guard here is defence for the
-    /// one place a second value would be observable — [`shutdown`], which
-    /// latches `EndpointDropped` over connections that may already have
-    /// died.
-    ///
-    /// [`shutdown`]: Self::shutdown
-    fn latch(cell: &Rc<RefCell<ConnCell<I::Suite>>>, lost: ConnectionLost) {
-        let mut borrow = cell.borrow_mut();
-        if borrow.closed.is_none() {
-            borrow.closed = Some(lost);
-            borrow.closed_wakers.wake_all();
         }
     }
 
@@ -605,9 +687,19 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     ///
     /// Read out of `poll_output()`'s terminal `Timeout`, which §16.4 makes
     /// "simultaneously the drain sentinel and the next-deadline
-    /// announcement". Both queues are empty here — [`serve`](Self::serve)
-    /// ran to `Timeout` and every mutating call since sent a command rather
-    /// than queuing an output — so this pops nothing.
+    /// announcement".
+    ///
+    /// # It must be called with no yield since the drain
+    ///
+    /// `poll_output()` **pops**, so the `_` arms below do not merely
+    /// mis-report a deadline — they *destroy* whatever the core queued,
+    /// which for a connection core is a datagram. This function has no way
+    /// to establish that the queues are empty; only its **caller's
+    /// position** does, and [`run`](Self::run) step 2 is that position and
+    /// says why. Moving this call after `transmit().await` is what the
+    /// regression test
+    /// `a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer`
+    /// (`tests/spec_shell.rs`) exists to catch.
     fn deadline(&self) -> Option<std::time::Instant> {
         let endpoint = match self.shell.state.borrow_mut().endpoint.poll_output() {
             EndpointOutput::Timeout(deadline) => deadline,
@@ -725,13 +817,48 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 );
             }
             Err(error) => {
-                // The shell's map said NONE and the core says otherwise:
-                // the two have diverged, which is the one failure mode the
-                // duplication in `ShellState::statics` can have.
-                debug_assert!(
-                    false,
-                    "the shell's static map admitted a connect the core refused: {error:?}",
-                );
+                // **The two maps disagreeing here is legitimate**, and
+                // §16.1 is where it is licensed. There was a
+                // `debug_assert!(false, …)` on this line asserting the
+                // opposite; it asserted something false and is deleted.
+                //
+                // The interleaving, which is ordinary application code:
+                // `Proven::accept()` queues `Command::AcceptChain(K)` on
+                // its first poll and yields, and the application calls
+                // `Endpoint::connect(K)` before the driver's next turn —
+                // which ruling 87 *guarantees* it can, by making the verb
+                // synchronous. `claim_static` reads the mirror, sees NONE
+                // (nothing has landed yet, and cannot have) and writes
+                // PENDING. The queue is now `[AcceptChain(K), Connect(K)]`:
+                // the accept runs first, the core's own map is still empty
+                // for K so it succeeds, and the connect that follows is
+                // refused by a core that now holds K.
+                //
+                // §16.1 declines to prevent exactly this: "a staged chain
+                // in progress is **deliberately not in `connect()`'s
+                // list**, and cannot be: until `authenticate()` the chain's
+                // static is merely claimed, and §6.1 forbids keying
+                // anything durable on an unproven claim. The invariant is
+                // held at the other end of that race instead" — §6.7's
+                // comparison at `accept()`. So the mirror is not wrong
+                // about *state*; it is one command behind, in the benign
+                // direction ("admits a connect the core will refuse").
+                //
+                // The branch below is already S3a's ratified answer:
+                // `connect()` to a static that already has a live
+                // `Connection` returns `Err(ConnectError::AlreadyConnected)`,
+                // which is what the core just said and what the `Connecting`
+                // is resolved with.
+                //
+                // `release_static` is stamp-checked and that is load-bearing
+                // here, not incidental: the accept drew its `attempt` from
+                // the same monotone counter *after* `claim_static` drew this
+                // one, so the entry now under `static_key` carries the later
+                // stamp and this release **declines**. The accept's LIVE
+                // entry survives, which is what keeps the mirror agreeing
+                // with the core from the next instant on. Pinned by
+                // `s3a_accept_ahead_of_connect_resolves_already_connected`
+                // in `tests/spec_shell.rs`.
                 self.shell
                     .state
                     .borrow_mut()
@@ -867,19 +994,133 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         // connection nobody claimed.
         drop(reply.send(Ok(handle)));
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stopping
+//
+// A separate impl block because [`Drop`] may not carry bounds the struct
+// does not, and the block above needs `I: 'static` for the erased
+// `Rc<dyn ShellLink>`. Nothing here does.
+// ═══════════════════════════════════════════════════════════════════════
+
+impl<I: Identity, W: Wire> Driver<I, W> {
+    /// Ruling 46's latch: set once, read for ever.
+    ///
+    /// §16.4 emits `Closed` exactly once per connection and the core
+    /// `debug_assert!`s it, so the `is_none()` guard here is defence for the
+    /// one place a second value would be observable — [`stop`], which
+    /// latches `EndpointDropped` over connections that may already have
+    /// died.
+    ///
+    /// [`stop`]: Self::stop
+    fn latch(cell: &Rc<RefCell<ConnCell<I::Suite>>>, lost: ConnectionLost) {
+        let mut borrow = cell.borrow_mut();
+        if borrow.closed.is_none() {
+            borrow.closed = Some(lost);
+            borrow.closed_wakers.wake_all();
+        }
+    }
 
     /// The driver has stopped (§16.3): every session dies silently, and
     /// **nothing is transmitted** (§15.4's endpoint-dropped row).
-    fn shutdown(&mut self) {
+    ///
+    /// # Every waiter resolves here, and that is the whole point
+    ///
+    /// This runs on an **unwind** as well as on the ordinary exit (see the
+    /// [`Drop`] impl below), so it is the only thing standing between a
+    /// panicking driver and an endpoint that is frozen but still reports
+    /// itself healthy. Two seams have to be closed, not one, because §16.3
+    /// splits the handle surface by cost (ruling 53):
+    ///
+    /// * The `oneshot`-backed verbs — `accept()` and the three staged verbs
+    ///   — close themselves: their senders die with the [`Driver`], `rx.await`
+    ///   errors, and each verb has a defined answer for that
+    ///   (`EndpointDropped`, or `None` for `accept()`). Nothing extra is
+    ///   needed and nothing here may get in their way.
+    /// * The **cell-backed** waiters do not. `Connection::closed()` parks in
+    ///   `closed_wakers` and a `Connecting` parks in its [`PendingSlot`];
+    ///   both are woken only by driver-side code, so without the two sweeps
+    ///   below they park for ever while `is_established()` keeps answering
+    ///   `true` from a cell nobody will write again.
+    ///
+    /// A `Connecting` can be parked in either of two places, and both are
+    /// swept:
+    ///
+    /// 1. its `Command::Connect` was processed, so the slot is in a
+    ///    [`ConnRecord`] — resolved with the records;
+    /// 2. its `Command::Connect` is **still in the channel** — the driver
+    ///    never saw it, so no record names it and only the queue does. That
+    ///    is why the channel is drained rather than merely dropped: dropping
+    ///    the receiver frees the slot's `Rc` but leaves the `Connecting`'s
+    ///    own copy parked with nobody to wake it.
+    ///
+    /// `ConnectError::Local` is the answer in both cases, for ruling 62's
+    /// reason: `ConnectError` deliberately has no `EndpointDropped`, and a
+    /// failure with no DH spent on the caller's behalf is what `Local`
+    /// names — the same value `Endpoint::connect` already returns when it
+    /// finds `driver_stopped` set.
+    ///
+    /// Idempotent: `latch` is guarded, `driver_stopped` is a set-once flag,
+    /// and both collections are cleared.
+    fn stop(&mut self) {
         self.shell.state.borrow_mut().driver_stopped = true;
-        for record in self.conns.values() {
+
+        // Nothing further can be queued; anything already queued is
+        // answered below rather than silently dropped.
+        self.commands.close();
+        while let Ok(command) = self.commands.try_recv() {
+            if let Command::Connect { slot, .. } = command {
+                slot.borrow_mut()
+                    .resolve(PendingOutcome::Failed(ConnectError::Local));
+            }
+        }
+
+        for record in self.conns.values_mut() {
             Self::latch(&record.cell, ConnectionLost::EndpointDropped);
             record.cell.borrow_mut().core = None;
+            if let Some(slot) = record.slot.take() {
+                slot.borrow_mut()
+                    .resolve(PendingOutcome::Failed(ConnectError::Local));
+            }
         }
+
         // Dropping the senders is what makes a parked `accept()` resolve
         // `None` — §16.2's "None = endpoint closed".
         self.waiting.clear();
         self.conns.clear();
+    }
+}
+
+/// **The stop path, on the ordinary exit and on an unwind alike.**
+///
+/// [`Driver::run`] does not call [`stop`](Driver::stop) itself; this does,
+/// on the one line where `self` goes away, so there is exactly one stop
+/// path and no `break` or `?` added later can skip it.
+///
+/// It is a `Drop` rather than a `catch_unwind` because `catch_unwind` would
+/// need `AssertUnwindSafe` over a `!Send`, `!UnwindSafe` actor holding an
+/// `Rc<RefCell<_>>` — an assertion this code is in no position to make —
+/// whereas `Drop` runs during unwinding by construction. **The panic is not
+/// swallowed**: it keeps propagating out of the task exactly as before.
+///
+/// What changes is what it leaves behind. Before this impl, a panic
+/// anywhere in the driver skipped the stop entirely: `driver_stopped` stayed
+/// `false`, so `Endpoint::connect` kept handing out `Connecting`s that could
+/// never resolve; every `closed()` future and every in-flight `Connecting`
+/// parked for ever; `is_established()` went on answering `true` from a cell
+/// nobody would write again; and `tokio::task::spawn_local` stored the panic
+/// in a `JoinHandle` the shell drops, so **nothing** surfaced — the test
+/// harness prints `ok` over a frozen endpoint. Now the same panic degrades
+/// to `ConnectionLost::EndpointDropped` and `ConnectError::Local`, which are
+/// answers an application can act on.
+///
+/// It also runs when the `Driver` future is dropped without ever being
+/// polled — a `LocalSet` dropped out from under it — which is the same
+/// state by a different route and deserves the same answer.
+impl<I: Identity, W: Wire> Drop for Driver<I, W> {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
