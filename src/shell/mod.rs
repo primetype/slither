@@ -37,10 +37,15 @@
 //! # What is here, and what is not
 //!
 //! Slice 3 builds `connect`/`accept`, the staged ladder, `close()`,
-//! `closed()` and the four accessors. §16.2's stream, message, datagram,
-//! `acked()`, `notified()` and keepalive verbs arrive with the slices that
-//! define them and are **absent rather than stubbed**: in this crate an
-//! unimplemented verb is a claim about the protocol.
+//! `closed()` and the four accessors. Slice 4 adds §16.2's stream surface:
+//! `open_bi`/`open_uni`/`accept_bi`/`accept_uni` plus [`SendStream`],
+//! [`RecvStream`] and [`BiStream`]. §16.2's message, datagram, `acked()`,
+//! `notified()` and
+//! keepalive verbs arrive with the slices that define them and are **absent
+//! rather than stubbed**: in this crate an unimplemented verb is a claim
+//! about the protocol. `SendStream::acked()` is slice 5's (ruling 122b) —
+//! it needs `ConnEvent::StreamFinished`, which needs §12's ACK processing —
+//! and the `AsyncRead`/`AsyncWrite` impls are slice 8's (ruling 96).
 
 pub mod wire;
 
@@ -49,10 +54,12 @@ mod driver;
 mod endpoint;
 mod shared;
 mod staged;
+mod stream;
 
 pub use self::connection::Connection;
 pub use self::endpoint::{Connecting, Endpoint, EndpointBuilder};
 pub use self::staged::{Claimed, Intro, Proven};
+pub use self::stream::{BiStream, RecvStream, SendStream};
 
 #[cfg(test)]
 mod tests {
@@ -791,5 +798,375 @@ mod tests {
             std::task::Poll::Ready(value) => Some(value),
             std::task::Poll::Pending => None,
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Slice 4b: end-to-end smoke
+    //
+    // **Not** the slice's acceptance tests — `tests/story_streams.rs` and
+    // `tests/spec_streams.rs` are, and they were written independently
+    // (working rule 6). These two exist because the implementer needs to
+    // know the seam works at all, and because the first of them is the
+    // shape that catches the slice's named worst defect.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// A uni stream carries its bytes, and **dropping the `SendStream`
+    /// after `finish()` leaves the peer's clean EOF intact**.
+    ///
+    /// The drop is the point. `SendHalf::reset` early-returns only when a
+    /// reset already exists — a set FIN does **not** stop it — so a `Drop`
+    /// that resets unconditionally destroys the unsent buffer and turns
+    /// this `Ok(None)` into `Err(ReadError::Reset(0))`. Any test that reads
+    /// before the sender drops passes over that defect.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_uni_stream_survives_its_senders_drop() {
+        local(async {
+            let pair = Pair::seeded(0x4B_0010);
+            let (a, b) = pair.establish().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            let payload = b"the spec is the authority";
+            let mut written = 0;
+            while written < payload.len() {
+                written += send.write(&payload[written..]).await.expect("write");
+            }
+            send.finish().await.expect("finish");
+            let id = send.id();
+            assert!(
+                id.is_some(),
+                "ruling 116: a live handle's id is always Some"
+            );
+            drop(send);
+            settle().await;
+
+            let mut recv = b.accept_uni().await.expect("accept_uni");
+            assert_eq!(recv.id(), id, "both ends name the same stream");
+
+            let mut got = Vec::new();
+            let mut buf = [0u8; 8];
+            while let Some(n) = recv.read(&mut buf).await.expect("read") {
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, payload);
+
+            // Sticky, and the id keeps answering after the stream is gone.
+            assert_eq!(recv.read(&mut buf).await, Ok(None));
+            assert_eq!(recv.id(), id, "ruling 116: `id()` keeps answering");
+        })
+        .await;
+    }
+
+    /// **Ruling 115's consequence, and the one thing in 4b the contract
+    /// left unstated — see `IMPLEMENTATION-4b.md` D1.**
+    ///
+    /// §16.2:4392 is unconditional: *dropping the last handle to a
+    /// `Connection` performs `close(NO_ERROR, "")`*. Ruling 115 has just
+    /// made a stream handle a handle, so the last one can now be a
+    /// `SendStream` — which is the *ordinary* shape ruling 115's own
+    /// rationale names, a task that owns a stream and has let the connection
+    /// handle go.
+    ///
+    /// Two things are pinned here. Dropping the `Connection` while a stream
+    /// lives must **not** close (the stream is still a handle), and dropping
+    /// that stream afterwards **must**. Without the second, this connection
+    /// emits no CLOSE at all and the peer pays `DEAD_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_handle_to_a_connection_may_be_a_stream() {
+        local(async {
+            let pair = Pair::seeded(0x4B_0012);
+            let (a, b) = pair.establish().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            send.finish().await.expect("finish");
+
+            drop(a);
+            settle().await;
+            assert!(
+                b.is_established(),
+                "ruling 115: a live `SendStream` is a handle, so this was \
+                 not the last one and no CLOSE is owed yet",
+            );
+
+            drop(send);
+            settle().await;
+            assert_eq!(
+                b.closed().await,
+                ConnectionLost::PeerClosed {
+                    code: crate::constants::NO_ERROR,
+                    reason: Vec::new(),
+                },
+                "§16.2: the last handle to a connection performs \
+                 `close(NO_ERROR, \"\")`, whatever kind of handle it is",
+            );
+        })
+        .await;
+    }
+
+    /// `reset()` reaches the peer as `Err(ReadError::Reset)`, and **ruling
+    /// 121's latch makes it stick**: without it the retry reads `Ok(None)`
+    /// out of the core and §9.6's abandoned data is reported as a complete
+    /// transfer.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_is_sticky_at_the_reader() {
+        local(async {
+            let pair = Pair::seeded(0x4B_0011);
+            let (a, b) = pair.establish().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            send.write(b"partial").await.expect("write");
+            settle().await;
+
+            let mut recv = b.accept_uni().await.expect("accept_uni");
+            let mut buf = [0u8; 32];
+            assert_eq!(recv.read(&mut buf).await, Ok(Some(7)));
+
+            send.reset(0x2a);
+            settle().await;
+
+            assert_eq!(
+                recv.read(&mut buf).await,
+                Err(crate::error::ReadError::Reset(0x2a))
+            );
+            assert_eq!(
+                recv.read(&mut buf).await,
+                Err(crate::error::ReadError::Reset(0x2a)),
+                "ruling 121: the core is not sticky, so the handle must be",
+            );
+
+            // The connection and its siblings are untouched.
+            assert!(a.is_established() && b.is_established());
+        })
+        .await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Slice 4b: the three faults `FlakyWire` cannot express
+    //
+    // Working rule 13. The fixture models a **network** — it loses,
+    // delays, duplicates, reorders and fails sends — and none of that
+    // reaches a stopped driver, an inline-polling waker or a drop with no
+    // runtime entered. All three are stream-handle faults, so all three
+    // live here rather than in an integration test that cannot construct
+    // them.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.8's maps are keyed by a value the **application** controls, so
+    /// what bounds them has to be asserted — and asserted from the side that
+    /// separates a build which removes its entries from one that does not.
+    ///
+    /// A `<= N` assertion would pass a build that never inserts at all
+    /// (working rule 9). This one parks a reader and a writer on every
+    /// stream, checks the maps actually hold them, drops the handles and
+    /// requires **zero** entries: the broken build leaves eight.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_stream_handles_empties_the_waker_maps() {
+        use std::task::Context;
+
+        use super::BiStream;
+
+        local(async {
+            let pair = Pair::seeded(0x4B_0001);
+            let (a, _b) = pair.establish().await;
+            assert_eq!(
+                a.stream_waker_entries(),
+                (0, 0),
+                "a connection with no streams holds no waker-map entries",
+            );
+
+            const N: usize = 8;
+            let mut handles = Vec::new();
+            for _ in 0..N {
+                handles.push(a.open_bi().await.expect("open_bi"));
+            }
+
+            // Park a real waiter on each, so the maps hold wakers and not
+            // merely empty slots: nothing has been written to these streams,
+            // so every read is pending.
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let mut buf = [0u8; 8];
+            let mut halves: Vec<_> = handles.into_iter().map(BiStream::split).collect();
+            for (_, recv) in &mut halves {
+                assert!(
+                    recv.poll_read(&mut cx, &mut buf).is_pending(),
+                    "a stream nobody has written to should park its reader",
+                );
+            }
+
+            assert_eq!(
+                a.stream_waker_entries(),
+                (N, N),
+                "every live half owns exactly one per-`StreamRef` entry",
+            );
+
+            drop(halves);
+            assert_eq!(
+                a.stream_waker_entries(),
+                (0, 0),
+                "a dropped handle must take its map entry with it (§16.8)",
+            );
+        })
+        .await;
+    }
+
+    /// **R2 and R3 in one shape.** A reader and a writer are parked; the
+    /// driver then goes away *without* the handle count reaching zero — the
+    /// only way it can, since a parked waiter is holding a handle — and both
+    /// must resolve rather than park for ever.
+    ///
+    /// The wake is delivered to an [`InlineWaker`], so this is also §16.8's
+    /// finding F10 for the two stream maps: `Driver::latch` takes the wakers
+    /// under `ConnCell`'s borrow and wakes them after it, and an executor
+    /// that re-polls inline lands in `poll_read`/`poll_write`, which take
+    /// that same borrow. With the wake inside the borrow this test panics in
+    /// the driver's own drop.
+    ///
+    /// Nothing in `testutil` can produce either fault: a fabric that loses
+    /// and reorders datagrams cannot stop a driver, and tokio's wakers only
+    /// push to a run queue.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_stream_waiter_resolves_when_the_driver_stops() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        use crate::error::{ReadError, WriteError};
+
+        type Halves = (
+            crate::testutil::TestSendStream,
+            crate::testutil::TestRecvStream,
+        );
+
+        // Which half resolved, and with what. `latch` hands the sweep one
+        // waker per map, so this `InlineWaker` is woken once for the reader
+        // and once for the writer and the action runs twice; what is being
+        // pinned is that **both** halves resolve, not how many times the
+        // executor was poked.
+        let outcomes: Rc<RefCell<Vec<(&'static str, ConnectionLost)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        let set = tokio::task::LocalSet::new();
+        #[expect(
+            unused_variables,
+            reason = "held past `drop(set)` so the driver's death is not a handle-count effect"
+        )]
+        let (pair, a, b, kept): (_, _, _, Rc<RefCell<Option<Halves>>>) = set
+            .run_until(async {
+                let pair = Pair::seeded(0x4B_0002);
+                let (a, b) = pair.establish().await;
+
+                let (send, recv) = a.open_bi().await.expect("open_bi").split();
+                let kept = Rc::new(RefCell::new(Some((send, recv))));
+
+                let waker = inline_waker();
+                let mut cx = Context::from_waker(&waker);
+                let mut buf = [0u8; 8];
+
+                {
+                    let mut borrow = kept.borrow_mut();
+                    let (send, recv) = borrow.as_mut().expect("both halves");
+
+                    // The reader parks at once: nothing has been written.
+                    assert!(recv.poll_read(&mut cx, &mut buf).is_pending());
+
+                    // The writer parks on §10.1's stream window. The core
+                    // call is what arms the wakeup — `StreamWritable` fires
+                    // only for a half whose `blocked` flag `SendHalf::write`
+                    // set — so this fills by writing, never by consulting a
+                    // credit accessor.
+                    let chunk = vec![0x5Au8; 8 * 1024];
+                    let mut parked = false;
+                    for _ in 0..64 {
+                        if send.poll_write(&mut cx, &chunk).is_pending() {
+                            parked = true;
+                            break;
+                        }
+                    }
+                    assert!(parked, "the writer never reached §10.1's stream window");
+                }
+
+                // Re-poll from inside `wake()`, which is what an executor
+                // that runs a ready task inline does.
+                ON_WAKE.with(|action| {
+                    let kept = Rc::clone(&kept);
+                    let outcomes = Rc::clone(&outcomes);
+                    *action.borrow_mut() = Some(Box::new(move || {
+                        let mut borrow = kept.borrow_mut();
+                        let Some((send, recv)) = borrow.as_mut() else {
+                            return;
+                        };
+                        let mut cx = Context::from_waker(Waker::noop());
+                        let mut buf = [0u8; 8];
+                        if let Poll::Ready(Err(ReadError::ConnectionLost(lost))) =
+                            recv.poll_read(&mut cx, &mut buf)
+                        {
+                            outcomes.borrow_mut().push(("read", lost));
+                        }
+                        if let Poll::Ready(Err(WriteError::ConnectionLost(lost))) =
+                            send.poll_write(&mut cx, b"x")
+                        {
+                            outcomes.borrow_mut().push(("write", lost));
+                        }
+                    }));
+                });
+
+                // The endpoints and both connections travel out with the
+                // parked halves: the driver must die from the `LocalSet`
+                // going away, not from the handle count reaching zero.
+                (pair, a, b, kept)
+            })
+            .await;
+
+        // Dropping the `LocalSet` drops the driver task, and `Drop for
+        // Driver` runs `stop()` — the same path a panicking driver takes.
+        drop(set);
+
+        let recorded = outcomes.borrow().clone();
+        for half in ["read", "write"] {
+            assert!(
+                recorded.contains(&(half, ConnectionLost::EndpointDropped)),
+                "the parked {half} was never swept by `Driver::latch`; \
+                 parking for ever is F1's shape — recorded: {recorded:?}",
+            );
+        }
+
+        ON_WAKE.with(|action| *action.borrow_mut() = None);
+        drop(kept.borrow_mut().take());
+    }
+
+    /// **R4.** A stream handle dropped with **no runtime entered at all**.
+    ///
+    /// Both `Drop` impls call `shared::now()`, which is
+    /// `tokio::time::Instant::now()`, and a panic inside a `Drop` during
+    /// unwinding aborts the process. `FlakyWire` cannot express a process,
+    /// so this is a plain `#[test]`: it builds the handles on a runtime,
+    /// tears the runtime down, and only then drops them.
+    #[test]
+    fn a_stream_handle_may_be_dropped_with_no_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("a current-thread runtime");
+        let set = tokio::task::LocalSet::new();
+
+        let (pair, a, b, bi) = runtime.block_on(set.run_until(async {
+            let pair = Pair::seeded(0x4B_0003);
+            let (a, b) = pair.establish().await;
+            let bi = a.open_bi().await.expect("open_bi");
+            (pair, a, b, bi)
+        }));
+
+        drop(set);
+        drop(runtime);
+
+        // No runtime, no `LocalSet`, no driver. `tokio::time::Instant::now`
+        // falls back to `std::time::Instant::now` outside a runtime rather
+        // than panicking — pinned here because the two `Drop` impls depend
+        // on it and nothing else in the suite reaches this state.
+        drop(bi);
+        drop(a);
+        drop(b);
+        drop(pair);
     }
 }

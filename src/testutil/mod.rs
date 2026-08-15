@@ -946,6 +946,15 @@ pub type TestEndpoint = crate::shell::Endpoint<TestIdentity>;
 /// A fixture connection handle.
 pub type TestConnection = crate::shell::Connection<crate::packet::ReferenceSuite>;
 
+/// A fixture send half.
+pub type TestSendStream = crate::shell::SendStream<crate::packet::ReferenceSuite>;
+
+/// A fixture receive half.
+pub type TestRecvStream = crate::shell::RecvStream<crate::packet::ReferenceSuite>;
+
+/// A fixture bidirectional stream.
+pub type TestBiStream = crate::shell::BiStream<crate::packet::ReferenceSuite>;
+
 /// A fixture stage-0 introduction.
 pub type TestIntro = crate::shell::Intro<TestIdentity>;
 

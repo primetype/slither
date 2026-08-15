@@ -24,7 +24,7 @@ use std::task::{Context, Waker};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::core::{Connection as CoreConnection, ConnectionId, IntroId, Timestamp};
+use crate::core::{Connection as CoreConnection, ConnectionId, IntroId, StreamRef, Timestamp};
 use crate::error::{AcceptError, AuthError, ConnectError, ConnectionLost, IntroError};
 use crate::identity::{Identity, PublicKeyOf};
 use crate::packet::Handshake;
@@ -48,8 +48,8 @@ pub(crate) fn now() -> std::time::Instant {
 /// This is §16.8's "quinn pattern" in its smallest useful form: slice 3
 /// needs it only for `closed()` and `accept()`, and slice 4's per-stream
 /// blocked-readers / blocked-writers maps are the same type keyed by
-/// [`StreamRef`](crate::core::StreamRef) — **not** `StreamId`, which a
-/// tie-break can renumber at install (§16.8, ruling 117).
+/// [`StreamRef`] — **not** `StreamId`, which a tie-break can renumber at
+/// install (§16.8, ruling 117).
 #[derive(Debug, Default)]
 pub(crate) struct Wakers {
     next: u64,
@@ -85,6 +85,15 @@ impl Wakers {
     /// ever parking still calls this from its guard's `Drop`.
     pub(crate) fn unpark(&mut self, key: u64) {
         self.parked.remove(&key);
+    }
+
+    /// Whether anyone is parked here.
+    ///
+    /// Read by [`release_waker_slot`] to drop a per-`StreamRef` entry once
+    /// its last waiter is gone: the map is keyed by a value the application
+    /// controls, so an entry that outlives its handle is unbounded growth.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parked.is_empty()
     }
 
     /// Take everyone parked here, clearing the map.
@@ -176,17 +185,169 @@ pub(crate) struct ConnCell<S: Handshake> {
     /// Set by any handle-side mutating borrow; cleared by the driver when
     /// it drains.
     pub(crate) dirty: bool,
-    /// How many `Connection` handles point at this cell. The last one out
-    /// performs §16.2's `close(NO_ERROR, "")` — unless it is also the last
-    /// handle in the process (ruling 88).
+    /// How many handles point at this cell — `Connection`, and since
+    /// **ruling 115** `SendStream`, `RecvStream` and `BiStream` too. The
+    /// last one out performs §16.2's `close(NO_ERROR, "")` — unless it is
+    /// also the last handle in the process (ruling 88).
     pub(crate) handles: usize,
+    /// §16.8's blocked-readers map: one entry per live
+    /// [`RecvStream`](super::RecvStream), created by that handle and removed
+    /// by its `Drop`.
+    ///
+    /// **Keyed by [`StreamRef`], never `StreamId`** (ruling 117): a
+    /// `StreamId` is fixed by an opener parity that §6.7's tie-break can
+    /// invert, so a map keyed by it would need rekeying at every install and
+    /// a park that straddled one would look up a key that no longer exists.
+    pub(crate) blocked_readers: BTreeMap<StreamRef, Wakers>,
+    /// §16.8's blocked-writers map, on the same terms.
+    pub(crate) blocked_writers: BTreeMap<StreamRef, Wakers>,
+    /// `open_bi`/`open_uni` futures parked on §10.4's cumulative limit,
+    /// indexed by `Dir::slot()`.
+    ///
+    /// An array and not a map: `Dir` has exactly two values, so this is
+    /// bounded by construction rather than by anyone's discipline.
+    pub(crate) stream_openers: [Wakers; 2],
+    /// `accept_bi`/`accept_uni` futures parked on an empty unclaimed queue.
+    /// Same shape, same reason.
+    pub(crate) stream_acceptors: [Wakers; 2],
 }
 
 impl<S: Handshake> ConnCell<S> {
+    /// A fresh cell around an installed core.
+    ///
+    /// `dirty` starts `true`: the core has been mutated by whatever built
+    /// it, and §16.4's drain contract is discharged by the driver's next
+    /// pass.
+    ///
+    /// A constructor rather than two struct literals in [`driver`], because
+    /// §16.8's waker maps grow a field per slice and a literal per call site
+    /// is a place to forget one.
+    ///
+    /// [`driver`]: super::driver
+    pub(crate) fn new(core: CoreConnection<S>, remote_address: SocketAddr) -> Self {
+        Self {
+            core: Some(core),
+            remote_address,
+            closed: None,
+            closed_wakers: Wakers::default(),
+            notifications: NotificationSlots,
+            dirty: true,
+            handles: 0,
+            blocked_readers: BTreeMap::new(),
+            blocked_writers: BTreeMap::new(),
+            stream_openers: Default::default(),
+            stream_acceptors: Default::default(),
+        }
+    }
+
     pub(crate) fn is_established(&self) -> bool {
         self.core
             .as_ref()
             .is_some_and(CoreConnection::is_established)
+    }
+
+    /// Sweep every stream waker parked in this cell, handing them back to be
+    /// woken **after** the borrow ends (§16.8, finding F10).
+    ///
+    /// `closed_wakers` is deliberately **not** in here: its caller
+    /// ([`Driver::latch`](super::driver::Driver)) takes it under the same
+    /// borrow, and folding it in would hide which sweep set the latch.
+    #[must_use = "the wakers must be woken after the cell borrow ends (§16.8)"]
+    pub(crate) fn take_all_stream_wakers(&mut self) -> Vec<Waker> {
+        let mut woken = Vec::new();
+        for wakers in self.blocked_readers.values_mut() {
+            woken.extend(wakers.take_all());
+        }
+        for wakers in self.blocked_writers.values_mut() {
+            woken.extend(wakers.take_all());
+        }
+        for wakers in &mut self.stream_openers {
+            woken.extend(wakers.take_all());
+        }
+        for wakers in &mut self.stream_acceptors {
+            woken.extend(wakers.take_all());
+        }
+        woken
+    }
+
+    /// How many per-`StreamRef` waker-map entries exist, in
+    /// `(readers, writers)` order.
+    ///
+    /// The pin for §16.8's bound (working rule 9): these two maps are keyed
+    /// by a value the **application** controls, so "bounded" is not
+    /// assertable from the outside and a build that never inserts satisfies
+    /// any upper bound for free. A test parks, asserts non-zero, drops the
+    /// handles and asserts zero — which separates the two.
+    #[cfg(test)]
+    pub(crate) fn stream_waker_entries(&self) -> (usize, usize) {
+        (self.blocked_readers.len(), self.blocked_writers.len())
+    }
+}
+
+/// Remove one handle's waker from a per-`StreamRef` map, and remove the
+/// entry itself once it is empty.
+///
+/// §16.8's map is keyed by a value the application controls, so what bounds
+/// it has to be stated. Three things do, and the argument needs all three:
+///
+/// 1. **per-waker** — `Wakers::unpark` on the handle's own key, so a
+///    cancelled poll leaves nothing behind;
+/// 2. **per-entry** — this function, called from the handle's `Drop`.
+///    **This is the bound that matters**, and it is structural rather than
+///    disciplinary: neither [`SendStream`](super::SendStream) nor
+///    [`RecvStream`](super::RecvStream) is `Clone`, so there is exactly one
+///    owner of each entry and its lifetime is exactly that handle's. The
+///    maps are therefore bounded by the number of **live stream handles** —
+///    §10.4's cumulative limit — not by the number of streams the
+///    connection has ever opened;
+/// 3. **per-wake** — `Wakers::take_all` clears the inner set, so a
+///    woken-and-never-re-parked stream leaves an empty `Wakers` rather than
+///    a stale one.
+///
+/// *What state does (2) assume (working rule 12)?* That the handles are not
+/// `Clone` and that `BiStream::split` yields one of each, never two. If
+/// either is ever relaxed, (2) fails and these maps need reference counting.
+pub(crate) fn release_waker_slot(map: &mut BTreeMap<StreamRef, Wakers>, r: StreamRef, key: u64) {
+    let std::collections::btree_map::Entry::Occupied(mut entry) = map.entry(r) else {
+        return;
+    };
+    entry.get_mut().unpark(key);
+    if entry.get().is_empty() {
+        entry.remove();
+    }
+}
+
+/// Seal `close(code, reason)` on a connection cell and mark it dirty
+/// (§15.2, §16.7).
+///
+/// Shared by [`Connection`](super::Connection)'s `close()` and its
+/// last-handle `Drop` **and** by the stream handles' `Drop`, which since
+/// ruling 115 can be the last handle to a connection. One implementation,
+/// because two would be two places to get §16.7's seal-then-signal order
+/// wrong.
+pub(crate) fn close_now<S: Handshake>(
+    shell: &Rc<dyn ShellLink>,
+    cell: &RefCell<ConnCell<S>>,
+    id: ConnectionId,
+    code: u64,
+    reason: &[u8],
+) {
+    let mutated = {
+        let mut cell = cell.borrow_mut();
+        match cell.core.as_mut() {
+            Some(core) => {
+                core.close(now(), code, reason);
+                cell.dirty = true;
+                true
+            }
+            // The driver has already released the core — §15.2's linger
+            // expired, or the connection was never installed. There is
+            // nothing left to seal with.
+            None => false,
+        }
+    };
+    if mutated {
+        shell.mark_dirty(id);
     }
 }
 

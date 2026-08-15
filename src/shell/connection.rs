@@ -24,11 +24,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::constants;
-use crate::core::ConnectionId;
+use crate::core::{ConnectionId, Dir, StreamRef};
 use crate::error::ConnectionLost;
 use crate::packet::{Channel, Handshake};
 
-use super::shared::{ConnCell, ShellLink, WakerSlot, now};
+use super::shared::{ConnCell, ShellLink, WakerSlot, close_now};
+use super::stream::{BiStream, RecvStream, SendStream};
 
 /// The static public key type of a suite — §2.4's canonical octets.
 type PublicKeyFor<S> = <<S as Channel>::Curve as hiss::curve::Curve>::PublicKey;
@@ -132,24 +133,14 @@ impl<S: Handshake> Connection<S> {
 
     /// Seal the CLOSE and mark the cell dirty. Shared by
     /// [`poll_close`](Self::poll_close) and the last-handle drop.
+    ///
+    /// The body lives in [`shared::close_now`] because ruling 115 gave the
+    /// stream handles the same last-handle obligation, and two copies would
+    /// be two places to get §16.7's seal-then-signal order wrong.
+    ///
+    /// [`shared::close_now`]: super::shared::close_now
     fn close_now(&self, code: u64, reason: &[u8]) {
-        let mutated = {
-            let mut cell = self.cell.borrow_mut();
-            match cell.core.as_mut() {
-                Some(core) => {
-                    core.close(now(), code, reason);
-                    cell.dirty = true;
-                    true
-                }
-                // The driver has already released the core — §15.2's
-                // linger expired, or the connection was never installed.
-                // There is nothing left to seal with.
-                None => false,
-            }
-        };
-        if mutated {
-            self.shell.mark_dirty(self.id);
-        }
+        close_now(&self.shell, &self.cell, self.id, code, reason);
     }
 
     /// Resolve when this connection ends, with the reason it ended
@@ -198,6 +189,249 @@ impl<S: Handshake> Connection<S> {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.2's stream verbs
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Open a bidirectional stream (§9.1).
+    ///
+    /// When §10.4's cumulative limit is exhausted this waits for a
+    /// MAX_STREAMS allowance rather than failing: `StreamsExhausted` is a
+    /// core-internal condition and no public verb can return it (ruling
+    /// 101).
+    ///
+    /// # In slice 4 an exhausted bidi space parks for ever
+    ///
+    /// A bidi index is returned to the peer's allowance only when **both**
+    /// halves are freed, and the send half is freed on acknowledgement —
+    /// which needs §12's ACK processing, which this slice does not have. So
+    /// once the bidi limit is reached, `open_bi` never resumes. `open_uni`
+    /// has no such gap: a peer-opened uni stream read to end-of-stream is
+    /// fully closed at once and grants its MAX_STREAMS_UNI.
+    ///
+    /// # Cancel-safety
+    ///
+    /// **Cancel-safe: a dropped future has claimed nothing.** The stream
+    /// index and the handle are taken in one synchronous step with no
+    /// fallible operation between them, so there is no state in which an
+    /// index has been spent on a stream no handle names.
+    pub async fn open_bi(&self) -> Result<BiStream<S>, ConnectionLost> {
+        let slot = self.opener_slot(Dir::Bi);
+        poll_fn(|cx| self.poll_open_bi(cx, slot.key())).await
+    }
+
+    /// Open a unidirectional stream — this end sends, the peer receives
+    /// (§9.1).
+    ///
+    /// Waits for a MAX_STREAMS allowance when §10.4's cumulative limit is
+    /// exhausted, and unlike [`open_bi`](Self::open_bi) that wait is
+    /// satisfiable in this slice: the peer's uni streams close as soon as
+    /// their receive half is retired.
+    ///
+    /// Cancel-safe, for [`open_bi`](Self::open_bi)'s reason.
+    pub async fn open_uni(&self) -> Result<SendStream<S>, ConnectionLost> {
+        let slot = self.opener_slot(Dir::Uni);
+        poll_fn(|cx| self.poll_open_uni(cx, slot.key())).await
+    }
+
+    /// Claim the next peer-opened bidirectional stream (§9.1).
+    ///
+    /// **FIFO, in open order** (ruling 112). §9.2's implicit opening can
+    /// open several streams from one frame; each becomes claimable
+    /// separately and each `accept_bi` claims exactly one.
+    ///
+    /// Once the connection has ended this reports `Err` **immediately, with
+    /// nothing drained first** (ruling 118). That is not an oversight of the
+    /// pull model: §15.2 lets `close()` drop stream state at once, so there
+    /// is nothing left to hand over, and handing back a handle on which
+    /// every `read` fails would be worse than saying so.
+    ///
+    /// Cancel-safe: a dropped future has claimed no stream. The claim and
+    /// the handle are one step, which matters more here than for `open_*` —
+    /// a popped stream with no handle would be unclaimable for ever while
+    /// the peer's bytes went on charging the receive ledger.
+    pub async fn accept_bi(&self) -> Result<BiStream<S>, ConnectionLost> {
+        let slot = self.acceptor_slot(Dir::Bi);
+        poll_fn(|cx| self.poll_accept_bi(cx, slot.key())).await
+    }
+
+    /// Claim the next peer-opened unidirectional stream (§9.1). FIFO, and
+    /// cancel-safe, exactly as [`accept_bi`](Self::accept_bi).
+    pub async fn accept_uni(&self) -> Result<RecvStream<S>, ConnectionLost> {
+        let slot = self.acceptor_slot(Dir::Uni);
+        poll_fn(|cx| self.poll_accept_uni(cx, slot.key())).await
+    }
+
+    /// The one implementation of [`open_bi`](Self::open_bi) (ruling 122a).
+    pub(crate) fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<BiStream<S>, ConnectionLost>> {
+        self.poll_open_with(cx, key, Dir::Bi, install_bi)
+    }
+
+    /// The one implementation of [`open_uni`](Self::open_uni).
+    pub(crate) fn poll_open_uni(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<SendStream<S>, ConnectionLost>> {
+        self.poll_open_with(cx, key, Dir::Uni, SendStream::install)
+    }
+
+    /// The one implementation of [`accept_bi`](Self::accept_bi).
+    pub(crate) fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<BiStream<S>, ConnectionLost>> {
+        self.poll_accept_with(cx, key, Dir::Bi, install_bi)
+    }
+
+    /// The one implementation of [`accept_uni`](Self::accept_uni).
+    pub(crate) fn poll_accept_uni(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<RecvStream<S>, ConnectionLost>> {
+        self.poll_accept_with(cx, key, Dir::Uni, RecvStream::install)
+    }
+
+    /// Mint this future's slot in §16.8's opener map, released on drop.
+    ///
+    /// `open_*`/`accept_*` keep the per-future [`WakerSlot`] shape that
+    /// `closed()` uses — several `open_bi()` futures can coexist on one
+    /// `&self` — whereas the stream handles hold their key in a field,
+    /// because slice 8's `AsyncWrite::poll_write` has no argument to carry
+    /// one (§16.3, ruling 53).
+    fn opener_slot(&self, dir: Dir) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().stream_openers[dir.slot()].key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().stream_openers[dir.slot()].unpark(key)
+        })
+    }
+
+    /// Mint this future's slot in §16.8's acceptor map.
+    fn acceptor_slot(&self, dir: Dir) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().stream_acceptors[dir.slot()].key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().stream_acceptors[dir.slot()].unpark(key)
+        })
+    }
+
+    /// `open_bi`/`open_uni`, differing only in what they build.
+    ///
+    /// # `build` runs under the same borrow as `core.open`, deliberately
+    ///
+    /// `core.open` increments `ever_opened` and spends an index against
+    /// §10.4's cumulative limit. A future dropped **after** the index was
+    /// spent and **before** the handle existed would leak it for the
+    /// connection's life, with a send half nothing can ever finish and a
+    /// contribution pinned in the ledger. That state is unreachable if and
+    /// only if the core call and the construction happen in one synchronous
+    /// body with no `?`, no early return and nothing fallible between them —
+    /// so `build` takes the live `&mut ConnCell` rather than the cell, and
+    /// the window is not merely unlikely but unrepresentable.
+    fn poll_open_with<T>(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+        dir: Dir,
+        build: impl FnOnce(
+            Rc<dyn ShellLink>,
+            Rc<RefCell<ConnCell<S>>>,
+            &mut ConnCell<S>,
+            ConnectionId,
+            StreamRef,
+        ) -> T,
+    ) -> Poll<Result<T, ConnectionLost>> {
+        let mut cell = self.cell.borrow_mut();
+        // Ruling 118: the latch answers first, and nothing is drained.
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(lost));
+        }
+        let Some(core) = cell.core.as_mut() else {
+            debug_assert!(
+                false,
+                "a connection cell held neither a core nor a close reason (§16.3)"
+            );
+            return Poll::Ready(Err(ConnectionLost::EndpointDropped));
+        };
+        match core.open(dir) {
+            Ok(r) => {
+                let handle = build(
+                    Rc::clone(&self.shell),
+                    Rc::clone(&self.cell),
+                    &mut cell,
+                    self.id,
+                    r,
+                );
+                Poll::Ready(Ok(handle))
+            }
+            // Ruling 101: the shell converts exhaustion into a park, which
+            // is why `StreamsExhausted` is `pub(crate)` and never reaches an
+            // application.
+            Err(_) => {
+                cell.stream_openers[dir.slot()].park(key, cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    /// `accept_bi`/`accept_uni`, on the same terms.
+    ///
+    /// The latch is checked **before** the pop, not after: a `poll_accept`
+    /// that popped and then noticed the connection had died would orphan the
+    /// stream it had just claimed.
+    ///
+    /// The park is woken by `ConnEvent::StreamOpened`, of which ruling 99
+    /// emits **one per stream** — so a wake is not a promise of a stream,
+    /// and every waiter re-polls and claims at most one.
+    fn poll_accept_with<T>(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+        dir: Dir,
+        build: impl FnOnce(
+            Rc<dyn ShellLink>,
+            Rc<RefCell<ConnCell<S>>>,
+            &mut ConnCell<S>,
+            ConnectionId,
+            StreamRef,
+        ) -> T,
+    ) -> Poll<Result<T, ConnectionLost>> {
+        let mut cell = self.cell.borrow_mut();
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(lost));
+        }
+        let Some(core) = cell.core.as_mut() else {
+            debug_assert!(
+                false,
+                "a connection cell held neither a core nor a close reason (§16.3)"
+            );
+            return Poll::Ready(Err(ConnectionLost::EndpointDropped));
+        };
+        match core.accept(dir) {
+            Some(r) => {
+                let handle = build(
+                    Rc::clone(&self.shell),
+                    Rc::clone(&self.cell),
+                    &mut cell,
+                    self.id,
+                    r,
+                );
+                Poll::Ready(Ok(handle))
+            }
+            None => {
+                cell.stream_acceptors[dir.slot()].park(key, cx);
+                Poll::Pending
+            }
+        }
+    }
+
     /// The peer's static public key — **proven**, not claimed (§6.1).
     ///
     /// A synchronous read of the shared cell (§16.8), never a driver
@@ -232,6 +466,18 @@ impl<S: Handshake> Connection<S> {
         self.session_id.clone()
     }
 
+    /// How many per-`StreamRef` waker-map entries this connection holds, in
+    /// `(readers, writers)` order — the pin for §16.8's bound.
+    ///
+    /// Crate-internal and test-only: it is not a protocol fact, it is the
+    /// only way to assert from the side that **separates** a build which
+    /// removes its map entries from one that does not. An upper-bound
+    /// assertion would pass a build that never inserts (working rule 9).
+    #[cfg(test)]
+    pub(crate) fn stream_waker_entries(&self) -> (usize, usize) {
+        self.cell.borrow().stream_waker_entries()
+    }
+
     /// Whether a session is installed.
     ///
     /// `true` for the whole of a live connection's life, and `false` again
@@ -241,6 +487,21 @@ impl<S: Handshake> Connection<S> {
     pub fn is_established(&self) -> bool {
         self.cell.borrow().is_established()
     }
+}
+
+/// Build both halves of one bidirectional stream under a **single** cell
+/// borrow — the `build` argument [`Connection::poll_open_with`] and
+/// [`Connection::poll_accept_with`] take for `Dir::Bi`.
+fn install_bi<S: Handshake>(
+    shell: Rc<dyn ShellLink>,
+    cell_rc: Rc<RefCell<ConnCell<S>>>,
+    cell: &mut ConnCell<S>,
+    conn: ConnectionId,
+    r: StreamRef,
+) -> BiStream<S> {
+    let send = SendStream::install(Rc::clone(&shell), Rc::clone(&cell_rc), cell, conn, r);
+    let recv = RecvStream::install(shell, cell_rc, cell, conn, r);
+    BiStream::new(send, recv)
 }
 
 impl<S: Handshake> std::fmt::Debug for Connection<S> {

@@ -116,8 +116,7 @@ use crate::packet::Handshake;
 
 use super::connection::Connection;
 use super::shared::{
-    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers,
-    now, resolve_slot,
+    Command, ConnCell, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers, now, resolve_slot,
 };
 use super::staged::Intro;
 use super::wire::Wire;
@@ -499,18 +498,64 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         match event {
             ConnEvent::Established => self.establish(id, cell),
             ConnEvent::Closed(lost) => Self::latch(cell, lost),
-            // Slice 4a's six stream events. The shell has no stream handles
-            // until 4b, so there is nothing to wake and nothing to latch;
-            // dropping them here is the whole of their slice-4a handling.
-            // 4b replaces this arm with the per-`StreamRef` waker maps
-            // (§16.8), which is why it is written as one arm rather than
-            // six — a six-arm version reads as six decisions taken.
-            ConnEvent::StreamOpened { .. }
-            | ConnEvent::StreamsAvailable { .. }
-            | ConnEvent::StreamReadable { .. }
-            | ConnEvent::StreamWritable { .. }
-            | ConnEvent::StreamFinished { .. }
-            | ConnEvent::StreamReset { .. } => {}
+
+            // §16.8's four waker maps. Every arm takes the wakers **inside**
+            // the borrow and wakes them **outside** it — see `wake_stream`.
+            ConnEvent::StreamReadable { r } => {
+                Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
+            }
+            ConnEvent::StreamWritable { r } => {
+                Self::wake_stream(cell, |cell| cell.blocked_writers.get_mut(&r));
+            }
+            // The **reader**, not the writer: `poll_read` re-polls and
+            // surfaces `Err(ReadError::Reset)`. In slice 4 a peer cannot
+            // reset our send half — §9.9's STOP_SENDING is deferred — so
+            // there is no blocked writer this could concern.
+            ConnEvent::StreamReset { r, .. } => {
+                Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
+            }
+            // **All of them, not one.** Ruling 99 emits one event per
+            // newly-opened stream, and §9.2's implicit open of index 5 opens
+            // six streams; but a wake is not a promise of a stream either
+            // way, so every parked `accept_*` re-polls and claims at most
+            // one. Waking a single waiter per event would be an assumption
+            // about a correspondence the core does not guarantee.
+            ConnEvent::StreamOpened { dir } => {
+                Self::wake_stream(cell, |cell| Some(&mut cell.stream_acceptors[dir.slot()]));
+            }
+            ConnEvent::StreamsAvailable { dir } => {
+                Self::wake_stream(cell, |cell| Some(&mut cell.stream_openers[dir.slot()]));
+            }
+            // `acked()` is slice 5 (ruling 122b) and this event never fires
+            // in slice 4 — reaching §9.7's `DataRecvd` needs §12's ACK
+            // processing. Nothing parks on it, so there is nothing to wake.
+            ConnEvent::StreamFinished { .. } => {}
+        }
+    }
+
+    /// Wake one waker set, with the cell borrow released first.
+    ///
+    /// The selector runs under the borrow and hands back the set; the wakes
+    /// happen after it ends. That order is the whole point: a `Waker` is
+    /// **application-supplied**, and an executor that polls a ready task
+    /// inline rather than queueing it re-enters `poll_read`/`poll_write`,
+    /// which take this same `borrow_mut`. `already mutably borrowed` inside
+    /// the driver task, from a consumer doing nothing wrong.
+    /// [`Wakers::take_all`] is `#[must_use]` so that this is the only
+    /// spelling the type permits, and this helper is where the six arms
+    /// share it rather than each restating it.
+    fn wake_stream(
+        cell: &Rc<RefCell<ConnCell<I::Suite>>>,
+        select: impl FnOnce(&mut ConnCell<I::Suite>) -> Option<&mut Wakers>,
+    ) {
+        let woken = {
+            let mut borrow = cell.borrow_mut();
+            select(&mut borrow)
+                .map(Wakers::take_all)
+                .unwrap_or_default()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 
@@ -827,15 +872,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         remote_static: PublicKeyOf<I>,
         slot: Rc<RefCell<PendingSlot<I>>>,
     ) {
-        let cell = Rc::new(RefCell::new(ConnCell {
-            core: Some(core),
-            remote_address: remote,
-            closed: None,
-            closed_wakers: Wakers::default(),
-            notifications: NotificationSlots,
-            dirty: true,
-            handles: 0,
-        }));
+        let cell = Rc::new(RefCell::new(ConnCell::new(core, remote)));
         self.conns.insert(
             id,
             ConnRecord {
@@ -922,15 +959,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         // and the core exposes no per-connection static accessor. The
         // handle's value *is* the proven one — `Proven` is only reachable
         // through `authenticate()`, which returned it.
-        let cell = Rc::new(RefCell::new(ConnCell {
-            core: Some(core),
-            remote_address: anchor,
-            closed: None,
-            closed_wakers: Wakers::default(),
-            notifications: NotificationSlots,
-            dirty: true,
-            handles: 0,
-        }));
+        let cell = Rc::new(RefCell::new(ConnCell::new(core, anchor)));
 
         // §5.4's NONE → LIVE was written by `core::Endpoint::accept` itself,
         // in the call above. Ruling 90 leaves that map in the core, so there
@@ -996,7 +1025,17 @@ impl<I: Identity, W: Wire> Driver<I, W> {
                 return;
             }
             borrow.closed = Some(lost);
-            borrow.closed_wakers.take_all()
+            let mut woken = borrow.closed_wakers.take_all();
+            // §16.8's four stream maps sweep here too, and this is the only
+            // thing that wakes a cell-parked stream waiter on **driver**
+            // death: [`stop`] calls this, and `Drop for Driver` calls
+            // `stop` on an unwind. Without it a writer parked on
+            // flow-control credit parks for ever when the driver panics —
+            // which no network fixture can produce, because a fixture that
+            // loses, delays, duplicates and reorders cannot express "this
+            // driver stopped".
+            woken.extend(borrow.take_all_stream_wakers());
+            woken
         };
         for waker in woken {
             waker.wake();
