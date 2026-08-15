@@ -155,6 +155,19 @@ pub trait Handshake: Channel {
     /// at `u64::MAX` it returns the counter that will never be used (§7.9).
     fn next_counter(seal: &Self::Seal) -> u64;
 
+    /// hiss's channel binding for the session, off the sealing half.
+    ///
+    /// **[RATIFIED 2026/08/15 — ruling 89]** §16.2's `session_id()` is
+    /// `hiss::noise::SessionId`, re-exported, and the ruling says it "is
+    /// reachable from the seal half slither already holds
+    /// (`DatagramSend::session_id`), so nothing is captured at install."
+    /// That is true of hiss's concrete type and **not** of
+    /// [`Seal`](Handshake::Seal), which is an associated type with no
+    /// bounds — so the shell cannot reach it without this accessor. Routed
+    /// through the suite for exactly the reason
+    /// [`next_counter`](Handshake::next_counter) is.
+    fn session_id(seal: &Self::Seal) -> &::hiss::noise::SessionId;
+
     /// Seal one Data packet's plaintext (§7.1).
     ///
     /// `ad` is the 14 header bytes verbatim (§3.4); `out` must have room

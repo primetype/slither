@@ -128,6 +128,19 @@ impl Tap {
         self.0.borrow_mut().drain(..).collect()
     }
 
+    /// Everything recorded so far as `(from, to, bytes)`, leaving the log
+    /// intact.
+    ///
+    /// The tuple shape a flow test filters on;
+    /// [`snapshot`](Tap::snapshot) is the same data as [`Spied`] values.
+    pub fn datagrams(&self) -> Vec<(SocketAddr, SocketAddr, Vec<u8>)> {
+        self.0
+            .borrow()
+            .iter()
+            .map(|spied| (spied.src, spied.dst, spied.bytes.clone()))
+            .collect()
+    }
+
     /// Copy everything recorded so far, leaving the log intact.
     pub fn snapshot(&self) -> Vec<Spied> {
         self.0.borrow().clone()
@@ -188,6 +201,13 @@ pub struct FlakyPolicy {
     pub drop_at: BTreeSet<usize>,
     /// Fail `send_to` while `Instant::now()` is inside the window.
     pub send_failure: Option<SendFailure>,
+    /// The shared toggle behind [`FlakyPolicy::fail_sends`].
+    ///
+    /// Private and `Rc`, so **clones share it**: a policy handed to
+    /// [`Network::wire_with`] can still be switched from the test that
+    /// built it, which is what Appendix B's "fails for a bounded interval,
+    /// then heals" needs when the interval's end is not known in advance.
+    failing: Rc<Cell<bool>>,
 }
 
 impl FlakyPolicy {
@@ -201,7 +221,40 @@ impl FlakyPolicy {
             drop_first: 0,
             drop_at: BTreeSet::new(),
             send_failure: None,
+            failing: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// Turn `ENETUNREACH` on every `send_to` on or off, **now**.
+    ///
+    /// The toggle is shared by every clone of this policy, so the usual
+    /// shape works:
+    ///
+    /// ```
+    /// # use slither::testutil::{FlakyPolicy, Network};
+    /// # let net = Network::seeded(0);
+    /// # let addr = "10.0.0.9:9".parse().expect("literal addr");
+    /// let policy = FlakyPolicy::perfect();
+    /// let wire = net.wire_with(addr, policy.clone());
+    /// policy.fail_sends(true);   // every send from `wire` now fails
+    /// policy.fail_sends(false);  // and the seam heals
+    /// ```
+    ///
+    /// Ruling 49 makes a failing send a **trace** obligation and nothing
+    /// more — no teardown, no verb resolved with an error — and §16.10
+    /// makes the injector itself required rather than optional, because
+    /// the obligation is unreachable without one.
+    ///
+    /// Independent of
+    /// [`failing_sends_until`](FlakyPolicy::failing_sends_until): either
+    /// being active fails the send.
+    pub fn fail_sends(&self, failing: bool) {
+        self.failing.set(failing);
+    }
+
+    /// Whether the toggle above is currently on.
+    pub fn is_failing(&self) -> bool {
+        self.failing.get()
     }
 
     /// Drop the first `n` datagrams, then deliver perfectly.
@@ -409,6 +462,33 @@ impl Network {
         }
     }
 
+    /// [`endpoint`](Network::endpoint), under the name a flow test reads
+    /// better with: `net.wire(addr)` is the wire, `net.endpoint(addr)` is
+    /// the registration. One function, two readings.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` is already registered.
+    pub fn wire(&self, addr: SocketAddr) -> FlakyWire {
+        self.endpoint(addr)
+    }
+
+    /// [`wire`](Network::wire) with `policy` installed before the first
+    /// send.
+    ///
+    /// The caller's copy keeps working: see [`FlakyPolicy::fail_sends`],
+    /// whose toggle is shared across clones, so a test can switch the seam
+    /// mid-run without ever reaching the wire again.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` is already registered.
+    pub fn wire_with(&self, addr: SocketAddr, policy: FlakyPolicy) -> FlakyWire {
+        let wire = self.endpoint(addr);
+        wire.set_policy(policy);
+        wire
+    }
+
     /// Blackhole `addr` in both directions: it sends and receives nothing.
     pub fn partition(&self, addr: SocketAddr) {
         self.0.borrow_mut().partitioned.insert(addr);
@@ -582,11 +662,14 @@ impl Wire for FlakyWire {
 
         let policy = self.policy.borrow().clone();
 
-        // 2. Injected send failure.
+        // 2. Injected send failure — the timed window, or the toggle.
         if let Some(failure) = &policy.send_failure
             && Instant::now() < failure.until
         {
             return Err(failure.to_io_error());
+        }
+        if policy.is_failing() {
+            return Err(io::Error::from_raw_os_error(ENETUNREACH));
         }
 
         // 3. Topology. A blackhole, not an error.
@@ -846,6 +929,267 @@ where
         let (provider, key) = self.inner.open()?;
         Ok((self.dhs.provider(provider), key))
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The shell harness — two endpoints, one network, a paused clock
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The identity every fixture endpoint runs on: [`CountingIdentity`] over
+/// the reference suite, so DH cost is observable and nothing on the path is
+/// `Send`.
+pub type TestIdentity = CountingIdentity<crate::packet::ReferenceSuite>;
+
+/// A fixture endpoint handle.
+pub type TestEndpoint = crate::shell::Endpoint<TestIdentity>;
+
+/// A fixture connection handle.
+pub type TestConnection = crate::shell::Connection<crate::packet::ReferenceSuite>;
+
+/// A fixture stage-0 introduction.
+pub type TestIntro = crate::shell::Intro<TestIdentity>;
+
+/// A fixture `connect()` future.
+pub type TestConnecting = crate::shell::Connecting<TestIdentity>;
+
+/// The static public key type the fixture uses.
+pub type TestPublicKey = crate::identity::PublicKeyOf<TestIdentity>;
+
+/// A cheap shared handle on one [`FlakyWire`].
+///
+/// [`crate::shell::EndpointBuilder::wire`] takes the wire **by value**, so
+/// without this a test could never reach the wire again to change its
+/// [`FlakyPolicy`] mid-run — which is what ruling 49's send-failure
+/// obligation needs. Cloning shares one wire: the send index, the RNG
+/// stream and the policy are all the same, so `drop_at` indices keep
+/// counting every send exactly once.
+#[derive(Clone)]
+pub struct SharedWire(Rc<FlakyWire>);
+
+impl SharedWire {
+    /// The address this wire is registered at.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.0.local_addr()
+    }
+
+    /// Replace the policy. Takes effect from the next send; the send index
+    /// is not reset.
+    pub fn set_policy(&self, policy: FlakyPolicy) {
+        self.0.set_policy(policy);
+    }
+
+    /// A clone of the current policy.
+    pub fn policy(&self) -> FlakyPolicy {
+        self.0.policy()
+    }
+}
+
+impl Wire for SharedWire {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, addr).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+}
+
+/// One endpoint of a [`Pair`], with everything a flow test asserts on.
+///
+/// No `Drop` impl, and the fields are `pub`, so a test can move the
+/// `endpoint` out and drop it on its own — which is exactly what S26's
+/// drop-order assertions need.
+pub struct Peer {
+    /// The handle under test. Dropping it stops that endpoint's driver
+    /// **only if** no `Connecting` or `Connection` of its own is still
+    /// alive (§16.3).
+    pub endpoint: TestEndpoint,
+    /// Where this endpoint lives on the [`Network`].
+    pub addr: SocketAddr,
+    /// A shared handle on its wire, for mid-run [`FlakyPolicy`] changes.
+    pub wire: SharedWire,
+    /// Its cumulative DH count (§6.1 prices the ladder cumulatively).
+    pub dhs: DhCounter,
+    /// Its static public key — what the *other* peer dials.
+    pub public_static: TestPublicKey,
+}
+
+/// Two endpoints on one in-memory [`Network`] — §16.10's kernel-free
+/// fixture, with drivers.
+///
+/// # Use it inside a `LocalSet`, on a paused clock
+///
+/// The shell is a `!Send` actor spawned with `tokio::task::spawn_local`
+/// (§16.3), so construction **panics outside a `LocalSet`**. [`local`] is
+/// the wrapper that supplies one:
+///
+/// ```no_run
+/// # use slither::testutil::{Pair, local};
+/// #[tokio::test(start_paused = true)]
+/// async fn a_flow_test() {
+///     local(async {
+///         let pair = Pair::seeded(0xC0FFEE);
+///         let (a, b) = pair.establish().await;
+///         a.close(0, b"bye").await;
+///         assert!(matches!(
+///             b.closed().await,
+///             slither::ConnectionLost::PeerClosed { .. }
+///         ));
+///     })
+///     .await;
+/// }
+/// ```
+///
+/// # Determinism
+///
+/// Everything is derived from the one seed: the network's loss and delay
+/// draws, both endpoints' §16.6 RNGs, and both static keys. Ruling 60 makes
+/// that a **MUST**, so there is no OS-entropy path here.
+pub struct Pair {
+    /// The fabric. `tap()`, `sends()`, `partition()` and friends live here.
+    pub net: Network,
+    /// The endpoint at `10.0.0.1:4001`. By convention the **dialler**.
+    pub a: Peer,
+    /// The endpoint at `10.0.0.2:4002`. By convention the **responder**.
+    pub b: Peer,
+}
+
+impl Pair {
+    /// Two endpoints at `10.0.0.1:4001` and `10.0.0.2:4002`, all draws
+    /// derived from `seed`, both on [`Config::new`].
+    ///
+    /// # Panics
+    ///
+    /// Outside a `tokio::task::LocalSet`.
+    ///
+    /// [`Config::new`]: crate::config::Config::new
+    pub fn seeded(seed: u64) -> Pair {
+        Pair::seeded_with(seed, crate::config::Config::new())
+    }
+
+    /// [`seeded`](Pair::seeded) with a `Config` both endpoints share.
+    ///
+    /// # Panics
+    ///
+    /// Outside a `tokio::task::LocalSet`.
+    pub fn seeded_with(seed: u64, config: crate::config::Config) -> Pair {
+        let net = Network::seeded(seed);
+        let a = Peer::spawn(&net, addr_a(), seed, 0xA1, config.clone());
+        let b = Peer::spawn(&net, addr_b(), seed, 0xB2, config);
+        Pair { net, a, b }
+    }
+
+    /// Dial `a` → `b` and drive §6.2's staged accept to completion,
+    /// returning both connections.
+    ///
+    /// The full 4-DH ladder, climbed the way an application climbs it:
+    /// `accept()` → `read_identity()` → `authenticate()` → `accept()`, run
+    /// concurrently with the dial so the paused clock advances. Nothing is
+    /// hidden — [`Peer::dhs`] still shows what each stage cost.
+    ///
+    /// # Panics
+    ///
+    /// If either side fails to establish.
+    pub async fn establish(&self) -> (TestConnection, TestConnection) {
+        let dial = async {
+            self.a
+                .endpoint
+                .connect(self.b.addr, self.b.public_static)
+                .expect("connect")
+                .await
+                .expect("the dial completed")
+        };
+        let accept = async {
+            let intro = self.b.endpoint.accept().await.expect("an introduction");
+            let claimed = intro.read_identity().await.expect("read_identity");
+            let proven = claimed.authenticate().await.expect("authenticate");
+            proven.accept().await.expect("accept")
+        };
+        tokio::join!(dial, accept)
+    }
+}
+
+impl Peer {
+    fn spawn(
+        net: &Network,
+        addr: SocketAddr,
+        seed: u64,
+        salt: u8,
+        config: crate::config::Config,
+    ) -> Peer {
+        let wire = SharedWire(Rc::new(net.endpoint(addr)));
+        let identity: TestIdentity = CountingIdentity::seeded(derive_seed(seed, salt));
+        let dhs = identity.counter();
+        let public_static = *crate::identity::Identity::public_static(&identity);
+        let endpoint = crate::shell::Endpoint::builder()
+            .identity(identity)
+            .wire(wire.clone())
+            .config(config)
+            .rng_seed(derive_seed(seed, salt ^ 0xFF))
+            .build();
+        Peer {
+            endpoint,
+            addr,
+            wire,
+            dhs,
+            public_static,
+        }
+    }
+}
+
+/// The `a` endpoint's address.
+pub fn addr_a() -> SocketAddr {
+    "10.0.0.1:4001".parse().expect("literal addr")
+}
+
+/// The `b` endpoint's address.
+pub fn addr_b() -> SocketAddr {
+    "10.0.0.2:4002".parse().expect("literal addr")
+}
+
+/// A third address, for the tests that need one that is not `a` or `b`.
+pub fn addr_c() -> SocketAddr {
+    "10.0.0.3:4003".parse().expect("literal addr")
+}
+
+/// Run `body` inside a `tokio::task::LocalSet`.
+///
+/// The shell is a `!Send` actor (§16.3), so every flow test needs one. Pair
+/// it with `#[tokio::test(start_paused = true)]` and every timer in the
+/// spec — the 5 s / 10 s / 15 s / 25 s / 25 ms / 90 s family — resolves in
+/// virtual time (§16.10).
+pub async fn local<F: std::future::Future>(body: F) -> F::Output {
+    tokio::task::LocalSet::new().run_until(body).await
+}
+
+/// Yield until the drivers have nothing left to do **at the current
+/// instant**.
+///
+/// The shell resolves `close()` as soon as the CLOSE is *sealed* (§16.2) —
+/// not once it has left the wire — so a test that closes and then asserts
+/// on the peer, or on [`Network::sends`], has to give both drivers a turn
+/// first. Awaiting anything does that; this is the spelling for when there
+/// is nothing else to await.
+///
+/// It advances **no** virtual time, deliberately: a test that needs a timer
+/// to fire should say so with `tokio::time::advance`, so the deadline it
+/// depends on is visible in the test rather than hidden in a fixture.
+pub async fn settle() {
+    for _ in 0..SETTLE_YIELDS {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Enough turns for a datagram to cross the fabric and be answered several
+/// times over, and cheap: a yield on a current-thread runtime is a queue
+/// push.
+const SETTLE_YIELDS: usize = 64;
+
+/// One 32-byte seed from the network seed and a per-endpoint salt.
+fn derive_seed(seed: u64, salt: u8) -> [u8; 32] {
+    let mut out = [salt; 32];
+    out[..8].copy_from_slice(&seed.to_le_bytes());
+    out
 }
 
 #[cfg(test)]

@@ -136,6 +136,27 @@ pub use error::{
 };
 pub use identity::{CurveOf, Identity, PrivateKeyOf, PublicKeyOf, SoftwareIdentity};
 pub use packet::{Channel, Handshake};
+pub use shell::{Claimed, Connecting, Connection, Endpoint, EndpointBuilder, Intro, Proven};
+
+/// A completed session's channel binding — **hiss's type, re-exported**.
+///
+/// **[RATIFIED 2026/08/15 — ruling 89]** `SessionId` is
+/// [`hiss::noise::SessionId`] and not a slither wrapper: hiss derives it
+/// from the handshake hash, both peers of a session produce the same value,
+/// and it is a *public* channel-binding value meant for out-of-band
+/// comparison — logging it, or a short-authentication-string check between
+/// peers. A slither wrapper would be a type that must be kept equal to
+/// hiss's by hand, for no gain.
+///
+/// # Its `Eq` is not constant-time
+///
+/// By hiss's deliberate choice. It carries no secret material and **must
+/// not be used to compare one**: reaching for it as a session token or an
+/// authentication comparison is the mistake this paragraph exists to
+/// prevent.
+///
+/// Read it off a live connection with [`Connection::session_id`].
+pub use hiss::noise::SessionId;
 
 // The three identifiers §16.4's surface names that a consumer must be able
 // to spell. They live inside the `pub(crate)` core, so they are re-exported

@@ -409,6 +409,12 @@ macro_rules! channel {
                 seal.next_counter()
             }
 
+            fn session_id(
+                seal: &::hiss::noise::DatagramSend<IK>,
+            ) -> &::hiss::noise::SessionId {
+                seal.session_id()
+            }
+
             fn seal(
                 seal: &mut ::hiss::noise::DatagramSend<IK>,
                 ad: &[u8],

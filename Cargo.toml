@@ -175,3 +175,23 @@ tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net",
 # derivations checked against a second data point. No runtime dependency, no
 # version change, no wire byte.
 hiss = { version = "0.3.2", features = ["x25519-cryptoxide"] }
+# ── Integration test targets ──────────────────────────────────────────────
+# The three story/spec suites drive two endpoints over `slither::testutil`,
+# which lives behind `test-util`. Declared here rather than as an inner
+# `#![cfg(feature = "test-util")]` so the requirement is visible in the
+# manifest and a feature-less `cargo test` skips the targets outright
+# instead of compiling three files down to "running 0 tests".
+#
+# Both `cargo test` and `cargo test --all-features` are release gates, so
+# these still run on every gated commit -- S1's acceptance test included.
+[[test]]
+name = "story_lifecycle"
+required-features = ["test-util"]
+
+[[test]]
+name = "story_dial"
+required-features = ["test-util"]
+
+[[test]]
+name = "spec_shell"
+required-features = ["test-util"]
