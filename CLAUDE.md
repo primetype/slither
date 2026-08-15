@@ -158,6 +158,38 @@ the spec rounds.
    in that file — including edits made for a different reason. I lost two
    accessors this way mid-review. Either commit first, or revert
    surgically.
+11. **A ruling's rationale must name a mechanism that exists — check it
+   against the code, not only the spec.** Rulings 87 and 89 were made one
+   day apart, both correct in conclusion, and both justified by a
+   mechanism that was not there: 87 said "`connect()` performs no DH",
+   describing a core factoring the frozen code does not have; 89 said
+   `SessionId` was "reachable from the seal half slither already holds",
+   which is true of hiss's concrete type and false of slither's
+   `Handshake::Seal`, an associated type with no bounds. Each cost real
+   work — 87's cost a shell-side mirror of a security invariant and
+   became ruling 90. **Ruling 64 already recorded that a rationale is not
+   reviewed by the act of ratifying its rule.** These are the same defect
+   in the maintainer's own text. Before a rationale ships, open the file
+   it describes.
+12. **A verification is only as good as its applicability: a true lemma
+   about the wrong state proves nothing.** The seam review ran two agents
+   blind to each other, and they disagreed on fact twice. Both times the
+   one who was wrong had verified something **true** — that
+   `core::Endpoint::accept()` guards against an existing static (it does;
+   it just does not fire when the accept is processed first), and that
+   `poll_output()` is idempotent *at* `Timeout` (it is; the question was
+   whether the cores **are** at `Timeout` when `deadline()` runs). Either
+   reviewer alone would have shipped a wrong verdict with a clean
+   argument attached. **When a review clears something, ask what state
+   the argument assumed — not whether the argument is sound.**
+13. **The fixture bounds the coverage.** Two of the four seam-review
+   findings were unreachable from all 451 tests **by construction**,
+   because `FlakyWire` models everything a *network* does and nothing a
+   *socket* does: a fabric that loses, delays, duplicates and reorders
+   cannot express "this send fails" or "this driver panics". No amount of
+   test-writing against it would have found them. When a whole class of
+   fault is absent from the results, suspect the harness before the
+   authors.
 
 ## Release gates (hard rules)
 
