@@ -104,6 +104,12 @@ pub(crate) struct DataHeader {
 
 impl DataHeader {
     /// The only way to build one. The index is the **peer's**.
+    // The endpoint core (slice 2a) builds the two handshake headers; the
+    // Data header's builder waits for the connection core's send path
+    // (§7.1, slice 4). Slice 1's module-wide `dead_code` allow came off
+    // when `core` landed, so the one item still ahead of its consumer says
+    // so on its own line.
+    #[allow(dead_code)]
     pub(crate) const fn new(receiver_index: u32, counter: u64) -> Self {
         Self {
             packet_type: constants::PKT_DATA,

@@ -130,6 +130,16 @@ the spec rounds.
    tests. One author writing both can make both wrong in a mutually
    consistent way, and CI stays green. Write the test from the story and
    its spec section first; implement against it.
+   **Parallel agents must own disjoint file paths — no exceptions.** In
+   slice 2a the implementer's placeholder stub overwrote the independent
+   author's 68 tests, because both briefs named `src/core/tests.rs` and
+   the finish order decided who won; in slice 1 the same overlap existed
+   and the order happened to favour the tests, which is why it went
+   unnoticed. If the implementer needs a module to compile against, it
+   declares `#[cfg(test)] mod tests;` and **creates nothing** — the file
+   is the test author's alone. A brief that hands two concurrent agents
+   one path has a race in it, and "it worked last time" is what a race
+   looks like from the outside.
 7. **Do not report a gate as green without running it.** Paste the
    command and its output.
 

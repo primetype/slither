@@ -774,6 +774,80 @@ impl<P: DhProvider<P256>> DhProvider<P256> for CountingProvider<P> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// The counting identity
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A [`SoftwareIdentity`](crate::identity::SoftwareIdentity) whose every handshake runs on a
+/// [`CountingProvider`] sharing **one** [`DhCounter`].
+///
+/// The count is therefore **endpoint-wide and cumulative across
+/// handshakes**, which is exactly what §6.1's ladder prices: 0 DH at park,
+/// 1 after `read_identity()`, 2 after `authenticate()`, 4 after `accept()`.
+///
+/// # It is `!Send`, and that is the point (S21)
+///
+/// [`DhCounter`] holds an `Rc<Cell<_>>`, so this identity and every
+/// provider it mints are `!Send`. An endpoint driven over it is a
+/// **compile-time proof** that no `Send` bound sits anywhere on the DH
+/// path: add one and the tests stop compiling, which reddens the build and
+/// the test gate together. That is the cheapest available enforcement of
+/// the requirement an iOS Secure Enclave key exists to state.
+pub struct CountingIdentity<S = crate::packet::ReferenceSuite> {
+    inner: crate::identity::SoftwareIdentity<S, ChaCha20Rng>,
+    dhs: DhCounter,
+}
+
+impl<S> CountingIdentity<S> {
+    /// A fresh identity whose static key and per-handshake sub-seeds are
+    /// derived from `seed`, so a whole endpoint is replayable.
+    pub fn seeded(seed: [u8; 32]) -> Self {
+        let inner = crate::identity::SoftwareIdentity::generate(ChaCha20Rng::from_seed(seed))
+            .expect("a seeded ChaCha20 stream yields a valid P-256 scalar");
+        Self {
+            inner,
+            dhs: DhCounter::new(),
+        }
+    }
+
+    /// The shared DH call count. Cheap to clone; clones observe the same
+    /// count.
+    pub fn counter(&self) -> DhCounter {
+        self.dhs.clone()
+    }
+
+    /// The number of `dh` calls this identity has performed.
+    pub fn dhs(&self) -> u32 {
+        self.dhs.get()
+    }
+}
+
+impl<S> crate::identity::Identity for CountingIdentity<S>
+where
+    S: crate::packet::Handshake<Curve = P256>,
+{
+    type Suite = S;
+    type Provider = CountingProvider<hiss::provider::EphemeralOnly<ChaCha20Rng>>;
+    type Error = crate::identity::SoftwareIdentityError;
+
+    fn public_static(&self) -> &<P256 as Curve>::PublicKey {
+        self.inner.public_static()
+    }
+
+    fn open(
+        &self,
+    ) -> Result<
+        (
+            Self::Provider,
+            <Self::Provider as CryptoKeyProvider<P256>>::PrivateKey,
+        ),
+        Self::Error,
+    > {
+        let (provider, key) = self.inner.open()?;
+        Ok((self.dhs.provider(provider), key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

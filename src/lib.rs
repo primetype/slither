@@ -74,6 +74,14 @@
 //!   the derived ones re-derived as compile-time assertions.
 //! - [`error`] — the closed error taxonomy of §18.1, plus `ConfigError`.
 //!   Its ten types are re-exported at the crate root.
+//! - [`packet`] — §2–§5's wire: the suite declaration, §6.1's handshake
+//!   ladder as a trait, the three headers, mac1 and §3.1's gate.
+//! - [`identity`] — the static-key seam. A consumer implements
+//!   [`Identity`] to put its key behind hardware; [`SoftwareIdentity`] is
+//!   the in-memory default.
+//! - [`config`] — endpoint configuration and §16.5's injected wall clock.
+//! - `core` — §16.4's two sans-io state machines. Crate-internal until the
+//!   driver that can drive them exists.
 //! - [`shell`] — the I/O shell. Slice by slice it grows the driver and the
 //!   handles; today it carries [`shell::wire::Wire`], the datagram seam an
 //!   application supplies.
@@ -97,20 +105,44 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod constants;
 pub mod error;
+pub mod identity;
 pub mod packet;
 pub mod shell;
 pub(crate) mod varint;
 
+// §16.4's two cores. `pub(crate)` in this slice, deliberately: nothing
+// outside the crate can drive them until the driver lands, so publishing
+// the surface now would freeze an unusable one under semver — and §16.6
+// makes a build that accepts a caller-chosen RNG seed "security-relevant",
+// a decision that belongs to the slice with an opinion about the public
+// surface. Promotion later is additive; demotion is breaking.
+//
+// NOTE for every file in this crate: a crate-level `mod core` makes a bare
+// `use core::…` ambiguous against the `core` crate in the extern prelude.
+// Write `::core::…` for the language core and `crate::core::…` for this
+// module — the convention the packet layer already follows.
+pub(crate) mod core;
+
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
 
+pub use config::{Config, SystemClock, WallClock};
 pub use error::{
     AcceptError, AuthError, ConfigError, ConnectError, ConnectionLost, DatagramError, IntroError,
     MessageError, ReadError, WriteError,
 };
-pub use packet::Channel;
+pub use identity::{CurveOf, Identity, PrivateKeyOf, PublicKeyOf, SoftwareIdentity};
+pub use packet::{Channel, Handshake};
+
+// The three identifiers §16.4's surface names that a consumer must be able
+// to spell. They live inside the `pub(crate)` core, so they are re-exported
+// here to be publicly *reachable* — `WallClock::now()` returns a
+// [`Timestamp`], and a public signature naming an unreachable type is a
+// rustdoc break, not merely a lint.
+pub use crate::core::{ConnectionId, IntroId, Timestamp};
 
 /// The `hiss` slither was built against, re-exported so the version you
 /// must match is findable.

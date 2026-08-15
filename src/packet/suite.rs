@@ -281,6 +281,131 @@ macro_rules! channel {
                 + $crate::constants::MAC1_LEN;
         }
 
+        // §6.1's ladder, routed through the suite so a generic
+        // `core::Endpoint<I>` can call it. `hiss::noise!` generates its
+        // transitions as INHERENT methods on per-state types, which no
+        // generic caller can name; this block is the only place those
+        // names are written down, and it is mechanical — every identifier
+        // below is `IK` plus hiss's fixed `{Role}Msg{n}[Intro]` suffix.
+        //
+        // Purely additive: no item of the `Channel` impl above moves, so
+        // slice 1's frozen wire tests are untouched.
+        impl $crate::packet::Handshake for $name {
+            type Initiator<P: ::hiss::provider::DhProvider<$curve>> = IKInitiatorMsg1<P>;
+            type InitiatorSent<P: ::hiss::provider::DhProvider<$curve>> = IKInitiatorMsg2<P>;
+            type Responder<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg1<P>;
+            type Msg1Intro<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg1Intro<P>;
+            type ResponderRead<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg2<P>;
+
+            type Transport = ::hiss::noise::Transport<IK>;
+            type Seal = ::hiss::noise::DatagramSend<IK>;
+            type Open = ::hiss::noise::DatagramRecv<IK>;
+
+            fn initiator<P: ::hiss::provider::DhProvider<$curve>>(
+                provider: P,
+                prologue: &[u8],
+                remote_static: <$curve as ::hiss::curve::Curve>::PublicKey,
+            ) -> IKInitiatorMsg1<P> {
+                IK::initiator(provider, prologue, remote_static)
+            }
+
+            fn write_msg1<P: ::hiss::provider::DhProvider<$curve>>(
+                state: IKInitiatorMsg1<P>,
+                static_key: <P as ::hiss::provider::CryptoKeyProvider<$curve>>::PrivateKey,
+                payload: &[u8; $crate::constants::MSG1_PAYLOAD_LEN],
+            ) -> ::core::result::Result<
+                (::std::vec::Vec<u8>, IKInitiatorMsg2<P>),
+                ::hiss::noise::HandshakeError,
+            > {
+                let (bytes, next) = state.write_message_1(static_key, payload)?;
+                ::core::result::Result::Ok((bytes.to_vec(), next))
+            }
+
+            fn read_msg2<P: ::hiss::provider::DhProvider<$curve>>(
+                state: IKInitiatorMsg2<P>,
+                msg2: &[u8],
+            ) -> ::core::result::Result<
+                ::hiss::noise::Transport<IK>,
+                ::hiss::noise::HandshakeError,
+            > {
+                // §3.1's gate admits only an exactly-`RESP_PACKET_LEN`
+                // response, so this conversion cannot fail for anything
+                // the core routes here. It is written as an error rather
+                // than an `unwrap` because a panic reachable from a
+                // received packet is the wrong failure for a transport.
+                let exact: &[u8; IK::MSG2_SIZE] = match ::core::convert::TryFrom::try_from(msg2) {
+                    ::core::result::Result::Ok(m) => m,
+                    ::core::result::Result::Err(_) => {
+                        return ::core::result::Result::Err(
+                            ::hiss::noise::HandshakeError::MessageTooShort,
+                        );
+                    }
+                };
+                state.read_message_2(exact)
+            }
+
+            fn responder<P: ::hiss::provider::DhProvider<$curve>>(
+                provider: P,
+                prologue: &[u8],
+                static_key: <P as ::hiss::provider::CryptoKeyProvider<$curve>>::PrivateKey,
+            ) -> ::core::result::Result<IKResponderMsg1<P>, ::hiss::noise::HandshakeError> {
+                IK::responder(provider, prologue, static_key)
+            }
+
+            fn read_msg1_intro<P: ::hiss::provider::DhProvider<$curve>>(
+                state: IKResponderMsg1<P>,
+                msg1: &[u8],
+            ) -> ::core::result::Result<
+                (
+                    <$curve as ::hiss::curve::Curve>::PublicKey,
+                    IKResponderMsg1Intro<P>,
+                ),
+                ::hiss::noise::HandshakeError,
+            > {
+                let exact: &[u8; IK::MSG1_SIZE] = match ::core::convert::TryFrom::try_from(msg1) {
+                    ::core::result::Result::Ok(m) => m,
+                    ::core::result::Result::Err(_) => {
+                        return ::core::result::Result::Err(
+                            ::hiss::noise::HandshakeError::MessageTooShort,
+                        );
+                    }
+                };
+                state.read_message_1_intro(exact)
+            }
+
+            fn complete<P: ::hiss::provider::DhProvider<$curve>>(
+                mid: IKResponderMsg1Intro<P>,
+            ) -> ::core::result::Result<
+                (
+                    [u8; $crate::constants::MSG1_PAYLOAD_LEN],
+                    IKResponderMsg2<P>,
+                ),
+                ::hiss::noise::HandshakeError,
+            > {
+                mid.complete()
+            }
+
+            fn write_msg2<P: ::hiss::provider::DhProvider<$curve>>(
+                state: IKResponderMsg2<P>,
+            ) -> ::core::result::Result<
+                (::std::vec::Vec<u8>, ::hiss::noise::Transport<IK>),
+                ::hiss::noise::HandshakeError,
+            > {
+                let (bytes, transport) = state.write_message_2()?;
+                ::core::result::Result::Ok((bytes.to_vec(), transport))
+            }
+
+            fn into_datagram(
+                transport: ::hiss::noise::Transport<IK>,
+                epoch_size: ::core::num::NonZeroU64,
+            ) -> (
+                ::hiss::noise::DatagramSend<IK>,
+                ::hiss::noise::DatagramRecv<IK>,
+            ) {
+                transport.into_datagram_with_epoch(epoch_size)
+            }
+        }
+
         // slither's §2.3 arithmetic against hiss's own computed sizes, for
         // EVERY suite the macro stamps. Two things ride on this pair:
         //

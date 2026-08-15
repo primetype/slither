@@ -1,0 +1,702 @@
+//! §16.4's `core::Endpoint<I: Identity>` — the sans-io endpoint core.
+//!
+//! One socket's worth of protocol state: the stage-0 introduction queue
+//! (§6.3), the timestamp guard (§17.1), the index and static tables
+//! (§17.2–17.4), and every in-flight outbound initiation (§5.5). It reads
+//! no clock, performs no I/O, and spawns nothing.
+//!
+//! # The drain contract
+//!
+//! Every mutating call is followed by draining [`poll_output`] to the
+//! terminal `Timeout(Option<Instant>)`, which is both the drain sentinel
+//! and the next-deadline announcement. **Output order within one drain is
+//! generation order** and is normative (§16.4).
+//!
+//! # What arrives where
+//!
+//! * A `PKT_HANDSHAKE_INIT` that passes §3.1's exact-length gate and mac1
+//!   is offered to the queue at **0 DH** and surfaces as `IntroReady`.
+//! * A `PKT_HANDSHAKE_RESP` is matched **by index, never by address**
+//!   (§5.5 step 4), and completes the pending it belongs to.
+//! * A `PKT_DATA` routes by `receiver_index` to a live session, or is
+//!   dropped. §17.3's corollary — "a datagram that routes by index but
+//!   fails to open touches nothing" — is the connection core's to keep;
+//!   the endpoint's part is that a miss changes nothing here.
+//!
+//! # The slice boundary this core knowingly carries
+//!
+//! §5.4's post-`ss` responder rule is three-valued: **LIVE** / **PENDING**
+//! / **NONE**. Only NONE is self-contained in the sections this slice
+//! implements — LIVE needs §6.4's re-home and its `Replaced` teardown,
+//! PENDING needs §6.6–6.7's tie-break, and both are slice 7. Slice 2a
+//! implements NONE fully and returns [`AcceptError::Stale`] for the other
+//! two.
+//!
+//! `Stale` is *already correct* for the PENDING/tie-break-winner branch. It
+//! is **not** correct in general for LIVE — a replacement whose timestamp
+//! passes both tests must succeed — so that arm is a documented, deliberate
+//! boundary rather than a silent approximation. What it does preserve is
+//! §16.1's **one session per peer static**, which returning `Stale` cannot
+//! violate. Slice 7 replaces the arm.
+//!
+//! [`poll_output`]: Endpoint::poll_output
+
+pub(crate) mod guard;
+pub(crate) mod handshake;
+pub(crate) mod intro_queue;
+pub(crate) mod staged;
+pub(crate) mod tables;
+
+use std::collections::{BTreeMap, VecDeque};
+use std::net::SocketAddr;
+use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
+
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
+
+use crate::config::Config;
+use crate::constants;
+use crate::core::{
+    Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession, Install, Timestamp,
+    ToEndpoint, Transmit,
+};
+use crate::error::ConnectError;
+use crate::identity::{Identity, PublicKeyOf};
+use crate::packet::{Handshake, Inbound, Mac1Key, classify};
+
+use self::guard::TimestampGuard;
+use self::intro_queue::{Arrival, IntroQueue};
+use self::staged::InitiatorSent;
+use self::tables::{IndexTables, StaticEntry, StaticMap, StaticState};
+
+pub use self::staged::IntroId;
+
+/// An outbound initiation, from `connect()` until it completes, gives up,
+/// or is cancelled. §5.5.
+///
+/// **Every field marked "fresh every attempt" is exactly that** — §5.5 rule
+/// 2: *"Every retransmit is a completely fresh initiation — new ephemeral,
+/// new random index, new strictly-greater timestamp."*
+struct Pending<I: Identity> {
+    conn: ConnectionId,
+    remote: SocketAddr,
+    remote_static: PublicKeyOf<I>,
+    remote_static_bytes: Vec<u8>,
+    /// Derived once from the peer's static: mac1 on an outbound msg1 is
+    /// keyed on the **recipient's** key.
+    peer_mac1: Mac1Key,
+    /// The current attempt's index — fresh every attempt. Held apart from
+    /// [`state`](Pending::state) because `read_msg2` consumes the state
+    /// whether it succeeds or fails, and the route must still be
+    /// retirable afterwards.
+    sender_index: Option<u32>,
+    /// hiss's post-msg1 initiator state — fresh every attempt. `None` when
+    /// this interval's attempt could not be built, or once a completion has
+    /// consumed it.
+    state: Option<Box<InitiatorSent<I>>>,
+    /// Armed at `RETRANSMIT_BASE + U[0, RETRANSMIT_JITTER_MAX]`. **Fixed,
+    /// not exponential** — §13's exponential PTO governs the data path
+    /// alone.
+    next_retransmit: Instant,
+    /// `HANDSHAKE_GIVEUP` after the **first** attempt, never re-based by a
+    /// retransmit.
+    give_up_at: Instant,
+    /// §5.5 rule 3: one completion attempt per retransmit interval.
+    attempt_spent: bool,
+}
+
+/// §16.4's endpoint core.
+pub(crate) struct Endpoint<I: Identity> {
+    config: Config,
+    identity: I,
+    /// Our static's canonical §2.4 octets, cached: mac1 keying and every
+    /// table read want them, and `public_static()` promises to be cheap.
+    our_static_bytes: Vec<u8>,
+    /// mac1 keyed on **our** static — the key an inbound packet is verified
+    /// against, because we are its recipient.
+    our_mac1: Mac1Key,
+    /// §16.6's one seeded endpoint RNG: every index, every jitter draw and
+    /// every connection sub-seed comes from it.
+    rng: ChaCha20Rng,
+    outputs: VecDeque<EndpointOutput<I::Suite>>,
+    intros: IntroQueue<I>,
+    guard: TimestampGuard,
+    indices: IndexTables,
+    statics: StaticMap,
+    /// Keyed order, so a drain over several pendings is deterministic —
+    /// §16.4 makes generation order normative and a `HashMap` would make it
+    /// a coin toss.
+    pendings: BTreeMap<ConnectionId, Pending<I>>,
+    /// §17.2's endpoint-global monotonic forcing. Survives across
+    /// connection generations, so close-and-reconnect still emits strictly
+    /// greater.
+    last_init_timestamp: Option<Timestamp>,
+    next_connection: u64,
+}
+
+impl<I: Identity> Endpoint<I> {
+    /// §16.4's constructor.
+    ///
+    /// `rng_seed` seeds the **one** endpoint RNG (§16.6). A build that lets
+    /// a caller choose it is security-relevant — indices must be
+    /// unpredictable off-path, which is what §5.5's on-path-only completion
+    /// spend rests on — and that is why this core is crate-internal in this
+    /// slice: publishing the constructor is a decision for the slice that
+    /// has an opinion about the public surface.
+    pub(crate) fn new(_now: Instant, config: Config, identity: I, rng_seed: [u8; 32]) -> Self {
+        let our_static_bytes = identity.public_static().as_ref().to_vec();
+        let our_mac1 = Mac1Key::derive(&our_static_bytes);
+        let intros = IntroQueue::new(config.intro_queue_cap(), config.intro_max_per_source());
+        Self {
+            config,
+            identity,
+            our_static_bytes,
+            our_mac1,
+            rng: ChaCha20Rng::from_seed(rng_seed),
+            outputs: VecDeque::new(),
+            intros,
+            guard: TimestampGuard::default(),
+            indices: IndexTables::default(),
+            statics: StaticMap::default(),
+            pendings: BTreeMap::new(),
+            last_init_timestamp: None,
+            next_connection: 0,
+        }
+    }
+
+    /// The identity this endpoint runs on.
+    pub(crate) fn identity(&self) -> &I {
+        &self.identity
+    }
+
+    /// Our static's canonical §2.4 octets.
+    pub(crate) fn our_static(&self) -> &[u8] {
+        &self.our_static_bytes
+    }
+
+    /// §17.4's `replacement_basis` for a peer static.
+    ///
+    /// `None` — this endpoint holds no connection for that static.
+    /// `Some(None)` — **we dialled** it.
+    /// `Some(Some(t))` — **we responded** to it, at initiation timestamp `t`.
+    ///
+    /// Not part of §16.4's API. It exists because §6.4 — the basis's only
+    /// reader — is slice 7, so without a reader here the field is written,
+    /// never checked, and a value written wrongly today would surface as a
+    /// slice-7 bug. `pub(crate)`, so it costs the public surface nothing.
+    pub(crate) fn replacement_basis(&self, peer_static: &[u8]) -> Option<Option<Timestamp>> {
+        self.statics
+            .get(peer_static)
+            .map(|entry| entry.replacement_basis)
+    }
+
+    /// §17.4's hint set: **the pending tables' dialled addresses alone**.
+    ///
+    /// A projection over the static map rather than a stored set — §17.4
+    /// defines the hint set as being those addresses, so deriving it makes
+    /// "established connections contribute no hints" true by construction.
+    /// Consultation is §6.5, slice 7; this exists for the same reason as
+    /// [`replacement_basis`](Self::replacement_basis).
+    pub(crate) fn hints(&self) -> Vec<SocketAddr> {
+        let mut hints: Vec<SocketAddr> = self.statics.hints().collect();
+        hints.sort_unstable();
+        hints
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.4's drain
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Drain one output. Terminates in `Timeout`, which announces the next
+    /// deadline (§16.4, §16.5).
+    pub(crate) fn poll_output(&mut self) -> EndpointOutput<I::Suite> {
+        match self.outputs.pop_front() {
+            Some(output) => output,
+            None => EndpointOutput::Timeout(self.deadline()),
+        }
+    }
+
+    /// §16.5, verbatim: *"The endpoint core's deadline is the min over its
+    /// pendings' retransmit/give-up deadlines, the parked intros'
+    /// expiries, and the timestamp-guard orphan aging (§17.1)."*
+    ///
+    /// That sentence is the complete list of endpoint-core timers, so this
+    /// is a scan over exactly three families. A timer wheel buys nothing at
+    /// these cardinalities; slice 3 may replace it when it builds §16.5's
+    /// timer table.
+    ///
+    /// The guard's own deadline is computed relative to the *last* instant
+    /// the core was told about, because an unpinned orphan's aging is
+    /// measured from its admission and nothing here reads a clock.
+    fn deadline(&self) -> Option<Instant> {
+        let pendings = self
+            .pendings
+            .values()
+            .map(|p| p.next_retransmit.min(p.give_up_at))
+            .min();
+        let intros = self.intros.next_deadline();
+        let orphans = self.guard.next_orphan_deadline();
+
+        [pendings, intros, orphans].into_iter().flatten().min()
+    }
+
+    fn emit(&mut self, output: EndpointOutput<I::Suite>) {
+        self.outputs.push_back(output);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.6 — the seeded RNG
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.6's per-connection sub-seed, **drawn even while unused**.
+    ///
+    /// The parenthesis in §16.6 is written for exactly this slice: the
+    /// connection core uses no randomness until slice 4, and omitting the
+    /// draw now would silently shift every seeded test's index and jitter
+    /// sequence when slice 4 added it.
+    fn draw_sub_seed(&mut self) -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        self.rng.fill_bytes(&mut seed);
+        seed
+    }
+
+    /// §5.5 rule 2's `RETRANSMIT_BASE + U[0, RETRANSMIT_JITTER_MAX]`.
+    ///
+    /// A modulo draw. The bias against a 333 ms bound from a 32-bit draw is
+    /// on the order of 2⁻²⁴ and this is scheduling jitter, not key
+    /// material; the unpredictability requirement in §16.6 is on **indices**.
+    fn draw_retransmit_delay(&mut self) -> Duration {
+        let span = constants::RETRANSMIT_JITTER_MAX.as_nanos() as u64 + 1;
+        let jitter = u64::from(self.rng.next_u32()) % span;
+        constants::RETRANSMIT_BASE + Duration::from_nanos(jitter)
+    }
+
+    fn next_connection_id(&mut self) -> ConnectionId {
+        let id = ConnectionId::from_raw(self.next_connection);
+        self.next_connection += 1;
+        id
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §17.2 — the outbound timestamp
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §5.3's initiation timestamp: the wall clock, **forced strictly
+    /// greater** than the last this endpoint emitted.
+    ///
+    /// Endpoint-global (§17.2), so a retransmit stays admissible when a
+    /// coarse clock has not advanced and close-and-reconnect still emits
+    /// strictly greater. The forcing step is one nanosecond because that is
+    /// the only unit the 12-byte encoding has.
+    fn draw_timestamp(&mut self) -> Timestamp {
+        let wall = self.config.clock().now();
+        let forced = match self.last_init_timestamp {
+            Some(previous) if wall <= previous => previous.succ(),
+            _ => wall,
+        };
+        self.last_init_timestamp = Some(forced);
+        forced
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §5.5 — outbound initiation
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.4's `connect`.
+    ///
+    /// Refuses a static that already has a connection — live or still
+    /// dialling. `AlreadyConnected` for a live one is documentation
+    /// obligation #1 ("reconnecting is `close()` then dial"); for a
+    /// *pending* one it is forced by §16.1, since admitting a second dial
+    /// would let both complete and leave two sessions on one static.
+    pub(crate) fn connect(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        remote_static: PublicKeyOf<I>,
+    ) -> Result<(ConnectionId, Connection<I::Suite>), ConnectError> {
+        let key = remote_static.as_ref().to_vec();
+        if self.statics.get(&key).is_some() {
+            return Err(ConnectError::AlreadyConnected);
+        }
+
+        let conn = self.next_connection_id();
+        let sub_seed = self.draw_sub_seed();
+        let peer_mac1 = Mac1Key::derive(&key);
+
+        let mut pending = Pending {
+            conn,
+            remote,
+            remote_static,
+            remote_static_bytes: key.clone(),
+            peer_mac1,
+            sender_index: None,
+            state: None,
+            next_retransmit: now,
+            give_up_at: now + constants::HANDSHAKE_GIVEUP,
+            attempt_spent: false,
+        };
+
+        self.statics.insert(
+            key.clone(),
+            StaticEntry {
+                conn,
+                state: StaticState::Pending,
+                dialled: Some(remote),
+                // §17.4: `None` when we dialled. Written once, never
+                // updated, read only by §6.4 in slice 7.
+                replacement_basis: None,
+            },
+        );
+        // §17.1: an in-flight outbound pending pins its static's guard
+        // entry — and a pin never creates one, so for a static we have
+        // only ever dialled this is a no-op, which is exactly §17.1's
+        // "we hold no entry at all".
+        self.guard.pin(&key);
+
+        self.start_attempt(now, &mut pending);
+        self.pendings.insert(conn, pending);
+
+        Ok((conn, Connection::connecting(sub_seed)))
+    }
+
+    /// Build and send one attempt, and arm the next retransmit.
+    ///
+    /// The same function serves the first send and every retransmit, which
+    /// is what makes §5.5's "every retransmit is a completely fresh
+    /// initiation" true by construction rather than by discipline.
+    fn start_attempt(&mut self, now: Instant, pending: &mut Pending<I>) {
+        // Retire the previous attempt's route first: §5.5 requires a
+        // completion to match the *current* attempt's index, so a msg2 for
+        // a superseded attempt must stop routing.
+        if let Some(previous) = pending.sender_index.take() {
+            self.indices.remove_pending(previous);
+        }
+        pending.state = None;
+        pending.attempt_spent = false;
+        pending.next_retransmit = now + self.draw_retransmit_delay();
+
+        let sender_index = self.indices.mint(&mut self.rng);
+        let timestamp = self.draw_timestamp();
+
+        // A local provider failure — an enclave that is locked, a key
+        // handle that will not open — is **not** a protocol condition, and
+        // §18.1's `ConnectError` is a closed two-variant taxonomy with no
+        // room for one. So the attempt is simply not built: the train
+        // continues, the next retransmit tries again, and a provider that
+        // never recovers surfaces as the outcome the spec *does* define —
+        // `TimedOut` at `HANDSHAKE_GIVEUP`. Inventing an error variant
+        // here would be a change to a ratified taxonomy.
+        let Ok((provider, our_key)) = self.identity.open() else {
+            return;
+        };
+        let state = <I::Suite as Handshake>::initiator(
+            provider,
+            constants::PROLOGUE,
+            pending.remote_static.clone(),
+        );
+        let Ok((msg1, sent)) =
+            <I::Suite as Handshake>::write_msg1(state, our_key, &timestamp.encode())
+        else {
+            return;
+        };
+
+        let data = handshake::frame_init(sender_index, &msg1, &pending.peer_mac1);
+        self.indices.insert_pending(sender_index, pending.conn);
+        pending.sender_index = Some(sender_index);
+        pending.state = Some(Box::new(sent));
+        self.emit(EndpointOutput::Transmit(Transmit {
+            to: pending.remote,
+            data,
+        }));
+    }
+
+    /// Release every trace of a pending. Shared by give-up and cancel.
+    fn drop_pending(&mut self, conn: ConnectionId) -> Option<Pending<I>> {
+        let pending = self.pendings.remove(&conn)?;
+        if let Some(index) = pending.sender_index {
+            self.indices.remove_pending(index);
+        }
+        self.statics.remove(&pending.remote_static_bytes);
+        self.guard.unpin(&pending.remote_static_bytes);
+        Some(pending)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.4 — inbound datagrams
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.4's `handle_datagram`.
+    pub(crate) fn handle_datagram(
+        &mut self,
+        now: Instant,
+        src: SocketAddr,
+        datagram: &[u8],
+    ) -> Disposition {
+        // §3.1's gate: `None` **is** the drop — no error, no trace, no
+        // counter, and nothing that distinguishes it from a datagram the
+        // endpoint handled itself.
+        let Some(inbound) = classify::<I::Suite>(datagram) else {
+            return Disposition::Done;
+        };
+
+        match inbound {
+            Inbound::Init {
+                header,
+                msg1,
+                preimage,
+                mac1,
+            } => {
+                // 0 DH so far, and 0 DH through the whole of this arm.
+                if !self.our_mac1.verify(preimage, mac1) {
+                    return Disposition::Done;
+                }
+                self.park_initiation(now, src, header.sender_index, msg1);
+                Disposition::Done
+            }
+
+            Inbound::Resp {
+                header,
+                msg2,
+                preimage,
+                mac1,
+            } => {
+                self.complete_initiation(
+                    header.receiver_index,
+                    header.sender_index,
+                    msg2,
+                    preimage,
+                    mac1,
+                );
+                Disposition::Done
+            }
+
+            Inbound::Data { header, .. } => match self.indices.session(header.receiver_index) {
+                Some(conn) => Disposition::ForConnection(conn),
+                None => Disposition::Done,
+            },
+        }
+    }
+
+    /// §6.3's arrival, and the `IntroReady` it may surface.
+    fn park_initiation(&mut self, now: Instant, src: SocketAddr, sender_index: u32, msg1: &[u8]) {
+        let outcome = self.intros.arrive(now, src, sender_index, msg1);
+        if let Some(evicted) = outcome.evicted {
+            // Only unconsumed entries are evictable, and an unconsumed
+            // entry has neither a provisional guard write nor a pin — but
+            // release both anyway rather than assert, because a leak here
+            // is a permanent, silent denial for a real peer.
+            self.release_chain_guard_state(evicted.guard_undo, evicted.guard_pin);
+        }
+        match outcome.arrival {
+            Arrival::Parked(id) => self.emit(EndpointOutput::IntroReady(id, src)),
+            // §6.3 rule 5: a replacement is transparent — same `IntroId`,
+            // newest bytes, and **no second surfacing**.
+            Arrival::Refreshed(_) | Arrival::Dropped => {}
+        }
+    }
+
+    /// §5.5 rules 3–5: complete a pending from its msg2.
+    ///
+    /// The order is what makes §5.5's claim true — *"a guessed-index or
+    /// mac1-invalid msg2 can never spend anything"*:
+    ///
+    /// 1. exact length (already done by §3.1's gate, ruling 65);
+    /// 2. **index** match against the current attempt — and **the source
+    ///    address is deliberately ignored**, because the initiator anchors
+    ///    at the address it dialled and the peer roams in later (§7.3);
+    /// 3. mac1, against **our** key, since we are the recipient;
+    /// 4. the interval's attempt, if already spent, drops;
+    /// 5. the attempt is spent **before** the crypto runs, so a failed
+    ///    completion costs the interval and the next retransmit refreshes
+    ///    it.
+    fn complete_initiation(
+        &mut self,
+        receiver_index: u32,
+        peer_index: u32,
+        msg2: &[u8],
+        preimage: &[u8],
+        mac1: &[u8],
+    ) {
+        let Some(conn) = self.indices.pending(receiver_index) else {
+            return;
+        };
+        if !self.our_mac1.verify(preimage, mac1) {
+            return;
+        }
+
+        // Take the attempt's state, spending the interval, before any
+        // crypto runs. Everything the completion needs is copied out here
+        // so the pending's borrow ends before the endpoint's tables move.
+        let (state, our_index, anchor, key) = {
+            let Some(pending) = self.pendings.get_mut(&conn) else {
+                return;
+            };
+            if pending.attempt_spent || pending.sender_index != Some(receiver_index) {
+                return;
+            }
+            pending.attempt_spent = true;
+            let Some(state) = pending.state.take() else {
+                return;
+            };
+            (
+                state,
+                receiver_index,
+                pending.remote,
+                pending.remote_static_bytes.clone(),
+            )
+        };
+
+        let Ok(transport) = <I::Suite as Handshake>::read_msg2(*state, msg2) else {
+            // The attempt stays spent and the state is gone — `read_msg2`
+            // consumes it either way. Not fatal: the next scheduled
+            // retransmit builds a completely fresh initiation, and the
+            // train still ends at `HANDSHAKE_GIVEUP`.
+            return;
+        };
+
+        let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, Self::epoch_size());
+
+        // §5.5 rule 5: our receiver index is our own `sender_index`; the
+        // peer's is the response's. §5.5 rule 4: the anchor is the address
+        // we **dialled**, not wherever the msg2 came from.
+        let session = EstablishedSession {
+            seal,
+            open,
+            our_index,
+            peer_index,
+            anchor,
+        };
+
+        self.pendings.remove(&conn);
+        self.indices.remove_pending(our_index);
+        self.indices.insert_session(our_index, conn);
+        // The static stays claimed by this connection, its
+        // `replacement_basis` still `None` — §17.4: `None` when we dialled.
+        self.statics.promote(&key);
+
+        self.emit(EndpointOutput::ToConnection(conn, Install { session }));
+    }
+
+    /// §7.7's epoch size, for hiss's ratcheting datagram split.
+    ///
+    /// The ratchet schedule itself is §7.7 and lands in slice 3; this is
+    /// the one parameter the split call needs today, and it is the ratified
+    /// constant rather than a placeholder.
+    fn epoch_size() -> NonZeroU64 {
+        NonZeroU64::new(constants::REKEY_EPOCH_MSGS).expect("REKEY_EPOCH_MSGS is nonzero")
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.5 — timers
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.4's `handle_timeout`. **Idempotent**: every due deadline is
+    /// disarmed or advanced before its logic runs, so calling twice at one
+    /// instant is a no-op the second time.
+    pub(crate) fn handle_timeout(&mut self, now: Instant) {
+        // §6.3 rule 4: silent eviction, emitting nothing — but a consumed
+        // chain's provisional guard write must still be reverted, or a real
+        // peer is left blocked by a record they never got to use.
+        for expired in self.intros.expire(now) {
+            self.release_chain_guard_state(expired.guard_undo, expired.guard_pin);
+        }
+
+        // §17.1 mitigation (ii).
+        self.guard.age_orphans(now);
+
+        self.drive_pendings(now);
+    }
+
+    fn drive_pendings(&mut self, now: Instant) {
+        let due: Vec<ConnectionId> = self
+            .pendings
+            .iter()
+            .filter(|(_, p)| p.give_up_at <= now || p.next_retransmit <= now)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for conn in due {
+            let Some(pending) = self.pendings.get(&conn) else {
+                continue;
+            };
+            // §16.5, normative: **give-up beats a same-instant
+            // retransmit**. The comparison is `<=` on both sides, so an
+            // equality lands here and not in the retransmit arm.
+            if pending.give_up_at <= now {
+                let _ = self.drop_pending(conn);
+                self.emit(EndpointOutput::HandshakeFailed(
+                    conn,
+                    ConnectError::TimedOut,
+                ));
+                continue;
+            }
+            let Some(mut pending) = self.pendings.remove(&conn) else {
+                continue;
+            };
+            self.start_attempt(now, &mut pending);
+            self.pendings.insert(conn, pending);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §16.4 — connection events
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.4's `handle_connection_event`.
+    ///
+    /// `Retired` is a MUST on teardown: it drops the index route **and**
+    /// releases the guard-entry pin, and without it both leak for the
+    /// endpoint's life.
+    ///
+    /// It is also **S29's cancellation path**. §16.4 lists no cancel verb,
+    /// and `Retired`'s documented effects are exactly cancellation's, so
+    /// the shell reaches for this rather than for something invented:
+    /// dropping a `Connecting` retires the connection, which here stops the
+    /// retransmit train, frees the index and releases the static so the
+    /// very next `connect()` to it succeeds instead of returning
+    /// `AlreadyConnected`. It emits **nothing** — the `Connecting` is
+    /// already resolved by its own drop, and a `HandshakeFailed` would be a
+    /// second resolution.
+    pub(crate) fn handle_connection_event(&mut self, id: ConnectionId, ev: ToEndpoint) {
+        match ev {
+            ToEndpoint::Retired { our_index } => {
+                self.indices.remove_session(our_index);
+                self.indices.remove_pending(our_index);
+                if self.drop_pending(id).is_none()
+                    && let Some(key) = self.statics.remove_by_connection(id)
+                {
+                    self.guard.unpin(&key);
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Shared teardown
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Undo §17.1's provisional write and release the mid-state pin.
+    ///
+    /// Every path that ends a chain **without** accepting it runs this:
+    /// `reject()`, expiry, eviction, a failed `authenticate()`, and an
+    /// `accept()` that returns `Stale`. Mitigation (i) is explicit that the
+    /// revert applies to all of them.
+    ///
+    /// **The pin is released first, and the order is load-bearing.** A
+    /// chain that authenticated a static nobody had recorded before *both*
+    /// created the entry and pinned it, so reverting first would find the
+    /// chain's own pin still held, decline to remove the entry it had just
+    /// created, and leave precisely the orphan mitigation (i) exists to
+    /// prevent — silently, and only for the authenticate-then-reject path
+    /// that is the whole point of the mitigation.
+    fn release_chain_guard_state(&mut self, undo: Option<guard::GuardUndo>, pin: Option<Vec<u8>>) {
+        if let Some(key) = pin {
+            self.guard.unpin(&key);
+        }
+        if let Some(undo) = undo {
+            self.guard.revert(undo);
+        }
+    }
+}

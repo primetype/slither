@@ -1,15 +1,24 @@
 //! §2–§5 — the wire: where bytes acquire meaning.
 //!
-//! This module holds the suite declaration ([`suite`]), the three packet
-//! headers (`header`), mac1 (`mac`), msg1's payload codec (`payload`) and
-//! §3.1's pre-AEAD classify/drop gate (`classify`). Everything but the
-//! suite is crate-internal: no §16 surface exposes a header.
+//! This module holds the suite declaration ([`suite`]), §6.1's handshake
+//! ladder as a trait ([`handshake`]), the three packet headers (`header`),
+//! mac1 (`mac`), msg1's payload codec (`payload`) and §3.1's pre-AEAD
+//! classify/drop gate (`classify`). Everything but the suite and the
+//! ladder trait is crate-internal: no §16 surface exposes a header.
 //!
 //! Nothing here drives a handshake, holds a key, opens a session, or reads
-//! a clock. No hiss state machine is stepped, no DH is performed, no index
-//! is minted, no timestamp guard is consulted, no frame is parsed. If a
-//! file in this module needs to know what a *connection* is, something has
-//! gone in the wrong place.
+//! a clock. No DH is performed, no index is minted, no timestamp guard is
+//! consulted, no frame is parsed. If a file in this module needs to know
+//! what a *connection* is, something has gone in the wrong place.
+//!
+//! [`Handshake`] is the one item that names hiss's state machine, and it
+//! names it without stepping it: the trait **declares** the ladder's shape
+//! so that a suite-generic `core::Endpoint<I>` can call transitions that
+//! `hiss::noise!` emits as *inherent* methods on generated types.
+//! [`crate::channel!`] stamps the single `impl`, and that expansion lands
+//! in the **caller's** module beside its own `IK`, not here. The driving —
+//! when each stage is paid, what is parked between them, what a rejection
+//! costs — is §6's, and lives in the endpoint core.
 //!
 //! # The gate is the crate's only silent-drop tier
 //!
@@ -28,13 +37,7 @@
 //! the sort of thing that gets added helpfully here and questioned by
 //! nobody.
 
-// Slice 1 is the wire and nothing consumes it yet: the endpoint core that
-// calls `classify`, derives a `Mac1Key` and builds a header arrives with
-// the next slice. Until then every item below is dead to the compiler
-// while being exactly the surface the spec asks for. This allow comes off
-// when `core` lands.
-#![allow(dead_code)]
-
+pub mod handshake;
 pub mod suite;
 
 pub(crate) mod header;
@@ -54,11 +57,9 @@ use crate::constants;
 // mac1 key or a payload codec. Start closed — widening later is not a
 // breaking change and narrowing is.
 pub(crate) use self::header::{DataHeader, InitHeader, RespHeader};
-// Same reason as the `dead_code` allow above: nothing consumes these two
-// yet, and the module they live in is the wire, not the consumer.
-#[allow(unused_imports)]
 pub(crate) use self::{mac::Mac1Key, payload::Msg1Payload};
 
+pub use self::handshake::Handshake;
 pub use self::suite::{Channel, ReferenceSuite};
 
 /// A datagram that survived §3.1's gate.
