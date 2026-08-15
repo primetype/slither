@@ -141,32 +141,6 @@ impl<F: FnMut(u64)> Drop for WakerSlot<F> {
     }
 }
 
-/// §5.4's three-valued static state, as the **shell** needs to answer it
-/// synchronously (§16.1, ruling 87). NONE is the absence of an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StaticState {
-    /// An outbound `connect()` whose `Connecting` is still alive.
-    Pending,
-    /// A live connection — dialled or accepted.
-    Live,
-}
-
-/// One entry of ruling 87's synchronous static map.
-///
-/// The `attempt` is what makes cancel-then-redial safe. On a paused clock
-/// the sequence `drop(connecting); ep.connect(same_static)` runs to
-/// completion **before the driver is scheduled at all**, so by the time the
-/// driver processes the first attempt's cancellation — or its
-/// `HANDSHAKE_GIVEUP` — the map already holds the *second* attempt's entry.
-/// A driver that removed by key alone would delete the live redial. Every
-/// writer therefore checks the stamp it is entitled to remove, and a stale
-/// writer finds a newer one and leaves it alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StaticSlot {
-    pub(crate) attempt: u64,
-    pub(crate) state: StaticState,
-}
-
 /// One connection's shell-side cell: §16.3's `Rc<RefCell<_>>` data path.
 ///
 /// It holds the connection **core** as well as the shell bookkeeping,
@@ -271,15 +245,14 @@ pub(crate) enum PendingOutcome<I: Identity> {
 /// The slot a `Connecting` and the driver share.
 ///
 /// It is an `Rc<RefCell<_>>` of its own rather than an entry in
-/// [`ShellState`] because the handle creates it **before** the driver has
-/// minted a [`ConnectionId`] — on a paused clock the driver may not run
-/// between `connect()` and the drop that cancels it, so there is no instant
-/// at which an id-keyed map would be safe to consult.
+/// [`ShellState`] because §16.8's resolution has to be readable by a future
+/// that may be polled at any time, and the driver writes it from the other
+/// side of the seam. It no longer carries the [`ConnectionId`]: ruling 90
+/// mints that synchronously in `connect()`, so the `Connecting` owns it
+/// outright.
 pub(crate) struct PendingSlot<I: Identity> {
     pub(crate) outcome: PendingOutcome<I>,
     pub(crate) waker: Option<Waker>,
-    /// Written by the driver once `core::Endpoint::connect` has minted it.
-    pub(crate) id: Option<ConnectionId>,
 }
 
 impl<I: Identity> PendingSlot<I> {
@@ -287,7 +260,6 @@ impl<I: Identity> PendingSlot<I> {
         Self {
             outcome: PendingOutcome::Waiting,
             waker: None,
-            id: None,
         }
     }
 
@@ -346,21 +318,6 @@ pub(crate) struct ShellState<I: Identity> {
     /// **mutating** endpoint verb is a driver round-trip, because §6.2
     /// requires the DH to land on the driver task (§16.3, ruling 53).
     pub(crate) endpoint: crate::core::Endpoint<I>,
-    /// Ruling 87's cell: §16.1's NONE / PENDING / LIVE, answerable with no
-    /// driver round-trip, keyed by the static's canonical §2.4 octets.
-    ///
-    /// This is a **second record** of state the endpoint core also keeps,
-    /// and the duplication is forced rather than chosen. Ruling 87 says
-    /// `connect()` "only mints the pending" and performs no DH, so the
-    /// natural implementation would write the core's own static map
-    /// synchronously. Slice 3a's frozen `core::Endpoint::connect()` mints
-    /// the pending **and** builds msg1 in one call — 2 DH — so the shell
-    /// cannot reach the core's map without paying on the caller's task.
-    /// See `IMPLEMENTATION-3b.md` §5 conflict C-B1.
-    ///
-    /// Every transition is enumerated in [`driver`](super::driver)'s module
-    /// docs, and the driver `debug_assert!`s if the core ever disagrees.
-    pub(crate) statics: BTreeMap<Vec<u8>, StaticSlot>,
     /// How many handles — `Endpoint`, `Connecting`, `Connection` — exist.
     ///
     /// Staged objects are deliberately **not** counted: §16.3 is explicit
@@ -372,44 +329,58 @@ pub(crate) struct ShellState<I: Identity> {
     /// Set once the driver has returned. Every verb answers from it rather
     /// than hanging.
     pub(crate) driver_stopped: bool,
-    /// Mints [`StaticSlot::attempt`]. Shell-side and monotone; unrelated to
-    /// the core's `ConnectionId`, which does not exist yet at the instant
-    /// `connect()` has to stamp its entry.
-    pub(crate) next_attempt: u64,
 }
 
-impl<I: Identity> ShellState<I> {
-    /// Claim `key` for a new outbound attempt, or report the state that
-    /// already holds it. §16.1's NONE/PENDING/LIVE test, at the instant of
-    /// the call.
-    pub(crate) fn claim_static(&mut self, key: Vec<u8>) -> Result<u64, ConnectError> {
-        if self.statics.contains_key(&key) {
-            return Err(ConnectError::AlreadyConnected);
-        }
-        let attempt = self.next_attempt;
-        self.next_attempt += 1;
-        self.statics.insert(
-            key,
-            StaticSlot {
-                attempt,
-                state: StaticState::Pending,
-            },
-        );
-        Ok(attempt)
-    }
+/// A guard against a core that re-emits for ever, matching the driver's own.
+/// See [`ShellState::drain_endpoint`].
+const HANDLE_DRAIN_BOUND: usize = 100_000;
 
-    /// Release `key`, but only if it still holds `attempt`.
+impl<I: Identity> ShellState<I> {
+    /// §16.4's drain contract, discharged on the **handle** side.
     ///
-    /// Returns whether anything was removed. See [`StaticSlot`] for why the
-    /// stamp check is not optional.
-    pub(crate) fn release_static(&mut self, key: &[u8], attempt: u64) -> bool {
-        match self.statics.get(key) {
-            Some(slot) if slot.attempt == attempt => {
-                self.statics.remove(key);
-                true
+    /// "Every mutating call is followed by draining `poll_output()` to the
+    /// terminal `Timeout`" (§16.4), and ruling 90 puts two mutating endpoint
+    /// calls on a handle:
+    ///
+    /// * [`Endpoint::connect`](super::Endpoint::connect) →
+    ///   `core::Endpoint::mint_pending`, and
+    /// * `Connecting::drop` → `core::Endpoint::handle_connection_event(..,
+    ///   Retired)`, ruling 50's cancel.
+    ///
+    /// **Both are 0 DH and both emit nothing**, so this loop terminates on
+    /// its first pop and the deadline it returns is the one the driver would
+    /// read. The `debug_assert` is the pin for "emit nothing", and it is not
+    /// decoration: were one of them ever to emit, popping here would
+    /// *destroy* the output — the silent-CLOSE-loss shape of finding 4 in
+    /// `.slices/03-skeleton/FIXES-3b.md`. The assert turns that into a named
+    /// failure in every debug build, which is every `cargo test`.
+    ///
+    /// The driver is woken by the command each of those verbs sends
+    /// afterwards, so it re-serves and re-reads the deadline regardless;
+    /// nothing here is load-bearing for liveness.
+    pub(crate) fn drain_endpoint(&mut self) {
+        for _ in 0..HANDLE_DRAIN_BOUND {
+            match self.endpoint.poll_output() {
+                crate::core::EndpointOutput::Timeout(_) => return,
+                other => {
+                    debug_assert!(
+                        false,
+                        "a handle-side endpoint verb queued an output (§16.4, ruling 90): \
+                         {}",
+                        match other {
+                            crate::core::EndpointOutput::Transmit(_) => "Transmit",
+                            crate::core::EndpointOutput::IntroReady(..) => "IntroReady",
+                            crate::core::EndpointOutput::ToConnection(..) => "ToConnection",
+                            crate::core::EndpointOutput::HandshakeFailed(..) => "HandshakeFailed",
+                            crate::core::EndpointOutput::Timeout(_) => unreachable!(),
+                        }
+                    );
+                }
             }
-            _ => false,
         }
+        panic!(
+            "core::Endpoint::poll_output did not reach Timeout in {HANDLE_DRAIN_BOUND} outputs (§16.4)"
+        );
     }
 }
 
@@ -442,10 +413,8 @@ impl<I: Identity> Shell<I> {
             Self {
                 state: Rc::new(RefCell::new(ShellState {
                     endpoint,
-                    statics: BTreeMap::new(),
                     handles: 0,
                     driver_stopped: false,
-                    next_attempt: 0,
                 })),
                 commands: tx,
             },
@@ -500,21 +469,38 @@ impl<I: Identity> Shell<I> {
 /// Every variant is either a §6.2 round-trip (a `oneshot` reply, because
 /// §16.3 requires the DH to land on the driver) or a one-way signal.
 pub(crate) enum Command<I: Identity> {
-    /// §16.2's `connect()`. **One-way** — ruling 87: the verb is not
-    /// `async`, so there is no reply to await, and the NONE/PENDING/LIVE
-    /// answer was already read out of [`ShellState::statics`].
+    /// §16.2's `connect()`. **One-way** — rulings 87 and 90: the verb is not
+    /// `async`, so there is no reply to await; `mint_pending` already
+    /// answered §16.1's NONE/PENDING/LIVE test out of the endpoint core's
+    /// own static map, and already minted `id` and `core`. What is left for
+    /// the driver is §6.1's two initiator DH — `start_attempt` — plus the
+    /// shell-side bookkeeping that goes with them.
+    ///
+    /// The core is **boxed**. A `core::Connection` is ~680 bytes and every
+    /// other variant here is a handful, so carrying it inline would make the
+    /// channel's element size — paid by `Dirty`, `Cancel` and `HandlesGone`
+    /// alike — the size of the largest verb. One allocation per dial buys it
+    /// back.
     Connect {
+        id: ConnectionId,
+        core: Box<CoreConnection<I::Suite>>,
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
-        static_key: Vec<u8>,
-        attempt: u64,
         slot: Rc<RefCell<PendingSlot<I>>>,
     },
-    /// Ruling 50: a `Connecting` was dropped. Carries the slot rather than
-    /// a [`ConnectionId`] because on a paused clock the driver may not have
-    /// run since the `Connect` that would have minted one — so there is no
-    /// id yet to name, and the slot is the only thing both sides can hold.
-    Cancel(Rc<RefCell<PendingSlot<I>>>),
+    /// Ruling 50: a `Connecting` was dropped.
+    ///
+    /// Carries the [`ConnectionId`] because ruling 90's `mint_pending`
+    /// minted it **synchronously**, inside the `connect()` that returned the
+    /// `Connecting` — so by the time anything can drop one, the id exists.
+    /// Before ruling 90 it could not: the id was minted on the driver, and
+    /// on a paused clock the driver may not have run since, so this variant
+    /// had to carry the slot instead.
+    ///
+    /// The core-side retirement is **not** this command's job — it already
+    /// happened, in `Connecting::drop` itself. This releases the driver's
+    /// own record.
+    Cancel(ConnectionId),
     /// §16.2's `accept()`. The reply carries a fully built [`Intro`], so a
     /// cancelled `accept()` drops one — which is §6.2's silent reject, the
     /// documented meaning of dropping a staged object, rather than a leak.

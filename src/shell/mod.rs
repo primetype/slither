@@ -24,12 +24,15 @@
 //!
 //! Endpoint verbs — `accept()` and §6.2's three staged verbs — are a
 //! command channel plus a oneshot reply, because §6.2 requires the DH costs
-//! to land on the driver task. `connect()` is the exception (ruling 87): it
-//! is not `async`, performs no DH, and answers §16.1's NONE/PENDING/LIVE
-//! test from a **synchronous read of the shared cell**. The connection data
-//! path and the four accessors share an `Rc<RefCell<_>>` with the driver;
-//! each data-path verb is written once as `poll_*`, and the `async fn` is
-//! `poll_fn` over it.
+//! to land on the driver task. `connect()` is the exception (rulings 87 and
+//! 90): it is not `async` because its first half, `mint_pending`, costs **0
+//! DH**, so the handle calls it on the shared cell and answers §16.1's
+//! NONE/PENDING/LIVE test out of the endpoint core's **own** static map.
+//! Its second half, `start_attempt`, carries §6.1's two initiator DH and
+//! rides the command channel like every other DH-bearing verb. The
+//! connection data path and the four accessors share an `Rc<RefCell<_>>`
+//! with the driver; each data-path verb is written once as `poll_*`, and
+//! the `async fn` is `poll_fn` over it.
 //!
 //! # What is here, and what is not
 //!
@@ -405,19 +408,21 @@ mod tests {
     ///
     /// 2. **`Retired` dropped on the floor.** Delete the
     ///    `handle_connection_event` call in `Driver::serve_connection`'s
-    ///    `ToEndpoint` arm. The **second half** is what sees that, and it
-    ///    is the half that used to assert nothing: *neither*
-    ///    `is_established()` *nor* `Endpoint::connect`'s `Ok` can observe
-    ///    it. `release_dead` nulls `ConnCell::core` and frees the
-    ///    **mirror** — `ShellState::statics`, §16.1's synchronous
-    ///    admission test — whether or not the `Retired` was delivered, and
-    ///    `connect()` is answered from that mirror. Only `core::Endpoint`'s
-    ///    own map still holds the static, and the sole thing that reports
-    ///    its answer back is the **resolved `Connecting`**: a dropped one
-    ///    throws it away. So the redial is driven to a completed handshake
-    ///    here rather than dropped on the next line. Under the mutation
-    ///    the core answers `AlreadyConnected`, no msg1 is ever
-    ///    transmitted, and `redial.await` resolves `Err`.
+    ///    `ToEndpoint` arm. The **second half** is what sees that. Before
+    ///    ruling 90 it was the half that used to assert nothing: *neither*
+    ///    `is_established()` *nor* `Endpoint::connect`'s `Ok` could observe
+    ///    the mutation, because `release_dead` freed the shell's **mirror**
+    ///    of the static map whether or not the `Retired` had been
+    ///    delivered, and `connect()` was answered from that mirror — so
+    ///    only the **resolved `Connecting`** reported the core's real
+    ///    answer, and a dropped one threw it away. Ruling 90 deleted the
+    ///    mirror: the redial's admission test is now `mint_pending` reading
+    ///    the core's own map, so under the mutation `connect()` itself
+    ///    answers `AlreadyConnected` and the `expect` below is the first
+    ///    thing that fires. The wire reading and the completed handshake
+    ///    are kept anyway — they were the assertions that separated the two
+    ///    builds when nothing cheaper could, and a test does not get weaker
+    ///    because the seam got stronger.
     ///
     /// The third build — a *core* that emits `Retired` at the death
     /// instead of at the expiry — is a mutation of frozen `src/core/**`,
@@ -452,11 +457,12 @@ mod tests {
             drop(a);
             drop(b);
 
-            // `connect()`'s `Ok` proves nothing: it is the mirror's
-            // answer. Take a wire reading first — under the mutation the
-            // endpoint core refuses before anything is sealed, so **no
-            // msg1 leaves at all**, and this separates without B's
-            // cooperation.
+            // Take a wire reading first — under the mutation the endpoint
+            // core refuses before anything is sealed, so **no msg1 leaves
+            // at all**, and this separates without B's cooperation. Before
+            // ruling 90 this was the *only* thing that separated them,
+            // because `connect()`'s `Ok` was the shell mirror's answer
+            // rather than the core's; it is now both.
             let tap = pair.net.tap();
             let from_a = || {
                 tap.snapshot()
@@ -470,7 +476,10 @@ mod tests {
                 .a
                 .endpoint
                 .connect(pair.b.addr, pair.b.public_static)
-                .expect("the shell mirror still said LIVE after the linger");
+                .expect(
+                    "`mint_pending` still found the static occupied after the linger: \
+                     `Retired` never reached the endpoint core (ruling 90)",
+                );
             settle().await;
             assert!(
                 from_a() > before,
@@ -631,9 +640,10 @@ mod tests {
             );
 
             // And the driver is alive rather than merely quiet. `connect()`
-            // tests `driver_stopped` *before* the static mirror, so a
-            // stopped driver answers `Local` here where a live one, with A
-            // still draining, answers `AlreadyConnected`.
+            // tests `driver_stopped` *before* it consults the endpoint
+            // core's static map, so a stopped driver answers `Local` here
+            // where a live one, with A still draining, answers
+            // `AlreadyConnected`.
             assert_eq!(
                 pair.a
                     .endpoint

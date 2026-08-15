@@ -50,46 +50,40 @@
 //! same drain on the no-linger paths; and **no `Retired` at all** when no
 //! session was ever installed — which is why [`Driver::release_dead`] keys
 //! on the *core's* state rather than on having seen a `Retired`, and why
-//! [`Driver::command_cancel`] synthesises one for a pending that has no
-//! session index to name (see there for why `0` is the safe value).
+//! ruling 50's cancel **synthesises** one for a pending that has no session
+//! index to name. After ruling 90 that synthesis happens in
+//! `Connecting::drop` rather than here, because the redial that follows it
+//! reads the endpoint core's own map; see [`Driver::command_cancel`], which
+//! is what is left of the cancel on this side.
 //!
-//! # The static map's transitions
+//! # The static map — there is exactly one, and the driver does not own it
 //!
-//! `ShellState::statics` is ruling 87's synchronous NONE/PENDING/LIVE cell.
-//! Its complete set of writers:
+//! **[RULING 90]** §5.4's NONE/PENDING/LIVE state lives in the endpoint
+//! core's `StaticMap` and **nowhere else**. Every transition is the core's:
 //!
-//! | Transition | Written by | When |
+//! | Transition | Made by | When |
 //! |---|---|---|
-//! | NONE → PENDING | the handle | `Endpoint::connect`, synchronously |
-//! | PENDING → NONE | the handle | `Connecting::drop`, synchronously (ruling 50) |
-//! | PENDING → NONE | the driver | `EndpointOutput::HandshakeFailed` — §5.5's give-up |
-//! | PENDING → LIVE | the driver | `ConnEvent::Established` |
-//! | NONE → LIVE | the driver | a staged `accept()` that returned a connection |
-//! | LIVE → NONE | the driver | the connection's state is released |
+//! | NONE → PENDING | `mint_pending` | `Endpoint::connect`, synchronously on the handle (0 DH) |
+//! | PENDING → NONE | `handle_connection_event(Retired)` | `Connecting::drop`, synchronously on the handle (ruling 50) |
+//! | PENDING → NONE | `drop_pending` | §5.5's give-up, inside `handle_timeout` |
+//! | PENDING → LIVE | `StaticMap::promote` | `complete_initiation` — the msg2 that installs |
+//! | NONE → LIVE | `accept` | §6.2's stage 3 |
+//! | LIVE → NONE | `handle_connection_event(Retired)` | teardown |
 //!
-//! Every driver-side removal is stamp-checked, because a cancel-and-redial
-//! installs a **newer** attempt under the same key before the driver has
-//! processed the older one's death.
+//! Until ruling 90 the shell kept a **stamped mirror** of that map, because
+//! ruling 87 made §16.2's `connect()` synchronous while slice 3a's
+//! `core::Endpoint::connect()` mints the pending *and* builds msg1 in one
+//! 2-DH call — so the handle could not reach the core's map without paying
+//! on the caller's task. The mirror was a second record of a security
+//! invariant, it needed a monotone `attempt` stamp on every entry to survive
+//! cancel-and-redial, and it was the root of the seam review's worst finding
+//! (C-B1). Splitting the core verb deleted all of it: the map, the stamps,
+//! `claim_static`, `release_static` and `next_attempt`.
 //!
-//! ## The mirror is allowed to lag, and §16.1 says so
-//!
-//! This map is a **synchronous admission test**, not a second authority.
-//! The core is the authority, and the two are allowed to disagree for the
-//! width of one command: §16.1 keeps a staged chain in progress out of
-//! `connect()`'s list on purpose — "until `authenticate()` the chain's
-//! static is merely claimed, and §6.1 forbids keying anything durable on an
-//! unproven claim" — and holds the invariant at the other end of the race,
-//! at §6.7's comparison in `accept()`. So `[AcceptChain(K), Connect(K)]` in
-//! the queue is a legal state in which the mirror says NONE and the core
-//! is about to say `AlreadyConnected`.
-//!
-//! The lag is only ever in the benign direction — the mirror admits a
-//! connect the core will refuse — and [`Driver::command_connect`]'s `Err`
-//! branch is S3a's ratified answer to it. There was a `debug_assert!` there
-//! claiming the disagreement was impossible; it turned a legal outcome into
-//! a dead endpoint in every debug build, and it is gone. See
-//! `s3a_accept_ahead_of_connect_resolves_already_connected` in
-//! `tests/spec_shell.rs`.
+//! What that buys, beyond one fewer copy: the two maps can no longer
+//! disagree **because there is only one**, so `[AcceptChain(K), Connect(K)]`
+//! in the command queue is decided by §6.4's PENDING branch in the core
+//! rather than by which command the driver reached first.
 //!
 //! # Stopping
 //!
@@ -122,8 +116,8 @@ use crate::packet::Handshake;
 
 use super::connection::Connection;
 use super::shared::{
-    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink,
-    StaticState, Wakers, now, resolve_slot,
+    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers,
+    now, resolve_slot,
 };
 use super::staged::Intro;
 use super::wire::Wire;
@@ -137,12 +131,10 @@ const DRAIN_BOUND: usize = 100_000;
 struct ConnRecord<I: Identity> {
     /// Shared with every [`Connection`] handle for this connection.
     cell: Rc<RefCell<ConnCell<I::Suite>>>,
-    /// The peer's canonical §2.4 static octets — the key into the shell's
-    /// static map — and the key itself, kept for the accessors.
-    static_key: Vec<u8>,
+    /// The peer's static, kept for the accessors a [`Connection`] handle
+    /// carries. **Not** a static-map key: ruling 90 leaves that map in the
+    /// core, and nothing here writes it.
     remote_static: PublicKeyOf<I>,
-    /// The stamp this connection's static entry carries.
-    attempt: u64,
     /// The `Connecting` awaiting establishment, while one exists.
     slot: Option<Rc<RefCell<PendingSlot<I>>>>,
 }
@@ -529,17 +521,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         };
         cell.borrow_mut().remote_address = anchor;
 
-        // PENDING → LIVE, stamp-checked.
-        if let Some(slot) = self
-            .shell
-            .state
-            .borrow_mut()
-            .statics
-            .get_mut(&record.static_key)
-            && slot.attempt == record.attempt
-        {
-            slot.state = StaticState::Live;
-        }
+        // §5.4's PENDING → LIVE is not written here: ruling 90 leaves the
+        // static map in the core, and `complete_initiation` promoted the
+        // entry in the same call that emitted the `Install` this event
+        // followed.
 
         let Some(slot) = record.slot.take() else {
             return;
@@ -565,15 +550,12 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// endpoint core telling us it has *already* dropped the pending, and
     /// no session was ever installed, so there is no index route and no
     /// guard pin left to release (rulings 81/84's "no `Retired` at all"
-    /// case).
+    /// case). `drop_pending` released the static in the same call, which is
+    /// the whole of §5.4's PENDING → NONE after ruling 90.
     fn fail_pending(&mut self, id: ConnectionId, error: ConnectError) {
         let Some(record) = self.conns.remove(&id) else {
             return;
         };
-        self.shell
-            .state
-            .borrow_mut()
-            .release_static(&record.static_key, record.attempt);
         if let Some(slot) = record.slot {
             resolve_slot(&slot, PendingOutcome::Failed(error));
         }
@@ -601,10 +583,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             let Some(record) = self.conns.remove(&id) else {
                 continue;
             };
-            self.shell
-                .state
-                .borrow_mut()
-                .release_static(&record.static_key, record.attempt);
+            // §5.4's LIVE → NONE is the core's, on the `Retired` this pass
+            // has already delivered (see the module docs' ordering note);
+            // ruling 90 leaves no shell-side copy to release here.
+            //
             // The core is released here, and only here. A handle that
             // calls `close()` afterwards finds `None` and does nothing —
             // the same answer the core itself would have given.
@@ -757,13 +739,13 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     fn handle_command(&mut self, command: Command<I>) {
         match command {
             Command::Connect {
+                id,
+                core,
                 remote,
                 remote_static,
-                static_key,
-                attempt,
                 slot,
-            } => self.command_connect(remote, remote_static, static_key, attempt, slot),
-            Command::Cancel(slot) => self.command_cancel(&slot),
+            } => self.command_connect(id, *core, remote, remote_static, slot),
+            Command::Cancel(id) => self.command_cancel(id),
             Command::Accept(reply) => {
                 self.waiting.push_back(reply);
                 self.dispatch_intros();
@@ -796,170 +778,99 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         }
     }
 
-    /// §16.2's `connect()`, on the driver task where §6.1's two initiator
-    /// DH may be spent (ruling 87).
+    /// §16.2's `connect()`'s **second half** — §6.1's two initiator DH, on
+    /// the driver task where §6.2 requires them (rulings 87 and 90).
+    ///
+    /// Everything cheap already happened, synchronously, in the verb itself:
+    /// `mint_pending` answered §16.1's NONE/PENDING/LIVE test out of the
+    /// endpoint core's own map, minted `id` and built the connection core.
+    /// There is no `Err` arm here because there is no second admission test
+    /// to fail — that is the whole of what deleting the mirror bought.
+    ///
+    /// # A cancel that overtook this command spends nothing
+    ///
+    /// On a paused clock `connect(); drop(connecting)` runs to completion
+    /// before the driver is scheduled, leaving `[Connect(id), Cancel(id)]`
+    /// in the queue. Ruling 50's cancel already retired the pending in the
+    /// core — synchronously, in `Connecting::drop` — so `start_attempt`
+    /// finds nothing under `id`, returns, and **no msg1 reaches the wire
+    /// and no DH is spent**. Before ruling 90 this arm called
+    /// `core::Endpoint::connect`, which built and sent msg1 unconditionally
+    /// and left the `Cancel` behind it to undo an attempt the peer had
+    /// already seen.
+    ///
+    /// The record is still inserted, and deliberately: the `Cancel` behind
+    /// us removes it, and an early return here would leave the two arms
+    /// disagreeing about whether it exists.
     fn command_connect(
         &mut self,
+        id: ConnectionId,
+        core: CoreConnection<I::Suite>,
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
-        static_key: Vec<u8>,
-        attempt: u64,
         slot: Rc<RefCell<PendingSlot<I>>>,
     ) {
-        // The `Connecting` may already have been dropped — on a paused
-        // clock nothing here has run since the verb returned. The `Cancel`
-        // is behind us in the queue and will retire this pending; short-
-        // circuiting would leave the core without the pending the cancel is
-        // about to release, and the retransmit train running.
-        let result =
-            self.shell
-                .state
-                .borrow_mut()
-                .endpoint
-                .connect(now(), remote, remote_static.clone());
+        let cell = Rc::new(RefCell::new(ConnCell {
+            core: Some(core),
+            remote_address: remote,
+            closed: None,
+            closed_wakers: Wakers::default(),
+            notifications: NotificationSlots,
+            dirty: true,
+            handles: 0,
+        }));
+        self.conns.insert(
+            id,
+            ConnRecord {
+                cell,
+                remote_static,
+                slot: Some(slot),
+            },
+        );
 
-        match result {
-            Ok((id, core)) => {
-                slot.borrow_mut().id = Some(id);
-                let cell = Rc::new(RefCell::new(ConnCell {
-                    core: Some(core),
-                    remote_address: remote,
-                    closed: None,
-                    closed_wakers: Wakers::default(),
-                    notifications: NotificationSlots,
-                    dirty: true,
-                    handles: 0,
-                }));
-                self.conns.insert(
-                    id,
-                    ConnRecord {
-                        cell,
-                        static_key,
-                        remote_static,
-                        attempt,
-                        slot: Some(slot),
-                    },
-                );
-            }
-            Err(error) => {
-                // **The two maps disagreeing here is legitimate**, and
-                // §16.1 is where it is licensed. There was a
-                // `debug_assert!(false, …)` on this line asserting the
-                // opposite; it asserted something false and is deleted.
-                //
-                // The interleaving, which is ordinary application code:
-                // `Proven::accept()` queues `Command::AcceptChain(K)` on
-                // its first poll and yields, and the application calls
-                // `Endpoint::connect(K)` before the driver's next turn —
-                // which ruling 87 *guarantees* it can, by making the verb
-                // synchronous. `claim_static` reads the mirror, sees NONE
-                // (nothing has landed yet, and cannot have) and writes
-                // PENDING. The queue is now `[AcceptChain(K), Connect(K)]`:
-                // the accept runs first, the core's own map is still empty
-                // for K so it succeeds, and the connect that follows is
-                // refused by a core that now holds K.
-                //
-                // §16.1 declines to prevent exactly this: "a staged chain
-                // in progress is **deliberately not in `connect()`'s
-                // list**, and cannot be: until `authenticate()` the chain's
-                // static is merely claimed, and §6.1 forbids keying
-                // anything durable on an unproven claim. The invariant is
-                // held at the other end of that race instead" — §6.7's
-                // comparison at `accept()`. So the mirror is not wrong
-                // about *state*; it is one command behind, in the benign
-                // direction ("admits a connect the core will refuse").
-                //
-                // The branch below is already S3a's ratified answer:
-                // `connect()` to a static that already has a live
-                // `Connection` returns `Err(ConnectError::AlreadyConnected)`,
-                // which is what the core just said and what the `Connecting`
-                // is resolved with.
-                //
-                // `release_static` is stamp-checked and that is load-bearing
-                // here, not incidental: the accept drew its `attempt` from
-                // the same monotone counter *after* `claim_static` drew this
-                // one, so the entry now under `static_key` carries the later
-                // stamp and this release **declines**. The accept's LIVE
-                // entry survives, which is what keeps the mirror agreeing
-                // with the core from the next instant on. Pinned by
-                // `s3a_accept_ahead_of_connect_resolves_already_connected`
-                // in `tests/spec_shell.rs`.
-                self.shell
-                    .state
-                    .borrow_mut()
-                    .release_static(&static_key, attempt);
-                resolve_slot(&slot, PendingOutcome::Failed(error));
-            }
-        }
-    }
-
-    /// Ruling 50: a `Connecting` was dropped.
-    ///
-    /// §16.4's API list has no cancel verb, and `ToEndpoint::Retired` is
-    /// the core-side effect S29 needs — the endpoint core's own docs name
-    /// this as "S29's cancellation path": it stops §5.5's retransmit train,
-    /// frees the pending index (§17.3), takes the dialled address out of
-    /// §6.5's hint set (§17.4), releases the §17.1 pin, and frees the
-    /// static so the very next `connect()` succeeds. It emits nothing — the
-    /// `Connecting` is already resolved by its own drop, and a
-    /// `HandshakeFailed` would be a second resolution.
-    ///
-    /// # Why `our_index: 0`
-    ///
-    /// A `connect()`-created connection that never installed a session has
-    /// no session index to name. `handle_connection_event` passes the value
-    /// to `remove_session` and `remove_pending` before doing the work that
-    /// actually matters here (`drop_pending`, which removes the *current*
-    /// attempt's index from the pending's own record). **`0` cannot collide
-    /// with anything**: `IndexTables::mint` draws a random **nonzero**
-    /// `u32` absent from both tables, so no live route is ever keyed on it.
-    /// Any other placeholder would have a 2⁻³² chance per live session of
-    /// evicting somebody else's route.
-    ///
-    /// # The order of the two statements below is §16.4's MUST
-    ///
-    /// §16.4: "the shell delivers `Retired` to `handle_connection_event`
-    /// **before** releasing the connection's shell-side bookkeeping (else
-    /// the index route and the guard-entry pin leak for the endpoint's
-    /// life)". This used to run the other way round — `self.conns.remove`
-    /// first — which is the literal inverse.
-    ///
-    /// It was harmless at the time for exactly one reason:
-    /// `handle_connection_event` emits nothing
-    /// (`src/core/endpoint/mod.rs:808-832`), so no endpoint output could
-    /// be looked up against a record that had just been removed. That is
-    /// a property of today's core, not of the seam — §16.1's PENDING-branch
-    /// tie-break at `accept()` ("cancels the pending and installs in its
-    /// place", slice 7) is a cancel that *would* produce output for `id`,
-    /// and it would have found `self.conns.get(&id) == None` and been
-    /// dropped on the floor at `serve_endpoint`'s `ToConnection` arm.
-    /// The membership test replaces the removal as the guard, so the
-    /// early return is unchanged and the record is still present for the
-    /// duration of the call.
-    ///
-    /// Note also that the `Retired` delivered here is **synthesised by the
-    /// shell**, not emitted by a connection core: §16.4's list of the
-    /// cases that carry one ("in both cases") does not reach ruling 50's
-    /// cancel at all. The ordering rationale does, so the ordering is
-    /// held here too rather than argued away.
-    fn command_cancel(&mut self, slot: &Rc<RefCell<PendingSlot<I>>>) {
-        let Some(id) = slot.borrow().id else {
-            // The `Connect` ahead of us in the queue failed, so there is no
-            // pending to cancel and the static was already released.
-            return;
-        };
-        if !self.conns.contains_key(&id) {
-            return;
-        }
+        // §6.1's `es` + `ss`, and §5.5's first initiation on the wire.
         self.shell
             .state
             .borrow_mut()
             .endpoint
-            .handle_connection_event(now(), id, ToEndpoint::Retired { our_index: 0 });
+            .start_attempt(now(), id);
+    }
+
+    /// Ruling 50: a `Connecting` was dropped — the driver's half of it.
+    ///
+    /// # The core-side retirement is **not** here, and after ruling 90 it
+    /// cannot be
+    ///
+    /// §16.4's API list has no cancel verb, and `ToEndpoint::Retired` is the
+    /// core-side effect S29 needs — the endpoint core's own docs name it
+    /// "S29's cancellation path": it stops §5.5's retransmit train, frees
+    /// the pending index (§17.3), takes the dialled address out of §6.5's
+    /// hint set (§17.4), releases the §17.1 pin, and frees the static so the
+    /// very next `connect()` succeeds. `Connecting::drop` delivers it
+    /// **synchronously**, in the instant the handle dies.
+    ///
+    /// It has to. Ruling 50's MUST is that the cancellation is ordered ahead
+    /// of any endpoint verb issued after the drop returns, *with no advance
+    /// of the clock between them* — and after ruling 90 the redial's
+    /// admission test is `mint_pending` reading the core's own static map.
+    /// A `Retired` delivered here, one command later, would be a redial
+    /// answered `AlreadyConnected` by a map still holding the corpse. The
+    /// mirror used to absorb that; there is no mirror.
+    ///
+    /// So what is left for this command is the driver's own bookkeeping —
+    /// the `ConnRecord` — plus the wake that makes the loop recompute its
+    /// deadlines with the pending gone.
+    ///
+    /// # §16.4's MUST still holds, and more strongly than before
+    ///
+    /// §16.4: "the shell delivers `Retired` to `handle_connection_event`
+    /// **before** releasing the connection's shell-side bookkeeping (else
+    /// the index route and the guard-entry pin leak for the endpoint's
+    /// life)." The two are now in different tasks' turns rather than two
+    /// statements, and the order between them is guaranteed by the channel:
+    /// the drop delivers `Retired` and *then* sends this command.
+    fn command_cancel(&mut self, id: ConnectionId) {
         self.conns.remove(&id);
-        // The shell-side static was released synchronously by
-        // `Connecting::drop` — before this command was even queued, which
-        // is what makes the immediate redial work with no clock advance.
     }
 
     /// §6.2's stage 3, on the driver task where its two DH belong.
@@ -994,8 +905,6 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         // and the core exposes no per-connection static accessor. The
         // handle's value *is* the proven one — `Proven` is only reachable
         // through `authenticate()`, which returned it.
-        let static_key = remote_static.as_ref().to_vec();
-
         let cell = Rc::new(RefCell::new(ConnCell {
             core: Some(core),
             remote_address: anchor,
@@ -1006,22 +915,9 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             handles: 0,
         }));
 
-        // NONE → LIVE. `claim_static` is not used: the shell's map is the
-        // *outbound* admission test, and an inbound replacement is §5.4's
-        // business, decided in the core, which has already decided it.
-        let attempt = {
-            let mut state = self.shell.state.borrow_mut();
-            let attempt = state.next_attempt;
-            state.next_attempt += 1;
-            state.statics.insert(
-                static_key.clone(),
-                super::shared::StaticSlot {
-                    attempt,
-                    state: StaticState::Live,
-                },
-            );
-            attempt
-        };
+        // §5.4's NONE → LIVE was written by `core::Endpoint::accept` itself,
+        // in the call above. Ruling 90 leaves that map in the core, so there
+        // is nothing to mirror here — and no second stamp to keep honest.
 
         let handle = Connection::new(
             Rc::clone(&self.link),
@@ -1034,9 +930,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             conn_id,
             ConnRecord {
                 cell,
-                static_key,
                 remote_static,
-                attempt,
                 slot: None,
             },
         );

@@ -254,10 +254,14 @@ impl Ep {
     }
 
     fn connect(&mut self, now: Instant, remote: SocketAddr, peer: &Pk) -> (ConnectionId, Drained) {
+        // Ruling 90 split §16.4's `connect` in two: `mint_pending` (0 DH)
+        // and `start_attempt` (§6.1's `es` + `ss`). The shell calls them from
+        // two tasks; a dial is still the two of them, in this order.
         let (id, _conn) = self
             .ep
-            .connect(now, remote, *peer)
+            .mint_pending(now, remote, *peer)
             .expect("connect should succeed");
+        self.ep.start_attempt(now, id);
         (id, self.drain())
     }
 
@@ -2326,7 +2330,7 @@ fn connect_to_a_static_with_a_live_connection_is_already_connected() {
     let peer = b.public_static;
     assert!(
         matches!(
-            a.ep.connect(t, b.addr, peer),
+            a.ep.mint_pending(t, b.addr, peer),
             Err(ConnectError::AlreadyConnected)
         ),
         "a second connect() to a live static succeeded"
@@ -2956,7 +2960,7 @@ fn retired_cancels_the_pending_and_frees_the_static_for_an_immediate_redial() {
 
     // And the static is free.
     assert!(
-        a.ep.connect(t, b.addr, peer).is_ok(),
+        a.ep.mint_pending(t, b.addr, peer).is_ok(),
         "a redial after cancellation returned AlreadyConnected (S29)"
     );
 }

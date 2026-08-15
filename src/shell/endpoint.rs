@@ -13,13 +13,13 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::config::Config;
-use crate::core::Endpoint as CoreEndpoint;
+use crate::core::{ConnectionId, Endpoint as CoreEndpoint, ToEndpoint};
 use crate::error::ConnectError;
 use crate::identity::{Identity, PublicKeyOf};
 
 use super::connection::Connection;
 use super::driver::Driver;
-use super::shared::{Command, PendingOutcome, PendingSlot, Shell};
+use super::shared::{Command, PendingOutcome, PendingSlot, Shell, now};
 use super::staged::Intro;
 use super::wire::Wire;
 
@@ -83,17 +83,25 @@ impl<I: Identity> Endpoint<I> {
 
     /// Dial `remote_static` at `remote` (§5.5).
     ///
-    /// **Not `async`** — §16.2 declares it so, and ruling 87 explains why
-    /// it can be: `connect()` performs no DH (§6.1's initiator costs are
-    /// paid when msg1 is built, on the driver), so it only has to mint the
-    /// attempt. [`ConnectError::AlreadyConnected`] therefore arrives
-    /// **before any await**, from a synchronous read of the shared cell
-    /// §16.8 already requires for the accessors.
+    /// **Not `async`** — §16.2 declares it so, and rulings 87 and 90 are why
+    /// it can be. Ruling 87 settled the signature on the grounds that
+    /// "`connect()` performs no DH — §6.1's initiator costs are paid when
+    /// msg1 is built, on the driver; the verb itself only mints the
+    /// pending". **Ruling 90 is the core factoring that makes that sentence
+    /// true**: `core::Endpoint::mint_pending` costs 0 DH, so this verb calls
+    /// it here, synchronously, and `core::Endpoint::start_attempt` spends
+    /// §6.1's two on the driver where §6.2 requires them.
     ///
-    /// That synchronous read is also what makes ruling 50's
+    /// So [`ConnectError::AlreadyConnected`] arrives **before any await**,
+    /// and it arrives from the **endpoint core's own static map** — §16.1's
+    /// NONE/PENDING/LIVE test read from the one authority, not from a
+    /// shell-side copy of it. There is no second record of
+    /// one-connection-per-static to disagree with the first.
+    ///
+    /// That same synchronous call is what makes ruling 50's
     /// cancellation-ordering **MUST** structural rather than a discipline:
-    /// [`Connecting::drop`] writes the static back to NONE in the same cell
-    /// this reads, so
+    /// [`Connecting::drop`] retires the pending in that same map, in the
+    /// same instant, so
     ///
     /// ```text
     /// drop(connecting);                    // cancels
@@ -107,9 +115,7 @@ impl<I: Identity> Endpoint<I> {
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
     ) -> Result<Connecting<I>, ConnectError> {
-        let static_key = remote_static.as_ref().to_vec();
-
-        let attempt = {
+        let (id, core) = {
             let mut state = self.shell.state.borrow_mut();
             if state.driver_stopped {
                 // Unreachable while this `Endpoint` lives — it is a handle,
@@ -118,24 +124,25 @@ impl<I: Identity> Endpoint<I> {
                 // local fault with 0 DH spent is what `Local` names.
                 return Err(ConnectError::Local);
             }
-            state.claim_static(static_key.clone())?
+            let minted = state
+                .endpoint
+                .mint_pending(now(), remote, remote_static.clone())?;
+            // §16.4: every mutating core call is followed by a drain. This
+            // one emits nothing; see `ShellState::drain_endpoint`.
+            state.drain_endpoint();
+            minted
         };
 
         let slot = Rc::new(RefCell::new(PendingSlot::new()));
         self.shell.send(Command::Connect {
+            id,
+            core: Box::new(core),
             remote,
             remote_static,
-            static_key: static_key.clone(),
-            attempt,
             slot: Rc::clone(&slot),
         });
 
-        Ok(Connecting::new(
-            self.shell.clone(),
-            slot,
-            static_key,
-            attempt,
-        ))
+        Ok(Connecting::new(self.shell.clone(), slot, id))
     }
 }
 
@@ -173,26 +180,22 @@ impl<I: Identity> Drop for Endpoint<I> {
 pub struct Connecting<I: Identity> {
     shell: Shell<I>,
     slot: Rc<RefCell<PendingSlot<I>>>,
-    static_key: Vec<u8>,
-    attempt: u64,
+    /// Minted synchronously by `mint_pending` (ruling 90), so it exists from
+    /// the instant this handle does — which is what lets `Drop` retire the
+    /// pending in the core rather than ask the driver to.
+    id: ConnectionId,
     /// Set once this future has handed its result out, so `Drop` knows the
     /// attempt is no longer in flight.
     resolved: bool,
 }
 
 impl<I: Identity> Connecting<I> {
-    fn new(
-        shell: Shell<I>,
-        slot: Rc<RefCell<PendingSlot<I>>>,
-        static_key: Vec<u8>,
-        attempt: u64,
-    ) -> Self {
+    fn new(shell: Shell<I>, slot: Rc<RefCell<PendingSlot<I>>>, id: ConnectionId) -> Self {
         shell.acquire();
         Self {
             shell,
             slot,
-            static_key,
-            attempt,
+            id,
             resolved: false,
         }
     }
@@ -238,17 +241,41 @@ impl<I: Identity> Drop for Connecting<I> {
             !self.resolved && matches!(self.slot.borrow().outcome, PendingOutcome::Waiting);
 
         if in_flight {
-            // Ruling 87: the static returns to NONE **here**, synchronously,
-            // in the very cell `connect()` reads — which is what an
-            // immediate redial with no clock advance observes.
-            self.shell
-                .state
-                .borrow_mut()
-                .release_static(&self.static_key, self.attempt);
-            // Ruling 50's MUST: this command and any later endpoint verb
-            // travel on one FIFO channel, so the cancellation is ordered
-            // ahead of everything the application issues after the drop.
-            self.shell.send(Command::Cancel(Rc::clone(&self.slot)));
+            // Ruling 50's MUST, and after ruling 90 it is discharged in the
+            // **core's own map**, synchronously, right here.
+            //
+            // §16.4 lists no cancel verb; `Retired` is the event whose
+            // documented effects are exactly cancellation's — it stops
+            // §5.5's train, frees the pending index (§17.3), takes the
+            // dialled address out of §6.5's hint set (§17.4), releases the
+            // §17.1 pin, and **returns the static to NONE**. It costs 0 DH,
+            // which is the whole reason a handle may call it: §6.2 puts DH
+            // on the driver, and there is none here.
+            //
+            // `our_index: 0` is provably safe: `IndexTables::mint` draws a
+            // random **nonzero** `u32`, so no live route is ever keyed on
+            // it, and a `connect()` that never installed a session has no
+            // session index to name.
+            //
+            // Doing it here rather than on the driver is what makes the
+            // ordering **structural**: an immediate redial calls
+            // `mint_pending` on the very map this line just released, with
+            // no clock advance and no driver turn in between. A version
+            // that only queued the command would answer that redial
+            // `AlreadyConnected`.
+            {
+                let mut state = self.shell.state.borrow_mut();
+                state.endpoint.handle_connection_event(
+                    now(),
+                    self.id,
+                    ToEndpoint::Retired { our_index: 0 },
+                );
+                // §16.4's drain contract; this call emits nothing.
+                state.drain_endpoint();
+            }
+            // What is left for the driver is its own bookkeeping: the
+            // `ConnRecord`, and the wake that lets it recompute deadlines.
+            self.shell.send(Command::Cancel(self.id));
         }
 
         self.shell.release();

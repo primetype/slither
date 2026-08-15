@@ -110,7 +110,7 @@ struct Pending<I: Identity> {
     /// would not open, or msg1 would not write on it — so not one msg1
     /// exists for the peer to have ignored. A give-up in that state is
     /// [`ConnectError::Local`], not [`ConnectError::TimedOut`]; see
-    /// [`start_attempt`](Endpoint::start_attempt).
+    /// [`build_attempt`](Endpoint::build_attempt).
     attempted: bool,
     /// Whether this pending actually took a §17.1 pin.
     ///
@@ -352,14 +352,38 @@ impl<I: Identity> Endpoint<I> {
     // §5.5 — outbound initiation
     // ═══════════════════════════════════════════════════════════════════
 
-    /// §16.4's `connect`.
+    /// §16.4's `mint_pending` — the first half of ruling 90's split.
     ///
     /// Refuses a static that already has a connection — live or still
     /// dialling. `AlreadyConnected` for a live one is documentation
     /// obligation #1 ("reconnecting is `close()` then dial"); for a
     /// *pending* one it is forced by §16.1, since admitting a second dial
     /// would let both complete and leave two sessions on one static.
-    pub(crate) fn connect(
+    ///
+    /// # It costs **0 DH**, and that is the whole point (**ruling 90**)
+    ///
+    /// Nothing here opens the identity or touches hiss: it draws an id, a
+    /// sub-seed and the peer's mac1 key, writes §5.4's PENDING row and takes
+    /// §17.1's pin. §6.1's two initiator DH are
+    /// [`start_attempt`](Self::start_attempt)'s, which §6.2 puts on the
+    /// driver task.
+    ///
+    /// That split is what lets §16.2's non-`async` `connect()` answer
+    /// §16.1's NONE/PENDING/LIVE test **from this map**, at the instant of
+    /// the call, instead of from a shell-side mirror of it. Ruling 87
+    /// described this factoring; before ruling 90 the code did not have it,
+    /// and the price was a second record of a security invariant.
+    ///
+    /// # The pending exists before its first attempt does
+    ///
+    /// Between this call and the first [`start_attempt`](Self::start_attempt)
+    /// the pending is real — it holds the static, the pin and the give-up
+    /// deadline — but `attempted` is `false`, no index is minted and no msg1
+    /// exists. `next_retransmit` is `now`, so §16.5's retransmit pass builds
+    /// the first attempt if nothing else does, and a give-up reached in that
+    /// state reports [`ConnectError::Local`] (ruling 72), which is the
+    /// truthful verdict for a dial no peer was ever told about.
+    pub(crate) fn mint_pending(
         &mut self,
         now: Instant,
         remote: SocketAddr,
@@ -410,10 +434,25 @@ impl<I: Identity> Endpoint<I> {
         // it, and no remote party can mint one.
         pending.guard_pinned = self.guard.pin(&key, guard::PinKind::KeyHolder);
 
-        self.start_attempt(now, &mut pending);
         self.pendings.insert(conn, pending);
 
         Ok((conn, Connection::connecting(sub_seed)))
+    }
+
+    /// §16.4's `start_attempt` — the second half of ruling 90's split, and
+    /// where §6.1's **2 initiator DH** are spent.
+    ///
+    /// A no-op for an unknown `conn`, and that is a live case rather than
+    /// defensive decoration: ruling 50's cancel retires the pending
+    /// **synchronously**, in the same instant the `Connecting` is dropped,
+    /// so a `connect()` cancelled before the driver ran finds nothing to
+    /// attempt here — and spends nothing, and puts no msg1 on the wire.
+    pub(crate) fn start_attempt(&mut self, now: Instant, conn: ConnectionId) {
+        let Some(mut pending) = self.pendings.remove(&conn) else {
+            return;
+        };
+        self.build_attempt(now, &mut pending);
+        self.pendings.insert(conn, pending);
     }
 
     /// Build and send one attempt, and arm the next retransmit.
@@ -421,7 +460,7 @@ impl<I: Identity> Endpoint<I> {
     /// The same function serves the first send and every retransmit, which
     /// is what makes §5.5's "every retransmit is a completely fresh
     /// initiation" true by construction rather than by discipline.
-    fn start_attempt(&mut self, now: Instant, pending: &mut Pending<I>) {
+    fn build_attempt(&mut self, now: Instant, pending: &mut Pending<I>) {
         // Retire the previous attempt's route first: §5.5 requires a
         // completion to match the *current* attempt's index, so a msg2 for
         // a superseded attempt must stop routing.
@@ -781,7 +820,7 @@ impl<I: Identity> Endpoint<I> {
             let Some(mut pending) = self.pendings.remove(&conn) else {
                 continue;
             };
-            self.start_attempt(now, &mut pending);
+            self.build_attempt(now, &mut pending);
             self.pendings.insert(conn, pending);
         }
     }

@@ -1,0 +1,1497 @@
+diff --git a/src/core/endpoint/mod.rs b/src/core/endpoint/mod.rs
+index 8b1d764..772f06a 100644
+--- a/src/core/endpoint/mod.rs
++++ b/src/core/endpoint/mod.rs
+@@ -110,7 +110,7 @@ struct Pending<I: Identity> {
+     /// would not open, or msg1 would not write on it — so not one msg1
+     /// exists for the peer to have ignored. A give-up in that state is
+     /// [`ConnectError::Local`], not [`ConnectError::TimedOut`]; see
+-    /// [`start_attempt`](Endpoint::start_attempt).
++    /// [`build_attempt`](Endpoint::build_attempt).
+     attempted: bool,
+     /// Whether this pending actually took a §17.1 pin.
+     ///
+@@ -352,14 +352,38 @@ impl<I: Identity> Endpoint<I> {
+     // §5.5 — outbound initiation
+     // ═══════════════════════════════════════════════════════════════════
+ 
+-    /// §16.4's `connect`.
++    /// §16.4's `mint_pending` — the first half of ruling 90's split.
+     ///
+     /// Refuses a static that already has a connection — live or still
+     /// dialling. `AlreadyConnected` for a live one is documentation
+     /// obligation #1 ("reconnecting is `close()` then dial"); for a
+     /// *pending* one it is forced by §16.1, since admitting a second dial
+     /// would let both complete and leave two sessions on one static.
+-    pub(crate) fn connect(
++    ///
++    /// # It costs **0 DH**, and that is the whole point (**ruling 90**)
++    ///
++    /// Nothing here opens the identity or touches hiss: it draws an id, a
++    /// sub-seed and the peer's mac1 key, writes §5.4's PENDING row and takes
++    /// §17.1's pin. §6.1's two initiator DH are
++    /// [`start_attempt`](Self::start_attempt)'s, which §6.2 puts on the
++    /// driver task.
++    ///
++    /// That split is what lets §16.2's non-`async` `connect()` answer
++    /// §16.1's NONE/PENDING/LIVE test **from this map**, at the instant of
++    /// the call, instead of from a shell-side mirror of it. Ruling 87
++    /// described this factoring; before ruling 90 the code did not have it,
++    /// and the price was a second record of a security invariant.
++    ///
++    /// # The pending exists before its first attempt does
++    ///
++    /// Between this call and the first [`start_attempt`](Self::start_attempt)
++    /// the pending is real — it holds the static, the pin and the give-up
++    /// deadline — but `attempted` is `false`, no index is minted and no msg1
++    /// exists. `next_retransmit` is `now`, so §16.5's retransmit pass builds
++    /// the first attempt if nothing else does, and a give-up reached in that
++    /// state reports [`ConnectError::Local`] (ruling 72), which is the
++    /// truthful verdict for a dial no peer was ever told about.
++    pub(crate) fn mint_pending(
+         &mut self,
+         now: Instant,
+         remote: SocketAddr,
+@@ -410,18 +434,33 @@ impl<I: Identity> Endpoint<I> {
+         // it, and no remote party can mint one.
+         pending.guard_pinned = self.guard.pin(&key, guard::PinKind::KeyHolder);
+ 
+-        self.start_attempt(now, &mut pending);
+         self.pendings.insert(conn, pending);
+ 
+         Ok((conn, Connection::connecting(sub_seed)))
+     }
+ 
++    /// §16.4's `start_attempt` — the second half of ruling 90's split, and
++    /// where §6.1's **2 initiator DH** are spent.
++    ///
++    /// A no-op for an unknown `conn`, and that is a live case rather than
++    /// defensive decoration: ruling 50's cancel retires the pending
++    /// **synchronously**, in the same instant the `Connecting` is dropped,
++    /// so a `connect()` cancelled before the driver ran finds nothing to
++    /// attempt here — and spends nothing, and puts no msg1 on the wire.
++    pub(crate) fn start_attempt(&mut self, now: Instant, conn: ConnectionId) {
++        let Some(mut pending) = self.pendings.remove(&conn) else {
++            return;
++        };
++        self.build_attempt(now, &mut pending);
++        self.pendings.insert(conn, pending);
++    }
++
+     /// Build and send one attempt, and arm the next retransmit.
+     ///
+     /// The same function serves the first send and every retransmit, which
+     /// is what makes §5.5's "every retransmit is a completely fresh
+     /// initiation" true by construction rather than by discipline.
+-    fn start_attempt(&mut self, now: Instant, pending: &mut Pending<I>) {
++    fn build_attempt(&mut self, now: Instant, pending: &mut Pending<I>) {
+         // Retire the previous attempt's route first: §5.5 requires a
+         // completion to match the *current* attempt's index, so a msg2 for
+         // a superseded attempt must stop routing.
+@@ -781,7 +820,7 @@ impl<I: Identity> Endpoint<I> {
+             let Some(mut pending) = self.pendings.remove(&conn) else {
+                 continue;
+             };
+-            self.start_attempt(now, &mut pending);
++            self.build_attempt(now, &mut pending);
+             self.pendings.insert(conn, pending);
+         }
+     }
+diff --git a/src/core/tests.rs b/src/core/tests.rs
+index cb3ed38..966db15 100644
+--- a/src/core/tests.rs
++++ b/src/core/tests.rs
+@@ -254,10 +254,14 @@ impl Ep {
+     }
+ 
+     fn connect(&mut self, now: Instant, remote: SocketAddr, peer: &Pk) -> (ConnectionId, Drained) {
++        // Ruling 90 split §16.4's `connect` in two: `mint_pending` (0 DH)
++        // and `start_attempt` (§6.1's `es` + `ss`). The shell calls them from
++        // two tasks; a dial is still the two of them, in this order.
+         let (id, _conn) = self
+             .ep
+-            .connect(now, remote, *peer)
++            .mint_pending(now, remote, *peer)
+             .expect("connect should succeed");
++        self.ep.start_attempt(now, id);
+         (id, self.drain())
+     }
+ 
+@@ -2326,7 +2330,7 @@ fn connect_to_a_static_with_a_live_connection_is_already_connected() {
+     let peer = b.public_static;
+     assert!(
+         matches!(
+-            a.ep.connect(t, b.addr, peer),
++            a.ep.mint_pending(t, b.addr, peer),
+             Err(ConnectError::AlreadyConnected)
+         ),
+         "a second connect() to a live static succeeded"
+@@ -2956,7 +2960,7 @@ fn retired_cancels_the_pending_and_frees_the_static_for_an_immediate_redial() {
+ 
+     // And the static is free.
+     assert!(
+-        a.ep.connect(t, b.addr, peer).is_ok(),
++        a.ep.mint_pending(t, b.addr, peer).is_ok(),
+         "a redial after cancellation returned AlreadyConnected (S29)"
+     );
+ }
+diff --git a/src/shell/driver.rs b/src/shell/driver.rs
+index 883af4d..2b18a96 100644
+--- a/src/shell/driver.rs
++++ b/src/shell/driver.rs
+@@ -50,46 +50,40 @@
+ //! same drain on the no-linger paths; and **no `Retired` at all** when no
+ //! session was ever installed — which is why [`Driver::release_dead`] keys
+ //! on the *core's* state rather than on having seen a `Retired`, and why
+-//! [`Driver::command_cancel`] synthesises one for a pending that has no
+-//! session index to name (see there for why `0` is the safe value).
++//! ruling 50's cancel **synthesises** one for a pending that has no session
++//! index to name. After ruling 90 that synthesis happens in
++//! `Connecting::drop` rather than here, because the redial that follows it
++//! reads the endpoint core's own map; see [`Driver::command_cancel`], which
++//! is what is left of the cancel on this side.
+ //!
+-//! # The static map's transitions
++//! # The static map — there is exactly one, and the driver does not own it
+ //!
+-//! `ShellState::statics` is ruling 87's synchronous NONE/PENDING/LIVE cell.
+-//! Its complete set of writers:
++//! **[RULING 90]** §5.4's NONE/PENDING/LIVE state lives in the endpoint
++//! core's `StaticMap` and **nowhere else**. Every transition is the core's:
+ //!
+-//! | Transition | Written by | When |
++//! | Transition | Made by | When |
+ //! |---|---|---|
+-//! | NONE → PENDING | the handle | `Endpoint::connect`, synchronously |
+-//! | PENDING → NONE | the handle | `Connecting::drop`, synchronously (ruling 50) |
+-//! | PENDING → NONE | the driver | `EndpointOutput::HandshakeFailed` — §5.5's give-up |
+-//! | PENDING → LIVE | the driver | `ConnEvent::Established` |
+-//! | NONE → LIVE | the driver | a staged `accept()` that returned a connection |
+-//! | LIVE → NONE | the driver | the connection's state is released |
++//! | NONE → PENDING | `mint_pending` | `Endpoint::connect`, synchronously on the handle (0 DH) |
++//! | PENDING → NONE | `handle_connection_event(Retired)` | `Connecting::drop`, synchronously on the handle (ruling 50) |
++//! | PENDING → NONE | `drop_pending` | §5.5's give-up, inside `handle_timeout` |
++//! | PENDING → LIVE | `StaticMap::promote` | `complete_initiation` — the msg2 that installs |
++//! | NONE → LIVE | `accept` | §6.2's stage 3 |
++//! | LIVE → NONE | `handle_connection_event(Retired)` | teardown |
+ //!
+-//! Every driver-side removal is stamp-checked, because a cancel-and-redial
+-//! installs a **newer** attempt under the same key before the driver has
+-//! processed the older one's death.
++//! Until ruling 90 the shell kept a **stamped mirror** of that map, because
++//! ruling 87 made §16.2's `connect()` synchronous while slice 3a's
++//! `core::Endpoint::connect()` mints the pending *and* builds msg1 in one
++//! 2-DH call — so the handle could not reach the core's map without paying
++//! on the caller's task. The mirror was a second record of a security
++//! invariant, it needed a monotone `attempt` stamp on every entry to survive
++//! cancel-and-redial, and it was the root of the seam review's worst finding
++//! (C-B1). Splitting the core verb deleted all of it: the map, the stamps,
++//! `claim_static`, `release_static` and `next_attempt`.
+ //!
+-//! ## The mirror is allowed to lag, and §16.1 says so
+-//!
+-//! This map is a **synchronous admission test**, not a second authority.
+-//! The core is the authority, and the two are allowed to disagree for the
+-//! width of one command: §16.1 keeps a staged chain in progress out of
+-//! `connect()`'s list on purpose — "until `authenticate()` the chain's
+-//! static is merely claimed, and §6.1 forbids keying anything durable on an
+-//! unproven claim" — and holds the invariant at the other end of the race,
+-//! at §6.7's comparison in `accept()`. So `[AcceptChain(K), Connect(K)]` in
+-//! the queue is a legal state in which the mirror says NONE and the core
+-//! is about to say `AlreadyConnected`.
+-//!
+-//! The lag is only ever in the benign direction — the mirror admits a
+-//! connect the core will refuse — and [`Driver::command_connect`]'s `Err`
+-//! branch is S3a's ratified answer to it. There was a `debug_assert!` there
+-//! claiming the disagreement was impossible; it turned a legal outcome into
+-//! a dead endpoint in every debug build, and it is gone. See
+-//! `s3a_accept_ahead_of_connect_resolves_already_connected` in
+-//! `tests/spec_shell.rs`.
++//! What that buys, beyond one fewer copy: the two maps can no longer
++//! disagree **because there is only one**, so `[AcceptChain(K), Connect(K)]`
++//! in the command queue is decided by §6.4's PENDING branch in the core
++//! rather than by which command the driver reached first.
+ //!
+ //! # Stopping
+ //!
+@@ -122,8 +116,8 @@ use crate::packet::Handshake;
+ 
+ use super::connection::Connection;
+ use super::shared::{
+-    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink,
+-    StaticState, Wakers, now, resolve_slot,
++    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers,
++    now, resolve_slot,
+ };
+ use super::staged::Intro;
+ use super::wire::Wire;
+@@ -137,12 +131,10 @@ const DRAIN_BOUND: usize = 100_000;
+ struct ConnRecord<I: Identity> {
+     /// Shared with every [`Connection`] handle for this connection.
+     cell: Rc<RefCell<ConnCell<I::Suite>>>,
+-    /// The peer's canonical §2.4 static octets — the key into the shell's
+-    /// static map — and the key itself, kept for the accessors.
+-    static_key: Vec<u8>,
++    /// The peer's static, kept for the accessors a [`Connection`] handle
++    /// carries. **Not** a static-map key: ruling 90 leaves that map in the
++    /// core, and nothing here writes it.
+     remote_static: PublicKeyOf<I>,
+-    /// The stamp this connection's static entry carries.
+-    attempt: u64,
+     /// The `Connecting` awaiting establishment, while one exists.
+     slot: Option<Rc<RefCell<PendingSlot<I>>>>,
+ }
+@@ -529,17 +521,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+         };
+         cell.borrow_mut().remote_address = anchor;
+ 
+-        // PENDING → LIVE, stamp-checked.
+-        if let Some(slot) = self
+-            .shell
+-            .state
+-            .borrow_mut()
+-            .statics
+-            .get_mut(&record.static_key)
+-            && slot.attempt == record.attempt
+-        {
+-            slot.state = StaticState::Live;
+-        }
++        // §5.4's PENDING → LIVE is not written here: ruling 90 leaves the
++        // static map in the core, and `complete_initiation` promoted the
++        // entry in the same call that emitted the `Install` this event
++        // followed.
+ 
+         let Some(slot) = record.slot.take() else {
+             return;
+@@ -565,15 +550,12 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+     /// endpoint core telling us it has *already* dropped the pending, and
+     /// no session was ever installed, so there is no index route and no
+     /// guard pin left to release (rulings 81/84's "no `Retired` at all"
+-    /// case).
++    /// case). `drop_pending` released the static in the same call, which is
++    /// the whole of §5.4's PENDING → NONE after ruling 90.
+     fn fail_pending(&mut self, id: ConnectionId, error: ConnectError) {
+         let Some(record) = self.conns.remove(&id) else {
+             return;
+         };
+-        self.shell
+-            .state
+-            .borrow_mut()
+-            .release_static(&record.static_key, record.attempt);
+         if let Some(slot) = record.slot {
+             resolve_slot(&slot, PendingOutcome::Failed(error));
+         }
+@@ -601,10 +583,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+             let Some(record) = self.conns.remove(&id) else {
+                 continue;
+             };
+-            self.shell
+-                .state
+-                .borrow_mut()
+-                .release_static(&record.static_key, record.attempt);
++            // §5.4's LIVE → NONE is the core's, on the `Retired` this pass
++            // has already delivered (see the module docs' ordering note);
++            // ruling 90 leaves no shell-side copy to release here.
++            //
+             // The core is released here, and only here. A handle that
+             // calls `close()` afterwards finds `None` and does nothing —
+             // the same answer the core itself would have given.
+@@ -757,13 +739,13 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+     fn handle_command(&mut self, command: Command<I>) {
+         match command {
+             Command::Connect {
++                id,
++                core,
+                 remote,
+                 remote_static,
+-                static_key,
+-                attempt,
+                 slot,
+-            } => self.command_connect(remote, remote_static, static_key, attempt, slot),
+-            Command::Cancel(slot) => self.command_cancel(&slot),
++            } => self.command_connect(id, *core, remote, remote_static, slot),
++            Command::Cancel(id) => self.command_cancel(id),
+             Command::Accept(reply) => {
+                 self.waiting.push_back(reply);
+                 self.dispatch_intros();
+@@ -796,170 +778,99 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+         }
+     }
+ 
+-    /// §16.2's `connect()`, on the driver task where §6.1's two initiator
+-    /// DH may be spent (ruling 87).
++    /// §16.2's `connect()`'s **second half** — §6.1's two initiator DH, on
++    /// the driver task where §6.2 requires them (rulings 87 and 90).
++    ///
++    /// Everything cheap already happened, synchronously, in the verb itself:
++    /// `mint_pending` answered §16.1's NONE/PENDING/LIVE test out of the
++    /// endpoint core's own map, minted `id` and built the connection core.
++    /// There is no `Err` arm here because there is no second admission test
++    /// to fail — that is the whole of what deleting the mirror bought.
++    ///
++    /// # A cancel that overtook this command spends nothing
++    ///
++    /// On a paused clock `connect(); drop(connecting)` runs to completion
++    /// before the driver is scheduled, leaving `[Connect(id), Cancel(id)]`
++    /// in the queue. Ruling 50's cancel already retired the pending in the
++    /// core — synchronously, in `Connecting::drop` — so `start_attempt`
++    /// finds nothing under `id`, returns, and **no msg1 reaches the wire
++    /// and no DH is spent**. Before ruling 90 this arm called
++    /// `core::Endpoint::connect`, which built and sent msg1 unconditionally
++    /// and left the `Cancel` behind it to undo an attempt the peer had
++    /// already seen.
++    ///
++    /// The record is still inserted, and deliberately: the `Cancel` behind
++    /// us removes it, and an early return here would leave the two arms
++    /// disagreeing about whether it exists.
+     fn command_connect(
+         &mut self,
++        id: ConnectionId,
++        core: CoreConnection<I::Suite>,
+         remote: SocketAddr,
+         remote_static: PublicKeyOf<I>,
+-        static_key: Vec<u8>,
+-        attempt: u64,
+         slot: Rc<RefCell<PendingSlot<I>>>,
+     ) {
+-        // The `Connecting` may already have been dropped — on a paused
+-        // clock nothing here has run since the verb returned. The `Cancel`
+-        // is behind us in the queue and will retire this pending; short-
+-        // circuiting would leave the core without the pending the cancel is
+-        // about to release, and the retransmit train running.
+-        let result =
+-            self.shell
+-                .state
+-                .borrow_mut()
+-                .endpoint
+-                .connect(now(), remote, remote_static.clone());
+-
+-        match result {
+-            Ok((id, core)) => {
+-                slot.borrow_mut().id = Some(id);
+-                let cell = Rc::new(RefCell::new(ConnCell {
+-                    core: Some(core),
+-                    remote_address: remote,
+-                    closed: None,
+-                    closed_wakers: Wakers::default(),
+-                    notifications: NotificationSlots,
+-                    dirty: true,
+-                    handles: 0,
+-                }));
+-                self.conns.insert(
+-                    id,
+-                    ConnRecord {
+-                        cell,
+-                        static_key,
+-                        remote_static,
+-                        attempt,
+-                        slot: Some(slot),
+-                    },
+-                );
+-            }
+-            Err(error) => {
+-                // **The two maps disagreeing here is legitimate**, and
+-                // §16.1 is where it is licensed. There was a
+-                // `debug_assert!(false, …)` on this line asserting the
+-                // opposite; it asserted something false and is deleted.
+-                //
+-                // The interleaving, which is ordinary application code:
+-                // `Proven::accept()` queues `Command::AcceptChain(K)` on
+-                // its first poll and yields, and the application calls
+-                // `Endpoint::connect(K)` before the driver's next turn —
+-                // which ruling 87 *guarantees* it can, by making the verb
+-                // synchronous. `claim_static` reads the mirror, sees NONE
+-                // (nothing has landed yet, and cannot have) and writes
+-                // PENDING. The queue is now `[AcceptChain(K), Connect(K)]`:
+-                // the accept runs first, the core's own map is still empty
+-                // for K so it succeeds, and the connect that follows is
+-                // refused by a core that now holds K.
+-                //
+-                // §16.1 declines to prevent exactly this: "a staged chain
+-                // in progress is **deliberately not in `connect()`'s
+-                // list**, and cannot be: until `authenticate()` the chain's
+-                // static is merely claimed, and §6.1 forbids keying
+-                // anything durable on an unproven claim. The invariant is
+-                // held at the other end of that race instead" — §6.7's
+-                // comparison at `accept()`. So the mirror is not wrong
+-                // about *state*; it is one command behind, in the benign
+-                // direction ("admits a connect the core will refuse").
+-                //
+-                // The branch below is already S3a's ratified answer:
+-                // `connect()` to a static that already has a live
+-                // `Connection` returns `Err(ConnectError::AlreadyConnected)`,
+-                // which is what the core just said and what the `Connecting`
+-                // is resolved with.
+-                //
+-                // `release_static` is stamp-checked and that is load-bearing
+-                // here, not incidental: the accept drew its `attempt` from
+-                // the same monotone counter *after* `claim_static` drew this
+-                // one, so the entry now under `static_key` carries the later
+-                // stamp and this release **declines**. The accept's LIVE
+-                // entry survives, which is what keeps the mirror agreeing
+-                // with the core from the next instant on. Pinned by
+-                // `s3a_accept_ahead_of_connect_resolves_already_connected`
+-                // in `tests/spec_shell.rs`.
+-                self.shell
+-                    .state
+-                    .borrow_mut()
+-                    .release_static(&static_key, attempt);
+-                resolve_slot(&slot, PendingOutcome::Failed(error));
+-            }
+-        }
++        let cell = Rc::new(RefCell::new(ConnCell {
++            core: Some(core),
++            remote_address: remote,
++            closed: None,
++            closed_wakers: Wakers::default(),
++            notifications: NotificationSlots,
++            dirty: true,
++            handles: 0,
++        }));
++        self.conns.insert(
++            id,
++            ConnRecord {
++                cell,
++                remote_static,
++                slot: Some(slot),
++            },
++        );
++
++        // §6.1's `es` + `ss`, and §5.5's first initiation on the wire.
++        self.shell
++            .state
++            .borrow_mut()
++            .endpoint
++            .start_attempt(now(), id);
+     }
+ 
+-    /// Ruling 50: a `Connecting` was dropped.
++    /// Ruling 50: a `Connecting` was dropped — the driver's half of it.
++    ///
++    /// # The core-side retirement is **not** here, and after ruling 90 it
++    /// cannot be
+     ///
+-    /// §16.4's API list has no cancel verb, and `ToEndpoint::Retired` is
+-    /// the core-side effect S29 needs — the endpoint core's own docs name
+-    /// this as "S29's cancellation path": it stops §5.5's retransmit train,
+-    /// frees the pending index (§17.3), takes the dialled address out of
+-    /// §6.5's hint set (§17.4), releases the §17.1 pin, and frees the
+-    /// static so the very next `connect()` succeeds. It emits nothing — the
+-    /// `Connecting` is already resolved by its own drop, and a
+-    /// `HandshakeFailed` would be a second resolution.
++    /// §16.4's API list has no cancel verb, and `ToEndpoint::Retired` is the
++    /// core-side effect S29 needs — the endpoint core's own docs name it
++    /// "S29's cancellation path": it stops §5.5's retransmit train, frees
++    /// the pending index (§17.3), takes the dialled address out of §6.5's
++    /// hint set (§17.4), releases the §17.1 pin, and frees the static so the
++    /// very next `connect()` succeeds. `Connecting::drop` delivers it
++    /// **synchronously**, in the instant the handle dies.
+     ///
+-    /// # Why `our_index: 0`
++    /// It has to. Ruling 50's MUST is that the cancellation is ordered ahead
++    /// of any endpoint verb issued after the drop returns, *with no advance
++    /// of the clock between them* — and after ruling 90 the redial's
++    /// admission test is `mint_pending` reading the core's own static map.
++    /// A `Retired` delivered here, one command later, would be a redial
++    /// answered `AlreadyConnected` by a map still holding the corpse. The
++    /// mirror used to absorb that; there is no mirror.
+     ///
+-    /// A `connect()`-created connection that never installed a session has
+-    /// no session index to name. `handle_connection_event` passes the value
+-    /// to `remove_session` and `remove_pending` before doing the work that
+-    /// actually matters here (`drop_pending`, which removes the *current*
+-    /// attempt's index from the pending's own record). **`0` cannot collide
+-    /// with anything**: `IndexTables::mint` draws a random **nonzero**
+-    /// `u32` absent from both tables, so no live route is ever keyed on it.
+-    /// Any other placeholder would have a 2⁻³² chance per live session of
+-    /// evicting somebody else's route.
++    /// So what is left for this command is the driver's own bookkeeping —
++    /// the `ConnRecord` — plus the wake that makes the loop recompute its
++    /// deadlines with the pending gone.
+     ///
+-    /// # The order of the two statements below is §16.4's MUST
++    /// # §16.4's MUST still holds, and more strongly than before
+     ///
+     /// §16.4: "the shell delivers `Retired` to `handle_connection_event`
+     /// **before** releasing the connection's shell-side bookkeeping (else
+     /// the index route and the guard-entry pin leak for the endpoint's
+-    /// life)". This used to run the other way round — `self.conns.remove`
+-    /// first — which is the literal inverse.
+-    ///
+-    /// It was harmless at the time for exactly one reason:
+-    /// `handle_connection_event` emits nothing
+-    /// (`src/core/endpoint/mod.rs:808-832`), so no endpoint output could
+-    /// be looked up against a record that had just been removed. That is
+-    /// a property of today's core, not of the seam — §16.1's PENDING-branch
+-    /// tie-break at `accept()` ("cancels the pending and installs in its
+-    /// place", slice 7) is a cancel that *would* produce output for `id`,
+-    /// and it would have found `self.conns.get(&id) == None` and been
+-    /// dropped on the floor at `serve_endpoint`'s `ToConnection` arm.
+-    /// The membership test replaces the removal as the guard, so the
+-    /// early return is unchanged and the record is still present for the
+-    /// duration of the call.
+-    ///
+-    /// Note also that the `Retired` delivered here is **synthesised by the
+-    /// shell**, not emitted by a connection core: §16.4's list of the
+-    /// cases that carry one ("in both cases") does not reach ruling 50's
+-    /// cancel at all. The ordering rationale does, so the ordering is
+-    /// held here too rather than argued away.
+-    fn command_cancel(&mut self, slot: &Rc<RefCell<PendingSlot<I>>>) {
+-        let Some(id) = slot.borrow().id else {
+-            // The `Connect` ahead of us in the queue failed, so there is no
+-            // pending to cancel and the static was already released.
+-            return;
+-        };
+-        if !self.conns.contains_key(&id) {
+-            return;
+-        }
+-        self.shell
+-            .state
+-            .borrow_mut()
+-            .endpoint
+-            .handle_connection_event(now(), id, ToEndpoint::Retired { our_index: 0 });
++    /// life)." The two are now in different tasks' turns rather than two
++    /// statements, and the order between them is guaranteed by the channel:
++    /// the drop delivers `Retired` and *then* sends this command.
++    fn command_cancel(&mut self, id: ConnectionId) {
+         self.conns.remove(&id);
+-        // The shell-side static was released synchronously by
+-        // `Connecting::drop` — before this command was even queued, which
+-        // is what makes the immediate redial work with no clock advance.
+     }
+ 
+     /// §6.2's stage 3, on the driver task where its two DH belong.
+@@ -994,8 +905,6 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+         // and the core exposes no per-connection static accessor. The
+         // handle's value *is* the proven one — `Proven` is only reachable
+         // through `authenticate()`, which returned it.
+-        let static_key = remote_static.as_ref().to_vec();
+-
+         let cell = Rc::new(RefCell::new(ConnCell {
+             core: Some(core),
+             remote_address: anchor,
+@@ -1006,22 +915,9 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+             handles: 0,
+         }));
+ 
+-        // NONE → LIVE. `claim_static` is not used: the shell's map is the
+-        // *outbound* admission test, and an inbound replacement is §5.4's
+-        // business, decided in the core, which has already decided it.
+-        let attempt = {
+-            let mut state = self.shell.state.borrow_mut();
+-            let attempt = state.next_attempt;
+-            state.next_attempt += 1;
+-            state.statics.insert(
+-                static_key.clone(),
+-                super::shared::StaticSlot {
+-                    attempt,
+-                    state: StaticState::Live,
+-                },
+-            );
+-            attempt
+-        };
++        // §5.4's NONE → LIVE was written by `core::Endpoint::accept` itself,
++        // in the call above. Ruling 90 leaves that map in the core, so there
++        // is nothing to mirror here — and no second stamp to keep honest.
+ 
+         let handle = Connection::new(
+             Rc::clone(&self.link),
+@@ -1034,9 +930,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
+             conn_id,
+             ConnRecord {
+                 cell,
+-                static_key,
+                 remote_static,
+-                attempt,
+                 slot: None,
+             },
+         );
+diff --git a/src/shell/endpoint.rs b/src/shell/endpoint.rs
+index 1ae6418..724968a 100644
+--- a/src/shell/endpoint.rs
++++ b/src/shell/endpoint.rs
+@@ -13,13 +13,13 @@ use std::rc::Rc;
+ use std::task::{Context, Poll};
+ 
+ use crate::config::Config;
+-use crate::core::Endpoint as CoreEndpoint;
++use crate::core::{ConnectionId, Endpoint as CoreEndpoint, ToEndpoint};
+ use crate::error::ConnectError;
+ use crate::identity::{Identity, PublicKeyOf};
+ 
+ use super::connection::Connection;
+ use super::driver::Driver;
+-use super::shared::{Command, PendingOutcome, PendingSlot, Shell};
++use super::shared::{Command, PendingOutcome, PendingSlot, Shell, now};
+ use super::staged::Intro;
+ use super::wire::Wire;
+ 
+@@ -83,17 +83,25 @@ impl<I: Identity> Endpoint<I> {
+ 
+     /// Dial `remote_static` at `remote` (§5.5).
+     ///
+-    /// **Not `async`** — §16.2 declares it so, and ruling 87 explains why
+-    /// it can be: `connect()` performs no DH (§6.1's initiator costs are
+-    /// paid when msg1 is built, on the driver), so it only has to mint the
+-    /// attempt. [`ConnectError::AlreadyConnected`] therefore arrives
+-    /// **before any await**, from a synchronous read of the shared cell
+-    /// §16.8 already requires for the accessors.
++    /// **Not `async`** — §16.2 declares it so, and rulings 87 and 90 are why
++    /// it can be. Ruling 87 settled the signature on the grounds that
++    /// "`connect()` performs no DH — §6.1's initiator costs are paid when
++    /// msg1 is built, on the driver; the verb itself only mints the
++    /// pending". **Ruling 90 is the core factoring that makes that sentence
++    /// true**: `core::Endpoint::mint_pending` costs 0 DH, so this verb calls
++    /// it here, synchronously, and `core::Endpoint::start_attempt` spends
++    /// §6.1's two on the driver where §6.2 requires them.
+     ///
+-    /// That synchronous read is also what makes ruling 50's
++    /// So [`ConnectError::AlreadyConnected`] arrives **before any await**,
++    /// and it arrives from the **endpoint core's own static map** — §16.1's
++    /// NONE/PENDING/LIVE test read from the one authority, not from a
++    /// shell-side copy of it. There is no second record of
++    /// one-connection-per-static to disagree with the first.
++    ///
++    /// That same synchronous call is what makes ruling 50's
+     /// cancellation-ordering **MUST** structural rather than a discipline:
+-    /// [`Connecting::drop`] writes the static back to NONE in the same cell
+-    /// this reads, so
++    /// [`Connecting::drop`] retires the pending in that same map, in the
++    /// same instant, so
+     ///
+     /// ```text
+     /// drop(connecting);                    // cancels
+@@ -107,9 +115,7 @@ impl<I: Identity> Endpoint<I> {
+         remote: SocketAddr,
+         remote_static: PublicKeyOf<I>,
+     ) -> Result<Connecting<I>, ConnectError> {
+-        let static_key = remote_static.as_ref().to_vec();
+-
+-        let attempt = {
++        let (id, core) = {
+             let mut state = self.shell.state.borrow_mut();
+             if state.driver_stopped {
+                 // Unreachable while this `Endpoint` lives — it is a handle,
+@@ -118,24 +124,25 @@ impl<I: Identity> Endpoint<I> {
+                 // local fault with 0 DH spent is what `Local` names.
+                 return Err(ConnectError::Local);
+             }
+-            state.claim_static(static_key.clone())?
++            let minted = state
++                .endpoint
++                .mint_pending(now(), remote, remote_static.clone())?;
++            // §16.4: every mutating core call is followed by a drain. This
++            // one emits nothing; see `ShellState::drain_endpoint`.
++            state.drain_endpoint();
++            minted
+         };
+ 
+         let slot = Rc::new(RefCell::new(PendingSlot::new()));
+         self.shell.send(Command::Connect {
++            id,
++            core: Box::new(core),
+             remote,
+             remote_static,
+-            static_key: static_key.clone(),
+-            attempt,
+             slot: Rc::clone(&slot),
+         });
+ 
+-        Ok(Connecting::new(
+-            self.shell.clone(),
+-            slot,
+-            static_key,
+-            attempt,
+-        ))
++        Ok(Connecting::new(self.shell.clone(), slot, id))
+     }
+ }
+ 
+@@ -173,26 +180,22 @@ impl<I: Identity> Drop for Endpoint<I> {
+ pub struct Connecting<I: Identity> {
+     shell: Shell<I>,
+     slot: Rc<RefCell<PendingSlot<I>>>,
+-    static_key: Vec<u8>,
+-    attempt: u64,
++    /// Minted synchronously by `mint_pending` (ruling 90), so it exists from
++    /// the instant this handle does — which is what lets `Drop` retire the
++    /// pending in the core rather than ask the driver to.
++    id: ConnectionId,
+     /// Set once this future has handed its result out, so `Drop` knows the
+     /// attempt is no longer in flight.
+     resolved: bool,
+ }
+ 
+ impl<I: Identity> Connecting<I> {
+-    fn new(
+-        shell: Shell<I>,
+-        slot: Rc<RefCell<PendingSlot<I>>>,
+-        static_key: Vec<u8>,
+-        attempt: u64,
+-    ) -> Self {
++    fn new(shell: Shell<I>, slot: Rc<RefCell<PendingSlot<I>>>, id: ConnectionId) -> Self {
+         shell.acquire();
+         Self {
+             shell,
+             slot,
+-            static_key,
+-            attempt,
++            id,
+             resolved: false,
+         }
+     }
+@@ -238,17 +241,41 @@ impl<I: Identity> Drop for Connecting<I> {
+             !self.resolved && matches!(self.slot.borrow().outcome, PendingOutcome::Waiting);
+ 
+         if in_flight {
+-            // Ruling 87: the static returns to NONE **here**, synchronously,
+-            // in the very cell `connect()` reads — which is what an
+-            // immediate redial with no clock advance observes.
+-            self.shell
+-                .state
+-                .borrow_mut()
+-                .release_static(&self.static_key, self.attempt);
+-            // Ruling 50's MUST: this command and any later endpoint verb
+-            // travel on one FIFO channel, so the cancellation is ordered
+-            // ahead of everything the application issues after the drop.
+-            self.shell.send(Command::Cancel(Rc::clone(&self.slot)));
++            // Ruling 50's MUST, and after ruling 90 it is discharged in the
++            // **core's own map**, synchronously, right here.
++            //
++            // §16.4 lists no cancel verb; `Retired` is the event whose
++            // documented effects are exactly cancellation's — it stops
++            // §5.5's train, frees the pending index (§17.3), takes the
++            // dialled address out of §6.5's hint set (§17.4), releases the
++            // §17.1 pin, and **returns the static to NONE**. It costs 0 DH,
++            // which is the whole reason a handle may call it: §6.2 puts DH
++            // on the driver, and there is none here.
++            //
++            // `our_index: 0` is provably safe: `IndexTables::mint` draws a
++            // random **nonzero** `u32`, so no live route is ever keyed on
++            // it, and a `connect()` that never installed a session has no
++            // session index to name.
++            //
++            // Doing it here rather than on the driver is what makes the
++            // ordering **structural**: an immediate redial calls
++            // `mint_pending` on the very map this line just released, with
++            // no clock advance and no driver turn in between. A version
++            // that only queued the command would answer that redial
++            // `AlreadyConnected`.
++            {
++                let mut state = self.shell.state.borrow_mut();
++                state.endpoint.handle_connection_event(
++                    now(),
++                    self.id,
++                    ToEndpoint::Retired { our_index: 0 },
++                );
++                // §16.4's drain contract; this call emits nothing.
++                state.drain_endpoint();
++            }
++            // What is left for the driver is its own bookkeeping: the
++            // `ConnRecord`, and the wake that lets it recompute deadlines.
++            self.shell.send(Command::Cancel(self.id));
+         }
+ 
+         self.shell.release();
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 0abd458..9542bcd 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -24,12 +24,15 @@
+ //!
+ //! Endpoint verbs — `accept()` and §6.2's three staged verbs — are a
+ //! command channel plus a oneshot reply, because §6.2 requires the DH costs
+-//! to land on the driver task. `connect()` is the exception (ruling 87): it
+-//! is not `async`, performs no DH, and answers §16.1's NONE/PENDING/LIVE
+-//! test from a **synchronous read of the shared cell**. The connection data
+-//! path and the four accessors share an `Rc<RefCell<_>>` with the driver;
+-//! each data-path verb is written once as `poll_*`, and the `async fn` is
+-//! `poll_fn` over it.
++//! to land on the driver task. `connect()` is the exception (rulings 87 and
++//! 90): it is not `async` because its first half, `mint_pending`, costs **0
++//! DH**, so the handle calls it on the shared cell and answers §16.1's
++//! NONE/PENDING/LIVE test out of the endpoint core's **own** static map.
++//! Its second half, `start_attempt`, carries §6.1's two initiator DH and
++//! rides the command channel like every other DH-bearing verb. The
++//! connection data path and the four accessors share an `Rc<RefCell<_>>`
++//! with the driver; each data-path verb is written once as `poll_*`, and
++//! the `async fn` is `poll_fn` over it.
+ //!
+ //! # What is here, and what is not
+ //!
+@@ -405,19 +408,21 @@ mod tests {
+     ///
+     /// 2. **`Retired` dropped on the floor.** Delete the
+     ///    `handle_connection_event` call in `Driver::serve_connection`'s
+-    ///    `ToEndpoint` arm. The **second half** is what sees that, and it
+-    ///    is the half that used to assert nothing: *neither*
+-    ///    `is_established()` *nor* `Endpoint::connect`'s `Ok` can observe
+-    ///    it. `release_dead` nulls `ConnCell::core` and frees the
+-    ///    **mirror** — `ShellState::statics`, §16.1's synchronous
+-    ///    admission test — whether or not the `Retired` was delivered, and
+-    ///    `connect()` is answered from that mirror. Only `core::Endpoint`'s
+-    ///    own map still holds the static, and the sole thing that reports
+-    ///    its answer back is the **resolved `Connecting`**: a dropped one
+-    ///    throws it away. So the redial is driven to a completed handshake
+-    ///    here rather than dropped on the next line. Under the mutation
+-    ///    the core answers `AlreadyConnected`, no msg1 is ever
+-    ///    transmitted, and `redial.await` resolves `Err`.
++    ///    `ToEndpoint` arm. The **second half** is what sees that. Before
++    ///    ruling 90 it was the half that used to assert nothing: *neither*
++    ///    `is_established()` *nor* `Endpoint::connect`'s `Ok` could observe
++    ///    the mutation, because `release_dead` freed the shell's **mirror**
++    ///    of the static map whether or not the `Retired` had been
++    ///    delivered, and `connect()` was answered from that mirror — so
++    ///    only the **resolved `Connecting`** reported the core's real
++    ///    answer, and a dropped one threw it away. Ruling 90 deleted the
++    ///    mirror: the redial's admission test is now `mint_pending` reading
++    ///    the core's own map, so under the mutation `connect()` itself
++    ///    answers `AlreadyConnected` and the `expect` below is the first
++    ///    thing that fires. The wire reading and the completed handshake
++    ///    are kept anyway — they were the assertions that separated the two
++    ///    builds when nothing cheaper could, and a test does not get weaker
++    ///    because the seam got stronger.
+     ///
+     /// The third build — a *core* that emits `Retired` at the death
+     /// instead of at the expiry — is a mutation of frozen `src/core/**`,
+@@ -452,11 +457,12 @@ mod tests {
+             drop(a);
+             drop(b);
+ 
+-            // `connect()`'s `Ok` proves nothing: it is the mirror's
+-            // answer. Take a wire reading first — under the mutation the
+-            // endpoint core refuses before anything is sealed, so **no
+-            // msg1 leaves at all**, and this separates without B's
+-            // cooperation.
++            // Take a wire reading first — under the mutation the endpoint
++            // core refuses before anything is sealed, so **no msg1 leaves
++            // at all**, and this separates without B's cooperation. Before
++            // ruling 90 this was the *only* thing that separated them,
++            // because `connect()`'s `Ok` was the shell mirror's answer
++            // rather than the core's; it is now both.
+             let tap = pair.net.tap();
+             let from_a = || {
+                 tap.snapshot()
+@@ -470,7 +476,10 @@ mod tests {
+                 .a
+                 .endpoint
+                 .connect(pair.b.addr, pair.b.public_static)
+-                .expect("the shell mirror still said LIVE after the linger");
++                .expect(
++                    "`mint_pending` still found the static occupied after the linger: \
++                     `Retired` never reached the endpoint core (ruling 90)",
++                );
+             settle().await;
+             assert!(
+                 from_a() > before,
+@@ -631,9 +640,10 @@ mod tests {
+             );
+ 
+             // And the driver is alive rather than merely quiet. `connect()`
+-            // tests `driver_stopped` *before* the static mirror, so a
+-            // stopped driver answers `Local` here where a live one, with A
+-            // still draining, answers `AlreadyConnected`.
++            // tests `driver_stopped` *before* it consults the endpoint
++            // core's static map, so a stopped driver answers `Local` here
++            // where a live one, with A still draining, answers
++            // `AlreadyConnected`.
+             assert_eq!(
+                 pair.a
+                     .endpoint
+diff --git a/src/shell/shared.rs b/src/shell/shared.rs
+index 54f9625..3155f5e 100644
+--- a/src/shell/shared.rs
++++ b/src/shell/shared.rs
+@@ -141,32 +141,6 @@ impl<F: FnMut(u64)> Drop for WakerSlot<F> {
+     }
+ }
+ 
+-/// §5.4's three-valued static state, as the **shell** needs to answer it
+-/// synchronously (§16.1, ruling 87). NONE is the absence of an entry.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub(crate) enum StaticState {
+-    /// An outbound `connect()` whose `Connecting` is still alive.
+-    Pending,
+-    /// A live connection — dialled or accepted.
+-    Live,
+-}
+-
+-/// One entry of ruling 87's synchronous static map.
+-///
+-/// The `attempt` is what makes cancel-then-redial safe. On a paused clock
+-/// the sequence `drop(connecting); ep.connect(same_static)` runs to
+-/// completion **before the driver is scheduled at all**, so by the time the
+-/// driver processes the first attempt's cancellation — or its
+-/// `HANDSHAKE_GIVEUP` — the map already holds the *second* attempt's entry.
+-/// A driver that removed by key alone would delete the live redial. Every
+-/// writer therefore checks the stamp it is entitled to remove, and a stale
+-/// writer finds a newer one and leaves it alone.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub(crate) struct StaticSlot {
+-    pub(crate) attempt: u64,
+-    pub(crate) state: StaticState,
+-}
+-
+ /// One connection's shell-side cell: §16.3's `Rc<RefCell<_>>` data path.
+ ///
+ /// It holds the connection **core** as well as the shell bookkeeping,
+@@ -271,15 +245,14 @@ pub(crate) enum PendingOutcome<I: Identity> {
+ /// The slot a `Connecting` and the driver share.
+ ///
+ /// It is an `Rc<RefCell<_>>` of its own rather than an entry in
+-/// [`ShellState`] because the handle creates it **before** the driver has
+-/// minted a [`ConnectionId`] — on a paused clock the driver may not run
+-/// between `connect()` and the drop that cancels it, so there is no instant
+-/// at which an id-keyed map would be safe to consult.
++/// [`ShellState`] because §16.8's resolution has to be readable by a future
++/// that may be polled at any time, and the driver writes it from the other
++/// side of the seam. It no longer carries the [`ConnectionId`]: ruling 90
++/// mints that synchronously in `connect()`, so the `Connecting` owns it
++/// outright.
+ pub(crate) struct PendingSlot<I: Identity> {
+     pub(crate) outcome: PendingOutcome<I>,
+     pub(crate) waker: Option<Waker>,
+-    /// Written by the driver once `core::Endpoint::connect` has minted it.
+-    pub(crate) id: Option<ConnectionId>,
+ }
+ 
+ impl<I: Identity> PendingSlot<I> {
+@@ -287,7 +260,6 @@ impl<I: Identity> PendingSlot<I> {
+         Self {
+             outcome: PendingOutcome::Waiting,
+             waker: None,
+-            id: None,
+         }
+     }
+ 
+@@ -346,21 +318,6 @@ pub(crate) struct ShellState<I: Identity> {
+     /// **mutating** endpoint verb is a driver round-trip, because §6.2
+     /// requires the DH to land on the driver task (§16.3, ruling 53).
+     pub(crate) endpoint: crate::core::Endpoint<I>,
+-    /// Ruling 87's cell: §16.1's NONE / PENDING / LIVE, answerable with no
+-    /// driver round-trip, keyed by the static's canonical §2.4 octets.
+-    ///
+-    /// This is a **second record** of state the endpoint core also keeps,
+-    /// and the duplication is forced rather than chosen. Ruling 87 says
+-    /// `connect()` "only mints the pending" and performs no DH, so the
+-    /// natural implementation would write the core's own static map
+-    /// synchronously. Slice 3a's frozen `core::Endpoint::connect()` mints
+-    /// the pending **and** builds msg1 in one call — 2 DH — so the shell
+-    /// cannot reach the core's map without paying on the caller's task.
+-    /// See `IMPLEMENTATION-3b.md` §5 conflict C-B1.
+-    ///
+-    /// Every transition is enumerated in [`driver`](super::driver)'s module
+-    /// docs, and the driver `debug_assert!`s if the core ever disagrees.
+-    pub(crate) statics: BTreeMap<Vec<u8>, StaticSlot>,
+     /// How many handles — `Endpoint`, `Connecting`, `Connection` — exist.
+     ///
+     /// Staged objects are deliberately **not** counted: §16.3 is explicit
+@@ -372,44 +329,58 @@ pub(crate) struct ShellState<I: Identity> {
+     /// Set once the driver has returned. Every verb answers from it rather
+     /// than hanging.
+     pub(crate) driver_stopped: bool,
+-    /// Mints [`StaticSlot::attempt`]. Shell-side and monotone; unrelated to
+-    /// the core's `ConnectionId`, which does not exist yet at the instant
+-    /// `connect()` has to stamp its entry.
+-    pub(crate) next_attempt: u64,
+ }
+ 
+-impl<I: Identity> ShellState<I> {
+-    /// Claim `key` for a new outbound attempt, or report the state that
+-    /// already holds it. §16.1's NONE/PENDING/LIVE test, at the instant of
+-    /// the call.
+-    pub(crate) fn claim_static(&mut self, key: Vec<u8>) -> Result<u64, ConnectError> {
+-        if self.statics.contains_key(&key) {
+-            return Err(ConnectError::AlreadyConnected);
+-        }
+-        let attempt = self.next_attempt;
+-        self.next_attempt += 1;
+-        self.statics.insert(
+-            key,
+-            StaticSlot {
+-                attempt,
+-                state: StaticState::Pending,
+-            },
+-        );
+-        Ok(attempt)
+-    }
++/// A guard against a core that re-emits for ever, matching the driver's own.
++/// See [`ShellState::drain_endpoint`].
++const HANDLE_DRAIN_BOUND: usize = 100_000;
+ 
+-    /// Release `key`, but only if it still holds `attempt`.
++impl<I: Identity> ShellState<I> {
++    /// §16.4's drain contract, discharged on the **handle** side.
++    ///
++    /// "Every mutating call is followed by draining `poll_output()` to the
++    /// terminal `Timeout`" (§16.4), and ruling 90 puts two mutating endpoint
++    /// calls on a handle:
++    ///
++    /// * [`Endpoint::connect`](super::Endpoint::connect) →
++    ///   `core::Endpoint::mint_pending`, and
++    /// * `Connecting::drop` → `core::Endpoint::handle_connection_event(..,
++    ///   Retired)`, ruling 50's cancel.
++    ///
++    /// **Both are 0 DH and both emit nothing**, so this loop terminates on
++    /// its first pop and the deadline it returns is the one the driver would
++    /// read. The `debug_assert` is the pin for "emit nothing", and it is not
++    /// decoration: were one of them ever to emit, popping here would
++    /// *destroy* the output — the silent-CLOSE-loss shape of finding 4 in
++    /// `.slices/03-skeleton/FIXES-3b.md`. The assert turns that into a named
++    /// failure in every debug build, which is every `cargo test`.
+     ///
+-    /// Returns whether anything was removed. See [`StaticSlot`] for why the
+-    /// stamp check is not optional.
+-    pub(crate) fn release_static(&mut self, key: &[u8], attempt: u64) -> bool {
+-        match self.statics.get(key) {
+-            Some(slot) if slot.attempt == attempt => {
+-                self.statics.remove(key);
+-                true
++    /// The driver is woken by the command each of those verbs sends
++    /// afterwards, so it re-serves and re-reads the deadline regardless;
++    /// nothing here is load-bearing for liveness.
++    pub(crate) fn drain_endpoint(&mut self) {
++        for _ in 0..HANDLE_DRAIN_BOUND {
++            match self.endpoint.poll_output() {
++                crate::core::EndpointOutput::Timeout(_) => return,
++                other => {
++                    debug_assert!(
++                        false,
++                        "a handle-side endpoint verb queued an output (§16.4, ruling 90): \
++                         {}",
++                        match other {
++                            crate::core::EndpointOutput::Transmit(_) => "Transmit",
++                            crate::core::EndpointOutput::IntroReady(..) => "IntroReady",
++                            crate::core::EndpointOutput::ToConnection(..) => "ToConnection",
++                            crate::core::EndpointOutput::HandshakeFailed(..) => "HandshakeFailed",
++                            crate::core::EndpointOutput::Timeout(_) => unreachable!(),
++                        }
++                    );
++                }
+             }
+-            _ => false,
+         }
++        panic!(
++            "core::Endpoint::poll_output did not reach Timeout in {HANDLE_DRAIN_BOUND} outputs (§16.4)"
++        );
+     }
+ }
+ 
+@@ -442,10 +413,8 @@ impl<I: Identity> Shell<I> {
+             Self {
+                 state: Rc::new(RefCell::new(ShellState {
+                     endpoint,
+-                    statics: BTreeMap::new(),
+                     handles: 0,
+                     driver_stopped: false,
+-                    next_attempt: 0,
+                 })),
+                 commands: tx,
+             },
+@@ -500,21 +469,38 @@ impl<I: Identity> Shell<I> {
+ /// Every variant is either a §6.2 round-trip (a `oneshot` reply, because
+ /// §16.3 requires the DH to land on the driver) or a one-way signal.
+ pub(crate) enum Command<I: Identity> {
+-    /// §16.2's `connect()`. **One-way** — ruling 87: the verb is not
+-    /// `async`, so there is no reply to await, and the NONE/PENDING/LIVE
+-    /// answer was already read out of [`ShellState::statics`].
++    /// §16.2's `connect()`. **One-way** — rulings 87 and 90: the verb is not
++    /// `async`, so there is no reply to await; `mint_pending` already
++    /// answered §16.1's NONE/PENDING/LIVE test out of the endpoint core's
++    /// own static map, and already minted `id` and `core`. What is left for
++    /// the driver is §6.1's two initiator DH — `start_attempt` — plus the
++    /// shell-side bookkeeping that goes with them.
++    ///
++    /// The core is **boxed**. A `core::Connection` is ~680 bytes and every
++    /// other variant here is a handful, so carrying it inline would make the
++    /// channel's element size — paid by `Dirty`, `Cancel` and `HandlesGone`
++    /// alike — the size of the largest verb. One allocation per dial buys it
++    /// back.
+     Connect {
++        id: ConnectionId,
++        core: Box<CoreConnection<I::Suite>>,
+         remote: SocketAddr,
+         remote_static: PublicKeyOf<I>,
+-        static_key: Vec<u8>,
+-        attempt: u64,
+         slot: Rc<RefCell<PendingSlot<I>>>,
+     },
+-    /// Ruling 50: a `Connecting` was dropped. Carries the slot rather than
+-    /// a [`ConnectionId`] because on a paused clock the driver may not have
+-    /// run since the `Connect` that would have minted one — so there is no
+-    /// id yet to name, and the slot is the only thing both sides can hold.
+-    Cancel(Rc<RefCell<PendingSlot<I>>>),
++    /// Ruling 50: a `Connecting` was dropped.
++    ///
++    /// Carries the [`ConnectionId`] because ruling 90's `mint_pending`
++    /// minted it **synchronously**, inside the `connect()` that returned the
++    /// `Connecting` — so by the time anything can drop one, the id exists.
++    /// Before ruling 90 it could not: the id was minted on the driver, and
++    /// on a paused clock the driver may not have run since, so this variant
++    /// had to carry the slot instead.
++    ///
++    /// The core-side retirement is **not** this command's job — it already
++    /// happened, in `Connecting::drop` itself. This releases the driver's
++    /// own record.
++    Cancel(ConnectionId),
+     /// §16.2's `accept()`. The reply carries a fully built [`Intro`], so a
+     /// cancelled `accept()` drops one — which is §6.2's silent reject, the
+     /// documented meaning of dropping a staged object, rather than a leak.
+diff --git a/tests/spec_shell.rs b/tests/spec_shell.rs
+index b759c5a..4a92e20 100644
+--- a/tests/spec_shell.rs
++++ b/tests/spec_shell.rs
+@@ -107,7 +107,7 @@
+ //! | Test | Pins |
+ //! |---|---|
+ //! | `a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer` | §16.4's drain contract across a wire that returns `Pending` |
+-//! | `s3a_accept_ahead_of_connect_resolves_already_connected` | §16.1's accept-vs-connect race, and S3a's answer to it |
++//! | `accept_vs_connect_race_reaches_6_4s_pending_branch` | §6.4's PENDING branch, reached — was the C-B1 mirror regression, rewritten for ruling 90 |
+ //! | `a_panicking_driver_resolves_every_waiter_instead_of_parking_it` | §16.3: a driver fault resolves every waiter rather than freezing the endpoint |
+ //!
+ //! `testutil::FlakyWire` models everything a *network* does — loss, delay,
+@@ -134,7 +134,7 @@ use std::time::Duration;
+ 
+ use slither::config::Config;
+ use slither::constants::{DEAD_TIMEOUT, RESP_PACKET_LEN, SHELL_LATENESS_BOUND};
+-use slither::error::{ConnectError, ConnectionLost, IntroError};
++use slither::error::{AcceptError, ConnectError, ConnectionLost, IntroError};
+ use slither::identity::{Identity, PublicKeyOf};
+ use slither::shell::wire::Wire;
+ use slither::testutil::{
+@@ -1180,51 +1180,127 @@ async fn a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer() {
+         .await;
+ }
+ 
+-/// **§16.1's accept-vs-connect race resolves to
+-/// `ConnectError::AlreadyConnected`, and the driver survives it.**
+-///
+-/// §16.1 declines to prevent this race and says so: "a **staged chain in
+-/// progress is deliberately not in `connect()`'s list**, and cannot be:
+-/// until `authenticate()` the chain's static is merely claimed, and §6.1
+-/// forbids keying anything durable on an unproven claim. The invariant is
+-/// held at the other end of that race instead — a proven static that is
+-/// PENDING at `accept()` runs §6.7's comparison … Either way … **no static
+-/// is ever LIVE and PENDING at once.**"
+-///
+-/// So a `connect()` issued between `Proven::accept()`'s command and the
+-/// driver's next turn is *expected* to be admitted by the shell's
+-/// synchronous map and refused by the core one command later. S3a fixes the
+-/// answer: `connect()` to a static that already has a live `Connection`
+-/// returns `Err(ConnectError::AlreadyConnected)`.
+-///
+-/// # The mutations this catches
+-///
+-/// * **The `debug_assert!(false, "the shell's static map admitted a connect
+-///   the core refused")` this replaces.** It asserted the two maps could not
+-///   disagree, which §16.1 says they can. In any debug build — every
+-///   `cargo test`, every consumer's dev build — one unlucky `join!`
+-///   detonated it, the driver task unwound, and the `LocalSet` swallowed
+-///   the panic. Caught twice over: the `Connecting` resolves
+-///   `ConnectError::Local` rather than `AlreadyConnected` once the stop
+-///   path runs, and the liveness phase below finds a dead driver.
+-/// * **A `release_static` that removed by key instead of by stamp.** The
+-///   losing `connect()` releases its own claim on the way out. Without the
+-///   stamp check it would delete the *accept's* newer LIVE entry, leaving
+-///   the mirror NONE while the core holds the static LIVE — a permanent,
+-///   silent divergence in the dangerous direction. Caught by the third
+-///   `connect()`, which reads the mirror and must still refuse.
+-///
+-/// # Why the liveness assertion is what it is
+-///
+-/// A stopped driver keeps serving the last values it wrote into the shared
+-/// cell, so `is_established()`, `remote_address()` and `session_id()` all
+-/// keep answering on a frozen endpoint — the naive liveness check passes
+-/// against exactly the build this test exists to fail. The assertion is
+-/// therefore **wire-observable work**: A closes the accepted connection and
+-/// B's independent handle must see `PeerClosed`, which cannot happen unless
+-/// A's driver drained the seal and put the datagram on the wire.
++/// **§6.4's PENDING branch, reached — the accept-vs-connect race after
++/// ruling 90.**
++///
++/// # What this test used to be, and why it is not that any more
++///
++/// It was the C-B1 regression: the shell kept a **mirror** of the endpoint
++/// core's static map, the two could disagree for the width of one command,
++/// and this pinned that the driver survived the disagreement and the losing
++/// dial resolved `AlreadyConnected`. **Ruling 90 deleted the mirror.** There
++/// is one map now, `Driver::command_connect` has no `Err` arm at all, and
++/// the divergence is impossible rather than handled — so the thing this
++/// test was written to catch cannot be built, and two of its three original
++/// assertions are **no longer pinnable by anything**:
++///
++/// * the two maps disagreeing (there is no second map), and
++/// * `release_static`'s stamp check (there are no stamps).
++///
++/// Saying that out loud is the point. A test renamed onto new ground while
++/// quietly pinning less than its name claims is how slice 3's seam review
++/// mutated §16.4's central MUST with 454/454 still green.
++///
++/// # What it pins now
++///
++/// The same interleaving, with the arbitration moved. `Endpoint::connect`
++/// is synchronous and its first half — `core::Endpoint::mint_pending`, 0 DH
++/// — writes §5.4's PENDING row **at the instant of the call**, while
++/// `Command::AcceptChain` is still queued. So the accept no longer finds the
++/// static NONE: it finds it **PENDING**, which routes it to §6.4's PENDING
++/// branch. §6.6 names this exact ordering — "a chain staged while its static
++/// was NONE and accepted after a `connect()` made that static PENDING
++/// reaches §6.4's PENDING branch instead" — and §6.4 calls it "the branch
++/// that closes the `read_identity()` → `connect()` → `accept()` ordering".
++/// Under the mirror that branch was **unreachable** through the shell.
++///
++/// # The tie-break direction is checked, not assumed
++///
++/// §6.4's PENDING branch is not one answer but two, chosen by §6.7's
++/// comparison over the **canonical static encoding** (§2.4): the peer's
++/// static smaller ⇒ we are the loser and the accept cancels our pending and
++/// installs; ours smaller ⇒ we are the winner, the accept returns
++/// `AcceptError::Stale` and our pending stands. The seeds here put A below
++/// B, so **A is the winner and `Stale` is the §6.7-correct answer** — and
++/// the assertion below is guarded by an explicit key-order check, so a
++/// future change of seeds turns this red instead of leaving it green for
++/// the wrong reason.
++///
++/// # The interim boundary, and the exposure change it represents
++///
++/// §6.4's **loser** branch is not implemented: `core::Endpoint::accept`
++/// returns `Stale` for PENDING *unconditionally* (`src/core/endpoint/mod.rs`
++/// module docs — "PENDING needs §6.6–6.7's tie-break … slice 7"). Neither is
++/// §6.5's hint check nor §6.6's internal completion. So ruling 90 changed
++/// **which half of §6.4 is wrong**:
++///
++/// | | before ruling 90 | after |
++/// |---|---|---|
++/// | what the accept does | takes the **NONE** path and installs | takes the PENDING path and returns `Stale` |
++/// | which §6.4 branch that is | the **loser**'s outcome, unconditionally | the **winner**'s outcome, unconditionally |
++/// | outcome of this scenario | one session, immediately | **both dials run to `HANDSHAKE_GIVEUP`** |
++///
++/// The old behaviour converged because the install was always paired with a
++/// *refusal* of the connect, so no msg1 of ours was ever in flight — it is
++/// **not** §6.4's "mutually dark" divergence, which needs exactly that
++/// in-flight msg1. What it was instead is an initiator role assigned by
++/// **command order**, which §6.4 forbids in terms: the comparison is "a
++/// two-sided agreement evaluated over the pair of statics, **never over
++/// local state**".
++///
++/// The new behaviour assigns nothing locally and defers to a comparison
++/// that does not exist yet, so in this slice neither dial completes on its
++/// own. The blocks below pin **both** halves of that: the boundary while it
++/// stands, and the recovery an application has meanwhile — drop the
++/// `Connecting`, which frees the static in the core's own map synchronously
++/// (ruling 50), and accept the peer's next retransmission.
++///
++/// **When slice 7 lands §6.5/§6.6, the INTERIM block must go red** — B would
++/// lose §6.6's internal tie-break and install as responder, and both dials
++/// would complete without the application dropping anything. That red is
++/// the signal, not a regression; replace the block with the completion.
++///
++/// # The mutation this catches, executed rather than claimed
++///
++/// **Putting the mirror back**, in any form that leaves the core's map free
++/// of the pending until the driver runs: the accept then finds NONE,
++/// installs, and `accepted` is `Ok`. That is the one assertion that
++/// separates the two architectures, and it is the second one below.
++///
++/// Run as `if self.statics.get(&peer_key).is_some_and(|e| matches!(e.state,
++/// StaticState::Live))` in `core::Endpoint::accept` — the mirror's effect,
++/// expressed inside the core. It does not merely fail this assertion: it
++/// detonates `StaticMap::insert`'s own `debug_assert!("§16.1: one session
++/// per peer static")`, because the accept installs a LIVE row over the
++/// PENDING one the dial holds. **The state the mirror produced is a state
++/// the core will not represent** — it escaped the assertion only because the
++/// mirror kept that row out of the core's map. Nothing short of §6.4's loser
++/// branch, which *cancels* the pending first, can install here.
++///
++/// # Two things this test does NOT catch, stated so nobody assumes it does
++///
++/// * **`Connecting::drop` deferring the retirement to the driver.** The
++///   recovery block below drops the dial and re-accepts — but the fresh
++///   `Intro` it needs only exists after B retransmits, so there is a clock
++///   advance and a driver turn in the gap, and a deferred `Retired` lands in
++///   time. Verified by running that mutation: this test stays **green**.
++///   Ruling 50's no-clock-advance ordering is pinned by
++///   `s29_cancel_then_immediate_redial` and
++///   `s29_retry_loop_replaces_rather_than_accumulates` in
++///   `tests/story_lifecycle.rs`, and by
++///   `a_cancelled_dial_frees_the_static_with_no_clock_advance` in
++///   `src/shell/mod.rs` — all three go red under it.
++/// * **A driver frozen after establishment.** The last phase is
++///   wire-observable work — A closes and B's *independent* handle must see
++///   `PeerClosed`, which no stale cell can fake — but the mutation that
++///   isolates it, a driver that stops transmitting only after the session
++///   exists, is not expressible with `FlakyWire`: cutting transmits wholesale
++///   hangs the test at the *first* `accept()` instead of failing the last
++///   phase. That is working rule 13's fixture bound, not a gap the authors
++///   could close here. Driver death itself is pinned by
++///   `a_panicking_driver_resolves_every_waiter_instead_of_parking_it` below.
+ #[tokio::test(flavor = "current_thread", start_paused = true)]
+-async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
++async fn accept_vs_connect_race_reaches_6_4s_pending_branch() {
+     let net = Network::new();
+     let local = tokio::task::LocalSet::new();
+     local
+@@ -1232,6 +1308,17 @@ async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
+             let a = Node::spawn(&net, 1, 6101);
+             let b = Node::spawn(&net, 2, 6102);
+ 
++            // §6.7's comparison is over §2.4's canonical encoding. Which
++            // branch of §6.4 this test exercises depends on it, so it is
++            // read rather than assumed.
++            assert!(
++                a.pk.as_ref() < b.pk.as_ref(),
++                "§6.7: the smaller static is the winning initiator. These seeds put A \
++                 below B, which is why `Stale` is the correct answer below. If this \
++                 fires, the seeds changed and the assertions after it are inverted — \
++                 swap them for §6.4's loser branch, do not delete this check"
++            );
++
+             // B dials A, so A has a chain from B to walk.
+             let b_dial = b.ep().connect(a.addr, a.pk).expect("B dials A");
+             let intro = a.ep().accept().await.expect("accept() returned None");
+@@ -1240,60 +1327,97 @@ async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
+ 
+             // THE RACE. `Proven::accept()` queues `Command::AcceptChain(K_b)`
+             // on its first poll and yields; `connect()` is synchronous
+-            // (ruling 87) and runs before the driver's next turn, so the
+-            // command queue is `[AcceptChain(K_b), Connect(K_b)]` while the
+-            // shell's mirror still says NONE for K_b — truthfully, because
+-            // §16.1 keeps a staged chain out of that map on purpose.
++            // (rulings 87 and 90) and runs before the driver's next turn, so
++            // the command queue is `[AcceptChain(K_b), Connect(K_b)]` — but
++            // `mint_pending` has *already* written K_b PENDING into the
++            // endpoint core's own map, which is the only map there is.
+             let (accepted, dialled) =
+                 tokio::join!(proven.accept(), async { a.ep().connect(b.addr, b.pk) });
+ 
+-            let a_to_b = accepted.expect("§6.7: the proven chain wins the race and installs");
+             let dialled = dialled.expect(
+-                "the shell's map answers from the instant of the call, and at that \
+-                 instant nothing had landed for this static — so the verb is admitted",
++                "ruling 90: `mint_pending` answers §16.1's test from the core's own \
++                 map, and at the instant of the call nothing had landed for this \
++                 static — so the verb is admitted, with 0 DH spent",
++            );
++            assert!(
++                matches!(accepted, Err(AcceptError::Stale)),
++                "§6.4's PENDING branch, winner side: the static this endpoint just \
++                 dialled is PENDING when the chain reaches `accept()`, and A's static \
++                 sorts below B's. An `Ok` here means the accept found the static NONE \
++                 — which is the shell mirror ruling 90 deleted, reintroduced. Got {:?}",
++                accepted.map(|_| "Ok(Connection)"),
+             );
+ 
+             settle().await;
+ 
+-            let mut dialled = pin!(dialled);
+-            let outcome = poll_once(dialled.as_mut()).await;
+-            let Poll::Ready(outcome) = outcome else {
+-                panic!(
+-                    "the refused attempt must already be resolved: the driver answers it \
+-                     synchronously in the same command it fails. Still Pending means the \
+-                     driver never got to it — which is what a driver that panicked on the \
+-                     divergence looks like from here"
+-                );
+-            };
++            let mut dialled = Box::pin(dialled);
+             assert!(
+-                matches!(outcome, Err(ConnectError::AlreadyConnected)),
+-                "S3a: connect() to a static that already has a live Connection returns \
+-                 AlreadyConnected. Got {:?} — ConnectError::Local here means the driver \
+-                 died and the stop path answered instead of the core",
+-                outcome.err(),
++                poll_once(dialled.as_mut()).await.is_pending(),
++                "the winner keeps its pending (§6.4): our own outbound is still \
++                 running after the refusal, not resolved by it",
+             );
+ 
+-            // The stamp check, from the outside: the losing connect()
+-            // released its own claim on the way out, and must NOT have
+-            // taken the accept's newer entry with it. This read is the
+-            // mirror, synchronously (ruling 87).
+-            let third = a.ep().connect(b.addr, b.pk);
++            // ── INTERIM BOUNDARY — slice 7 (§6.5/§6.6) must turn this red ──
++            // Neither side can finish on its own. A's msg1 reaches B, but B
++            // has no hint check and no internal tie-break yet, so it parks
++            // the msg1 as an ordinary introduction instead of losing §6.7's
++            // comparison and installing as responder. Both trains just run.
++            let mut b_dial = Box::pin(b_dial);
++            tokio::time::advance(Duration::from_secs(20)).await;
++            settle().await;
+             assert!(
+-                matches!(third, Err(ConnectError::AlreadyConnected)),
+-                "release_static is stamp-checked: the accept drew the later attempt \
+-                 stamp, so the losing connect's release must decline. An Ok here means \
+-                 the mirror was cleared while the core still holds the static LIVE — \
+-                 the divergence that never heals. Got {:?}",
+-                third.err(),
++                poll_once(dialled.as_mut()).await.is_pending()
++                    && poll_once(b_dial.as_mut()).await.is_pending(),
++                "with §6.6's internal tie-break unimplemented, four retransmit \
++                 intervals resolve neither dial. When slice 7 lands it, B loses the \
++                 comparison and installs as responder — delete this block and assert \
++                 the completion instead",
+             );
+ 
+-            // ── liveness, the only way that cannot be faked ──────────
+-            // B's dial resolved into a real connection when A accepted;
+-            // both peers now have handles to one session.
++            // ── The recovery an application has meanwhile ────────────
++            // Dropping the `Connecting` returns the static to NONE in the
++            // core's own map, synchronously (ruling 50) — so the very next
++            // introduction from B takes §6.4's NONE path and installs.
++            drop(dialled);
++            tokio::time::advance(Duration::from_secs(7)).await;
++            settle().await;
++
++            let a_to_b = {
++                let intro = a
++                    .ep()
++                    .accept()
++                    .await
++                    .expect("B is still retransmitting, so a fresh Intro must surface");
++                let claimed = intro.read_identity().await.expect("read_identity");
++                let proven = claimed.authenticate().await.expect("authenticate");
++                proven.accept().await.expect(
++                    "the static went back to NONE when the `Connecting` dropped, so \
++                     this accept takes §6.4's NONE path. `Stale` here means the \
++                     retirement was deferred to the driver instead of performed in \
++                     `Connecting::drop` (ruling 50, ruling 90)",
++                )
++            };
++
++            settle().await;
+             let b_to_a = b_dial
+                 .await
+-                .expect("B's dial completed when A accepted its chain");
++                .expect("B's dial completed when A finally accepted its chain");
+ 
++            // S3a at the shell seam: the static is LIVE now, and a dial to
++            // it is refused synchronously — from the same one map.
++            assert!(
++                matches!(
++                    a.ep().connect(b.addr, b.pk),
++                    Err(ConnectError::AlreadyConnected)
++                ),
++                "S3a: connect() to a static that already has a live Connection returns \
++                 AlreadyConnected, before any await",
++            );
++
++            // ── liveness, the only way that cannot be faked ──────────
++            // A stopped driver keeps serving the last values it wrote into
++            // the shared cell, so every accessor answers on a frozen
++            // endpoint. Wire-observable work does not.
+             let mut peer = pin!(b_to_a.closed());
+             a_to_b.close(7, b"still here").await;
+             settle().await;
+@@ -1306,9 +1430,7 @@ async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
+                     reason: b"still here".to_vec(),
+                 }),
+                 "the CLOSE only reaches B if A's driver drained the seal and put the \
+-                 datagram on the wire after the race. A frozen driver still answers \
+-                 every accessor from its stale cell, so nothing cheaper than this \
+-                 separates the two builds"
++                 datagram on the wire after the race"
+             );
+         })
+         .await;

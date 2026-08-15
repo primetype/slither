@@ -107,7 +107,7 @@
 //! | Test | Pins |
 //! |---|---|
 //! | `a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer` | §16.4's drain contract across a wire that returns `Pending` |
-//! | `s3a_accept_ahead_of_connect_resolves_already_connected` | §16.1's accept-vs-connect race, and S3a's answer to it |
+//! | `accept_vs_connect_race_reaches_6_4s_pending_branch` | §6.4's PENDING branch, reached — was the C-B1 mirror regression, rewritten for ruling 90 |
 //! | `a_panicking_driver_resolves_every_waiter_instead_of_parking_it` | §16.3: a driver fault resolves every waiter rather than freezing the endpoint |
 //!
 //! `testutil::FlakyWire` models everything a *network* does — loss, delay,
@@ -134,7 +134,7 @@ use std::time::Duration;
 
 use slither::config::Config;
 use slither::constants::{DEAD_TIMEOUT, RESP_PACKET_LEN, SHELL_LATENESS_BOUND};
-use slither::error::{ConnectError, ConnectionLost, IntroError};
+use slither::error::{AcceptError, ConnectError, ConnectionLost, IntroError};
 use slither::identity::{Identity, PublicKeyOf};
 use slither::shell::wire::Wire;
 use slither::testutil::{
@@ -1180,57 +1180,144 @@ async fn a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer() {
         .await;
 }
 
-/// **§16.1's accept-vs-connect race resolves to
-/// `ConnectError::AlreadyConnected`, and the driver survives it.**
+/// **§6.4's PENDING branch, reached — the accept-vs-connect race after
+/// ruling 90.**
 ///
-/// §16.1 declines to prevent this race and says so: "a **staged chain in
-/// progress is deliberately not in `connect()`'s list**, and cannot be:
-/// until `authenticate()` the chain's static is merely claimed, and §6.1
-/// forbids keying anything durable on an unproven claim. The invariant is
-/// held at the other end of that race instead — a proven static that is
-/// PENDING at `accept()` runs §6.7's comparison … Either way … **no static
-/// is ever LIVE and PENDING at once.**"
+/// # What this test used to be, and why it is not that any more
 ///
-/// So a `connect()` issued between `Proven::accept()`'s command and the
-/// driver's next turn is *expected* to be admitted by the shell's
-/// synchronous map and refused by the core one command later. S3a fixes the
-/// answer: `connect()` to a static that already has a live `Connection`
-/// returns `Err(ConnectError::AlreadyConnected)`.
+/// It was the C-B1 regression: the shell kept a **mirror** of the endpoint
+/// core's static map, the two could disagree for the width of one command,
+/// and this pinned that the driver survived the disagreement and the losing
+/// dial resolved `AlreadyConnected`. **Ruling 90 deleted the mirror.** There
+/// is one map now, `Driver::command_connect` has no `Err` arm at all, and
+/// the divergence is impossible rather than handled — so the thing this
+/// test was written to catch cannot be built, and two of its three original
+/// assertions are **no longer pinnable by anything**:
 ///
-/// # The mutations this catches
+/// * the two maps disagreeing (there is no second map), and
+/// * `release_static`'s stamp check (there are no stamps).
 ///
-/// * **The `debug_assert!(false, "the shell's static map admitted a connect
-///   the core refused")` this replaces.** It asserted the two maps could not
-///   disagree, which §16.1 says they can. In any debug build — every
-///   `cargo test`, every consumer's dev build — one unlucky `join!`
-///   detonated it, the driver task unwound, and the `LocalSet` swallowed
-///   the panic. Caught twice over: the `Connecting` resolves
-///   `ConnectError::Local` rather than `AlreadyConnected` once the stop
-///   path runs, and the liveness phase below finds a dead driver.
-/// * **A `release_static` that removed by key instead of by stamp.** The
-///   losing `connect()` releases its own claim on the way out. Without the
-///   stamp check it would delete the *accept's* newer LIVE entry, leaving
-///   the mirror NONE while the core holds the static LIVE — a permanent,
-///   silent divergence in the dangerous direction. Caught by the third
-///   `connect()`, which reads the mirror and must still refuse.
+/// Saying that out loud is the point. A test renamed onto new ground while
+/// quietly pinning less than its name claims is how slice 3's seam review
+/// mutated §16.4's central MUST with 454/454 still green.
 ///
-/// # Why the liveness assertion is what it is
+/// # What it pins now
 ///
-/// A stopped driver keeps serving the last values it wrote into the shared
-/// cell, so `is_established()`, `remote_address()` and `session_id()` all
-/// keep answering on a frozen endpoint — the naive liveness check passes
-/// against exactly the build this test exists to fail. The assertion is
-/// therefore **wire-observable work**: A closes the accepted connection and
-/// B's independent handle must see `PeerClosed`, which cannot happen unless
-/// A's driver drained the seal and put the datagram on the wire.
+/// The same interleaving, with the arbitration moved. `Endpoint::connect`
+/// is synchronous and its first half — `core::Endpoint::mint_pending`, 0 DH
+/// — writes §5.4's PENDING row **at the instant of the call**, while
+/// `Command::AcceptChain` is still queued. So the accept no longer finds the
+/// static NONE: it finds it **PENDING**, which routes it to §6.4's PENDING
+/// branch. §6.6 names this exact ordering — "a chain staged while its static
+/// was NONE and accepted after a `connect()` made that static PENDING
+/// reaches §6.4's PENDING branch instead" — and §6.4 calls it "the branch
+/// that closes the `read_identity()` → `connect()` → `accept()` ordering".
+/// Under the mirror that branch was **unreachable** through the shell.
+///
+/// # The tie-break direction is checked, not assumed
+///
+/// §6.4's PENDING branch is not one answer but two, chosen by §6.7's
+/// comparison over the **canonical static encoding** (§2.4): the peer's
+/// static smaller ⇒ we are the loser and the accept cancels our pending and
+/// installs; ours smaller ⇒ we are the winner, the accept returns
+/// `AcceptError::Stale` and our pending stands. The seeds here put A below
+/// B, so **A is the winner and `Stale` is the §6.7-correct answer** — and
+/// the assertion below is guarded by an explicit key-order check, so a
+/// future change of seeds turns this red instead of leaving it green for
+/// the wrong reason.
+///
+/// # The interim boundary, and the exposure change it represents
+///
+/// §6.4's **loser** branch is not implemented: `core::Endpoint::accept`
+/// returns `Stale` for PENDING *unconditionally* (`src/core/endpoint/mod.rs`
+/// module docs — "PENDING needs §6.6–6.7's tie-break … slice 7"). Neither is
+/// §6.5's hint check nor §6.6's internal completion. So ruling 90 changed
+/// **which half of §6.4 is wrong**:
+///
+/// | | before ruling 90 | after |
+/// |---|---|---|
+/// | what the accept does | takes the **NONE** path and installs | takes the PENDING path and returns `Stale` |
+/// | which §6.4 branch that is | the **loser**'s outcome, unconditionally | the **winner**'s outcome, unconditionally |
+/// | outcome of this scenario | one session, immediately | **both dials run to `HANDSHAKE_GIVEUP`** |
+///
+/// The old behaviour converged because the install was always paired with a
+/// *refusal* of the connect, so no msg1 of ours was ever in flight — it is
+/// **not** §6.4's "mutually dark" divergence, which needs exactly that
+/// in-flight msg1. What it was instead is an initiator role assigned by
+/// **command order**, which §6.4 forbids in terms: the comparison is "a
+/// two-sided agreement evaluated over the pair of statics, **never over
+/// local state**".
+///
+/// The new behaviour assigns nothing locally and defers to a comparison
+/// that does not exist yet, so in this slice neither dial completes on its
+/// own. The blocks below pin **both** halves of that: the boundary while it
+/// stands, and the recovery an application has meanwhile — drop the
+/// `Connecting`, which frees the static in the core's own map synchronously
+/// (ruling 50), and accept the peer's next retransmission.
+///
+/// **When slice 7 lands §6.5/§6.6, the INTERIM block must go red** — B would
+/// lose §6.6's internal tie-break and install as responder, and both dials
+/// would complete without the application dropping anything. That red is
+/// the signal, not a regression; replace the block with the completion.
+///
+/// # The mutation this catches, executed rather than claimed
+///
+/// **Putting the mirror back**, in any form that leaves the core's map free
+/// of the pending until the driver runs: the accept then finds NONE,
+/// installs, and `accepted` is `Ok`. That is the one assertion that
+/// separates the two architectures, and it is the second one below.
+///
+/// Run as `if self.statics.get(&peer_key).is_some_and(|e| matches!(e.state,
+/// StaticState::Live))` in `core::Endpoint::accept` — the mirror's effect,
+/// expressed inside the core. It does not merely fail this assertion: it
+/// detonates `StaticMap::insert`'s own `debug_assert!("§16.1: one session
+/// per peer static")`, because the accept installs a LIVE row over the
+/// PENDING one the dial holds. **The state the mirror produced is a state
+/// the core will not represent** — it escaped the assertion only because the
+/// mirror kept that row out of the core's map. Nothing short of §6.4's loser
+/// branch, which *cancels* the pending first, can install here.
+///
+/// # Two things this test does NOT catch, stated so nobody assumes it does
+///
+/// * **`Connecting::drop` deferring the retirement to the driver.** The
+///   recovery block below drops the dial and re-accepts — but the fresh
+///   `Intro` it needs only exists after B retransmits, so there is a clock
+///   advance and a driver turn in the gap, and a deferred `Retired` lands in
+///   time. Verified by running that mutation: this test stays **green**.
+///   Ruling 50's no-clock-advance ordering is pinned by
+///   `s29_cancel_then_immediate_redial` and
+///   `s29_retry_loop_replaces_rather_than_accumulates` in
+///   `tests/story_lifecycle.rs`, and by
+///   `a_cancelled_dial_frees_the_static_with_no_clock_advance` in
+///   `src/shell/mod.rs` — all three go red under it.
+/// * **A driver frozen after establishment.** The last phase is
+///   wire-observable work — A closes and B's *independent* handle must see
+///   `PeerClosed`, which no stale cell can fake — but the mutation that
+///   isolates it, a driver that stops transmitting only after the session
+///   exists, is not expressible with `FlakyWire`: cutting transmits wholesale
+///   hangs the test at the *first* `accept()` instead of failing the last
+///   phase. That is working rule 13's fixture bound, not a gap the authors
+///   could close here. Driver death itself is pinned by
+///   `a_panicking_driver_resolves_every_waiter_instead_of_parking_it` below.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
+async fn accept_vs_connect_race_reaches_6_4s_pending_branch() {
     let net = Network::new();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let a = Node::spawn(&net, 1, 6101);
             let b = Node::spawn(&net, 2, 6102);
+
+            // §6.7's comparison is over §2.4's canonical encoding. Which
+            // branch of §6.4 this test exercises depends on it, so it is
+            // read rather than assumed.
+            assert!(
+                a.pk.as_ref() < b.pk.as_ref(),
+                "§6.7: the smaller static is the winning initiator. These seeds put A \
+                 below B, which is why `Stale` is the correct answer below. If this \
+                 fires, the seeds changed and the assertions after it are inverted — \
+                 swap them for §6.4's loser branch, do not delete this check"
+            );
 
             // B dials A, so A has a chain from B to walk.
             let b_dial = b.ep().connect(a.addr, a.pk).expect("B dials A");
@@ -1240,60 +1327,97 @@ async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
 
             // THE RACE. `Proven::accept()` queues `Command::AcceptChain(K_b)`
             // on its first poll and yields; `connect()` is synchronous
-            // (ruling 87) and runs before the driver's next turn, so the
-            // command queue is `[AcceptChain(K_b), Connect(K_b)]` while the
-            // shell's mirror still says NONE for K_b — truthfully, because
-            // §16.1 keeps a staged chain out of that map on purpose.
+            // (rulings 87 and 90) and runs before the driver's next turn, so
+            // the command queue is `[AcceptChain(K_b), Connect(K_b)]` — but
+            // `mint_pending` has *already* written K_b PENDING into the
+            // endpoint core's own map, which is the only map there is.
             let (accepted, dialled) =
                 tokio::join!(proven.accept(), async { a.ep().connect(b.addr, b.pk) });
 
-            let a_to_b = accepted.expect("§6.7: the proven chain wins the race and installs");
             let dialled = dialled.expect(
-                "the shell's map answers from the instant of the call, and at that \
-                 instant nothing had landed for this static — so the verb is admitted",
+                "ruling 90: `mint_pending` answers §16.1's test from the core's own \
+                 map, and at the instant of the call nothing had landed for this \
+                 static — so the verb is admitted, with 0 DH spent",
+            );
+            assert!(
+                matches!(accepted, Err(AcceptError::Stale)),
+                "§6.4's PENDING branch, winner side: the static this endpoint just \
+                 dialled is PENDING when the chain reaches `accept()`, and A's static \
+                 sorts below B's. An `Ok` here means the accept found the static NONE \
+                 — which is the shell mirror ruling 90 deleted, reintroduced. Got {:?}",
+                accepted.map(|_| "Ok(Connection)"),
             );
 
             settle().await;
 
-            let mut dialled = pin!(dialled);
-            let outcome = poll_once(dialled.as_mut()).await;
-            let Poll::Ready(outcome) = outcome else {
-                panic!(
-                    "the refused attempt must already be resolved: the driver answers it \
-                     synchronously in the same command it fails. Still Pending means the \
-                     driver never got to it — which is what a driver that panicked on the \
-                     divergence looks like from here"
-                );
-            };
+            let mut dialled = Box::pin(dialled);
             assert!(
-                matches!(outcome, Err(ConnectError::AlreadyConnected)),
-                "S3a: connect() to a static that already has a live Connection returns \
-                 AlreadyConnected. Got {:?} — ConnectError::Local here means the driver \
-                 died and the stop path answered instead of the core",
-                outcome.err(),
+                poll_once(dialled.as_mut()).await.is_pending(),
+                "the winner keeps its pending (§6.4): our own outbound is still \
+                 running after the refusal, not resolved by it",
             );
 
-            // The stamp check, from the outside: the losing connect()
-            // released its own claim on the way out, and must NOT have
-            // taken the accept's newer entry with it. This read is the
-            // mirror, synchronously (ruling 87).
-            let third = a.ep().connect(b.addr, b.pk);
+            // ── INTERIM BOUNDARY — slice 7 (§6.5/§6.6) must turn this red ──
+            // Neither side can finish on its own. A's msg1 reaches B, but B
+            // has no hint check and no internal tie-break yet, so it parks
+            // the msg1 as an ordinary introduction instead of losing §6.7's
+            // comparison and installing as responder. Both trains just run.
+            let mut b_dial = Box::pin(b_dial);
+            tokio::time::advance(Duration::from_secs(20)).await;
+            settle().await;
             assert!(
-                matches!(third, Err(ConnectError::AlreadyConnected)),
-                "release_static is stamp-checked: the accept drew the later attempt \
-                 stamp, so the losing connect's release must decline. An Ok here means \
-                 the mirror was cleared while the core still holds the static LIVE — \
-                 the divergence that never heals. Got {:?}",
-                third.err(),
+                poll_once(dialled.as_mut()).await.is_pending()
+                    && poll_once(b_dial.as_mut()).await.is_pending(),
+                "with §6.6's internal tie-break unimplemented, four retransmit \
+                 intervals resolve neither dial. When slice 7 lands it, B loses the \
+                 comparison and installs as responder — delete this block and assert \
+                 the completion instead",
+            );
+
+            // ── The recovery an application has meanwhile ────────────
+            // Dropping the `Connecting` returns the static to NONE in the
+            // core's own map, synchronously (ruling 50) — so the very next
+            // introduction from B takes §6.4's NONE path and installs.
+            drop(dialled);
+            tokio::time::advance(Duration::from_secs(7)).await;
+            settle().await;
+
+            let a_to_b = {
+                let intro = a
+                    .ep()
+                    .accept()
+                    .await
+                    .expect("B is still retransmitting, so a fresh Intro must surface");
+                let claimed = intro.read_identity().await.expect("read_identity");
+                let proven = claimed.authenticate().await.expect("authenticate");
+                proven.accept().await.expect(
+                    "the static went back to NONE when the `Connecting` dropped, so \
+                     this accept takes §6.4's NONE path. `Stale` here means the \
+                     retirement was deferred to the driver instead of performed in \
+                     `Connecting::drop` (ruling 50, ruling 90)",
+                )
+            };
+
+            settle().await;
+            let b_to_a = b_dial
+                .await
+                .expect("B's dial completed when A finally accepted its chain");
+
+            // S3a at the shell seam: the static is LIVE now, and a dial to
+            // it is refused synchronously — from the same one map.
+            assert!(
+                matches!(
+                    a.ep().connect(b.addr, b.pk),
+                    Err(ConnectError::AlreadyConnected)
+                ),
+                "S3a: connect() to a static that already has a live Connection returns \
+                 AlreadyConnected, before any await",
             );
 
             // ── liveness, the only way that cannot be faked ──────────
-            // B's dial resolved into a real connection when A accepted;
-            // both peers now have handles to one session.
-            let b_to_a = b_dial
-                .await
-                .expect("B's dial completed when A accepted its chain");
-
+            // A stopped driver keeps serving the last values it wrote into
+            // the shared cell, so every accessor answers on a frozen
+            // endpoint. Wire-observable work does not.
             let mut peer = pin!(b_to_a.closed());
             a_to_b.close(7, b"still here").await;
             settle().await;
@@ -1306,9 +1430,7 @@ async fn s3a_accept_ahead_of_connect_resolves_already_connected() {
                     reason: b"still here".to_vec(),
                 }),
                 "the CLOSE only reaches B if A's driver drained the seal and put the \
-                 datagram on the wire after the race. A frozen driver still answers \
-                 every accessor from its stale cell, so nothing cheaper than this \
-                 separates the two builds"
+                 datagram on the wire after the race"
             );
         })
         .await;
