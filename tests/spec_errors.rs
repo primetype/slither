@@ -104,26 +104,34 @@ fn config_error_is_exhaustively_matched() {
 // The fence functions themselves.
 // =======================================================================
 
-/// SPEC.md §18.1: `ConnectError::{AlreadyConnected, TimedOut}` — exactly
-/// two variants, both unit. `AlreadyConnected` is returned by `connect()`
-/// itself and also as the tie-break-loser resolution of an in-flight
-/// `Connecting` (§6.4's PENDING branch, §6.7); `TimedOut` is initial-connect
-/// give-up at `HANDSHAKE_GIVEUP` (§5.5).
+/// SPEC.md §18.1: `ConnectError::{AlreadyConnected, TimedOut, Local}` —
+/// exactly three variants, all unit. `AlreadyConnected` is returned by
+/// `connect()` itself and also as the tie-break-loser resolution of an
+/// in-flight `Connecting` (§6.4's PENDING branch, §6.7); `TimedOut` is
+/// initial-connect give-up at `HANDSHAKE_GIVEUP` (§5.5); `Local`
+/// **[RATIFIED 2026/08/15 — ruling 72]** is *our own* `Identity::open()`
+/// failing — a locked enclave, a hardware fault.
 fn match_connect_error(e: ConnectError) {
     match e {
         ConnectError::AlreadyConnected => {}
         ConnectError::TimedOut => {}
+        ConnectError::Local => {}
     }
 }
 
-/// SPEC.md §18.1: `IntroError::{Expired, Internal, Malformed,
-/// EndpointDropped}` — exactly four variants, all unit. `Superseded`
-/// appears nowhere (§6.3) — it is not a fifth variant to add here.
+/// SPEC.md §18.1: `IntroError::{Expired, Internal, Malformed, Local,
+/// EndpointDropped}` — exactly five variants, all unit. `Superseded`
+/// appears nowhere (§6.3) — it is not a sixth variant to add here.
+/// `Local` **[RATIFIED 2026/08/15 — ruling 72]** is *our own* provider
+/// failing, and is the opposite of `Malformed` in every way that matters:
+/// the chain is left **parked** and a retry can still succeed, where a
+/// `Malformed` chain is discarded and the verdict is definitive.
 fn match_intro_error(e: IntroError) {
     match e {
         IntroError::Expired => {}
         IntroError::Internal => {}
         IntroError::Malformed => {}
+        IntroError::Local => {}
         IntroError::EndpointDropped => {}
     }
 }

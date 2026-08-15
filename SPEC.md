@@ -4860,6 +4860,21 @@ held it longest, and precisely when a captured initiation could be
 replayed. Mitigation (iii) is untouched: LRU **recency** remains
 admission-only; it is the **aging clock** that starts at release.
 
+**[RATIFIED 2026/08/15 — ruling 77]** Only the release of a
+**key-holder-proven** pin starts that clock — a live connection, an
+in-flight outbound pending, or a `Proven` chain. A merely **`Claimed`**
+chain's pin still bars eviction, as the bullet above requires, but does
+**not** restart aging. Reaching `Claimed` costs 1 DH and proves nothing
+(§6.1: the claimed static is attacker-choosable), so without this
+narrowing anyone able to send a mac1-valid msg1 naming a static that
+already holds an entry could restart that entry's clock at will and defer
+mitigation (ii) indefinitely. The exposure is bounded — the record is
+*retained*, not destroyed, and `TS_GUARD_ORPHAN_CAP` with admission-only
+recency still evicts — but an unauthenticated party must not move a
+timer. This is §6.1's "nothing durable may be keyed on the claimed
+static" reaching one step further than §6.1 states it: not merely no new
+durable state, but **no control over the lifetime of existing state**.
+
 - All other entries (orphans — dead connections) live in a bounded LRU
   with timer aging:
 
@@ -5079,11 +5094,24 @@ deleted.
   §18.1's closure exists to stop variants accreting after release; nothing
   has shipped, so this costs nothing now and would be a breaking change
   later.
-- **`AuthError::{Replay, HandshakeFailed, Expired, EndpointDropped}`** —
+- **`AuthError::{Replay, HandshakeFailed, Expired, Local, EndpointDropped}`** —
   `Replay`: the automatic guard failure (§17.1); `HandshakeFailed`: the
   tail-tag death of a forged claim — **the only variant in the staged
   taxonomy that is a security signal**; the rest are liveness and
-  lifecycle; `Expired`/`EndpointDropped` as above, at this stage.
+  lifecycle; **`Local`** **[RATIFIED 2026/08/15 — ruling 78]**: as
+  §18.1's `IntroError::Local`, since `authenticate()` may drive a skipped
+  `read_identity()` (ruling 75) and can therefore meet the same local
+  fault; `Expired`/`EndpointDropped` as above, at this stage.
+
+  **[RATIFIED 2026/08/15 — ruling 78]** Ruling 72 did not reach this
+  type, and the omission was the worse half of the defect it fixed:
+  without `Local`, a locked or biometrics-gated enclave surfaced as
+  `HandshakeFailed` — the one variant this taxonomy designates a
+  **security signal**, deliberately detail-free because it means a forged
+  claim died at the msg1 tail's AEAD tag. Reporting a device lock through
+  it does not merely misattribute a local fault to the peer; it reports
+  the peer as an attacker, and teaches an operator to distrust the single
+  variant that must stay trustworthy.
 - **`AcceptError::{Stale, EndpointDropped}`** —
   `Stale`: no initiation for the proven static is parked, **or** the
   admitted candidate fails the replacement-basis rule — the live

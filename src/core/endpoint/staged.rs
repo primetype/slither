@@ -145,20 +145,44 @@ impl<I: Identity> Endpoint<I> {
     /// unchanged either way. Any assertion about cost has to be cumulative
     /// to be true of both.
     ///
-    /// # Two failure modes, treated differently on purpose
+    /// # Idempotent (**ruling 74**)
     ///
-    /// A **local** failure (the identity will not open, our own static will
-    /// not install) has spent **0 DH** and may well be transient — an
-    /// enclave that is momentarily locked — so the chain is left parked and
-    /// a retry can still succeed. A **hiss** failure means msg1 is
-    /// structurally unreadable: 1 DH is spent, the verdict is definitive,
-    /// and the chain is discarded. §18.1's `IntroError` is closed and has
-    /// no variant for a local provider fault, so both report `Malformed`;
-    /// see the slice notes.
+    /// This verb is keyed by [`IntroId`] and takes `&mut self`, so — unlike
+    /// §6.2's `self`-consuming handles — it **can** be called twice. §6.1
+    /// resolves that in the direction that cannot perturb the ladder: a
+    /// second call on an already `Claimed` or `Proven` chain returns the
+    /// revealed static and pays **0 DH**, *opening no provider*. The early
+    /// returns below are that rule, not an optimisation — the ladder holds
+    /// under any number of calls because [`Identity::open`] is never
+    /// reached from a chain that has already left stage 0.
+    ///
+    /// # Two failure modes, opposite in every way that matters (**ruling 72**)
+    ///
+    /// A **local** failure — the identity will not open, or the responder
+    /// machine will not build on it — has spent **0 DH**, is *our* fault,
+    /// and may well be transient (a momentarily locked enclave, which S21
+    /// treats as expected). So it reports [`IntroError::Local`] and **the
+    /// chain is left parked**: a retry can still succeed.
+    ///
+    /// A **hiss** failure means msg1 is structurally unreadable: the
+    /// *peer's* bytes are at fault, 1 DH is spent, the verdict is
+    /// definitive, and the chain is **discarded** with its stage-0 slot
+    /// freed. It reports [`IntroError::Malformed`].
+    ///
+    /// The implementation already drew this distinction — parked versus
+    /// discarded — before §18.1 could express it; ruling 72 is what gave
+    /// the two outcomes two names. Collapsing them again tells the
+    /// application the remote peer sent garbage when our own key hardware
+    /// was locked, which is §18.2's recurring shape: the party who can fix
+    /// the problem handed evidence pointing elsewhere.
+    ///
+    /// [`Identity::open`]: crate::identity::Identity::open
     pub(crate) fn read_identity(&mut self, id: IntroId) -> Result<PublicKeyOf<I>, IntroError> {
         let msg1 = {
             let entry = self.intros.get(id).ok_or(IntroError::Expired)?;
             match &entry.state {
+                // Ruling 74: a repeat call is answered from the chain, at 0
+                // incremental DH and with no provider opened.
                 ChainState::Claimed { claimed, .. } => return Ok(claimed.clone()),
                 ChainState::Proven { peer, .. } => return Ok(peer.clone()),
                 ChainState::Poisoned => {
@@ -171,13 +195,18 @@ impl<I: Identity> Endpoint<I> {
 
         // The responder machine is built HERE, not at park: see the module
         // docs, and §17.5's ceiling on concurrent provider handles.
+        //
+        // Ruling 72: both of these are *our* provider failing, at 0 DH.
+        // `Local`, and the chain stays parked — note the bare `return`,
+        // with no `discard_chain`, which is the whole difference from the
+        // hiss arm below.
         let Ok((provider, our_key)) = self.identity.open() else {
-            return Err(IntroError::Malformed);
+            return Err(IntroError::Local);
         };
         let Ok(responder) =
             <I::Suite as Handshake>::responder(provider, constants::PROLOGUE, our_key)
         else {
-            return Err(IntroError::Malformed);
+            return Err(IntroError::Local);
         };
 
         match <I::Suite as Handshake>::read_msg1_intro(responder, &msg1) {
@@ -203,6 +232,9 @@ impl<I: Identity> Endpoint<I> {
                 Ok(claimed)
             }
             Err(_) => {
+                // Ruling 72, the other half: the peer's bytes are at fault,
+                // 1 DH is spent and the verdict is definitive — so this arm
+                // alone destroys the entry and frees its stage-0 slot.
                 self.discard_chain(id);
                 Err(IntroError::Malformed)
             }
@@ -213,14 +245,17 @@ impl<I: Identity> Endpoint<I> {
     /// (`+ss`). The guard admits here, post-`ss`, which is what keeps
     /// §17.1's write path key-holder-only.
     ///
-    /// # It advances a still-parked chain
+    /// # It advances a still-parked chain (**ruling 75**)
     ///
     /// §6.2's typestate makes `read_identity()` unskippable on the handle
     /// path; the core is keyed by `IntroId` and has no such fence. A chain
-    /// still at stage 0 is therefore driven through the `es` here rather
-    /// than refused — §6.1 prices this verb at **2 DH cumulative**, so
-    /// doing the missing work costs exactly what the table says, and no
-    /// error variant has to be invented for a case §18.1 does not name.
+    /// still at stage 0 is therefore driven through the skipped `es` here
+    /// rather than refused — §6.1 prices this verb at **2 DH cumulative**,
+    /// so doing the missing work lands on *exactly* the ratified amount,
+    /// and no error variant has to be invented for a case §18.1 does not
+    /// name. Like ruling 74 above, this is resolved in the direction that
+    /// cannot perturb §6.1's ladder: the permissive answer is the one that
+    /// costs what the table already says.
     ///
     /// # The write is provisional
     ///
@@ -233,10 +268,17 @@ impl<I: Identity> Endpoint<I> {
         now: Instant,
         id: IntroId,
     ) -> Result<(PublicKeyOf<I>, Timestamp), AuthError> {
+        self.observe(now);
         if matches!(
             self.intros.get(id).map(|entry| &entry.state),
             Some(ChainState::Parked)
         ) {
+            // Ruling 75's `es`, driven here. The error map is *not* a
+            // judgement: §18.1's `AuthError` is closed at
+            // `{Replay, HandshakeFailed, Expired, EndpointDropped}` and
+            // ruling 72 amended `IntroError` and `ConnectError` only, so
+            // there is no `AuthError::Local` to carry an `IntroError::Local`
+            // into. See the slice notes — this is reported, not resolved.
             self.read_identity(id).map_err(|e| match e {
                 IntroError::Expired => AuthError::Expired,
                 _ => AuthError::HandshakeFailed,
@@ -333,9 +375,12 @@ impl<I: Identity> Endpoint<I> {
     /// alongside a dropped chain.
     pub(crate) fn accept(
         &mut self,
-        _now: Instant,
+        now: Instant,
         id: IntroId,
     ) -> Result<(ConnectionId, Connection<I::Suite>), AcceptError> {
+        // Ruling 73: this verb carries a `now`, so it starts the orphan
+        // clock for any pin released by a verb that does not.
+        self.observe(now);
         let (peer_key, timestamp, anchor, peer_index) = {
             let entry = self.intros.get(id).ok_or(AcceptError::Stale)?;
             match &entry.state {

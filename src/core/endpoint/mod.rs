@@ -104,6 +104,14 @@ struct Pending<I: Identity> {
     give_up_at: Instant,
     /// §5.5 rule 3: one completion attempt per retransmit interval.
     attempt_spent: bool,
+    /// Whether **any** attempt has reached the wire. Ruling 72.
+    ///
+    /// `false` means every interval so far failed *locally* — the identity
+    /// would not open, or msg1 would not write on it — so not one msg1
+    /// exists for the peer to have ignored. A give-up in that state is
+    /// [`ConnectError::Local`], not [`ConnectError::TimedOut`]; see
+    /// [`start_attempt`](Endpoint::start_attempt).
+    attempted: bool,
     /// Whether this pending actually took a §17.1 pin.
     ///
     /// A pin **never creates an entry**, so a dial to a static nobody has
@@ -144,6 +152,14 @@ pub(crate) struct Endpoint<I: Identity> {
     /// greater.
     last_init_timestamp: Option<Timestamp>,
     next_connection: u64,
+    /// The last instant the core was **told**. **Ruling 73.**
+    ///
+    /// Not a clock — the core still never reads one. It exists because two
+    /// of §16.4's verbs release §17.1 pins with no `now` in hand
+    /// (`handle_connection_event`, `reject`), and ruling 73 measures the
+    /// orphan TTL from the release. This is the lower bound the guard
+    /// stamps with; [`guard::TimestampGuard::observe`] floors it.
+    last_now: Instant,
 }
 
 impl<I: Identity> Endpoint<I> {
@@ -155,7 +171,7 @@ impl<I: Identity> Endpoint<I> {
     /// spend rests on — and that is why this core is crate-internal in this
     /// slice: publishing the constructor is a decision for the slice that
     /// has an opinion about the public surface.
-    pub(crate) fn new(_now: Instant, config: Config, identity: I, rng_seed: [u8; 32]) -> Self {
+    pub(crate) fn new(now: Instant, config: Config, identity: I, rng_seed: [u8; 32]) -> Self {
         let our_static_bytes = identity.public_static().as_ref().to_vec();
         let our_mac1 = Mac1Key::derive(&our_static_bytes);
         let intros = IntroQueue::new(config.intro_queue_cap(), config.intro_max_per_source());
@@ -173,6 +189,10 @@ impl<I: Identity> Endpoint<I> {
             pendings: BTreeMap::new(),
             last_init_timestamp: None,
             next_connection: 0,
+            // §16.4 gives the constructor a `now`, so the watermark is
+            // never unset — there is no "before the first call" case to
+            // represent.
+            last_now: now,
         }
     }
 
@@ -266,9 +286,12 @@ impl<I: Identity> Endpoint<I> {
     /// these cardinalities; slice 3 may replace it when it builds §16.5's
     /// timer table.
     ///
-    /// The guard's own deadline is computed relative to the *last* instant
-    /// the core was told about, because an unpinned orphan's aging is
-    /// measured from its admission and nothing here reads a clock.
+    /// The guard's own deadline needs no clock at all: ruling 73 stamps an
+    /// orphan with the instant its last pin was released (or with the next
+    /// instant the core is *told*, where §16.4's verb has no `now` —
+    /// [`guard::TimestampGuard::observe`]), so the deadline is a stored
+    /// value plus a constant. An orphan awaiting its stamp announces
+    /// nothing and is swept by nothing, which is the safe direction.
     fn deadline(&self) -> Option<Instant> {
         let pendings = self
             .pendings
@@ -283,6 +306,21 @@ impl<I: Identity> Endpoint<I> {
 
     fn emit(&mut self, output: EndpointOutput<I::Suite>) {
         self.outputs.push_back(output);
+    }
+
+    /// Take note of the instant this call was made. **Ruling 73.**
+    ///
+    /// Called at the top of every §16.4 verb that carries a `now`. It
+    /// advances the watermark the clockless verbs stamp with, and finalises
+    /// any stamp they have already left provisional. Not a clock read: the
+    /// core is *told* the instant, it never asks for one.
+    ///
+    /// Monotone by construction — a caller that went backwards would
+    /// otherwise shorten a window, which is the one direction ruling 73
+    /// forbids.
+    fn observe(&mut self, now: Instant) {
+        self.last_now = self.last_now.max(now);
+        self.guard.observe(now);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -356,6 +394,7 @@ impl<I: Identity> Endpoint<I> {
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
     ) -> Result<(ConnectionId, Connection<I::Suite>), ConnectError> {
+        self.observe(now);
         let key = remote_static.as_ref().to_vec();
         if self.statics.get(&key).is_some() {
             return Err(ConnectError::AlreadyConnected);
@@ -376,6 +415,7 @@ impl<I: Identity> Endpoint<I> {
             next_retransmit: now,
             give_up_at: now + constants::HANDSHAKE_GIVEUP,
             attempt_spent: false,
+            attempted: false,
             guard_pinned: false,
         };
 
@@ -422,13 +462,19 @@ impl<I: Identity> Endpoint<I> {
         let timestamp = self.draw_timestamp();
 
         // A local provider failure — an enclave that is locked, a key
-        // handle that will not open — is **not** a protocol condition, and
-        // §18.1's `ConnectError` is a closed two-variant taxonomy with no
-        // room for one. So the attempt is simply not built: the train
-        // continues, the next retransmit tries again, and a provider that
-        // never recovers surfaces as the outcome the spec *does* define —
-        // `TimedOut` at `HANDSHAKE_GIVEUP`. Inventing an error variant
-        // here would be a change to a ratified taxonomy.
+        // handle that will not open — does **not** end the dial here.
+        // Ruling 72 is explicit that a local fault is *ours* and
+        // **transient**, and S21 treats a momentarily locked enclave as
+        // expected; killing a dial on one bad interval would convert the
+        // transient into a terminal, which is not what a taxonomy fix is
+        // for. So the attempt is simply not built and the train continues —
+        // the next retransmit tries again, on a fresh `open()`.
+        //
+        // What the ruling *does* buy is the verdict at the end of the
+        // train: `attempted` stays `false` while no msg1 has reached the
+        // wire, and a give-up in that state reports `ConnectError::Local`
+        // rather than blaming a peer that was never sent anything. See
+        // `expire_pendings`.
         let Ok((provider, our_key)) = self.identity.open() else {
             return;
         };
@@ -437,6 +483,8 @@ impl<I: Identity> Endpoint<I> {
             constants::PROLOGUE,
             pending.remote_static.clone(),
         );
+        // Also local: this is our own static's DH under hiss, not anything
+        // the peer contributed — nothing has been received at this point.
         let Ok((msg1, sent)) =
             <I::Suite as Handshake>::write_msg1(state, our_key, &timestamp.encode())
         else {
@@ -444,6 +492,7 @@ impl<I: Identity> Endpoint<I> {
         };
 
         let data = handshake::frame_init(sender_index, &msg1, &pending.peer_mac1);
+        pending.attempted = true;
         self.indices.insert_pending(sender_index, pending.conn);
         pending.sender_index = Some(sender_index);
         pending.state = Some(Box::new(sent));
@@ -461,7 +510,8 @@ impl<I: Identity> Endpoint<I> {
         }
         self.statics.remove(&pending.remote_static_bytes);
         if pending.guard_pinned {
-            self.guard.unpin(&pending.remote_static_bytes);
+            self.guard
+                .unpin(&pending.remote_static_bytes, self.last_now);
         }
         Some(pending)
     }
@@ -477,6 +527,7 @@ impl<I: Identity> Endpoint<I> {
         src: SocketAddr,
         datagram: &[u8],
     ) -> Disposition {
+        self.observe(now);
         // §3.1's gate: `None` **is** the drop — no error, no trace, no
         // counter, and nothing that distinguishes it from a datagram the
         // endpoint handled itself.
@@ -638,43 +689,96 @@ impl<I: Identity> Endpoint<I> {
     /// §16.4's `handle_timeout`. **Idempotent**: every due deadline is
     /// disarmed or advanced before its logic runs, so calling twice at one
     /// instant is a no-op the second time.
+    ///
+    /// # §16.5's equal-deadline order, exhaustive and normative (**ruling 76**)
+    ///
+    /// The four endpoint deadline families run in this order and no other:
+    ///
+    /// 1. **handshake give-up** — [`expire_pendings`](Self::expire_pendings)
+    /// 2. **intro expiry** — §6.3 rule 4
+    /// 3. **guard-orphan aging** — §17.1 mitigation (ii)
+    /// 4. **retransmit** — [`retransmit_pendings`](Self::retransmit_pendings)
+    ///
+    /// The governing principle, from which all four follow: **a terminal
+    /// outcome precedes a routine one, and state removal precedes
+    /// emission.** Give-up beating a same-instant retransmit — the one pair
+    /// §16.5 ordered before ruling 76 — is an instance of it, not a special
+    /// case, which is why the give-up sweep is now a phase of its own
+    /// rather than an arm inside the retransmit loop. §16.4 makes generation
+    /// order normative, so an unordered pair here would make that claim
+    /// hollow exactly where two timers collide.
+    ///
+    /// Ruling 73 removed the one interaction that made (1) versus (3)
+    /// contentious: a give-up releases its pin, and orphan aging now runs
+    /// from that release, so step (3) grants the entry a **fresh** window
+    /// instead of finding an expired one.
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
-        // §6.3 rule 4: silent eviction, emitting nothing — but a consumed
-        // chain's provisional guard write must still be reverted, or a real
-        // peer is left blocked by a record they never got to use.
+        self.observe(now);
+
+        // (1) Terminal, and it removes state before anything else emits.
+        self.expire_pendings(now);
+
+        // (2) §6.3 rule 4: silent eviction, emitting nothing — but a
+        // consumed chain's provisional guard write must still be reverted,
+        // or a real peer is left blocked by a record they never got to use.
+        // Before (3), because it releases guard pins that (3) then ages.
         for expired in self.intros.expire(now) {
             self.release_chain_guard_state(expired.guard_undo, expired.guard_pin);
         }
 
-        // §17.1 mitigation (ii).
+        // (3) §17.1 mitigation (ii).
         self.guard.age_orphans(now);
 
-        self.drive_pendings(now);
+        // (4) Routine, and the only step of the four that transmits.
+        self.retransmit_pendings(now);
     }
 
-    fn drive_pendings(&mut self, now: Instant) {
+    /// §16.5 step (1): the handshake give-up, which is terminal.
+    ///
+    /// Runs as a complete phase before any retransmit is built, so a
+    /// give-up cannot be interleaved behind another pending's routine
+    /// send (ruling 76).
+    fn expire_pendings(&mut self, now: Instant) {
         let due: Vec<ConnectionId> = self
             .pendings
             .iter()
-            .filter(|(_, p)| p.give_up_at <= now || p.next_retransmit <= now)
+            // Normative: **give-up beats a same-instant retransmit**. The
+            // comparison is `<=`, so an equality is a give-up and the
+            // pending is gone before step (4) can look at it.
+            .filter(|(_, p)| p.give_up_at <= now)
             .map(|(id, _)| *id)
             .collect();
 
         for conn in due {
-            let Some(pending) = self.pendings.get(&conn) else {
-                continue;
+            // Ruling 72: a train that never got one msg1 onto the wire
+            // failed *locally* — there is no peer to have timed out. A
+            // train that transmitted and was not answered is a genuine
+            // `TimedOut`, whatever happened on the intervals in between.
+            let attempted = self.pendings.get(&conn).is_some_and(|p| p.attempted);
+            let _ = self.drop_pending(conn);
+            let why = if attempted {
+                ConnectError::TimedOut
+            } else {
+                ConnectError::Local
             };
-            // §16.5, normative: **give-up beats a same-instant
-            // retransmit**. The comparison is `<=` on both sides, so an
-            // equality lands here and not in the retransmit arm.
-            if pending.give_up_at <= now {
-                let _ = self.drop_pending(conn);
-                self.emit(EndpointOutput::HandshakeFailed(
-                    conn,
-                    ConnectError::TimedOut,
-                ));
-                continue;
-            }
+            self.emit(EndpointOutput::HandshakeFailed(conn, why));
+        }
+    }
+
+    /// §16.5 step (4): the routine retransmit.
+    ///
+    /// Every pending still here has already survived step (1), so no
+    /// give-up check is needed — that is what makes the order a property of
+    /// the code rather than of a comment.
+    fn retransmit_pendings(&mut self, now: Instant) {
+        let due: Vec<ConnectionId> = self
+            .pendings
+            .iter()
+            .filter(|(_, p)| p.next_retransmit <= now)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for conn in due {
             let Some(mut pending) = self.pendings.remove(&conn) else {
                 continue;
             };
@@ -707,10 +811,14 @@ impl<I: Identity> Endpoint<I> {
             ToEndpoint::Retired { our_index } => {
                 self.indices.remove_session(our_index);
                 self.indices.remove_pending(our_index);
+                // Ruling 73: this is the release that starts the orphan
+                // clock, and §16.4 hands this verb no `now` — so it stamps
+                // with the watermark and `observe` floors it at the next
+                // clocked call. See `Endpoint::last_now`.
                 if self.drop_pending(id).is_none()
                     && let Some(key) = self.statics.remove_by_connection(id)
                 {
-                    self.guard.unpin(&key);
+                    self.guard.unpin(&key, self.last_now);
                 }
             }
         }
@@ -736,7 +844,9 @@ impl<I: Identity> Endpoint<I> {
     /// that is the whole point of the mitigation.
     fn release_chain_guard_state(&mut self, undo: Option<guard::GuardUndo>, pin: Option<Vec<u8>>) {
         if let Some(key) = pin {
-            self.guard.unpin(&key);
+            // Ruling 73: `reject()` reaches here with no `now` (§16.4), so
+            // the watermark is the stamp and `observe` floors it.
+            self.guard.unpin(&key, self.last_now);
         }
         if let Some(undo) = undo {
             self.guard.revert(undo);

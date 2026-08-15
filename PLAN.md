@@ -2,7 +2,7 @@
 
 > **Status: APPROVED 2026/08/14.** All ten decisions in §6 are ruled
 > (rulings 53–59); the spec text is amended to match.
-> Inputs: `SPEC.md` (ratified 2026/08/14, 76 rulings) and `STORIES.md`
+> Inputs: `SPEC.md` (ratified 2026/08/14, 78 rulings) and `STORIES.md`
 > (30 capability stories, all approved).
 > The spec is the authority. Where this plan and the spec disagree, the
 > spec wins and this plan is wrong.

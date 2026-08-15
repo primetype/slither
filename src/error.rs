@@ -4,7 +4,12 @@
 //!
 //! §18.1 names **nine** error types and every variant each may hold. That
 //! set is closed by process: a new variant is a ratification decision, not
-//! a patch release. Nine of the ten types here are therefore *exhaustive*
+//! a patch release. **Ruling 72 is what that decision looks like** —
+//! `ConnectError::Local` and `IntroError::Local` were added *because* the
+//! taxonomy could not say "our own key hardware failed", and they were
+//! added before release precisely because §18.1's closure makes the same
+//! amendment a breaking change afterwards. Nine of the ten types here are
+//! therefore *exhaustive*
 //! Rust enums, which says the same thing in the type system — a consumer
 //! who matches without a `_` arm gets a **compile error** the day a variant
 //! lands, and for a transport that is the loud failure worth having. A
@@ -41,10 +46,10 @@
 
 /// Why an outbound dial did not produce a connection. §18.1.
 ///
-/// Exactly two variants. There is no `EndpointDropped`: by ruling 62 a
-/// `Connecting` future is a *handle* — it changes protocol state when
-/// dropped — so the driver cannot stop beneath one, and the variant would
-/// describe an unreachable state.
+/// Exactly three variants (ruling 72). There is no `EndpointDropped`: by
+/// ruling 62 a `Connecting` future is a *handle* — it changes protocol
+/// state when dropped — so the driver cannot stop beneath one, and the
+/// variant would describe an unreachable state.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectError {
     /// A connection to this static already exists.
@@ -53,6 +58,21 @@ pub enum ConnectError {
     /// The dial was retried until `HANDSHAKE_GIVEUP` and gave up.
     #[error("the initial connect gave up after HANDSHAKE_GIVEUP")]
     TimedOut,
+    /// **Our own** [`Identity::open`] failed — a locked or
+    /// biometrics-gated enclave, a hardware fault, a provider that is
+    /// momentarily unavailable. §18.1, **ruling 72**.
+    ///
+    /// The fault is *ours*, not the peer's, and S21 treats it as
+    /// **expected** rather than exceptional. It is reported only when the
+    /// dial ends having **never got a single msg1 onto the wire** — see
+    /// the note on `ConnectError` in the endpoint core; a dial whose first
+    /// attempt failed and whose second succeeded is not a local failure at
+    /// all, and one that transmitted and was not answered is a genuine
+    /// [`TimedOut`](ConnectError::TimedOut).
+    ///
+    /// [`Identity::open`]: crate::identity::Identity::open
+    #[error("our own identity provider failed to open")]
+    Local,
 }
 
 /// Why a parked introduction could not be taken up. §18.1.
@@ -66,8 +86,29 @@ pub enum IntroError {
     #[error("the initiation belonged to a pending outbound dial and was consumed")]
     Internal,
     /// The introduction's msg1 is structurally unreadable.
+    ///
+    /// **The peer's bytes are at fault and the verdict is definitive**: 1
+    /// DH is spent, the chain is **discarded**, and its stage-0 slot is
+    /// freed (§6.1). Retaining it would hand an attacker a per-source slot
+    /// for the price of unreadable bytes. Contrast
+    /// [`Local`](IntroError::Local), which is the opposite in every way
+    /// that matters (ruling 72).
     #[error("the introduction's msg1 is structurally unreadable")]
     Malformed,
+    /// **Our own** provider failed — [`Identity::open`], or the responder
+    /// machine it feeds, would not build. §18.1, **ruling 72**.
+    ///
+    /// **0 DH has been spent and the chain is left parked**, so a retry
+    /// can still succeed: a locked enclave is transient, and S21 treats it
+    /// as expected. Reporting this as
+    /// [`Malformed`](IntroError::Malformed) would tell the application the
+    /// remote peer sent garbage — evidence pointing at the wrong party,
+    /// which an application may reasonably act on by denylisting or
+    /// alerting.
+    ///
+    /// [`Identity::open`]: crate::identity::Identity::open
+    #[error("our own identity provider failed to open")]
+    Local,
     /// The endpoint driver stopped.
     #[error("the endpoint driver stopped")]
     EndpointDropped,
@@ -312,9 +353,11 @@ mod tests {
         vec![
             Box::new(ConnectError::AlreadyConnected),
             Box::new(ConnectError::TimedOut),
+            Box::new(ConnectError::Local),
             Box::new(IntroError::Expired),
             Box::new(IntroError::Internal),
             Box::new(IntroError::Malformed),
+            Box::new(IntroError::Local),
             Box::new(IntroError::EndpointDropped),
             Box::new(AuthError::Replay),
             Box::new(AuthError::HandshakeFailed),

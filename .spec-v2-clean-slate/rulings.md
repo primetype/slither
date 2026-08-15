@@ -1435,3 +1435,52 @@ were resolved *as already built* — the value of asking was not that the
 code changed but that the behaviour stopped being an accident. An
 unstated rule that happens to be implemented correctly is still unstated,
 and the next implementer gets no help from it.
+
+**Rulings 77–78 — the two defects rulings 72 and 73 created.** Both were
+found by the agent applying 72–76, and both are cases of a fix carrying
+its own flaw one level down. That is now three times in this project
+(ruling 70 named a constant without noticing it had two origins; ruling 64
+mis-scoped its own rationale), and it is worth stating as a habit rather
+than an anecdote: **a ruling's blast radius includes the ruling.**
+
+**Ruling 77 — only a key-holder pin restarts the orphan clock.** Ruling 73
+started aging at pin release. But §17.1 pins at `read_identity()`, on a
+static that is merely **claimed**, and §6.1 states plainly that reaching
+`Claimed` requires no secret and the claimed static is attacker-choosable.
+So ruling 73 handed anyone able to send a mac1-valid msg1 a way to restart
+the aging clock of any static already holding an entry, at 1 DH, for as
+long as they liked — deferring mitigation (ii) indefinitely.
+
+Narrowed: a `Claimed` chain's pin still bars eviction, as §17.1 requires,
+but does not restart aging; only a live connection, an outbound pending or
+a `Proven` chain does. Ruling 73's security argument is untouched, because
+a retiring connection is a key-holder pin and still gets its full window.
+
+*The exposure was bounded and the narrowing is still right.* The record is
+**retained**, not destroyed — mildly protective — and `TS_GUARD_ORPHAN_CAP`
+with admission-only recency still evicts, so memory is capped. Ruled
+anyway, because an unauthenticated party must not move a timer: it is a
+lever that compounds with whatever a later slice adds beside it. Read as
+§6.1's own rule reaching one step further than §6.1 states it — not merely
+*no new durable state* keyed on a claimed static, but **no control over
+the lifetime of existing state**.
+
+*The corroboration is the part worth keeping.* The independent test
+`an_orphaned_guard_entry_ages_out_at_ts_guard_orphan_ttl` **failed** under
+ruling 73 and **passes unedited** under 77. Its author had reasoned about
+this hazard's mitigation-(iii) form and designed against it, months of
+context before ruling 73 existed. A test written from the spec alone
+rejected a ruling that had drifted from it — which is the strongest
+argument yet for keeping the test author away from the implementation.
+
+**Ruling 78 — `AuthError::Local`.** Ruling 72 added `Local` to
+`IntroError` and `ConnectError` and did not reach `AuthError`, where the
+same fault mapped onto `HandshakeFailed`. That is the worse half of the
+original defect: §18.1 designates `HandshakeFailed` **the only security
+signal in the staged taxonomy**, deliberately detail-free because it means
+a forged claim died at the msg1 tail's AEAD tag. Reporting a locked
+enclave through it does not merely blame the peer for a local fault — it
+reports the peer as an **attacker**, and teaches an operator to distrust
+the one variant that must stay trustworthy. `authenticate()` can meet the
+fault because ruling 75 lets it drive a skipped `read_identity()`, so the
+two rulings interact: 75 widened the path, 72 fixed only part of it.
