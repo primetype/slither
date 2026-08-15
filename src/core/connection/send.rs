@@ -15,7 +15,8 @@
 //! §8.7's `ranges` class says the lost packet's stream ranges *"return to
 //! the pending set and are re-framed on fresh counters"*. Slice 4 must build
 //! the **state** those classes act on and must not build the detection
-//! (§12.5's seam), so [`on_ack_range`] and [`on_lost_range`] exist here,
+//! (slice 5's loss-recovery seam, SPEC §13), so [`on_ack_range`] and
+//! [`on_lost_range`] exist here,
 //! unit-tested, and are called from nowhere on the wire. Slice 5 wires §12
 //! to them.
 //!
@@ -57,7 +58,8 @@ pub(crate) struct Chunk {
 
 /// §9.6's sender-emitted reset, as it lives in the stream's own state.
 ///
-/// §12.1's seam: the **receiver**-emitted reset of §9.8 is retained in a
+/// Slice 6's message seam (SPEC §9.8): the **receiver**-emitted reset of
+/// §9.8 is retained in a
 /// connection-level regenerate set that outlives the stream state. These are
 /// deliberately not one structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,8 +212,9 @@ impl SendHalf {
     /// Buffer as much of `data` as both credit levels allow.
     ///
     /// `conn_room` is the connection-level headroom the caller read off the
-    /// ledger — **§12.6's seam**: "how many bytes may I send right now" has
-    /// exactly one call site, so slice 7's congestion window inserts a
+    /// ledger — **slice 5's congestion seam (SPEC §14, ruling 130)**: "how
+    /// many bytes may I send right now" has
+    /// exactly one call site, so slice 5's congestion window inserts a
     /// second bound there and not here.
     pub(crate) fn write(&mut self, data: &[u8], conn_room: u64) -> Result<usize, WriteError> {
         if self.fin || self.reset.is_some() {
@@ -399,7 +402,7 @@ impl SendHalf {
         self.max_data
     }
 
-    // ── §12.4's seam: defined here, driven by slice 5 ───────────────────
+    // ── Slice 5's ACK seam (SPEC §12): defined here, driven there ───────
 
     /// §12's ACK application, for one acknowledged stream range.
     ///
@@ -737,7 +740,8 @@ mod tests {
         assert_eq!(half.next_chunk(10), None);
     }
 
-    /// §12.4's seam: `DataRecvd` is reachable **only** through the ACK entry
+    /// Slice 5's ACK seam (SPEC §12): `DataRecvd` is reachable **only**
+    /// through the ACK entry
     /// points, which nothing on the wire calls in slice 4.
     #[test]
     fn data_recvd_needs_every_byte_and_the_fin_acknowledged() {

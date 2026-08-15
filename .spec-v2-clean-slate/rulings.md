@@ -3326,3 +3326,240 @@ failure is an assertion too weak to separate the broken build; this is an
 assertion too **strong** — one that separates the broken build *and* some
 correct ones. Both are failures of the same question, *what exactly does
 this separate*, and only the weak form had a rule written for it.
+
+---
+
+## Round 23 — slice 5 planning: reliability (2026/08/15)
+
+Ten open questions, eight conflicts. Two of them correct ratified text of
+mine, and one settles a slice boundary that six documents disagree about.
+
+**Ruling 130 — §13 and §14 are slice 5's. Six texts say slice 7 and they
+all descend from one.**
+
+`PLAN.md`'s slice-5 row reads *"§12 ACK …, §13 RFC 9002 …, §14 NewReno,
+ruling 47's `acked()`"*, and **§14 does not appear in its slice-7 row at
+all**. Against it: ruling 105 (*"§13 is slice 7"*), ruling 114 twice
+(*"§14's congestion window is slice 7"*), `send.rs:213`,
+`tests_streams.rs:3234`'s `#[ignore]` reason, and the source they all
+descend from — `.slices/04-streams/PLAN.md:1903`, a *slice-4 planning
+document*, which is not authority over the slice plan. Ruling 129, made
+yesterday, agrees with `PLAN.md`. **`PLAN.md` is the approved plan and it
+wins**; the six others are corrected.
+
+Two inherited debts move with the answer, and this is the part that costs
+something. **Ruling 105's loss-driven tombstone variant** (*"free a
+stream, drop the ACK, let the peer's PTO retransmission re-name it"*)
+needs §12 **and** §13. **Ruling 98's STREAM-retransmission seal row** —
+the row where one frame type takes two different seals — needs a
+retransmission, which is §13's. The brief asked whether §12 forces ruling
+98's row earlier; the planner's answer is exactly right and sharper than
+the question: *§12 does not, but §13 does, and §13 is slice 5's.* Both
+are slice-5 debts.
+
+**Ruling 131 — §13.2's `Loss` timer arms from survivors below
+`largest_acked`, not from every in-flight packet.** §13.2 says
+*"Survivors **inside the threshold** arm the `Loss` timer at `time_sent +
+loss_delay` (**minimum across in-flight packets**)"*. The subject is
+packets below `largest_acked` that failed both loss tests; the
+parenthetical ranges over the whole map, including packets *above*
+`largest_acked` that the walk does not judge at all. They differ whenever
+anything newer than `largest_acked` is outstanding — the ordinary case
+during a transfer — and the wide reading arms a timer that fires and
+declares nothing, or worse, declares recent packets lost. RFC 9002
+§6.1.2 and v0.1 both take the narrow one.
+
+**The prose is right and the parenthetical is the code-shaped rule.**
+That is now the fourth time in this project, and working rule 3 exists
+because of the first three. The parenthetical is corrected to *"minimum
+across the survivors"*.
+
+**Ruling 132 — ruling 128's guard (b) does not exist as described, and
+the ruling is cheaper than I priced it.**
+
+Ruling 128 said the second thing hiding drained data is *"the shell
+releasing the core at `Retired`, which `drop_state` emits at the instant
+of death"*, and that moving it *"means touching ruling 81"*. On the
+**draining** path — the path ruling 128's own test builds —
+`Frame::Close` sets `Lifecycle::Draining { until: now + CLOSE_LINGER }`
+and arms the timer; **`drop_state` does not run there.** It runs at
+linger expiry, five seconds later. I also cited `driver.rs:650`, which is
+`release_dead`; `Retired` is handled at `driver.rs:471–482`.
+
+The real blockers are three, all of them ordinary: ruling 118's accept
+latch, ruling 124's read precedence, and `core::Connection::read`'s
+`self.lost` guard. **Ruling 81 need not be touched.** The conclusion
+stands unchanged; the scoping decision was priced against work that is
+not required.
+
+**This is the fifth ruling of mine justified by a mechanism that is not
+what I said it was** (87, 89, 120, 90's absent clause, and now 128). It
+is also the second in two days where the error is *precisely* working
+rule 12's: I read `die()` → `drop_state()`, which is true, and never
+asked which path the case in front of me actually takes. Ruling 128 was
+itself the ruling that overturned 118 on this exact fault. **Checking the
+mechanism is not enough if you check it on the wrong path** — and the
+wrong path is easy to pick when a function named `die` exists.
+
+**Ruling 133 — the closing endpoint frees stream state; the draining
+endpoint keeps it for `CLOSE_LINGER`; the `die()` paths keep nothing.**
+
+§15.2's local-close bullet says all stream, flow-control, recovery and
+congestion state *may* drop immediately; the code today drops none of it,
+because `drop_state` leaves `streams` and `flow` untouched on every path.
+Ruling 128 requires the **receiver** to keep it. Both cannot be one rule,
+and the asymmetry has a reason rather than a convenience: **at the closer
+the application signalled that it is done, and at the receiver it did
+not.** A `close()` while a receive half holds unread bytes is a decision
+to discard them; a peer's CLOSE is not.
+
+So: local close frees `streams`/`flow` at once (§15.2's letter, and the
+memory ceiling §17.5 assumes). The draining path retains them for the
+linger and frees at expiry. The no-linger deaths — liveness, nonce
+exhaustion, `Replaced`, endpoint dropped — retain nothing, and **that
+consequence is to be documented rather than discovered**: a receiver
+killed by `DEAD_TIMEOUT` mid-stream cannot drain, which is honest,
+because a path that produced no CLOSE produced no finished sender either.
+
+**Ruling 134 — `write()` accepts bytes the congestion window cannot yet
+send. The window defers the *seal*, never the *acceptance*.**
+
+Nothing in §14, §16.2, §16.7 or §10.6 says what `write()` does when flow
+control admits and the window does not, because until slice 5 there was
+no window. It is the largest behavioural decision in the slice and it is
+decided as (a): the bytes enter send state, `write()` returns `Ok(n)`,
+and §14.5's gate holds them off the wire.
+
+Four reasons. Ruling 111's own parenthetical describes *"a `reset()`
+following a `write()` that congestion control has not yet released"* as
+**ordinary operation** — that state must be reachable or the ruling
+describes nothing. Ruling 129 asserts slice 5 makes its positive control
+reachable, which requires exactly this. §10.6 already bounds the buffer
+at the peer's advertised credit, so (a) introduces no new memory
+obligation. And (b) would have the shell's writer park on *window room*,
+a condition no `ConnEvent` announces — `StreamWritable` is credit-driven
+— so slice 5 would owe a new event, a new waker map and a new wakeup
+path, none of which the spec describes.
+
+`write()` therefore remains a **flow-control** verb, and the congestion
+window is invisible to it. Two `#[ignore]`d obligations go green on this:
+ruling 129's control, and
+`credit_frames_precede_the_stream_fill_in_a_packet`.
+
+**Ruling 135 — both `acked()` verbs answer from their settled snapshot
+before the death latch.** This is ruling 128's defect on the sender's
+side, and it is reachable by the identical mechanism: the peer's ACK and
+the peer's CLOSE arrive in one driver pass, the latch is set before the
+application is woken, and `write; acked(); close()` — the sequence S28
+exists for and §16.2 spells out — answers `Err(ConnectionLost)` over a
+transfer that was fully delivered and fully acknowledged. Not a race the
+sender can win. Ruling 124's sentence governs with one word changed: *a
+stream whose bytes were acknowledged completed, and the connection dying
+afterwards does not un-complete it.*
+
+**Ruling 136 — a packet's `size` for §13.5 and §14.5 is the full
+datagram** — `DATA_HEADER_LEN + ciphertext + AEAD_TAG_LEN`, i.e.
+`Transmit::data.len()`. Nearly derivable already: §14.5 derives
+`INITIAL_WINDOW` as `min(10 × 1200, max(2 × 1200, 14 720))` *"at
+`MAX_DATAGRAM` = 1200"*, and `MAX_DATAGRAM` is the datagram. **A window
+expressed in datagram units must be spent in datagram units.** Counting
+plaintext instead under-counts by 30 B per packet — a standing ~2.5 %
+overshoot at a 12 000 B window that grows with the window and that no
+functional test can see.
+
+**Ruling 137 — `SentPacket` carries a path generation from slice 5, and
+§14.6's single marker is corrected.** §14.6 says the recovery-period
+marker is set to the roam instant and not cleared, and §13.6 lists
+**four** things pre-roam packets must not feed: a congestion event, the
+persistent-congestion walk, an RTT sample, and `app_limited` growth. The
+marker serves the first and fourth, because §14.3 already gates both on
+it. **It cannot serve the RTT fence**: `recovery_start` is also set by
+every ordinary congestion event, so an implementation reusing it would
+suppress RTT sampling after every normal loss episode — silently, and
+for ever on a lossy path. §14.6 names quinn's path-generation stamping in
+the same breath, which is the mechanism that works.
+
+So the stamp lands now: a `u32` on `SentPacket`, documented as slice 7's,
+asserted 0 in slice 5. One dead field against a schema change in the
+densest remaining slice, and it pre-empts a defect that would otherwise
+be written into four fences.
+
+**Ruling 138 — §13.1's second sample condition is vacuous and MUST NOT be
+implemented.** A sample is taken when `largest` is newly acknowledged
+*"and at least one newly acknowledged packet is ack-eliciting"*, while
+§13.5 says *"Non-ack-eliciting packets are never inserted."* Every packet
+in the map is ack-eliciting, so the clause can never be false. It is RFC
+9002 §5.1's wording carried across from a design that tracks both kinds.
+Left alone, an implementer reading §13.1 as exhaustive builds the
+non-ack-eliciting tracking **in order to evaluate a condition that is
+always true** — §8's defect class arriving as wasted machinery rather
+than as a wrong answer. The contract states it is vacuous; §13.1 gains a
+note.
+
+**Ruling 139 — six low-cost questions, taken as recommended.**
+(a) `pto_count` increments **at the `Pto` timer's firing**, before the
+probe is built — RFC 9002's point, and the one that stays right in slice
+7 where §7.3's budget can prevent a probe leaving.
+(b) Persistent congestion **does not clear** `recovery_start`: §14.4 says
+only that slow start effectively restarts, which `cwnd = MINIMUM_WINDOW <
+ssthresh` already achieves, and §14.3's symmetric rule is stated in
+slither without RFC 9002's carve-out.
+(c) `app_limited` is recorded on **the packet that emptied the queue
+while headroom remained** — §14.5's "records it onto each sent packet"
+reads as a property of the send, and the alternative lets a bulk sender
+holding the queue one packet ahead grow the window while effectively
+idle, which is the case §14.5 reasons about.
+(d) `Controller` is **`pub(crate)`**, with a rustdoc line saying so
+deliberately, so slice 9's API review does not read it as an oversight;
+§14.1 defers pluggability to "later" and §19 intends to revisit the shape
+for CUBIC/BBR.
+(e) `SendStream::acked()` **before `finish()` parks and does not
+resolve** — §16.2 says "every byte written to that stream **and its
+FIN**", and there is no FIN yet. The hazard (`write().await;
+acked().await;` hangs) goes in the rustdoc at the call site, on the same
+terms as slice 4's "`open_bi` parks for ever on an exhausted bidi space".
+(f) §13.2's boundary is **`>`**, not v0.1's `>=` — §13 governs. The
+difference is one `K_GRANULARITY` tick and is invisible except to a test
+that lands on it, so slice 5's test lands on it, **one-sidedly, on both
+sides** (slice 1's `LEN`/`LEN-1`/`LEN+1` lesson).
+
+**Ruling 140 — seven doc comments in slice-4 core files cite section
+numbers that do not exist in `SPEC.md`.** `send.rs` and `streams.rs`
+carry "§12.5's seam", "§12.1's seam", "**§12.6's seam**", "§12.7: credit
+frames apply as O(1) monotone-max" and three more. `SPEC.md`'s §12 has
+exactly five subsections and no §12.6 or §12.7; the numbers are
+`.slices/04-streams/PLAN.md`'s. In a project whose first hard rule is
+that `SPEC.md` is the authority, "§N" in a doc comment reads as a spec
+citation. They are dangling **in slice 5's own files, pointing at the
+spec section slice 5 implements** — the maximum-confusion position. The
+integrator fixes them.
+
+### The cut, ratified
+
+**5a (core: §12 + §13 + §14) then 5b (shell: `acked()`, ruling 128's
+drain), sequential, with three concurrent agents inside 5a** — one
+implementer and **two** blind test authors, one for §12 and one for
+§13/§14, on disjoint paths.
+
+The planner's argument for refusing to split §12 from §13/§14 is the one
+that decides it: they are a single feedback loop through a single call
+site, and splitting them would ship a sent-packet map whose only
+consumers live in the other half — **which is ruling 113's exact defect**,
+one of the five debts this slice exists to pay. Repeating a defect while
+paying it off would be a poor use of a slice.
+
+Two test authors rather than one because the acceptance evidence differs
+in kind: §12's is structural (ranges, fusion to the replay window), and
+§13/§14's is numeric and derivable from the spec text alone — the
+strongest case for a blind author this project has had.
+
+### Working rule 5, twelfth of thirteen
+
+The planner **declined** a brief instruction: I told it
+`credit_frames_precede_the_stream_fill_in_a_packet` was slice 7's and
+asked it to confirm; it reported that it could not, because §14 is absent
+from `PLAN.md`'s slice-7 row and the test goes green exactly when slice
+5's admission gate can leave stream data pending. That refusal is what
+produced ruling 130, and ruling 130 is what moves two further debts into
+this slice. **The instruction was wrong, and confirming it would have
+carried three errors forward silently.**

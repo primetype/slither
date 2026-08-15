@@ -3648,7 +3648,19 @@ ack-eliciting sent-packet map. RFC 9002's shape throughout.
 
 The estimator keeps `latest_rtt`, `smoothed_rtt`, `rttvar`, and `min_rtt`.
 An ACK yields an RTT sample when its `largest` is newly acknowledged and
-at least one newly acknowledged packet is ack-eliciting. First sample:
+at least one newly acknowledged packet is ack-eliciting.
+**[CLARIFIED 2026/08/15 — ruling 138]** The second clause is **vacuous in
+slither and MUST NOT be implemented**: §13.5 says non-ack-eliciting
+packets are never inserted into the sent-packet map, so every packet an
+ACK can newly acknowledge is ack-eliciting. The wording is RFC 9002
+§5.1's, carried across from a design that tracks both kinds. It is
+recorded rather than deleted because an implementer reading this
+paragraph as exhaustive would otherwise build the non-ack-eliciting
+tracking *in order to evaluate a condition that is always true*. Note
+also that "newly acknowledged" is load-bearing in the first clause: if
+this ACK's `largest` was already acknowledged by an earlier ACK, there is
+**no** sample, even when the frame newly acknowledges other packets.
+First sample:
 `smoothed_rtt = latest_rtt`, `rttvar = latest_rtt / 2`,
 `min_rtt = latest_rtt`. Later samples: `min_rtt = min(min_rtt, latest)`;
 the peer's `ack_delay`, capped at `MAX_ACK_DELAY`, is subtracted only when
@@ -3683,7 +3695,16 @@ been acknowledged **and** either:
   before the acknowledgment arrived.
 
 Survivors inside the threshold arm the `Loss` timer at
-`time_sent + loss_delay` (minimum across in-flight packets). Lost packets'
+`time_sent + loss_delay` (**minimum across those survivors**).
+**[AMENDED 2026/08/15 — ruling 131]** This parenthetical read "minimum
+across in-flight packets", which ranges over the whole sent-packet map
+including entries **above** `largest_acked` that this walk does not judge
+at all. The two readings diverge whenever anything newer than
+`largest_acked` is outstanding — the ordinary case during a transfer —
+and the wide one arms a timer that fires and declares nothing, or, if an
+implementation then acts on it, declares recent packets lost. The
+subject of the sentence is the survivors; the parenthetical now agrees
+with it, as RFC 9002 §6.1.2 does. Lost packets'
 frames re-queue by retransmission class (§8.7); the lost packet's bytes
 leave `bytes_in_flight`, and the loss feeds the congestion controller once
 per episode (§14.3).
@@ -3901,7 +3922,18 @@ one seam; the RTT estimator survives it as a prior (§13.1):
   controller (§13.6): they resolve for loss and retransmission but feed
   no congestion event, no persistent-congestion walk, no RTT sample, and
   no `app_limited` growth (RFC 9000 §9.4's per-path separation; quinn's
-  path-generation stamping). This is conservative per RFC 9002/quinn
+  path-generation stamping).
+  **[AMENDED 2026/08/15 — ruling 137]** *One marker cannot serve those
+  four fences and the text must not be read as saying it does.* The
+  recovery-period marker serves the congestion event and `app_limited`
+  growth, because §14.3 already gates both on it. It **cannot** serve the
+  RTT fence: `recovery_start` is also set by every ordinary congestion
+  event, so an implementation reusing it would suppress RTT sampling
+  after every normal loss episode — silently, and permanently on a lossy
+  path. The mechanism that works is the one this bullet already names:
+  **path-generation stamping**. `SentPacket` therefore carries a `u32`
+  path generation from slice 5 onward, held at 0 until roaming exists,
+  and §13.6's fences read that stamp rather than the recovery marker. This is conservative per RFC 9002/quinn
   precedent (a fresh
   controller per path); a reviewer could argue for keeping cwnd across a
   same-NAT port rebind — declined here for want of evidence the path is
@@ -3971,7 +4003,19 @@ reserved cleartext close packet type (`0x04`) stays dead.
 - **Receiving an authenticated CLOSE**: surface
   `ConnectionLost::PeerClosed { code, reason }`, emit **nothing**, hold a
   brief drain for the same `CLOSE_LINGER` (discarding late packets, no
-  replies), then drop all state.
+  replies), then drop all state. **[AMENDED 2026/08/15 — ruling 133]**
+  *Received stream state is retained for that drain, and this is the
+  asymmetry ruling 128 needs.* The bullet above lets a **closing**
+  endpoint free stream and flow-control state at once, and it should:
+  calling `close()` while a receive half holds unread bytes **is** a
+  decision to discard them. A peer's CLOSE is not that decision, so here
+  the bytes stay claimable for the linger (§16.2, ruling 128) and are
+  freed at expiry. The no-linger deaths — liveness (§7.4), nonce
+  exhaustion (§7.9), `Replaced` (§5.4), endpoint dropped — retain
+  nothing, and the consequence is stated rather than left to be found: a
+  receiver killed by `DEAD_TIMEOUT` mid-transfer cannot drain, which is
+  honest, because a path that produced no CLOSE produced no finished
+  sender either.
 - **Protocol violations by the authenticated peer** (§8.2's semantic
   class — `FLOW_CONTROL_ERROR`, `STREAM_LIMIT_ERROR`,
   `STREAM_STATE_ERROR`, `FINAL_SIZE_ERROR` — and its post-AEAD

@@ -138,7 +138,8 @@ impl Stream {
 
 /// §8.7's `regenerate` class, as a set of frame **identities**.
 ///
-/// §12.5's seam: slice 4 populates it and drives it from state changes only.
+/// Slice 5's loss-recovery seam (SPEC §13): slice 4 populates it and drives
+/// it from state changes only.
 /// The *value* is never stored — it is read off the ledger at pack time, so
 /// a re-queued identity carries *"the freshest current value"* by
 /// construction rather than by remembering to refresh it.
@@ -163,7 +164,8 @@ pub(crate) struct Streams {
     /// §16.4's *"backpressure by retention"*: peer-opened streams awaiting
     /// `accept(dir)`.
     ///
-    /// §12.1's seam: a **queue of unclaimed halves**, not "the newest one" —
+    /// Slice 6's message seam (SPEC §9.8): a **queue of unclaimed halves**,
+    /// not "the newest one" —
     /// §9.8 adds a second claim verb drawing from the same supply.
     unclaimed: [VecDeque<StreamRef>; 2],
     /// §8.5's round-robin rotation over streams with pending data.
@@ -362,7 +364,7 @@ impl Streams {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // §12.4's seam — defined here, wired to §12 by slice 5
+    // Slice 5's ACK seam — defined here, wired to SPEC §12 there
     // ═══════════════════════════════════════════════════════════════════
 
     /// One acknowledged stream range. Nothing on the wire calls this in
@@ -541,7 +543,7 @@ impl Streams {
 
     /// §10.3's MAX_STREAM_DATA.
     ///
-    /// §12.7: *"credit frames apply as O(1) monotone-max"* and **never open
+    /// SPEC §10.6: *"credit frames apply as O(1) monotone-max"* and **never open
     /// streams**. A receiver that lazily created a stream entry here would
     /// hand a peer unbounded allocation at four bytes per stream — and it is
     /// the natural implementation if the ledger is a map with an
@@ -1241,7 +1243,7 @@ mod tests {
         );
     }
 
-    /// §12.7: *"credit frames never open streams"*. A receiver that lazily
+    /// SPEC §10.6: *"credit frames never open streams"*. A receiver that lazily
     /// created an entry here would hand a peer unbounded allocation at four
     /// bytes per stream — and it is the natural implementation if the ledger
     /// is a map with an `entry().or_default()`.

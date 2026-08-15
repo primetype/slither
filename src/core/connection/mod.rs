@@ -56,6 +56,8 @@ mod tests;
 // whose 73 tests found three defects in the contract itself (Round 18).
 // Declared here at integration, for the same reason as `tests` above.
 #[cfg(test)]
+pub(crate) mod testfix;
+#[cfg(test)]
 mod tests_streams;
 
 use std::collections::VecDeque;
@@ -507,20 +509,27 @@ impl<C: Handshake> Connection<C> {
     }
 
     /// §12's ACK application for one stream range. **Uncalled from the
-    /// wire** in slice 4 (§12.4's seam); slice 5 wires §12 to it.
+    /// wire** in slice 4; slice 5 wires SPEC §12 to it.
     ///
     /// Takes `now` because an ACK can complete a send half, fully close a
     /// stream and owe a MAX_STREAMS grant (§10.4).
     ///
-    /// Whether the acknowledged frame carried the **FIN** is inferred from
-    /// `range.end == final_size`, because the signature carries no flag.
-    /// That is exact for every frame this implementation emits — the FIN
-    /// rides the frame that ends the stream and nothing else — but §8.7 lets
-    /// a retransmission re-frame ranges freely, so slice 5 should carry the
-    /// flag explicitly off its sent-packet map rather than re-derive it here.
-    /// See the implementation report.
-    pub(crate) fn on_ack_range(&mut self, now: Instant, r: StreamRef, range: std::ops::Range<u64>) {
-        let fin = self.frame_carried_fin(r, &range);
+    /// **[RATIFIED 2026/08/15 — ruling 113, corrected by ruling 130's
+    /// round]** `fin` is carried explicitly, off §12's sent-packet map. It
+    /// used to be inferred as `range.end == final_size`, which is exact for
+    /// every frame *this* implementation emits — the FIN rides the frame
+    /// that ends the stream and nothing else — and wrong in general, because
+    /// §8.7 lets a retransmission **re-frame ranges freely**, so a range
+    /// ending at the final size need not have carried the FIN. The
+    /// inference would have silently set `fin_acked` on a re-framed
+    /// retransmission and driven the send half to `DataRecvd` early.
+    pub(crate) fn on_ack_range(
+        &mut self,
+        now: Instant,
+        r: StreamRef,
+        range: std::ops::Range<u64>,
+        fin: bool,
+    ) {
         self.streams
             .on_ack_range(r, range, fin, &mut self.flow, &mut self.events);
         self.drain_events();
@@ -529,20 +538,18 @@ impl<C: Handshake> Connection<C> {
 
     /// §13's loss detection for one stream range: it returns to the pending
     /// set and is re-framed on a fresh counter (§8.7 `ranges`). **Uncalled
-    /// from the wire** in slice 4 (§12.5's seam).
+    /// from the wire** in slice 4; slice 5 wires SPEC §13 to it.
+    ///
+    /// `fin` is explicit for the same reason as [`on_ack_range`](Self::on_ack_range).
     pub(crate) fn on_lost_range(
         &mut self,
         now: Instant,
         r: StreamRef,
         range: std::ops::Range<u64>,
+        fin: bool,
     ) {
-        let fin = self.frame_carried_fin(r, &range);
         self.streams.on_lost_range(r, range, fin);
         self.pump(now);
-    }
-
-    fn frame_carried_fin(&self, r: StreamRef, range: &std::ops::Range<u64>) -> bool {
-        self.streams.final_size(r) == Some(range.end)
     }
 
     /// §9.6's RESET_STREAM acknowledged. **Uncalled from the wire** in slice
