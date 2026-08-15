@@ -2727,6 +2727,42 @@ space's closed-stream watermark and not currently open is a no-op —
 ACKed, never re-opened (§9.2). All offset arithmetic (`offset + length`,
 final-size and credit comparisons) is checked or saturating.
 
+**[RATIFIED 2026/08/15 — ruling 97]** **These checks are a set, and their
+evaluation order is normative**, because one crafted frame can trip
+several and all of them end the connection — so the only observable
+difference is the error code on the wire, which is what Appendix B
+asserts on and what a peer's operator reads:
+
+1. **`STREAM_STATE_ERROR`** — may this peer send this frame at all?
+2. **the watermark no-op** (§9.2) — is this frame inert?
+3. **`STREAM_LIMIT_ERROR`** — may this index exist?
+4. **`FINAL_SIZE_ERROR`** — is it consistent with what we already know?
+5. **`FLOW_CONTROL_ERROR`** — does it fit the credit we advertised?
+
+Legality precedes the watermark because the two collide and disagree: for
+a **locally-opened uni** stream the peer may never send STREAM at all, so
+a frame naming a fully-closed local-uni index satisfies both rules, one
+answering "silently ACK" and the other "end the connection". The
+watermark answers *which index*; the state error answers *who may send*.
+A frame the peer could never legally send at any index is not a late
+retransmission of anything, and ordering the watermark first would delete
+this check for exactly the indices an attacker can most cheaply name. The
+check is decidable without consulting the stream table — §9.1's id
+encodes direction and opener parity, and with the role fixed at install
+(ruling 106) it is a total function of the id — so a freed stream cannot
+confuse it.
+
+Flow control runs **last** so the ledger is consulted exactly once per
+frame, after the frame is known otherwise legal; this is the same
+ordering §9.6 and §10.3 already require when they put the credit bound
+check before any true-up. `FINAL_SIZE_ERROR` precedes it because a frame
+contradicting a pinned final size is a statement about a stream we
+already fully understand, and answering it with a credit code would
+mislead. `STREAM_LIMIT_ERROR` precedes the open it would authorise, so a
+frame naming an index above the limit performs **no** implicit opening
+and emits **no** `StreamOpened` (ruling 99) — the order is what bounds
+that event burst, not merely what names the error.
+
 **MAX_DATA (`0x10`)** / **MAX_STREAM_DATA (`0x11`)**
 
 ```
@@ -2936,7 +2972,16 @@ is no message-size ceiling beyond flow control. Rules:
   data beyond advertised credit ⇒ `FLOW_CONTROL_ERROR`.
 - An empty STREAM frame with FIN is a valid end-of-stream marker; an
   empty frame without FIN and without data is valid and a no-op
-  (tolerated, never emitted).
+  (tolerated, never emitted). **[RATIFIED 2026/08/15 — ruling 100]** The
+  no-op is about the frame's *data*, not about §9.2's open: such a frame
+  naming a not-yet-open index above the watermark **does open it**, and
+  every lower one, and charges the cumulative limit. It delivers no
+  bytes, pins no final size and consumes no credit — that is all "no-op"
+  claims. Reading it as suppressing the open would make the open set
+  depend on a payload property §9.2 never mentions, and would make a
+  zero-length write on an open stream indistinguishable in the codec from
+  a stream-creating frame. Reachable only from a foreign or hostile peer,
+  whose own allowance it spends (§10.4).
 - Reassembly memory is bounded twice over: by advertised credit (the span
   a receiver must cover, §10.6) and by the reassembly-fragment mandate of
   §10.6 — per-stream reassembly state MUST be O(advertised credit) and
@@ -3199,7 +3244,24 @@ one ruling):
 | `INITIAL_MAX_STREAM_DATA` | 262 144 B (256 KiB) |
 | `INITIAL_MAX_STREAMS_BIDI` | 32 (cumulative) |
 | `INITIAL_MAX_STREAMS_UNI` | 128 (cumulative — higher for message traffic, §9.8) |
-| `STREAMS_CREDIT_BATCH` | 8 |
+| `STREAMS_CREDIT_BATCH` | 8 — **receiver policy, not a wire constant** (ruling 103) |
+
+**[RATIFIED 2026/08/15 — ruling 103]** **The table's five rows are two
+kinds of thing, and only the first four are wire constants.** The four
+initial windows are unnegotiated, so both ends must assume the same value
+and a divergence corrupts the peer's accounting immediately; changing one
+is a wire change. `STREAMS_CREDIT_BATCH` is when a receiver *chooses* to
+advertise — this section's own "later credit is receiver policy" — and
+two peers running different batch values interoperate perfectly. Grouping
+them in one table gives the policy knob the wire pins' protection, so a
+future tuning change looks like a wire change and draws a ratification
+round it does not need.
+
+`REASSEMBLY_CHUNKS_MAX` (§10.6) is a **third** kind: receiver policy like
+the batch, but externally *observable*, since a peer that fragments past
+one receiver's ceiling is killed and past another's is not (§10.5). The
+values and their locations do not move — that would be wire-pin churn for
+nothing — but the code and `spec_constants.rs` mark which kind each is.
 
 ### 10.3 Advancing credit
 
@@ -3232,9 +3294,10 @@ reset bytes march the connection into a permanent send stall after
 `INITIAL_MAX_DATA` with no error and no timer — reachable in honest
 operation by any application that cancels streams. The true-up applies
 only **after** the §8.4 `FLOW_CONTROL_ERROR` bound check, with checked or
-saturating `u64` arithmetic (§9.6): it releases exactly the credit the
-bytes had consumed and can never be driven above the advertised limit —
-a peer cannot manufacture credit, only waste its own window. The
+saturating `u64` arithmetic (§9.6): for every retirement that has a
+pinned final size it releases exactly the credit the bytes had consumed,
+and no retirement can be driven above the **advertised** limit — a peer
+cannot manufacture credit, only waste its own window. The
 true-up is **absolute, not additive**: it advances the stream's
 contribution to the connection-level consumed count **to** its
 `final_size` — a monotone bring-to-final, idempotent with bytes
@@ -3242,6 +3305,35 @@ already counted by reads (§10.1's per-stream absolute sum) — and
 never adds `final_size` on top of them; a read-then-retire sequence
 therefore counts each byte exactly once, and a receiver can never
 over-advance its own MAX_DATA past its buffer commitment.
+
+**[RATIFIED 2026/08/15 — ruling 93]** **Abandonment is the one retirement
+with no final size, and it trues up to the stream window.** Dropping a
+`RecvStream` (§16.2) retires the half **immediately** — freed, tombstoned
+at §9.2's watermark, trued up in the same step — rather than arming a
+retirement for a FIN or reset that a stalled sender has no reason to
+send. Its final size is unknown and unknowable, so the value is the
+**highest stream-level limit this endpoint ever advertised** for that
+half: seeded to `INITIAL_MAX_STREAM_DATA` (§10.2) and grown by the
+re-grant above, never the constant as a fixed value. That is the least
+upper bound on what the peer could have sent without a
+`FLOW_CONTROL_ERROR`, and it is ≥ the highest received offset, so the
+bring-to-final stays monotone.
+
+The highest *received* offset is the wrong value and its failure is
+silent: the sender charges its connection window by highest offset
+**sent**, so bytes lost or still in flight are already charged there and
+absent here, and the difference is leaked for the connection's life. The
+memory argument lands on the same value and is the stronger one — §10.6
+makes credit the buffer commitment, what was committed to that half was
+its stream window, and freeing the half releases exactly that. Releasing
+less than the memory actually freed is the wedge this rule exists to
+close. Over-advancing is bounded at one stream window per abandoned half,
+and abandonment requires a claimed stream, which §10.4 bounds.
+
+The sender still stalls at the **stream** window — §16.2 says so, and
+with `STOP_SENDING` deferred (§19) no slither frame can cure it — but the
+**connection** window and the **cumulative stream allowance** are both
+released, which is what "never wedges the connection window" requires.
 
 ### 10.4 Stream limits — cumulative credit
 
@@ -3260,7 +3352,11 @@ types and a replenishment rule.
   peer's allowance (RFC 9000 §4.6's scope) — batching
   advertisements: emit MAX_STREAMS when ≥ `STREAMS_CREDIT_BATCH` (8)
   grants are unadvertised, **or** when the peer's remaining allowance
-  drops to ≤ 8. Receipt of MAX_STREAMS surfaces
+  drops to ≤ `STREAMS_CREDIT_BATCH` — **one constant, both triggers**
+  (ruling 102: a batch of 8 and a headroom of 8 are the same batch of
+  slack, and no test can separate the readings at today's value, so the
+  two must move together when it is revisited). Receipt of MAX_STREAMS
+  surfaces
   `ConnEvent::StreamsAvailable { dir }` to wake blocked openers (§16.4).
 - Opening beyond the limit ⇒ `STREAM_LIMIT_ERROR` ⇒ CLOSE (§8.2).
 - `STREAMS_BLOCKED` stays deferred with the rest of the BLOCKED family
@@ -3268,10 +3364,33 @@ types and a replenishment rule.
 
 ### 10.5 Violations
 
+**§10 defines three violations, and this section lists all of them.**
+
 A peer exceeding advertised credit — stream or connection level — is a
 protocol violation: CLOSE with `FLOW_CONTROL_ERROR`. A peer opening
-beyond a stream limit: CLOSE with `STREAM_LIMIT_ERROR`. There is no
-tolerance band; the limits are exact (§8.2's semantic class).
+beyond a stream limit: CLOSE with `STREAM_LIMIT_ERROR`. For these two
+there is no tolerance band; the limits are exact (§8.2's semantic class),
+because both are **accounting** limits that the sender computes for
+itself from what this endpoint advertised, so a peer that exceeds one has
+either miscounted or is probing.
+
+**[RATIFIED 2026/08/15 — ruling 104]** The third is defined in §10.6: a
+stream whose stored discontiguous ranges would exceed
+`REASSEMBLY_CHUNKS_MAX` after coalescing is a protocol violation, CLOSE
+with `PROTOCOL_VIOLATION` (§15.3). **It is a tolerance and not an exact
+limit** — the sender cannot compute it, since it depends on this
+receiver's coalescing and on the arrival order the *network* produced;
+§10.6 ships the value revisitable, and its admissible implementation (a)
+makes the ceiling unreachable entirely. It is the memory-safety bound of
+the three, and the one an implementer building §10's violation handling
+from this section alone has historically missed.
+
+*The paragraph above and the two-sentence claim before it must be read
+together, and were amended together.* This section previously enumerated
+two of three and closed on "there is no tolerance band; the limits are
+exact" — a claim true of exactly the two it listed and false of the one
+it omitted, which is what made the omission hard to see: the section read
+as complete because it was internally consistent with its own gap.
 
 ### 10.6 Credit is the buffer commitment
 
@@ -3316,6 +3435,32 @@ defragmentation/throughput check.
 | Constant | Value |
 |---|---|
 | `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream |
+
+**[RATIFIED 2026/08/15 — ruling 94]** **slither implements (b), and
+allocates lazily — and the level this mandate is stated at is not the
+level its own worked example computes.** The mandate is *per stream*; the
+example is *per connection* — "a 1 MiB span" is `INITIAL_MAX_DATA`, while
+the per-stream window is `INITIAL_MAX_STREAM_DATA` = 256 KiB. Take (a)
+literally at the level the mandate names and a receiver eagerly allocates
+256 KiB per open receive half: with `INITIAL_MAX_STREAMS_UNI` = 128, that
+is **32 MiB** allocated against 1 MiB of credit — a 32× amplification of
+exactly the class this section exists to close, produced by following
+this section's own admissible option.
+
+Both bounds are real and they are reconciled by never allocating ahead of
+arrival. The connection-level credit is what protects memory; the
+per-stream bound is what keeps any one stream's metadata proportional.
+Buffering only what has arrived makes total buffered bytes across **all**
+streams bounded by the advertised connection credit, and (b)'s
+coalesce-on-insert keeps each stream's range count bounded independently.
+An implementation of (a) that allocates the span up front satisfies the
+letter of the per-stream mandate and breaches the memory guarantee the
+mandate is for; it is admissible only if its allocation is also bounded
+connection-wide.
+
+*A test for this must assert allocated **capacity**, not bytes received.*
+An eager per-stream allocator receives few bytes and passes a
+bytes-received assertion for free.
 
 **Consumption, defined.** Consumption is **the application taking bytes
 out of the connection core** — a `read()` draining the contiguous prefix,
@@ -4191,13 +4336,24 @@ Dropping the last handle to a `Connection` performs
 `close(NO_ERROR, "")` — the graceful teardown of §15.2 (the superseded
 "drop = silent local teardown" rule carried onto the wire signal that now
 exists). Dropping a `SendStream` without `finish()` resets it with error
-code 0. Dropping a `RecvStream` abandons the receive half: arrivals for
-it are discarded and stream-level credit is never again advanced (a
-sender that keeps pushing stalls at the stream window), the half closes
-when the pinned final size or a reset arrives (§9.7), and on that
-retirement its bytes up to the final size count as consumed at the
-connection level (§10.3) — an abandoned stream never wedges the
-connection window. Dropping every handle stops the driver and every
+code 0. **[RATIFIED 2026/08/15 — ruling 93]** Dropping a `RecvStream`
+abandons the receive half: arrivals for it are discarded and stream-level
+credit is never again advanced (a sender that keeps pushing stalls at the
+stream window), and the half is **retired at once** — freed, tombstoned
+at §9.2's watermark, and trued up to the stream window at the connection
+level (§10.3) in the same step. An abandoned stream never wedges the
+connection window and never starves the peer's cumulative stream
+allowance.
+
+*This sentence previously said the half "closes when the pinned final
+size or a reset arrives", which contradicted the promise that closes it.*
+A sender stalled at the stream window — the stall this same sentence
+describes — sends no FIN, because its FIN follows its data, and has no
+reason to reset; with `STOP_SENDING` deferred (§19) slither cannot ask.
+So no final size was ever pinned, no retirement ever ran, and four
+abandoned 256 KiB streams wedged the 1 MiB connection window for the
+connection's life. §10.3's list, which names "handle abandoned" among the
+retirements, held the correct rule. Dropping every handle stops the driver and every
 connection dies silently — nothing transmitted (§15.4).
 
 **Where those two rules coincide, nothing is transmitted.**
@@ -4476,7 +4632,8 @@ enum EndpointOutput {
     HandshakeFailed(ConnectionId, ConnectError), // shell-only (below)
     Timeout(Option<Instant>),                    // terminal
 }
-struct Install { session: EstablishedSession }
+struct Install { session: EstablishedSession, role: Role }
+enum Role { Initiator, Responder }               // ruling 106; §6.7 fixes it, §9.1 reads it
 struct EstablishedSession { /* the hiss transport pair (seal + open), our session
                                index, the peer's index, and the anchor address (§5.6) */ }
 struct Transmit { to: SocketAddr, data: Vec<u8> }
@@ -4488,16 +4645,17 @@ impl core::Connection {
     fn handle_timeout(&mut self, now: Instant);                        // idempotent
     fn handle_endpoint_event(&mut self, now: Instant, ev: Install);    // Install only
     // application surface (mirrors §16.2, core-shaped):
-    fn open(&mut self, dir: Dir) -> Result<StreamId, StreamsExhausted>;
-    fn write(&mut self, now: Instant, id: StreamId, data: &[u8]) -> Result<usize, WriteError>;
-    fn finish(&mut self, id: StreamId) -> Result<(), WriteError>;
-    fn reset(&mut self, now: Instant, id: StreamId, error_code: u64);
-    fn read(&mut self, id: StreamId, buf: &mut [u8]) -> Result<Option<usize>, ReadError>;
+    fn open(&mut self, dir: Dir) -> Result<StreamRef, StreamsExhausted>;
+    fn write(&mut self, now: Instant, r: StreamRef, data: &[u8]) -> Result<usize, WriteError>;
+    fn finish(&mut self, r: StreamRef) -> Result<(), WriteError>;
+    fn reset(&mut self, now: Instant, r: StreamRef, error_code: u64);
+    fn read(&mut self, r: StreamRef, buf: &mut [u8]) -> Result<Option<usize>, ReadError>;
+    fn stream_id(&self, r: StreamRef) -> Option<StreamId>;   // ruling 95; §16.9's accessor
     fn send_message(&mut self, now: Instant, msg: &[u8]) -> Result<(), MessageError>;
     fn send_datagram(&mut self, now: Instant, data: &[u8]) -> Result<(), DatagramError>;
     fn close(&mut self, now: Instant, code: u64, reason: &[u8]);
     // claim verbs — the pull model (§10.6, §11.3, §9.8):
-    fn accept(&mut self, dir: Dir) -> Option<StreamId>;   // claim a peer-opened stream
+    fn accept(&mut self, dir: Dir) -> Option<StreamRef>;  // claim a peer-opened stream
     fn recv_message(&mut self) -> Option<Vec<u8>>;        // claim the oldest complete unclaimed message
     fn recv_datagram(&mut self) -> Option<Vec<u8>>;       // claim the oldest queued datagram
     fn poll_output(&mut self) -> ConnOutput;
@@ -4511,12 +4669,13 @@ enum ConnOutput {
 }
 enum ConnEvent {
     Established,                                 // the install; the shell resolves Connecting
-    StreamOpened { dir: Dir },                   // signal: claim via accept(dir)
+    StreamOpened { dir: Dir },                   // signal: claim via accept(dir); one per
+                                                 // newly-opened stream, ruling 99
     StreamsAvailable { dir: Dir },               // MAX_STREAMS credit arrived (§10.4)
-    StreamReadable { id: StreamId },
-    StreamWritable { id: StreamId },             // stream/connection credit arrived for a blocked writer
-    StreamFinished { id: StreamId },             // send half fully acknowledged
-    StreamReset { id: StreamId, error_code: u64 },
+    StreamReadable { r: StreamRef },
+    StreamWritable { r: StreamRef },             // stream/connection credit arrived for a blocked writer
+    StreamFinished { r: StreamRef },             // send half fully acknowledged
+    StreamReset { r: StreamRef, error_code: u64 },
     MessageReadable,                             // signal: claim via recv_message() (§9.8)
     DatagramReadable,                            // signal: claim via recv_datagram() (§11)
     AddressMoved { from: SocketAddr, to: SocketAddr },
@@ -4533,12 +4692,46 @@ enum ToEndpoint {
   an `Install`.** `Install` targets only a `connect()`-created connection
   awaiting completion, **exactly once**, resolving its
   `Connecting` — whether from msg2 completion or a lost tie-break's
-  admission (§6.7). It carries the session and nothing else: with the
-  rekey swap deleted (§7.6) there is exactly one install per connection,
-  so no discriminator distinguishes them and none is carried. Emitting a
-  symmetry `Install`
+  admission (§6.7). With the rekey swap deleted (§7.6) there is exactly
+  one install per connection, so no discriminator distinguishes them and
+  none is carried. Emitting a symmetry `Install`
   after `accept()` (double-install) and waiting for one that never comes
   are both excluded.
+- **`Install` carries the role, and the connection core cannot derive
+  it.** **[RATIFIED 2026/08/15 — ruling 106]** §6.7 fixes initiator-ness
+  for the life of the connection and §9.1's stream-ID parity reads it —
+  but §6.6 step 4 admits a peer that **dialled** as the *responder*, so a
+  core inferring "I was created by `connect()`, therefore I am the
+  initiator" is wrong on exactly that path. It fails silently: both ends
+  still agree on every stream they open themselves, and disagree only on
+  parity. It cannot be recovered afterwards from hiss — ruling 89 leaves
+  `Handshake::Seal` an associated type with no bounds — so the endpoint,
+  which is the only party that knows the tie-break's outcome, states it.
+- **The core's stream verbs are keyed by `StreamRef`, not `StreamId`.**
+  **[RATIFIED 2026/08/15 — ruling 95]** §16.9 assigns wire stream IDs at
+  establishment, because parity is fixed only then, and makes `id()`
+  return `None` until then — while §16.9's whole point is that a
+  `connect()`-created connection is *writable before install*. So `open()`
+  must return something, and it cannot be a wire `StreamId`. `StreamRef`
+  is an opaque core-internal handle, **stable across install**;
+  `stream_id(r)` is §16.9's accessor that the shell's `id()` reads, and
+  it returns `None` until establishment.
+
+  The trap this closes is not the missing `Option`. It is a core that
+  returns an internal index *typed as* `StreamId` and remaps it at
+  install, leaving every live handle holding a stale key — a build that
+  passes a pre-establishment test and a post-establishment test and fails
+  only "open early, write late".
+
+  **The key type reaches eleven sites, not five**: `open`, `write`,
+  `finish`, `reset`, `read`, `accept`, the new `stream_id`, and the four
+  `ConnEvent`s that name a stream (`StreamReadable`, `StreamWritable`,
+  `StreamFinished`, `StreamReset`). The events must key the same way the
+  handles do or the shell cannot match a wakeup to a waker before
+  establishment, which is precisely when §16.9 says work is in flight.
+  *This ruling was first written naming five signatures; the other six
+  were found by opening the file to edit it.* Ruling 71's shape, and the
+  reason §16.4's lists get counted rather than read.
 - **`Contested` and `ContestCleared` report the mark, and its
   resolution.** **[RATIFIED 2026/08/14 — ruling 45; emission moment and
   variant names fixed 2026/08/14 by ruling 46, per FAB-6]** §7.5's

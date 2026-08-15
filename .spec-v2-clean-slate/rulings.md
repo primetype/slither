@@ -2040,3 +2040,429 @@ failed on integration, and **both failures had one root cause** — this
 gap — which the implementer had already reported as a blocker from the
 other side, without either agent seeing the other's work. Thirty-three
 passed unedited against an implementation written blind to them.
+
+## Round 17 — slice 4 streams: the eleven open questions (2026/08/15)
+
+Slice 4's planner produced seventeen unstated-scope hunts and eight
+conflicts, ranked as eleven open questions by *cost of a wrong answer*.
+Four were put to the maintainer; the rest are ruled here. **Every
+provisional below was checked against the code, not only the spec**
+(working rule 11), and the check overturned one of them.
+
+**Ruling 93 — dropping a `RecvStream` retires the half at once, and the
+connection-level true-up is to the stream window.** Conflict C2: §10.3's
+list makes "handle abandoned (§16.2)" a retirement; §16.2's mechanism
+makes abandonment merely *arm* a later one. §16.2's own final clause —
+"an abandoned stream never wedges the connection window" — is **false
+under the mechanism the same sentence describes**: a sender stalled at
+the stream window sends no FIN and has no reason to reset, so no final
+size is ever pinned, no retirement runs, and four abandoned 256 KiB
+streams wedge the 1 MiB connection window for the connection's life.
+`STOP_SENDING` is deferred to §19, so slither cannot ask the sender to
+stop. §10.3's rationale describes this exact failure as "reachable in
+honest operation by any application that cancels streams". The list is
+right; the prose mechanism is wrong; the prose *promise* agrees with the
+list. **Working rule 3's sixth instance, and the first where the prose
+contradicts itself inside one sentence.**
+
+On drop: free the half, tombstone the index at the watermark, and
+advance that stream's connection-level contribution — immediately.
+
+**The value is the stream window, not the high-water mark**, and the
+distinction is the whole ruling. The planner's provisional was the
+highest received offset; that leaks credit permanently. The sender
+charges its connection window by *highest offset sent*; bytes lost or in
+flight are already charged there and have not reached our high-water
+mark, so truing up to the high-water mark re-creates C2's wedge at
+smaller amplitude. The value that cannot leak is **the highest
+stream-level limit we ever advertised** for that half — seeded to
+`INITIAL_MAX_STREAM_DATA` (H15) and grown by §10.3's re-grant, never
+`INITIAL_MAX_STREAM_DATA` as a fixed constant, because credit advanced
+before the drop is credit the sender may legally have spent. It is the
+least upper bound on what the peer could have sent without committing a
+`FLOW_CONTROL_ERROR` (§10.5).
+
+*The stronger argument is memory, not accounting, and it lands on the
+same value.* §10.6 makes credit the **buffer commitment**. What we
+committed to that half was its stream window; what we release by freeing
+it is that same window. Advancing by the bytes that happened to arrive
+would release less commitment than the memory actually freed. Over-
+advancing is the safe direction and is bounded: at most one stream window
+per abandoned half, and abandonment requires a claimed stream, which
+`MAX_STREAMS` bounds.
+
+Monotone and never double-counted: the advertised limit is ≥ the
+high-water mark, satisfying §10.3's "absolute, not additive" and
+"monotone bring-to-final"; and the tombstone makes every later frame for
+that index inert (§9.2), so the contribution never moves again.
+
+The sender still stalls at the *stream* window — §16.2 accepts that and
+no slither frame can cure it — but the **connection** window and the
+**cumulative stream allowance** are both released, which closes both
+wedges. §16.2's mechanism sentence is amended to match.
+
+*Two tests, and the second is the one that matters.*
+`a_dropped_recv_stream_releases_connection_credit_at_once` separates this
+ruling from §16.2's reading. It does **not** separate this ruling from
+the planner's provisional — both release at once. Working rule 9: the
+degenerate implementation must red something, so
+`a_dropped_recv_stream_trues_up_to_the_stream_window_not_the_high_water_mark`
+is required, and it is the only test that pins the value.
+
+**Ruling 94 — reassembly allocates lazily, coalesces on insert, and is
+bounded connection-wide.** Conflict C3 / hunt H8: §10.6's mandate is
+per-stream ("O(advertised credit)"), its worked example is per-connection
+(a "1 MiB span" — that is `INITIAL_MAX_DATA`, while the per-stream window
+is 256 KiB). Taking §10.6's own admissible option (a) literally at the
+level its mandate names, 128 peer-opened uni streams eagerly allocate
+**32 MiB** against 1 MiB of credit: a 32× remote memory amplification
+produced by following the section that exists to forbid it. Slice 4
+implements option **(b)** — coalesce-on-insert, `REASSEMBLY_CHUNKS_MAX` =
+1024 — allocating only on arrival, so both bounds hold at once.
+
+**The test must assert allocated capacity, not bytes received.** An
+eager per-stream allocator receives few bytes and would pass a
+bytes-received assertion for free — working rule 9's exact trap, in the
+test that exists to close a memory vector. The core therefore needs a
+test-visible accounting of reassembly capacity, and
+`buffered_bytes_stay_within_the_connection_window_across_many_streams`
+asserts on that.
+
+**Ruling 95 — the core's stream verbs are keyed by an opaque `StreamRef`,
+stable across install.** Conflict C1: §16.4 line 4491 returns a
+`StreamId` from `open()`; §16.9 says wire stream IDs "are assigned at
+establishment" because parity is fixed only then, and `id()` "returns
+`None` until the connection is established". Both cannot be implemented
+literally, since §16.9's whole point is that a `connect()`-created
+connection is writable before install. The trap is not the missing
+`Option` — it is a core that returns an internal index *typed as*
+`StreamId` and remaps at install, leaving every handle holding a stale
+key: a build that passes a pre-establishment test and a post-establishment
+test and fails only "open early, write late". `core::Connection::
+stream_id(&self, r: StreamRef) -> Option<StreamId>` is §16.9's accessor
+that the shell's `id()` reads. Pinned by
+`an_early_opened_stream_keeps_its_handle_across_install`.
+
+**Amended within the hour, by the act of applying it.** This ruling was
+written as "§16.4's five signatures are amended — ruling 71's shape
+again, a signature list that omits a member." Opening `SPEC.md` to make
+that edit showed **eleven** sites: the five verbs, plus `accept`, plus
+the new accessor, plus the **four `ConnEvent`s that name a stream** —
+`StreamReadable`, `StreamWritable`, `StreamFinished`, `StreamReset`. The
+events are not optional to convert: if they carry `StreamId` while
+handles hold `StreamRef`, the shell cannot match a wakeup to its waker
+before establishment, which is exactly when §16.9 says work is in flight.
+
+**Written in the round that observes this class is recursive, inside the
+ruling that cites ruling 71 for it.** The count in a ruling about a
+miscounted list was itself a miscounted list. **Seventh instance of "a
+ruling's blast radius includes the ruling", and the first caught in the
+maintainer's own text before it reached an agent** — by the same method
+as all six before it: opening the file, not re-reading the reasoning.
+
+**Ruling 96 — `BiStream` the type lands in slice 4; its `AsyncRead`/
+`AsyncWrite` impls and `compat/` stay in slice 8.** Conflict C7:
+`PLAN.md`'s slice-8 row lists `BiStream`, §16.2 and ruling 55 make it
+`open_bi`'s return type, and slice 4 owns `open_bi`. A slice cannot own a
+verb and not own its return type without either contradicting ruling 55
+or forcing a breaking public API change between two shipped slices.
+`PLAN.md`'s row means the *composability* of `BiStream`, not its
+existence. A plan/spec boundary error settled by moving the boundary;
+cost ~40 lines. `PLAN.md` amended.
+
+**Ruling 97 — the receive path's semantic checks are ordered
+legality → watermark → limit → final size → flow control, and all four
+watermarks are maintained.** Hunts H3/H4/H5, question Q4. §8.4's
+per-frame error lists are sets with no evaluation order, and one crafted
+frame can trip several; all of them kill the connection, so the only
+observable difference is **the error code on the wire** — which is what
+Appendix B asserts on and what a peer's operator reads. A list read as
+exhaustive is still not a list read as ordered.
+
+The load-bearing position is the first. For a locally-opened uni stream
+the peer may *never* send STREAM, so a STREAM frame naming a fully-closed
+local-uni index satisfies both §9.2's watermark no-op and §8.4's
+`STREAM_STATE_ERROR` — silent ACK versus kill. **Legality wins.** The
+watermark answers *which index*; the state error answers *who may send*.
+A frame the peer could never legally send at any index is not a late
+retransmission of anything, and putting the watermark first would delete
+a violation check for exactly the streams an attacker can most cheaply
+name.
+
+*What else must be true for "legality first" to be safe* (working rule
+11's sharpening): the check must be decidable **without consulting the
+stream table**, or a freed stream could confuse it. It is — §9.1's id
+encodes direction and opener parity, and combined with our established
+role it is a total function of the id alone. **That is a second consumer
+of ruling 106**: the check is only total because the role is carried on
+`Install`.
+
+Flow control runs last so the ledger is consulted exactly once per frame,
+after the frame is known otherwise legal — which is what §8.4 and §9.6
+already require when they put the credit bound check before any true-up.
+`FINAL_SIZE_ERROR` precedes it because a frame contradicting a pinned
+final size is a statement about a stream we already fully understand, and
+answering it with a credit code would mislead.
+
+All four watermarks are maintained (H3). §9.2 states the construction for
+four spaces and writes its rationale for the two peer-opened ones; the
+other two serve §8.4's separate rule that "credit for a fully-closed
+stream is a valid no-op". An implementer who keeps two will meet a
+`STREAM_STATE_ERROR` where §8.4 promised a no-op.
+
+Pinned by `a_stream_frame_on_a_closed_local_uni_space_is_a_state_error`
+and one test per adjacent pair.
+
+**Ruling 98 — not a ruling: §7.4 already enumerates the quiet set, and
+the plan's table is wrong on two rows.** Question Q5 / hunt H7 asked
+whether MAX_STREAMS_BIDI/UNI are non-marking, since §10.3 says "credit
+frames" while its subject is the other two, and asserted that "**nothing
+says what RESET_STREAM and STREAM use**". Both premises fail at
+`SPEC.md:1953–1958`, inside §7.4 — the section named for this exact
+distinction:
+
+> - **`seal`** marks `last_send`: packets carrying at least one
+>   first-transmission STREAM frame or DATAGRAM frame (fresh application
+>   sends), and the keepalive (§7.5).
+> - **`seal_quiet`** … the **quiet set**: pure ACKs, PTO probes,
+>   retransmissions, the credit frames (MAX_DATA, MAX_STREAM_DATA,
+>   **MAX_STREAMS_BIDI/UNI**), **RESET_STREAM**, and CLOSE.
+
+All four credit frames are named. **RESET_STREAM is named** — the plan's
+table put it on the marking `seal` "by omission from §10.3", which is
+backwards. And STREAM is marking only on **first transmission**;
+retransmissions are in the quiet set by the same list, a distinction the
+plan's table does not carry. `src/core/connection/session.rs:412–414`
+already quotes the correct set in `seal_quiet`'s doc comment, written in
+slice 3a.
+
+So the table slice 4 must implement is: STREAM first transmission →
+`seal`; STREAM retransmission → `seal_quiet`; RESET_STREAM → `seal_quiet`;
+all four credit frames → `seal_quiet`; every one of them ack-eliciting.
+Marking is a property of the **seal**, not the frame, so a packet mixing
+a fresh STREAM frame with credit frames is marking. That last sentence is
+the only part of this that no section states, and it follows from
+`seal`/`seal_quiet` being a per-seal choice.
+
+`a_max_streams_only_packet_does_not_defer_the_keepalive` is still worth
+writing — it now pins a stated rule rather than a provisional.
+
+**This is working rule 4 inverted, and it is worth naming.** The rule
+says to grep for the rationale and not only the token. Here the hunt
+greped the token in the sections *about* credit (§10.3, §10.4) and the
+answer lived in the section about *sealing* (§7.4). A hunt scoped to the
+subject matter missed an enumeration filed under the mechanism. The plan
+was right that §10.3's scope is ambiguous; it was wrong that the
+ambiguity was unresolved, and the cost of shipping its table would have
+been a marking RESET_STREAM deferring keepalives forever.
+
+**Ruling 99 — one `StreamOpened` per newly-opened stream, and §10.4's
+limit check runs before the opens.** Hunt H11: §16.4's event carries no
+id, and §9.2 opens index `N` "and every lower-numbered not-yet-open
+stream of that space", so a peer whose first frame names index 5 opens
+six streams in one packet. One event for six means the shell must loop
+`accept()` until `None` on every wake or lose five — a lost-wakeup that
+manifests only under the reordering the tests inject. `accept(dir)`
+returns one stream per call, and §9.2's own rationale worries about "a
+phantom `StreamOpened` for a finished stream", singular.
+
+*What bounds the burst* — the question working rule 8 says to ask of any
+construction. One event per stream against an unbounded index would be an
+event-queue amplification vector: one small frame, 2⁶⁰ events. What
+bounds it is §10.4's cumulative limit, at most 128 for uni today — **and
+only if the limit check runs before the opens are performed**, which is
+where ruling 97's order does load-bearing work rather than merely
+choosing an error code. An implementation that opens first and validates
+after is both a wrong error code and an unbounded burst.
+`an_implicit_open_of_six_streams_emits_six_stream_opened_events`, and a
+second test that a frame naming an index above the limit emits **zero**
+events before killing the connection.
+
+**Ruling 100 — an empty, FIN-less STREAM frame opens its stream.** Hunt
+H10 / conflict C4: §9.2 makes the first STREAM frame the open; §9.5 calls
+an empty frame without FIN and without data "a no-op (tolerated, never
+emitted)". §9.2's rule is about the **frame**; §9.5's no-op is about the
+**data** — it delivers no bytes, pins no final size, consumes no credit.
+Reading §9.5 as suppressing the open would make the open set depend on a
+payload property §9.2 never mentions, and would make a legitimate
+zero-length write on an open stream and a stream-creating frame
+indistinguishable in the codec. Reachable only from a foreign or hostile
+peer, and the allowance it consumes is the peer's own and bounded by
+§10.4. `an_empty_finless_stream_frame_opens_its_stream`.
+
+**Ruling 101 — `StreamId` and `Dir` are public; `StreamsExhausted` stays
+`pub(crate)`.** Hunt H13: three symbols the spec uses and never defines —
+ruling 89's shape, three times over. `StreamId` is forced public by
+§16.2's `SendStream::id(&self) -> Option<StreamId>`. Minimum surface:
+`Copy + Eq + Ord + Hash + Debug + Display`, `index() -> u64`,
+`dir() -> Dir`, `initiated_by_connection_initiator() -> bool`, `u64`
+round-trip, and **no constructor that lets an application mint an id for
+a stream it does not own**.
+
+**The planner's provisional was internally inconsistent and the code
+settles it.** It recommended `Dir` be `pub(crate)` "unless 4b finds a
+public signature that needs it" while listing `dir() -> Dir` in
+`StreamId`'s public surface — a publicly reachable signature naming an
+unreachable type, which is `private_interfaces` and therefore a hard
+error under our `-D warnings` gate. Either `Dir` is public or `StreamId`
+loses the accessor that makes it useful for the logging and correlation
+`id()` exists to serve. `Dir` is public. Two variants, closed by the
+protocol, no `#[non_exhaustive]` — that would cost every user a wildcard
+arm forever for a set that cannot grow.
+
+Both live in the `pub(crate)` core and are re-exported from `lib.rs`
+beside `ConnectionId`/`IntroId`/`Timestamp`, whose comment (`lib.rs:161–
+166`) already states this exact reasoning: "a public signature naming an
+unreachable type is a rustdoc break, not merely a lint."
+
+`StreamsExhausted` stays `pub(crate)`: §18.1's taxonomy is closed (ruling
+61), and §16.2 specifies that `open_bi`/`open_uni` "wait for MAX_STREAMS
+allowance when the cumulative limit is exhausted" — the shell converts
+the core error into a park, so no public verb can ever return it.
+Breaching a closed taxonomy for a condition the public API is specified
+never to surface is the wrong trade.
+
+**Ruling 102 — §10.4's "≤ 8" low-allowance threshold is
+`STREAMS_CREDIT_BATCH`, one constant used twice.** Hunt H6: the first
+trigger names the constant, the second writes the literal, and §10.2
+declares exactly one constant of value 8. **No test can separate the
+readings at today's values** — which is why it needs the ruling rather
+than a test: an unnamed magic number with no home in the constants table
+would silently decouple from the named one the first time anyone tunes
+it, and a batch of 8 with a headroom of 8 is one batch of slack, which is
+what the batching rationale means. §10.4 amended to name the constant in
+both places.
+
+**Ruling 103 — the flow-control constants are three kinds of thing, and
+the tables group them as one.** Hunt H16 found §10.2's five-row table
+mixing four **wire constants** (the initial windows: unnegotiated, so
+both ends must assume the same value, and changing one corrupts the
+peer's accounting immediately) with `STREAMS_CREDIT_BATCH`, which §10.2's
+own next clause calls "receiver policy" — two peers running different
+batch values interoperate perfectly. `tests/spec_constants.rs` pins all
+five as wire pins, and `CLAUDE.md` says a red wire pin "needs a ruling,
+not an updated expectation", so a local tuning knob currently gets a
+ratification round it does not need, and implies an observability it does
+not have.
+
+**Extending the hunt one section further than it was run** — working rule
+8 says to ask what bounds a list, and H16 asked it of §10.2's table only
+— `REASSEMBLY_CHUNKS_MAX` (§10.6) is a *third* kind: receiver policy like
+the batch, but **externally observable**, because a peer that fragments
+past one receiver's ceiling is killed and past another's is not. It is
+shipped "ratified-but-revisitable" and is a tolerance.
+
+Keep all values and all locations unchanged — moving them is wire-pin
+churn for nothing — and **mark the kind** in `src/constants.rs` and in
+`tests/spec_constants.rs`: wire constant / invisible policy / observable
+policy. The next person to touch one then knows which kind of change they
+are making. §10.2 already says which kind it is; only the table's
+grouping disagrees.
+
+**Ruling 104 — §10's violation set has three members, and §10.5's
+closing sentence must be amended with it.** Hunt H17: §10.5 is titled
+"Violations", sits inside the chapter that defines all three, and
+enumerates two — `FLOW_CONTROL_ERROR` and `STREAM_LIMIT_ERROR` — while
+§10.6, the next section, defines the third: reassembly ranges exceeding
+`REASSEMBLY_CHUNKS_MAX` after coalescing is a `PROTOCOL_VIOLATION`. **This
+is ruling 64's defect at the same arity** — "two things this rule does not
+reach" when there were three — and the missing member is the memory-safety
+bound. An implementer building §10's violation handling from §10.5 builds
+two of three.
+
+The subtler half, and the reason it is hard to see: §10.5 closes with
+"There is no tolerance band; the limits are exact", which is true of both
+violations it lists and **false of the omitted one** —
+`REASSEMBLY_CHUNKS_MAX` is explicitly a tolerance, admissible
+implementation (a) makes it unreachable entirely, and §10.6 ships it
+revisitable. The section reads complete because it is internally
+consistent with its own omission. **Working rule 4 is the operative
+warning**: a fix that adds a third bullet and leaves that sentence
+standing ships a self-contradicting section, which is the failure working
+rule 4 was written from. Both are amended together. Slice 4 implements
+all three and its tests treat the set as three-membered.
+
+**Ruling 105 — slice 4 discharges the receive-path half of Appendix B's
+tombstone obligation; the loss-driven variant is owed to slice 7.**
+Conflict C8. The obligation reads "free a stream, **drop the ACK**, and
+let the peer's **PTO retransmission** re-name it" — §12 is slice 5 and
+§13 is slice 7, so neither stimulus exists yet. Injecting the duplicate
+STREAM frame through `FlakyPolicy`'s duplication exercises the identical
+receive-path code with a *stronger* stimulus, since it arrives with no
+delay. Slice 4 writes that test and records the loss-driven variant in
+its exit note as owed to slice 7. An obligation quietly marked done by a
+weaker test is how a slice ships a gap; recording it is the difference
+between a downgrade and a debt.
+
+**Ruling 106 — `Install` carries the connection's role.** Slice 4's
+carried finding, and the highest-value thing in the routing track's
+report. §6.7 fixes initiator-ness "for the life of the connection:
+stream-ID parity (§9.1) is fixed by this outcome", and §6.6 step 4 makes
+a peer that *dialled* admit and write msg2 **as responder**. A connection
+core deriving parity from "I was created by `connect()`" is therefore
+wrong on exactly that path — and silently, since both ends still agree on
+every stream they open themselves and disagree only on parity. Per ruling
+89 it cannot be recovered from hiss afterwards: `Handshake::Seal` is an
+associated type with no bounds.
+
+Verified against the tree rather than assumed (working rule 11):
+`src/core/mod.rs:195–198` — `pub struct Install<C: Handshake> { pub
+session: EstablishedSession<C> }`, one field, no role, and `grep` for
+`enum Role`/`is_initiator` across the cores returns nothing. §16.4's
+`struct Install` (`SPEC.md:4479`) is amended to carry it, and ruling 97's
+legality check is its second consumer.
+
+**Ruling 107 — slice 4 is cut into 4a (core) and 4b (shell + stories),
+along the core/shell seam.** The planner re-derived round 12's argument
+rather than transferring it, and checked the three ways it could have
+failed to transfer. The one that nearly holds is "the API is spec-given
+this time, so the test author is not guessing" — and it does not survive
+contact with the detail, because a story test cannot write
+`conn.open_bi().await?.split()` without rulings 95, 96 and 101, none of
+which are in the spec. After the cut those are compiled and green in 4a
+before 4b's test author starts, and the author reads them off a real
+crate.
+
+Two further arguments, both from this project's own failures: a combined
+slice puts four concurrent agents around `src/core/connection/`,
+`src/shell/` and `tests/` at once, with two of them wanting
+`src/core/connection/mod.rs` — the slice-2a accident's exact shape, which
+working rule 6 makes absolute. And 4b is where the seam review found four
+defects, two unreachable from all 451 tests by construction (working rule
+13); its content is per-`StreamId` waker maps under `RefCell` keyed by a
+value the *application* controls, cancel-safety of four new `async fn`s,
+and drop semantics where dropping a `SendStream` emits a wire frame and
+dropping a `RecvStream` mutates the flow-control ledger. Small and risky
+argues **for** a review boundary.
+
+The subsystem cut (§9 | §10) was considered and rejected: §10 is threaded
+through §9, not layered on it — §8.4's STREAM error list contains
+`FLOW_CONTROL_ERROR`, §10.6 makes the reassembler's bound a flow-control
+quantity, and §9.6/§9.7's true-ups are §10.3 rules living inside §9
+sections. It would produce a first half knowingly wrong and a second half
+that edits all of it.
+
+**4a closes zero stories and that is in its brief, not discovered at
+review.** It closes eleven Appendix B obligations and three named
+precursors (`s12_precursor_*`, `s13_precursor_*`, `s17_precursor_*`),
+named as precursors so that calling one of them S12 cannot let 4b ship
+without the handle-level test the story asks for.
+
+### What this round says about the process
+
+Fifteen rulings, of which the maintainer took four and the rest followed
+the planner — **except one, where checking the code overturned the
+provisional outright** (ruling 98) and one where the provisional
+contradicted itself (ruling 101). Both were caught by opening a file, not
+by re-reading the argument. That is working rule 11's whole content, and
+it is now the second consecutive round where the mechanism check changed
+an answer rather than confirming it.
+
+The plan's own hunt found thirteen prior instances of the unstated-scope
+class and added seventeen more candidates in one slice. **Rulings 99, 103
+and 104 each extend a hunt the planner ran one step further than the
+planner ran it** — what bounds the event burst, what bounds the
+constants-table grouping, what the omitted violation does to the
+sentence that closes the section. The defect class is not merely
+frequent; it is *recursive*, and a hunt for it is itself a construction
+with a scope worth asking about.

@@ -285,7 +285,7 @@ code compiles, but when its stories are paused-clock tests that pass.
 | 5 | **Reliability** | §12 ACK fused to the replay window + delayed ACK, §13 RFC 9002 (reuse v0.1 arithmetic), §14 NewReno, ruling 47's `acked()` / `flush()` | S12 (full, over `FlakyWire`), S28 |
 | 6 | **Sugar** | §9.8 messages + `MESSAGE_OVERFLOW` + the guarded overflow check, §11 datagrams + drop-oldest + counters | S15, S16, S30 |
 | 7 | **Mobility & contest** | §7.3 roaming + amplification budget, §7.5 keepalive + persistent keepalive + the contested probe *(§7.4's liveness half moved to 3a — round 12)*, §5.4 / §6.4 / §6.7–6.8 replacement + tie-break + restart *(§6.5 and §6.6 moved to slice 4 — ruling 91)*, `notified()` + `Notification` | S3, S4, S5, S11, S18, S19, S20, S27 (full) |
-| 8 | **Composability** | all of §3 above: `compat/{io,stream,codec,tower}.rs`, `BiStream`, the `io::Error` conversions, the no-prefetch pin | S25, and S31–S33 (drafted, §7) |
+| 8 | **Composability** | all of §3 above: `compat/{io,stream,codec,tower}.rs`, **`BiStream`'s `AsyncRead`/`AsyncWrite` impls** (the type itself, with `split`/`join`, lands in slice 4 — ruling 96), the `io::Error` conversions, the no-prefetch pin | S25, and S31–S33 (drafted, §7) |
 | 9 | **Ship** | the five documentation obligations, Appendix B complete, all eight gates, MSRV 1.96, `cargo deny`, rustdoc `-D warnings`, bubble-engine cutover | — |
 
 **Slices 0–3 are the spine and 3b is the risk.** It is the slice where
