@@ -196,23 +196,10 @@ required-features = ["test-util"]
 name = "spec_shell"
 required-features = ["test-util"]
 
-# ── SLICE 4b INTEGRATION: UNCOMMENT WHEN THE TEST FILES LAND ──────────────
-# Slice 4b's stream surface, on the same terms as the three above. It is
-# written but commented out because `tests/story_streams.rs` and
-# `tests/spec_streams.rs` belong to the **blind test author** (working rule
-# 6) and are not in the implementer's tree: cargo refuses to parse a manifest
-# naming a `[[test]]` whose file is absent — not a warning, a hard
-# `failed to parse manifest`, which reds every release gate at once.
-#
-# Leaving it commented is not silent. Without a stanza cargo auto-discovers
-# `tests/*.rs` with no `required-features`, so a plain `cargo test` compiles
-# them without `test-util` and fails on `slither::testutil` — loudly, at the
-# first gate run after integration.
-#
-# [[test]]
-# name = "story_streams"
-# required-features = ["test-util"]
-#
-# [[test]]
-# name = "spec_streams"
-# required-features = ["test-util"]
+[[test]]
+name = "story_streams"
+required-features = ["test-util"]
+
+[[test]]
+name = "spec_streams"
+required-features = ["test-util"]

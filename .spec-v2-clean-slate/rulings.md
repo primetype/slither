@@ -3168,3 +3168,138 @@ conflicts, 4b's three are two contract defects and one process gap. Two
 consecutive slices have now produced zero implementation defects from the
 blind split, and the defects the split *does* surface have moved
 upstream, into the documents the agents build from.
+
+---
+
+## Round 22 — slice 4b integration (2026/08/15)
+
+Twenty-five blind tests, **compiled on first contact** with no name, type
+or arity mismatch anywhere. Three failed. One was a fixture defect, one
+was the test asserting against ratified text — and one **overturned a
+ruling I made four hours earlier**.
+
+**Ruling 128 — ruling 118 was wrong at the receiving end. Received,
+unclaimed stream state survives the connection's death, and `accept_*`
+and `read` serve it.**
+
+Ruling 118 said `accept_*` reports `ConnectionLost` immediately, and gave
+a structural reason: *"§15.2 lets `close()` drop stream, recovery and
+congestion state immediately, so after death there is nothing left to
+hand over."* **That sentence is about the closing endpoint.** §15.2's
+local-close bullet drops the closer's state; its *next* bullet, receiving
+an authenticated CLOSE, says *"hold a brief drain for the same
+`CLOSE_LINGER` … then drop all state"* — so the receiver still has
+everything for the linger. I applied a true statement about one endpoint
+to the other one. **This is working rule 12 in my own text**: the
+argument was sound about the state it assumed, and I never asked which
+state it assumed.
+
+The consequence is not academic, and the blind test author found it by
+writing the ordinary case down. A sender that writes, finishes and drops
+its handles — the fire-and-forget pattern, which §16.2 makes reachable
+**by accident**, since dropping the last handle performs
+`close(NO_ERROR, "")` and ruling 125 has just made a stream handle able
+to be that last handle — puts every byte and the FIN on the wire and then
+closes. The peer's driver processes the data and the CLOSE in the same
+pass, latches `closed`, and *then* wakes the application. Under ruling
+118 the application's `accept_uni()` answers `Err(PeerClosed)` over a
+stream that arrived in full. **It is not a race the receiver can win**:
+even a receiver already parked in `accept_uni()` is woken after the latch
+is set. The most natural sender pattern in the protocol delivered nothing
+usable, in every case.
+
+This is ruling 47's problem seen from the other end. Ruling 47 exists
+because message-then-close *"loses its tail at the path's loss rate,
+silently"*, and judged that unacceptable on the sender's side; the
+receiver's side is the same loss with the same cause, and `acked()` does
+not fix it — the peer's *transport* acknowledging is not the peer's
+*application* claiming.
+
+**The rule.** While the core still holds a stream's received state:
+`read` serves the buffered bytes and then the FIN's `Ok(None)`;
+`accept_*` hands over streams already opened before the death. When
+nothing is left, both answer `Err(ConnectionLost)`. **Parking is never
+permitted on a dead connection** — nothing further can arrive, so a
+`read` with no data and no FIN is an error, not a `Pending`. `closed()`
+is unaffected and still resolves at the death: the connection *is* dead;
+what survives is data that already arrived. The analogy is TCP's, where a
+peer's FIN does not stop you draining what is already in your receive
+buffer.
+
+**Where it is implemented: slice 5, and this is a scoping decision, not a
+deferral of the finding.** Two guards make the data unreachable and both
+were checked against the code rather than assumed. `Connection::drop_state`
+drops the session and disarms the timers and **leaves `streams` and `flow`
+untouched** — the bytes are genuinely still there. What hides them is
+(a) `core::Connection::read`'s unconditional `self.lost` check, and
+(b) the shell releasing the core at `ToEndpoint::Retired`
+(`driver.rs:650`), which `drop_state` emits **at the instant of death**.
+Moving (b) means touching ruling 81's definition of when `Retired` fires,
+which is a statement about the endpoint's index table and the guard-entry
+pin, not about streams. That is a coherent piece of work and it belongs
+with ruling 47's `acked()`, which slice 5 already owns, rather than
+bolted onto a slice that is otherwise complete. `tests/spec_streams.rs`
+carries `a_receiver_can_drain_a_stream_the_sender_closed_behind`,
+`#[ignore]`d and naming this ruling — ruling 114's precedent: deleting it
+loses the obligation, running it fails a correct slice-4 build.
+
+**§16.2 and ruling 118 are amended, not reversed wholesale.** 118's
+answer stands for `notified()`-versus-the-rest as far as *ordering*
+goes, and stands entirely for the **closing** endpoint, where §15.2 really
+does drop the state. What it may no longer claim is that there is nothing
+to hand over.
+
+**Ruling 129 — §9.6's no-op is correct and the test was wrong; the
+positive control it wanted is unreachable in slice 4.**
+
+The author wrote `an_explicit_reset_after_finish_supersedes_the_fin` as
+the positive control for the drop-after-finish test — a build whose
+`reset()` early-returns on `fin` would pass the latter by never resetting
+a finished stream at all. Sound instinct. But §9.6 says in terms: *"A
+RESET_STREAM for an already-FIN-complete receive half is a valid no-op if
+the final sizes agree, `FINAL_SIZE_ERROR` otherwise"*, and **in slice 4
+the sizes always agree**. Ruling 111 pins `final_size` at the highest
+byte *actually transmitted*; with no congestion control a `write()` never
+leaves accepted-but-unsealed bytes behind, because a blocked write returns
+`Pending` and the bytes stay with the caller (ruling 114). So the two
+sizes can only diverge once something holds sealed-but-unsent data, which
+is slice 5's congestion window — **exactly the case ruling 111's own
+parenthetical describes as "ordinary operation", and which does not yet
+exist.**
+
+The test now pins §9.6's no-op, which is a real assertion: a receive half
+that surfaced `Reset` there would turn a complete, correctly delivered
+transfer into an error — ruling 121's misreport in the other direction.
+The pairing the author wanted is preserved by a different test,
+`dropping_an_unfinished_send_stream_resets_it_with_code_zero`, which no
+no-op `Drop` can pass. Slice 5 owes the reachable control.
+
+**The third failure was a fixture defect worth recording: seal is not
+send.** S13's stall test blackholed a path, wrote the middle chunk, and
+healed — with **no driver pass inside the window**. Ruling 114 says a
+mutating call *seals* everything the ledger admits; the datagram then
+sits in the core's output queue, and the I/O is the driver's, after
+`mark_dirty` wakes it (§16.3). So nothing was dropped, all 10 530 bytes
+arrived contiguously, and a test whose entire subject is *"is B reachable
+across a permanent gap in A"* had no gap in it. Its own doc comment
+flagged the coupling to ruling 114 and drew the wrong consequence from
+it. One `settle()` fixes it. **Ruling 114 bounds where sealing happens,
+not when transmission happens** — the third distinct thing that ruling
+has now been misread as saying.
+
+### What this round says about the process
+
+**Two consecutive slices, and the blind split has still produced zero
+implementation defects.** 4a's five failures were three test defects and
+two spec conflicts; 4b's three are one test defect, one test asserting
+against ratified text, and **one overturned ruling of mine**. The defects
+have moved decisively upstream — they are in the contracts, the rulings
+and the fixtures, not in the code — which is what a working process looks
+like, and also a warning: the documents are now the least-reviewed
+artefact in the project.
+
+Ruling 128 is the sharpest case yet for the split's value. Nothing about
+it was discoverable by reading code: the implementation matched the
+contract, the contract matched ruling 118, and ruling 118 had a clean
+argument attached. It took an author who had never seen any of them
+writing down what an application would actually do.

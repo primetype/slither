@@ -4288,20 +4288,35 @@ event surface.
   drained — a notification generated before the death is not lost to the
   death. It is cancel-safe: a dropped future has claimed nothing.
 
-**[RATIFIED 2026/08/15 — ruling 118]** *The drain-then-report rule is
-`notified()`'s alone; it does not carry to the stream and payload
-claims.* `accept_bi`, `accept_uni`, `recv_message` and `recv_datagram`
-report `ConnectionLost` **immediately** once the connection has ended,
-with nothing drained first. The reason is structural rather than a
-preference: **§15.2 lets `close()` drop stream, recovery and congestion
-state immediately**, so by the time the death is observable there is
-nothing left to hand over — draining would return a handle on which every
-`read` fails, satisfying "never dropped on the floor" in letter while
-delivering nothing. A `Notification` is different in exactly the way that
-matters: it is a fact about the connection, complete in itself, and it
-survives the event it describes. This sentence previously said only "the
-same pull model", and a list of four verbs was read as ranging over a
-rule that fits one of them.
+**[RATIFIED 2026/08/15 — ruling 118, AMENDED the same day by ruling
+128]** *The drain-then-report rule is `notified()`'s alone as an
+**ordering** rule; what it may not claim is that nothing survives.* At
+the **closing** endpoint, §15.2 really does let `close()` drop stream,
+recovery and congestion state immediately, and there is nothing to hand
+over. Ruling 118 said that and stopped, and applying it to the
+**receiving** endpoint was an error: §15.2's next bullet gives a peer
+that receives an authenticated CLOSE a `CLOSE_LINGER` drain before it
+drops state, so a stream that fully arrived is still there.
+
+**[RATIFIED 2026/08/15 — ruling 128]** *Data that arrived before the
+death survives it.* While the connection still holds a stream's received
+state, `read` serves the buffered bytes and then the FIN's `Ok(None)`,
+and `accept_bi`/`accept_uni` hand over streams opened before the death;
+when nothing is left, both report `ConnectionLost`. **Parking is never
+permitted on a dead connection** — nothing further can arrive, so a
+`read` with no data and no FIN is an error rather than a wait. `closed()`
+is unaffected and still resolves at the death: the connection *is* dead,
+and what survives is only what already arrived. The case that forces this
+is the ordinary one — a sender that writes, finishes and drops its
+handles closes implicitly (§16.2, ruling 125), its peer's driver
+processes the data and the CLOSE in one pass, and the peer's application
+is woken **after** the latch is set. Without this rule that application
+can never reach a stream that arrived in full, and it is not a race it
+can win by being prompt. It is ruling 47's problem from the receiving
+end, and `acked()` does not reach it: the peer's transport acknowledging
+is not the peer's application claiming. A `Notification` remains
+different in the way that matters — it is a fact about the connection,
+complete in itself, and it survives the event it describes.
 
 **Retention is one slot per kind**, which is what keeps the notification
 state O(1) per connection and lets it need no queue bound at all
