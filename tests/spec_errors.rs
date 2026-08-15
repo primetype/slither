@@ -136,15 +136,18 @@ fn match_intro_error(e: IntroError) {
     }
 }
 
-/// SPEC.md §18.1: `AuthError::{Replay, HandshakeFailed, Expired,
-/// EndpointDropped}` — exactly four variants, all unit. `HandshakeFailed`
+/// SPEC.md §18.1: `AuthError::{Replay, HandshakeFailed, Expired, Local,
+/// EndpointDropped}` — exactly five variants, all unit. `HandshakeFailed`
 /// is called out as "the only variant in the staged taxonomy that is a
-/// security signal."
+/// security signal"; `Local` **[RATIFIED 2026/08/15 — ruling 78]** exists
+/// so that *our own* provider failing does not fall through to it and
+/// report the peer as an attacker.
 fn match_auth_error(e: AuthError) {
     match e {
         AuthError::Replay => {}
         AuthError::HandshakeFailed => {}
         AuthError::Expired => {}
+        AuthError::Local => {}
         AuthError::EndpointDropped => {}
     }
 }

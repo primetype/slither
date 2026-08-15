@@ -8,7 +8,10 @@
 //! `ConnectError::Local` and `IntroError::Local` were added *because* the
 //! taxonomy could not say "our own key hardware failed", and they were
 //! added before release precisely because §18.1's closure makes the same
-//! amendment a breaking change afterwards. Nine of the ten types here are
+//! amendment a breaking change afterwards. Ruling 78 then added
+//! `AuthError::Local`, which ruling 72 had missed — and missing it was the
+//! worse half, because the variant a local fault fell through to there is
+//! the taxonomy's one **security signal**. Nine of the ten types here are
 //! therefore *exhaustive*
 //! Rust enums, which says the same thing in the type system — a consumer
 //! who matches without a `_` arm gets a **compile error** the day a variant
@@ -129,6 +132,19 @@ pub enum AuthError {
     /// The parked introduction outlived `INTRO_TTL`.
     #[error("the parked introduction outlived INTRO_TTL")]
     Expired,
+    /// **Our own** provider failed, exactly as [`IntroError::Local`].
+    /// §18.1, **ruling 78**.
+    ///
+    /// `authenticate()` may drive a skipped `read_identity()` (ruling 75),
+    /// so it can meet the same local fault. Ruling 72 did not reach this
+    /// type, and the omission was the worse half of the defect it fixed:
+    /// without this variant a locked enclave surfaced as
+    /// [`HandshakeFailed`](AuthError::HandshakeFailed) — which does not
+    /// merely misattribute a local fault to the peer, it **reports the peer
+    /// as an attacker**, and teaches an operator to distrust the one
+    /// variant that must stay trustworthy.
+    #[error("our own identity provider failed to open")]
+    Local,
     /// The endpoint driver stopped.
     #[error("the endpoint driver stopped")]
     EndpointDropped,
@@ -362,6 +378,7 @@ mod tests {
             Box::new(AuthError::Replay),
             Box::new(AuthError::HandshakeFailed),
             Box::new(AuthError::Expired),
+            Box::new(AuthError::Local),
             Box::new(AuthError::EndpointDropped),
             Box::new(AcceptError::Stale),
             Box::new(AcceptError::EndpointDropped),

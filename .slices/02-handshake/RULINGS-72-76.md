@@ -195,3 +195,67 @@ instead; nothing else in the change depends on it.
    resolved; documented at the site in `staged.rs`.
 3. Finding D: an unproven mid-state's pin/unpin restarts the orphan aging clock.
 4. Finding A: `Local` carries no source; doing so needs `Identity::Error: Send + Sync + Clone`.
+
+# ── Rulings 77 and 78 (spec at 138bdf3) ──
+
+## R77 — SPEC §17.1 (4863-4877)
+Only the release of a **key-holder-proven** pin starts the orphan clock — a live connection, an
+in-flight outbound pending, or a **`Proven`** chain. A merely `Claimed` chain's pin **still bars
+eviction** (the §17.1 bullet is unchanged) but does **not restart aging**. An entry pinned solely by
+`Claimed` chains keeps whatever `orphaned_at` it had; one that never held a key-holder pin has none.
+=> `age_deadline`'s `pins > 0` suspension is **unchanged**. Only the *stamp on release* narrows.
+
+## R78 — SPEC §18.1 (5097-5114)
+`AuthError::{Replay, HandshakeFailed, Expired, Local, EndpointDropped}`. `Local` as
+`IntroError::Local`, because `authenticate()` may drive a skipped `read_identity()` (ruling 75).
+
+## R77/R78 — changes made
+- `src/core/endpoint/guard.rs` — `PinKind::{Claimed, KeyHolder}`; `ChainPin { key, kind }`;
+  `GuardEntry::keyholder_pins`; `pin(key, kind)`; `promote_pin(key)`; `unpin(key, kind, last_now)`
+  stamps only when `kind == KeyHolder && keyholder_pins == 0`.
+  **`age_deadline` still tests `pins`** — ruling 77 narrowed which release *starts* the clock, not
+  which pin *suspends* aging, and §17.1's "never evicted, never aged while pinned" bullet (which
+  names a staged mid-state) is unchanged. A `Claimed` holder can therefore still defer aging while
+  it holds the pin, but cannot move the instant the window is measured from, which is the property
+  the ruling asks for.
+- `src/core/endpoint/intro_queue.rs` — `guard_pin: Option<Vec<u8>>` -> `Option<ChainPin>`.
+- `src/core/endpoint/staged.rs` — `read_identity` pins `Claimed`; `authenticate` pins `KeyHolder`
+  (new pin) or `promote_pin`s the existing one and rewrites `ChainPin::kind`; the `read_identity`
+  error map is now **exhaustive** and routes `IntroError::Local -> AuthError::Local` (ruling 78).
+- `src/core/endpoint/mod.rs` — `connect` pins `KeyHolder`; `drop_pending` and
+  `handle_connection_event` unpin `KeyHolder`; `release_chain_guard_state` takes the `ChainPin` and
+  uses its carried kind.
+- `src/error.rs`, `tests/spec_errors.rs` — `AuthError::Local` (fence edit again, flagged).
+
+### Why the kind is carried, not re-derived
+Deriving `PinKind` from `ChainState` at release looked cheaper but is wrong: a chain that failed
+mid-verb is `Poisoned` and no longer says what stage it reached. `accept()`'s post-`mem::replace`
+failure paths would classify a genuinely `Proven` chain's pin as `Claimed`, leaving
+`keyholder_pins` stuck above zero — an entry that never stamps and therefore **never ages**.
+
+### Why the `Replay` probe is correctly a `Claimed` release
+`authenticate()` returns `Err(Replay)` from the `admits` check, which sits **before** the write of
+`ChainState::Proven`. The chain never becomes `Proven`, its `ChainPin::kind` is never promoted, and
+the release moves no timer — which is exactly why
+`an_orphaned_guard_entry_ages_out_at_ts_guard_orphan_ttl` now passes unedited.
+
+## Gates after rulings 77/78 (each run individually)
+| Gate | Result |
+|---|---|
+| `cargo build --all-features --all-targets` | Finished `dev` profile |
+| `cargo fmt --all --check` | FMT_EXIT=0 |
+| `cargo clippy --all-features --all-targets -- -D warnings` | Finished, zero warnings |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Generated, no warnings |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | Generated, no warnings |
+| `cargo test` | **141 + 103 + 11 + 4 + 4 passed, 0 failed** |
+| `cargo test --all-features` | **141 + 103 + 11 + 4 + 4 passed, 0 failed** |
+| `cargo +1.96 check --all-features --all-targets` | Finished |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+All 13 golden-wire / size tests green. No wire byte moved. Nothing committed.
+
+## Open items — status
+1. §16.4's clockless `handle_connection_event`/`reject` — **still open** (Finding C). The
+   `last_now` + provisional-floor shape stands; adding `now` to those two signatures would delete it.
+2. `AuthError` had no `Local` — **CLOSED by ruling 78**.
+3. An unproven mid-state's pin restarting the orphan clock — **CLOSED by ruling 77**.
+4. `Local` carries no source — **still open** (Finding A); needs `Identity::Error: Send + Sync + Clone`.

@@ -43,6 +43,7 @@ use crate::identity::{Identity, PublicKeyOf};
 use crate::packet::{Handshake, Mac1Key};
 
 use super::Endpoint;
+use super::guard::{ChainPin, PinKind};
 use super::tables::{StaticEntry, StaticState};
 
 /// A parked introduction's identity inside one endpoint.
@@ -214,8 +215,13 @@ impl<I: Identity> Endpoint<I> {
                 // §17.1: a staged mid-state pins its static's guard entry,
                 // and the pin **never creates** one — for a static no
                 // key-holder has ever written, this is a no-op.
+                //
+                // Ruling 77: `Claimed`, and that is the whole point. The
+                // static here is *claimed*, reached for 1 DH and proving
+                // nothing (§6.1: attacker-choosable), so this pin bars
+                // eviction but must not touch the orphan clock.
                 let key = claimed.as_ref().to_vec();
-                let pinned = self.guard.pin(&key);
+                let pinned = self.guard.pin(&key, PinKind::Claimed);
 
                 self.intros.consume(id);
                 let entry = self
@@ -227,7 +233,10 @@ impl<I: Identity> Endpoint<I> {
                     claimed: claimed.clone(),
                 };
                 if pinned {
-                    entry.guard_pin = Some(key);
+                    entry.guard_pin = Some(ChainPin {
+                        key,
+                        kind: PinKind::Claimed,
+                    });
                 }
                 Ok(claimed)
             }
@@ -273,15 +282,26 @@ impl<I: Identity> Endpoint<I> {
             self.intros.get(id).map(|entry| &entry.state),
             Some(ChainState::Parked)
         ) {
-            // Ruling 75's `es`, driven here. The error map is *not* a
-            // judgement: §18.1's `AuthError` is closed at
-            // `{Replay, HandshakeFailed, Expired, EndpointDropped}` and
-            // ruling 72 amended `IntroError` and `ConnectError` only, so
-            // there is no `AuthError::Local` to carry an `IntroError::Local`
-            // into. See the slice notes — this is reported, not resolved.
+            // Ruling 75's `es`, driven here — so this verb can meet the
+            // same local fault `read_identity()` can, which is why §18.1
+            // gained `AuthError::Local` (ruling 78). Matched exhaustively:
+            // a sixth `IntroError` variant must stop here rather than be
+            // swept into a security signal by a `_` arm.
             self.read_identity(id).map_err(|e| match e {
                 IntroError::Expired => AuthError::Expired,
-                _ => AuthError::HandshakeFailed,
+                // Ruling 78. Routing *our* locked enclave to
+                // `HandshakeFailed` did not merely misattribute the fault;
+                // it reported the peer as an attacker through the one
+                // variant §18.1 designates a security signal.
+                IntroError::Local => AuthError::Local,
+                // Ruling 72's other half: the peer's bytes really are at
+                // fault, and this is what `HandshakeFailed` is for.
+                IntroError::Malformed => AuthError::HandshakeFailed,
+                // Neither is reachable from the core — `Internal` is §6.5's
+                // shell interception and `EndpointDropped` is the driver
+                // stopping — so answer with the lifecycle variant rather
+                // than the security one.
+                IntroError::Internal | IntroError::EndpointDropped => AuthError::Expired,
             })?;
         }
 
@@ -326,11 +346,21 @@ impl<I: Identity> Endpoint<I> {
 
         // The record may have created the entry the pin could not, so take
         // the mid-state's pin now if `read_identity` found nothing to pin.
-        let needs_pin = self
-            .intros
-            .get(id)
-            .is_some_and(|entry| entry.guard_pin.is_none());
-        let pinned = needs_pin && self.guard.pin(&key);
+        //
+        // Ruling 77: either way the pin ends up a **key-holder's** — the
+        // `ss` above is what proves it, and §17.1 names a `Proven` chain
+        // beside a live connection. A pin `read_identity` already took was
+        // a merely-`Claimed` one and is promoted rather than doubled.
+        let pinned = match self.intros.get(id).map(|entry| entry.guard_pin.is_some()) {
+            Some(false) => self.guard.pin(&key, PinKind::KeyHolder),
+            Some(true) => {
+                self.guard.promote_pin(&key);
+                false
+            }
+            // The chain vanished, which the check immediately below turns
+            // into a revert. Touch no pin from here.
+            None => false,
+        };
 
         if self.intros.get(id).is_none() {
             debug_assert!(false, "the chain cannot vanish mid-verb");
@@ -347,8 +377,17 @@ impl<I: Identity> Endpoint<I> {
             timestamp,
         };
         entry.guard_undo = Some(undo);
-        if pinned {
-            entry.guard_pin = Some(key);
+        match &mut entry.guard_pin {
+            // Promoted above: the chain is `Proven`, so its pin is a
+            // key-holder's and must be released as one (ruling 77).
+            Some(pin) => pin.kind = PinKind::KeyHolder,
+            None if pinned => {
+                entry.guard_pin = Some(ChainPin {
+                    key,
+                    kind: PinKind::KeyHolder,
+                });
+            }
+            None => {}
         }
 
         Ok((claimed, timestamp))

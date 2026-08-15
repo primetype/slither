@@ -434,7 +434,11 @@ impl<I: Identity> Endpoint<I> {
         // entry — and a pin never creates one, so for a static we have
         // only ever dialled this is a no-op, which is exactly §17.1's
         // "we hold no entry at all".
-        pending.guard_pinned = self.guard.pin(&key);
+        //
+        // Ruling 77 names an in-flight outbound pending among the
+        // key-holder pins: it exists because *this* application asked for
+        // it, and no remote party can mint one.
+        pending.guard_pinned = self.guard.pin(&key, guard::PinKind::KeyHolder);
 
         self.start_attempt(now, &mut pending);
         self.pendings.insert(conn, pending);
@@ -510,8 +514,11 @@ impl<I: Identity> Endpoint<I> {
         }
         self.statics.remove(&pending.remote_static_bytes);
         if pending.guard_pinned {
-            self.guard
-                .unpin(&pending.remote_static_bytes, self.last_now);
+            self.guard.unpin(
+                &pending.remote_static_bytes,
+                guard::PinKind::KeyHolder,
+                self.last_now,
+            );
         }
         Some(pending)
     }
@@ -818,7 +825,11 @@ impl<I: Identity> Endpoint<I> {
                 if self.drop_pending(id).is_none()
                     && let Some(key) = self.statics.remove_by_connection(id)
                 {
-                    self.guard.unpin(&key, self.last_now);
+                    // A live connection is a key-holder pin (ruling 77):
+                    // reaching it took the peer's key, and this release is
+                    // the one ruling 73's security argument is about.
+                    self.guard
+                        .unpin(&key, guard::PinKind::KeyHolder, self.last_now);
                 }
             }
         }
@@ -842,11 +853,20 @@ impl<I: Identity> Endpoint<I> {
     /// created, and leave precisely the orphan mitigation (i) exists to
     /// prevent — silently, and only for the authenticate-then-reject path
     /// that is the whole point of the mitigation.
-    fn release_chain_guard_state(&mut self, undo: Option<guard::GuardUndo>, pin: Option<Vec<u8>>) {
-        if let Some(key) = pin {
+    fn release_chain_guard_state(
+        &mut self,
+        undo: Option<guard::GuardUndo>,
+        pin: Option<guard::ChainPin>,
+    ) {
+        if let Some(pin) = pin {
             // Ruling 73: `reject()` reaches here with no `now` (§16.4), so
             // the watermark is the stamp and `observe` floors it.
-            self.guard.unpin(&key, self.last_now);
+            //
+            // Ruling 77: the kind travels on the pin. A chain refused at
+            // `authenticate()` — including a `Replay` — never reached
+            // `Proven`, so its pin is still `Claimed` and its release moves
+            // no timer.
+            self.guard.unpin(&pin.key, pin.kind, self.last_now);
         }
         if let Some(undo) = undo {
             self.guard.revert(undo);

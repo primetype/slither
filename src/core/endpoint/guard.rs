@@ -45,6 +45,13 @@
 //! outbound pending at once (that is §5.4's PENDING row), and a flag would
 //! lose the second pin on the first release, unpinning a live entry.
 //!
+//! **[RATIFIED 2026/08/15 — ruling 77]** Pins come in two kinds
+//! ([`PinKind`]). Both bar eviction; only a **key-holder** release starts
+//! the aging clock below. A pin taken at `read_identity()` is a *claimed*
+//! static's and proves nothing — so an unauthenticated party naming a
+//! static that already holds an entry must not be able to move that
+//! entry's timer.
+//!
 //! # The orphan clock starts at release (**ruling 73**)
 //!
 //! An entry ages from the instant its **last pin is released**, never from
@@ -62,6 +69,28 @@ use std::time::Instant;
 use crate::constants;
 use crate::core::Timestamp;
 
+/// What a §17.1 pin proves about whoever holds it. **Ruling 77.**
+///
+/// Both kinds bar eviction — §17.1's bullet is unchanged — but only a
+/// [`KeyHolder`](PinKind::KeyHolder) release starts ruling 73's orphan
+/// clock. Reaching [`Claimed`](PinKind::Claimed) costs 1 DH and proves
+/// **nothing**: §6.1 is explicit that the claimed static is
+/// attacker-choosable. So without this split anyone able to send a
+/// mac1-valid msg1 naming a static that already holds an entry could
+/// restart that entry's clock at will and defer mitigation (ii)
+/// indefinitely. §17.1 states the principle: this is §6.1's "nothing
+/// durable may be keyed on the claimed static" reaching one step further —
+/// not merely no new durable state, but **no control over the lifetime of
+/// existing state**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinKind {
+    /// A staged chain at §6.1's stage 1. Attacker-choosable.
+    Claimed,
+    /// A live connection, an in-flight outbound pending, or a `Proven`
+    /// chain — every one of which took the peer's key to reach.
+    KeyHolder,
+}
+
 /// One static's guard state.
 #[derive(Debug, Clone)]
 pub(crate) struct GuardEntry {
@@ -75,7 +104,20 @@ pub(crate) struct GuardEntry {
     /// second pin turns authenticate-then-drop back into an orphan mint.
     pub(crate) greatest: Option<Timestamp>,
     /// Live connections + in-flight pendings + staged mid-states.
+    ///
+    /// **All** pins, of either [`PinKind`]: this is the count §17.1's
+    /// "never evicted, never aged while pinned" rests on, and ruling 77
+    /// left it alone.
     pub(crate) pins: u32,
+    /// The subset of [`pins`](GuardEntry::pins) that are
+    /// [`PinKind::KeyHolder`]. **Ruling 77.**
+    ///
+    /// The orphan clock is stamped when *this* reaches zero, not when
+    /// `pins` does. A lingering `Claimed` pin therefore still suspends
+    /// aging — [`age_deadline`](GuardEntry::age_deadline) tests `pins` —
+    /// but the instant the window will be measured from is already fixed,
+    /// and the `Claimed` holder cannot move it.
+    pub(crate) keyholder_pins: u32,
     /// §6.6/§6.7's `HANDSHAKE_GIVEUP` extension past the connection's
     /// death. Unreachable in slice 2a — both write sites that set it are
     /// slice 7 — and present so that slice 7 does not have to reshape the
@@ -90,8 +132,10 @@ pub(crate) struct GuardEntry {
     /// does. Mitigation (iii) is untouched — only
     /// [`orphaned_at`](GuardEntry::orphaned_at) moved.
     pub(crate) last_admitted: Instant,
-    /// When this entry became an **orphan** — the instant its last pin was
-    /// released. `None` while pinned. **[RATIFIED 2026/08/15 — ruling 73]**
+    /// When this entry became an **orphan** — the instant its last
+    /// **key-holder** pin was released ([`PinKind`], ruling 77). `None`
+    /// while a key-holder pin is held.
+    /// **[RATIFIED 2026/08/15 — rulings 73 and 77]**
     ///
     /// §17.1 defines an orphan as a *dead-connection* entry, so an entry
     /// cannot age **as an orphan** before it is one. Aging from
@@ -144,10 +188,15 @@ impl GuardEntry {
     /// When this entry becomes eligible for aging out, or `None` while a
     /// live pin holds it.
     ///
-    /// The `?` on `orphaned_at` is a belt-and-braces `None`: an unpinned
-    /// entry always carries a stamp. Answering `None` — never swept, never
-    /// announced — is the safe direction if that invariant is ever broken,
-    /// where a fabricated instant would not be.
+    /// The test is on **`pins`, of either [`PinKind`]** — ruling 77 narrowed
+    /// which release *starts* the clock, not which pin suspends it. §17.1's
+    /// "never evicted, never aged" bullet, which a staged mid-state is
+    /// named in, is unchanged.
+    ///
+    /// The `?` on `orphaned_at` is a belt-and-braces `None`: an entry with
+    /// no key-holder pin always carries a stamp. Answering `None` — never
+    /// swept, never announced — is the safe direction if that invariant is
+    /// ever broken, where a fabricated instant would not be.
     ///
     /// Computed without a `now`, so §16.5's min-deadline scan needs no
     /// clock: a `HANDSHAKE_GIVEUP` exemption (§6.6/§6.7, slice 7) simply
@@ -167,6 +216,24 @@ impl GuardEntry {
             _ => base,
         })
     }
+}
+
+/// The §17.1 pin a staged chain holds, and what it proves. **Ruling 77.**
+///
+/// The kind is carried rather than re-derived at release, because a chain
+/// that failed mid-verb is [`Poisoned`](super::staged::ChainState::Poisoned)
+/// and no longer says what stage it reached. Re-deriving would misclassify
+/// exactly the failure paths, and a `KeyHolder` release misclassified as
+/// `Claimed` leaves `keyholder_pins` stuck above zero — an entry that never
+/// stamps, and so never ages.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainPin {
+    /// The static this chain pins.
+    pub(crate) key: Vec<u8>,
+    /// What the pin proves, as of now. Upgraded from
+    /// [`PinKind::Claimed`] to [`PinKind::KeyHolder`] when the chain's
+    /// `ss` lands (`authenticate()`).
+    pub(crate) kind: PinKind,
 }
 
 /// What `authenticate()` must be able to undo. §17.1 mitigation (i).
@@ -234,6 +301,7 @@ impl TimestampGuard {
                     GuardEntry {
                         greatest: Some(candidate),
                         pins: 0,
+                        keyholder_pins: 0,
                         exempt_until: None,
                         last_admitted: now,
                         // Born unpinned, so it is an orphan from this
@@ -292,35 +360,77 @@ impl TimestampGuard {
 
     /// Take a pin. **Never creates an entry** (§17.1).
     ///
-    /// Taking a pin **stops the orphan clock** (ruling 73): a pinned entry
-    /// is not an orphan, so it has no aging deadline at all until its last
-    /// pin goes again.
-    pub(crate) fn pin(&mut self, key: &[u8]) -> bool {
+    /// A [`PinKind::KeyHolder`] pin **clears the orphan clock** (ruling
+    /// 73): the entry is not an orphan while a key-holder holds it, so the
+    /// window will be measured from the release still to come.
+    ///
+    /// A [`PinKind::Claimed`] pin leaves the stamp exactly where it was
+    /// (ruling 77). It still suspends aging, because
+    /// [`GuardEntry::age_deadline`] tests the total; what it cannot do is
+    /// move the instant the window runs from.
+    pub(crate) fn pin(&mut self, key: &[u8], kind: PinKind) -> bool {
         match self.entries.get_mut(key) {
             Some(entry) => {
                 entry.pins = entry.pins.saturating_add(1);
-                entry.orphaned_at = None;
-                entry.provisional_stamp = false;
+                if kind == PinKind::KeyHolder {
+                    entry.keyholder_pins = entry.keyholder_pins.saturating_add(1);
+                    entry.orphaned_at = None;
+                    entry.provisional_stamp = false;
+                }
                 true
             }
             None => false,
         }
     }
 
+    /// Upgrade a [`PinKind::Claimed`] pin to [`PinKind::KeyHolder`], where
+    /// the chain holding it has since proven possession. **Ruling 77.**
+    ///
+    /// `read_identity()` pins at stage 1, when the static is merely
+    /// *claimed*. When `authenticate()`'s `ss` lands the chain becomes
+    /// `Proven` and that same pin is a key-holder's — §17.1 names a
+    /// `Proven` chain alongside a live connection. Without this the entry
+    /// would keep a stamp the key-holder has superseded.
+    ///
+    /// Guarded against over-counting: a chain proves once, and
+    /// `authenticate()` on an already-`Proven` chain returns before
+    /// reaching here.
+    pub(crate) fn promote_pin(&mut self, key: &[u8]) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        if entry.keyholder_pins >= entry.pins {
+            debug_assert!(false, "promoting a pin that was never taken");
+            return;
+        }
+        entry.keyholder_pins += 1;
+        entry.orphaned_at = None;
+        entry.provisional_stamp = false;
+    }
+
     /// Release a pin taken by [`pin`](Self::pin).
     ///
-    /// **Ruling 73: this is where the orphan clock starts.** `last_now` is
-    /// the last instant the core was *told* — §16.4 ratifies
+    /// **Rulings 73 and 77: this is where the orphan clock starts** — but
+    /// only when the pin being released is a
+    /// [`KeyHolder`](PinKind::KeyHolder) one and it was the last of them. A
+    /// [`Claimed`](PinKind::Claimed) release leaves the stamp untouched, so
+    /// an unauthenticated party naming someone else's static cannot move
+    /// the timer.
+    ///
+    /// `last_now` is the last instant the core was *told* — §16.4 ratifies
     /// `handle_connection_event` and `reject` with no `now` and both reach
     /// this verb, so it is a lower bound rather than the release instant,
     /// and the stamp is marked provisional until
     /// [`observe`](Self::observe) can floor it. See
     /// [`GuardEntry::provisional_stamp`].
-    pub(crate) fn unpin(&mut self, key: &[u8], last_now: Instant) {
+    pub(crate) fn unpin(&mut self, key: &[u8], kind: PinKind, last_now: Instant) {
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
         entry.pins = entry.pins.saturating_sub(1);
+        if kind == PinKind::KeyHolder {
+            entry.keyholder_pins = entry.keyholder_pins.saturating_sub(1);
+        }
         // A pin-only entry (record already reverted) has nothing left to
         // protect once its last pin goes, and leaving it would be an orphan
         // with no record — pure bookkeeping the LRU would then have to age.
@@ -328,7 +438,10 @@ impl TimestampGuard {
             self.entries.remove(key);
             return;
         }
-        if entry.pins == 0 {
+        // Note the condition is on `keyholder_pins`, not `pins`: a lingering
+        // `Claimed` chain still suspends aging, but the instant the window
+        // runs from is fixed here, by the key-holder, and stays fixed.
+        if kind == PinKind::KeyHolder && entry.keyholder_pins == 0 {
             entry.orphaned_at = Some(last_now);
             entry.provisional_stamp = true;
             self.has_provisional = true;

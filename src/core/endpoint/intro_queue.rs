@@ -53,7 +53,7 @@ use std::time::Instant;
 use crate::constants;
 use crate::identity::Identity;
 
-use super::guard::GuardUndo;
+use super::guard::{ChainPin, GuardUndo};
 use super::staged::{ChainState, IntroId};
 
 /// §6.3's per-source cap key: the source **IP**, or its /64 for IPv6.
@@ -106,8 +106,11 @@ pub(crate) struct IntroEntry<I: Identity> {
     pub(crate) consumed: bool,
     /// §17.1's provisional guard write, if `authenticate()` has run.
     pub(crate) guard_undo: Option<GuardUndo>,
-    /// The static this chain currently pins in the guard, if any.
-    pub(crate) guard_pin: Option<Vec<u8>>,
+    /// The static this chain currently pins in the guard, if any, and what
+    /// that pin proves (ruling 77). The kind is carried here rather than
+    /// re-derived from [`state`](IntroEntry::state) at release, which a
+    /// failed verb leaves `Poisoned`.
+    pub(crate) guard_pin: Option<ChainPin>,
     /// **Ruling 69's single age key**: the instant of the last refresh, or
     /// of the original park if nothing has refreshed it. Both expiry and
     /// both evictions read it through [`age_key`](Self::age_key).
