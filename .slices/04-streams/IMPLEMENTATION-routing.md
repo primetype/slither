@@ -1,0 +1,353 @@
+# IMPL-R — §6.5 routing rule + §6.6 internal tie-break completion
+
+Started. HEAD 54fd68e. Baseline 456 (--all-features) / 422 (bare).
+
+## 0. Skeleton / plan
+## 1. CLAUDE.md working rules (read first)
+## 2. Rulings 90 and 91
+## 3. RULING-90.md §13 §14 §15
+## 4. Spec §6.4 (1310-1457)
+## 5. Spec §6.5 (1458-1514)
+## 6. Spec §6.6 (1515-1563)
+## 7. Spec §6.7 (1564-1662) — comparison only
+## 8. §17.1 guard / §17.4 hint set
+## 9. Current code survey
+## 10. Design
+## 11. Implementation log
+## 12. DH ladder measurement
+## 13. Regression measurement (read_identity -> connect -> accept)
+## 14. Tests that went red + diffs I would make
+## 15. Conflicts / working-rule-3 reports / working-rule-8 findings
+## 16. Gate output
+
+---
+
+## 2. Rulings 90 and 91 — read (rulings.md:1840-1960)
+
+**90**: `connect()` split into `mint_pending` (0 DH, sync, shell reads core's map)
++ `start_attempt` (2 DH on driver). Mirror deleted. Amendment (round 16):
+`Connecting::drop` must be a synchronous core call too (0 DH ⇒ §6.2 permits);
+`connect` DELETED not wrapped; `start_attempt` is a **no-op for unknown
+ConnectionId** (reachable — ruling 50's cancel can retire the pending before
+the Connect command is processed).
+
+**91**: §6.5 + §6.6 move slice 7 → slice 4. The fault is not the split but the
+**absence** of §6.5 routing + §6.6 internal completion. Maintainer's two
+premises for tolerating the interim were **both wrong by measurement** (agent
+proved it): (a) nothing converges because §6.5/§6.6 are absent; (b) the old
+install was always paired with a *refusal* of the connect, so no msg1 of ours
+was in flight and §6.4's divergence case did not arise.
+
+Key: restoring the mirror's behaviour **detonates `StaticMap::insert`'s
+`§16.1: one session per peer static` debug_assert** — a LIVE row over a PENDING
+row. The old state is not representable in the core's map.
+
+## 3. RULING-90.md §13/§14/§15 — read
+
+§13 mutation: accept blind to PENDING ⇒ `tables.rs:134` debug_assert fires.
+§14 two withdrawn claims (executed, not read back) — the standard of evidence.
+§15 measured regression:
+
+```
+accept()  -> Some(Stale)
+connect() -> Ok
+after settle:   A dial Pending          B dial Pending
+at give-up:     A dial Err(TimedOut)    B dial Err(TimedOut)
+recovery (drop the dial, then accept):  INSTALLED
+```
+
+§15 also names the doc comments to fix: `src/core/endpoint/mod.rs:26-40` and `:247`.
+
+INTERIM BOUNDARY block is item 4 of the rewritten test
+`tests/spec_shell.rs::accept_vs_connect_race_reaches_6_4s_pending_branch`.
+
+## 4. §6.4 (1310-1457) — read. PENDING branch = 1407-1448
+
+- PENDING at admission: apply §6.7's comparison over the same ordered pair.
+  - **peer's static smaller** ⇒ we are LOSER: accept() **cancels** the pending
+    (pending + index dropped; `Connecting` resolves
+    `Err(ConnectError::AlreadyConnected)`) and the accept proceeds as an
+    ordinary fresh install with this endpoint as **responder**.
+  - **our static smaller** ⇒ we are WINNER: `AcceptError::Stale`, pending left
+    in place, candidate's timestamp **recorded** in the guard (§17.1).
+- §17.1 ordering bullet (1387-1406): guard record is normally **reverted** on a
+  `Stale`. **One exception**: the tie-break-WINNER case of the PENDING branch
+  returns `Stale` and **KEEPS** its record. "No other Stale leaves a record
+  behind."
+- 1449-1456: `Stale` cases = no parked initiation / candidate fails basis /
+  PENDING and we are the tie-break winner.
+
+## 5. §6.5 (1458-1514) — the routing rule
+
+Inbound `HandshakeInit` processing in the endpoint core:
+1. Stage 0 (always): length gate, classify, mac1 verify. Silent drop on failure.
+   Cost: one keyed hash.
+2. **Hint check (no DH)**: hint set = **the dialled addresses of all in-flight
+   outbound initiations — nothing else**. Established connections' addresses are
+   NOT hints. `src` ∉ hint set → park at stage 0 (§6.3), surface `Intro`.
+3. **Eager path (`src` ∈ hint set)**: run split intro read (1 DH, `es`), inspect
+   claimed static:
+   - claimed ∈ pending outbound remotes → **internal tie-break (§6.6)**. Never
+     touches accept queue; application never sees it.
+   - claimed ∉ pending outbound remotes → raw packet **demoted** to stage-0
+     queue under §6.3 rules, **carrying its paid mid-state**, tagged
+     identity-already-read: surfaces as `Intro`, and `read_identity()` on it
+     returns the cached claim at **0 incremental DH**.
+4. **`read_identity()` interception (backstop)**: when a parked `Intro`'s
+   claimed static turns out to be a pending outbound remote, endpoint performs
+   the same internal tie-break and `read_identity()` returns
+   `Err(IntroError::Internal)`.
+
+Probed set is pending outbound remotes ONLY. False negative (peer dials from a
+different source port) parks as ordinary `Intro`, self-heals ONLY at step 4;
+does NOT self-heal through retransmission (same rewritten port every time).
+
+## 6. §6.6 (1515-1563) — internal tie-break completion
+
+Order, on the already-paid mid-state:
+1. **Tag** — `complete()` (`ss`, +1 DH). Forged claim dies here. Pending untouched.
+2. **Guard** — §17.1 per-static greatest-timestamp: strictly greater or die.
+   LIVE and NONE statics unreachable in this path. Converse does NOT hold:
+   §6.4's PENDING branch is a **different route to the same comparison**.
+3. **Tie-break** — §6.7. Our static smaller ⇒ WINNER: authenticated inbound
+   silently dropped, timestamp **recorded**, our outbound completes normally.
+   Peer's static smaller ⇒ proceed as responder.
+4. **Admit** (LOSER side) — record strictly-greater timestamp as full admission,
+   cancel our own pending (§6.7), mint responder index (§17.3), write msg2
+   (`ee`,`se`, +2 DH). Completes connection as an `Install` (§16.4), resolving
+   its `Connecting` exactly as a msg2 completion would, and sets that
+   connection's replacement basis to `Some(t)` (§17.4) — responder here.
+
+Failure at 1-2: silent drop + trace (`slither::policy`), pending untouched,
+nothing recorded. Step-3 winner-side drop: silent + traced, but records the
+loser's timestamp. Writes no basis (winner is initiator ⇒ basis stays `None`).
+
+**DH accounting for the eager path**: 1 (es) + 1 (ss) = 2 to reach the
+tie-break; loser adds 2 (ee, se) for msg2 ⇒ 4 total. Winner stops at 2.
+
+## 7. §6.7 (1564-1662) — comparison only
+
+**The peer with the lexicographically smaller static public key is the winning
+initiator.** Comparison over the canonical static encoding (§2.4) as unsigned
+octet strings — `as_ref()` bytes directly, no `Ord` bound (Appendix A.3).
+Tie-break runs ONLY on an authenticated inbound — after `ss` succeeds. A match
+at `es` selects the path but decides nothing. **A forgery cannot cancel a
+pending.**
+- Our static smaller ⇒ winner: inbound silently dropped, timestamp recorded,
+  basis stays `None`.
+- Peer's static smaller ⇒ we cancel our pending now (post-`ss`; no give-up, no
+  error) and admit + write msg2 as responder (§6.6 step 4).
+
+Stream-parity: tie-break winner is the connection initiator for the life of the
+connection.
+
+## 8. §17.1 / §17.4 — read
+
+§17.1: four write sites, all post-`ss` (key-holder-only): staged
+`authenticate()`, re-homed candidate admission, §6.6 step 4 admit, and the
+**winner-side record** (records without admitting). Revert on `Stale` — the
+winner-side record is the one deliberate exception.
+**Pin outlives its connection by `HANDSHAKE_GIVEUP`** for entries written by
+§6.6 step 4 or by a winner-side record.
+
+§17.4: hint set = pending tables' dialled addresses. Established connections
+contribute **no** hints — the endpoint tracks no per-connection address.
+`replacement_basis`: `Some(t)` when responder (staged accept, re-homed accept,
+**or tie-break loser's admit step §6.6 step 4**); `None` when we dialled (a
+`connect()` completed by msg2, **or a tie-break we won**). Written once at
+install, never updated.
+
+## 9. Current code survey
+
+### `src/core/endpoint/mod.rs` (908 lines)
+- `Pending<I>`: conn, remote, remote_static, remote_static_bytes, peer_mac1,
+  sender_index, state (`InitiatorSent`), next_retransmit, give_up_at,
+  attempt_spent, attempted, guard_pinned.
+- `Endpoint<I>`: config, identity, our_static_bytes, our_mac1, rng, outputs,
+  intros, guard, indices, statics, pendings (BTreeMap<ConnectionId,Pending>),
+  last_init_timestamp, next_connection.
+- `handle_datagram` → `Inbound::Init` arm: mac1 verify then
+  **`park_initiation` unconditionally** — this is where §6.5's hint check +
+  eager path must go.
+- `mint_pending` / `start_attempt` / `build_attempt` / `drop_pending`.
+- `complete_initiation` (msg2 path) → `statics.promote(&key)`, basis stays None.
+- doc comment lines 26-40 ("both are slice 7") and :247 ("Consultation is §6.5,
+  slice 7") — to update.
+
+### `src/core/endpoint/staged.rs` (599 lines)
+- `ChainState`: Parked / Claimed{mid,claimed} / Proven{state,peer,timestamp} /
+  Poisoned.
+- `read_identity_as`: parked → open provider → `read_msg1_intro` → Claimed +
+  `guard.pin(Claimed)`. **No §6.5 step-4 interception yet.**
+- `authenticate`: drives `es` if parked, `complete()` (ss), guard admits+record
+  (provisional undo), promote pin to KeyHolder, → Proven.
+- `accept`: **line 503 `if self.statics.get(&peer_key).is_some() { discard_chain; return Stale }`**
+  — this is the unconditional Stale that covers both LIVE and PENDING, and it
+  calls `discard_chain` which REVERTS the guard record. §6.4:1401-1406 says the
+  winner-side Stale KEEPS its record. That is the bug to fix.
+
+### `src/core/endpoint/tables.rs`
+- `StaticEntry { conn, state: Pending|Live, dialled: Option<SocketAddr>, replacement_basis }`.
+- `StaticMap::insert` carries the `§16.1: one session per peer static` debug_assert.
+- `promote(key)` sets Live + dialled None but **does not touch basis** — §6.6 step 4
+  needs basis = `Some(t)`. Needs a parameter.
+- `hints()` projection already exists.
+
+### `src/core/endpoint/intro_queue.rs`
+- `IntroEntry.consumed` doc already says: "`true` from `read_identity()` (and, in
+  slice 7, from a **freeze-on-carry park**)" — that is §6.5 step 3's demotion.
+- `by_addr` holds unconsumed entries only; `arrive()` does dedup → per-source cap
+  → global cap → park.
+
+### `src/core/endpoint/guard.rs`
+- `GuardEntry.exempt_until` exists, unwritten: "both write sites that set it are
+  slice 7" = §6.6 step 4 admit and the §6.7 winner-side record. **Mine to write.**
+- `record()` returns a `GuardUndo`; `pin`/`unpin`/`promote_pin` with `PinKind`.
+
+### `src/core/mod.rs` (NOT in my owned list — touch only if forced)
+- `EndpointOutput::{Transmit, IntroReady, ToConnection(id, Install), HandshakeFailed(id, ConnectError), Timeout}`.
+- `Install { session: EstablishedSession { seal, open, our_index, peer_index, anchor } }`.
+
+## 10. Design (draft)
+
+### The two routes differ in WHICH connection survives — and the spec says so twice
+- **§6.6 step 4 (internal route)**: the pending's own `Connecting` is resolved by
+  the `Install` — *same* ConnectionId. §6.7: "A connecting (never-established)
+  connection that loses the tie-break is completed by the tie-break's `Install`".
+  Static row goes PENDING→LIVE **in place**, basis None→`Some(t)`.
+- **§6.4 PENDING branch, loser side (staged route)**: the pending's `Connecting`
+  resolves **`Err(ConnectError::AlreadyConnected)`** and `accept()` returns a
+  **fresh** `(ConnectionId, Connection)`. Two connection objects; one survives.
+  Needs `EndpointOutput::HandshakeFailed(dial_conn, ConnectError::AlreadyConnected)`
+  to resolve the dial's `Connecting`.
+
+### §16.1 is why the static row must be mutated, never re-inserted
+`StaticMap::insert`'s debug_assert fires on a second row for one static. On the
+internal route the row must be promoted in place. On the staged route the row
+must be **removed** (with the pending) before the accept's `insert`.
+
+### DH accounting (§6.1 ladder must not move)
+| path | DH |
+|---|---|
+| `src` ∉ hints → park | 0 |
+| eager, claimed ∉ pending remotes → demote | 1 (`es`), and `read_identity()` on it is 0 incremental ⇒ cumulative 1 ✓ |
+| eager, internal, winner | 2 (`es`+`ss`) |
+| eager, internal, loser | 4 (`es`+`ss`+`ee`+`se`) |
+| step-4 interception (parked chain) | `read_identity()` pays `es`, tie-break pays `ss` (+`ee`,`se` if loser) |
+
+§6.5 states the last row's cost openly: the oracle is "exposed both as timing
+(the tie-break's extra `ss`) and as an explicit API discriminator
+(`IntroError::Internal` versus a `Claimed` at one DH less)".
+
+## 15. FINDINGS (running)
+
+### FINDING A — **BLOCKER**: §6.5 step 4 cannot be implemented against §16.4's `read_identity` signature
+
+§16.4's API list (SPEC.md:4451-4468), verbatim:
+
+```
+    fn read_identity(&mut self, id: IntroId) -> Result<PublicKey, IntroError>;
+    fn authenticate(&mut self, now: Instant, id: IntroId) -> ...
+    fn accept(&mut self, now: Instant, id: IntroId) -> ...
+    fn reject(&mut self, now: Instant, id: IntroId);   // [ruling 80]
+```
+
+**`read_identity` is the one staged verb with no `now`.** §6.5 step 4 makes it
+the verb that runs §6.6 — which **records a §17.1 guard entry** (step 3 winner
+and step 4 admit both record), **cancels a pending**, and **installs a
+connection**. `TimestampGuard::record(key, candidate, now)` needs a real
+instant: it stamps `last_admitted` (mitigation (iii)'s LRU recency), stamps
+`orphaned_at` when it creates the entry, and drives `evict_if_over_cap(now)`.
+Ruling 80 forbids fabricating one — "this stamp is the release instant, with no
+watermark, no approximation and no floor to correct one" — and CLAUDE.md's own
+invariant is "`now: Instant` is an argument on **every mutating call**".
+
+**This is ruling 80's defect, third instance.** Ruling 80's text: "the block was
+ratified carrying an invariant it did not satisfy, and the two verbs that had to
+know the time were the two not given it." There are three.
+
+**Why I did not just add the parameter.** `core::Endpoint::read_identity(id)` has
+one call site in `src/shell/driver.rs:754` and **~30 in `src/core/tests.rs`** —
+both files the brief forbids me. Adding `now` would not red a test expectation,
+it would **fail to compile**, taking every gate with it.
+
+**What I did instead** — steps 1-3 of §6.5, §6.6 entire (reached from the eager
+path), and §6.4's PENDING branch entire. Step 4 is left unimplemented with the
+blocker named in `routing.rs`. **The chains step 4 would have caught still
+converge**, by §6.6's own words: "PENDING is not exclusive to this path: a chain
+staged while its static was NONE and accepted after a `connect()` made that
+static PENDING reaches §6.4's PENDING branch instead. That branch is a
+**different route to the same comparison**." The observable deviation is that the
+`Intro` surfaces and the application makes a decision, where §6.5 wants the
+endpoint to swallow it — and §6.5's own false-negative case (NAT port rewrite)
+therefore needs the application to drain `accept()`, which §6.5 already tells it
+to do ("**Applications that dial SHOULD also drain `accept()`**").
+
+**The ruling this needs:** add `now: Instant` to §16.4's `read_identity`, as
+ruling 80 did for `reject` and `handle_connection_event`, and land step 4 with
+the test-file edits that follow.
+
+### FINDING B — working rule 8: `authenticate()`'s ruling-75 drive is a second route to the `es` that §6.5 step 4 does not mention
+
+Ruling 75 lets `authenticate()` drive a skipped `es` on a still-`Parked` chain.
+§6.5 step 4's condition ("a **parked** `Intro`'s claimed static turns out to be
+a pending outbound remote") is therefore satisfied inside `authenticate()` too,
+and §6.5 does not say. **§18.1 settles it**: there is an `IntroError::Internal`
+and there is **no `AuthError::Internal`**, so `authenticate()` has no way to
+report an interception. The interception belongs to the `read_identity()` verb
+alone, and a chain authenticated straight from `Parked` converges on §6.4's
+PENDING branch. Moot in this slice (Finding A), recorded for the slice that
+lands step 4.
+
+### FINDING C — working rule 8: §17.1's `HANDSHAKE_GIVEUP` pin extension names three write sites; §6.6 says there are four
+
+§17.1: "An entry written by the internal tie-break's **admit step (§6.6 step
+4)** or by a **winner-side record** (§6.7, including §6.4's PENDING branch when
+we are the tie-break winner) stays exempt … for `HANDSHAKE_GIVEUP`".
+
+That enumerates: §6.6 step 4 admit, §6.6/§6.7 winner record, §6.4 PENDING
+winner record. It is **silent on §6.4's PENDING loser install** — but §6.6 says
+of §6.4's branch: "loser cancels its pending and installs as responder (**steps
+3-4 below**)", i.e. §6.4's loser install **is** §6.6 step 4 reached by the other
+route, and "the two routes … can never disagree".
+
+§6.7's rationale decides it: the extension exists because "a recycled entry
+re-arms the replay", and the replay it re-arms is *a captured msg1 that cancels
+a pending*. §6.4's loser route cancels a pending on exactly the same captured
+msg1. **Implemented with the extension on all four sites**; the cost of being
+wrong in this direction is one retained 45-byte timestamp for 90 s, and the cost
+of being wrong in the other is the bound §6.7 says "may not be dropped".
+Reported rather than resolved (working rule 3).
+
+### FINDING D — §6.5 is silent on two failures inside its own eager path
+1. **The split intro read fails** (hiss rejects msg1): 1 DH spent, the peer's
+   bytes are at fault, nothing has surfaced. Implemented as a **silent drop**,
+   by parallel with `IntroError::Malformed`'s "the verdict is definitive" — the
+   opposite choice (park it anyway) hands the application a chain it will pay a
+   second DH to fail on.
+2. **`Identity::open()` fails** (ruling 72's locked enclave): 0 DH spent, the
+   fault is **ours** and transient. Implemented as **fall back to parking at
+   stage 0**, which is ruling 72's direction exactly — the packet is fine, we
+   merely could not pay. Dropping it would convert our transient into the
+   peer's terminal.
+Neither is stated. Both are derived from ruling 72's own distinction.
+
+### FINDING E — working rule 8: `Install` carries no role, and §6.7 lets a `connect()`-created connection become the **responder**
+
+§16.4: "*It carries the session and nothing else: with the rekey swap deleted
+(§7.6) there is exactly one install per connection, so no discriminator
+distinguishes them and none is carried.*" §6.7: "**The tie-break winner is the
+connection initiator for the life of the connection: stream-ID parity (§9.1) is
+fixed by this outcome at establishment.**"
+
+§6.6 step 4 resolves the *dial's* `Connecting` with an `Install` on a connection
+that is now the **responder**. Nothing in `Install`, `EstablishedSession`
+(`seal`/`open`/`our_index`/`peer_index`/`anchor`) or `Connection::connecting`
+says so, and `Handshake::Seal` is an associated type with no bounds (ruling
+89's lesson), so it cannot be recovered from hiss either. **A connection core
+that derives §9.1's parity from "I was created by `connect()`" computes the
+wrong parity on exactly this path.** Out of my scope (`src/core/connection/**`
+is the streams track's) and reported for it: this work is what makes the case
+reachable.
+
+## 11. Implementation log

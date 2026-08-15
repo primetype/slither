@@ -26,24 +26,32 @@
 //! # The slice boundary this core knowingly carries
 //!
 //! §5.4's post-`ss` responder rule is three-valued: **LIVE** / **PENDING**
-//! / **NONE**. Only NONE is self-contained in the sections this slice
-//! implements — LIVE needs §6.4's re-home and its `Replaced` teardown,
-//! PENDING needs §6.6–6.7's tie-break, and both are slice 7. Slice 2a
-//! implements NONE fully and returns [`AcceptError::Stale`] for the other
-//! two.
+//! / **NONE**. Two of the three are complete: NONE from slice 2a, and
+//! **PENDING** with ruling 91, which pulled §6.5's routing and §6.6's
+//! internal tie-break forward into this slice — [`routing`] holds both,
+//! and §6.4's PENDING branch is in [`staged`]'s `accept()`.
 //!
-//! `Stale` is *already correct* for the PENDING/tie-break-winner branch. It
-//! is **not** correct in general for LIVE — a replacement whose timestamp
-//! passes both tests must succeed — so that arm is a documented, deliberate
-//! boundary rather than a silent approximation. What it does preserve is
-//! §16.1's **one session per peer static**, which returning `Stale` cannot
-//! violate. Slice 7 replaces the arm.
+//! **LIVE is what remains.** §6.4's re-home walk and its proven-LIVE
+//! replacement admission — the basis check, `ConnectionLost::Replaced`,
+//! and §7.5's contested-connection probe — still return
+//! [`AcceptError::Stale`] here. That is not correct in general: a
+//! replacement whose timestamp passes both the guard and the basis must
+//! succeed. It is a documented, deliberate boundary, and what it preserves
+//! meanwhile is §16.1's **one session per peer static**, which returning
+//! `Stale` cannot violate.
+//!
+//! §6.5's step-4 `read_identity()` interception is also outstanding, for a
+//! reason that is not scheduling: §16.4 gives that verb no `now` and §6.6
+//! cannot record a guard entry without one. [`routing`]'s module docs
+//! state the case, and nothing diverges meanwhile — those chains reach the
+//! same comparison by §6.4's PENDING branch.
 //!
 //! [`poll_output`]: Endpoint::poll_output
 
 pub(crate) mod guard;
 pub(crate) mod handshake;
 pub(crate) mod intro_queue;
+pub(crate) mod routing;
 pub(crate) mod staged;
 pub(crate) mod tables;
 
@@ -226,13 +234,16 @@ impl<I: Identity> Endpoint<I> {
     /// §17.4's `replacement_basis` for a peer static.
     ///
     /// `None` — this endpoint holds no connection for that static.
-    /// `Some(None)` — **we dialled** it.
-    /// `Some(Some(t))` — **we responded** to it, at initiation timestamp `t`.
+    /// `Some(None)` — **we dialled** it, and won or was never raced.
+    /// `Some(Some(t))` — **we responded** to it, at initiation timestamp `t`
+    /// — including a dial that **lost** §6.7's tie-break and installed as
+    /// responder over §6.6 step 4.
     ///
-    /// Not part of §16.4's API. It exists because §6.4 — the basis's only
-    /// reader — is slice 7, so without a reader here the field is written,
-    /// never checked, and a value written wrongly today would surface as a
-    /// slice-7 bug. `pub(crate)`, so it costs the public surface nothing.
+    /// Not part of §16.4's API. §6.4's proven-LIVE admission — the basis's
+    /// only reader — is still a later slice, so without an accessor the
+    /// field is written and never checked, and a value written wrongly
+    /// today would surface as a bug in that slice. `pub(crate)`, so it
+    /// costs the public surface nothing.
     pub(crate) fn replacement_basis(&self, peer_static: &[u8]) -> Option<Option<Timestamp>> {
         self.statics
             .get(peer_static)
@@ -244,8 +255,11 @@ impl<I: Identity> Endpoint<I> {
     /// A projection over the static map rather than a stored set — §17.4
     /// defines the hint set as being those addresses, so deriving it makes
     /// "established connections contribute no hints" true by construction.
-    /// Consultation is §6.5, slice 7; this exists for the same reason as
-    /// [`replacement_basis`](Self::replacement_basis).
+    ///
+    /// §6.5 step 2 consults the same projection through
+    /// [`is_hinted`](Self::is_hinted); this accessor is the *observable*
+    /// form of it, sorted so a test can compare a set without depending on
+    /// `HashMap` iteration order.
     pub(crate) fn hints(&self) -> Vec<SocketAddr> {
         let mut hints: Vec<SocketAddr> = self.statics.hints().collect();
         hints.sort_unstable();
@@ -419,9 +433,12 @@ impl<I: Identity> Endpoint<I> {
                 conn,
                 state: StaticState::Pending,
                 dialled: Some(remote),
-                // §17.4: `None` when we dialled. Written once, never
-                // updated, read only by §6.4 in slice 7.
+                // §17.4: `None` while this is merely a dial. The install
+                // writes the real answer — `None` again for a msg2
+                // completion, `Some(t)` for §6.6 step 4's admission.
                 replacement_basis: None,
+                // No tie-break has written this static's guard entry.
+                guard_exempt: false,
             },
         );
         // §17.1: an in-flight outbound pending pins its static's guard
@@ -541,13 +558,28 @@ impl<I: Identity> Endpoint<I> {
         }));
     }
 
-    /// Release every trace of a pending. Shared by give-up and cancel.
+    /// Release every trace of a pending. Shared by give-up, cancel, and
+    /// §6.4's PENDING branch on the loser side.
+    ///
+    /// **§17.1's `HANDSHAKE_GIVEUP` extension is armed here**, before the
+    /// unpin, when the row says a tie-break wrote this static's guard
+    /// entry. §17.1 dates that window from the connection's death, and for
+    /// a pending this *is* the death — the give-up expiry that §17.1 names
+    /// explicitly ("if that outbound never completed"), or a cancellation.
+    /// Arming before releasing also keeps `unpin` from deleting the entry
+    /// outright when the record is the only thing on it.
     fn drop_pending(&mut self, now: Instant, conn: ConnectionId) -> Option<Pending<I>> {
         let pending = self.pendings.remove(&conn)?;
         if let Some(index) = pending.sender_index {
             self.indices.remove_pending(index);
         }
-        self.statics.remove(&pending.remote_static_bytes);
+        let exempt = self
+            .statics
+            .remove(&pending.remote_static_bytes)
+            .is_some_and(|entry| entry.guard_exempt);
+        if exempt {
+            self.extend_guard_exemption(now, &pending.remote_static_bytes);
+        }
         if pending.guard_pinned {
             self.guard
                 .unpin(&pending.remote_static_bytes, guard::PinKind::KeyHolder, now);
@@ -580,11 +612,16 @@ impl<I: Identity> Endpoint<I> {
                 preimage,
                 mac1,
             } => {
-                // 0 DH so far, and 0 DH through the whole of this arm.
+                // §6.5 step 1 ends here: length gate, classify, mac1 —
+                // one keyed hash, 0 DH, and a failure is the silent drop.
                 if !self.our_mac1.verify(preimage, mac1) {
                     return Disposition::Done;
                 }
-                self.park_initiation(now, src, header.sender_index, msg1);
+                // §6.5 steps 2–3. **Still 0 DH unless `src` is a hint**,
+                // which is the whole design of the hint check: an endpoint
+                // with no dial in flight reaches `park_initiation` having
+                // spent nothing.
+                self.route_initiation(now, src, header.sender_index, msg1);
                 Disposition::Done
             }
 
@@ -704,9 +741,12 @@ impl<I: Identity> Endpoint<I> {
         self.pendings.remove(&conn);
         self.indices.remove_pending(our_index);
         self.indices.insert_session(our_index, conn);
-        // The static stays claimed by this connection, its
-        // `replacement_basis` still `None` — §17.4: `None` when we dialled.
-        self.statics.promote(&key);
+        // The static stays claimed by this connection. §17.4: `None` when
+        // we dialled — "a `connect()` completed by msg2 … neither teaches
+        // us any timestamp of the peer's, because msg2 carries no payload".
+        // §6.6 step 4 is the other way a dialled row installs, and it is
+        // the one that writes `Some(t)`.
+        self.statics.promote(&key, None);
 
         self.emit(EndpointOutput::ToConnection(conn, Install { session }));
     }
@@ -859,8 +899,14 @@ impl<I: Identity> Endpoint<I> {
                 // stamp it with. §16.4's own invariant already required
                 // one: this is a mutating call.
                 if self.drop_pending(now, id).is_none()
-                    && let Some(key) = self.statics.remove_by_connection(id)
+                    && let Some((key, entry)) = self.statics.remove_by_connection(id)
                 {
+                    // §17.1's extension, dated from this connection's death
+                    // — the instant the bullet names. Armed before the
+                    // release, for the reason `drop_pending` states.
+                    if entry.guard_exempt {
+                        self.extend_guard_exemption(now, &key);
+                    }
                     // A live connection is a key-holder pin (ruling 77):
                     // reaching it took the peer's key, and this release is
                     // the one ruling 73's security argument is about.

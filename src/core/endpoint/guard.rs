@@ -8,11 +8,13 @@
 //! # Every write site is post-`ss`
 //!
 //! §17.1 has four write sites and all four sit **after** the proving `ss`,
-//! so **only a key-holder can write a guard entry**. Slice 2a implements
-//! one of them — `authenticate()` on the staged path. The other three
-//! (§6.4's re-homed admission, §6.6's tie-break admit, §6.7's winner-side
-//! record) are slice 7, and [`GuardEntry::exempt_until`] exists from the
-//! start so slice 7 adds a call rather than a migration.
+//! so **only a key-holder can write a guard entry**. Three are implemented:
+//! `authenticate()` on the staged path, §6.6 step 4's tie-break admit, and
+//! §6.7's winner-side record (by either of §6.6's two routes). §6.4's
+//! **re-homed** candidate admission is the one still outstanding.
+//! [`GuardEntry::exempt_until`] was shaped for the last two from the start,
+//! and ruling 91 spent it as predicted — one added call
+//! ([`TimestampGuard::extend_exemption`]), no migration.
 //!
 //! **The initiator path never touches this.** §17.1: for a static we only
 //! ever dialled "we hold no entry at all — every §17.1 write site is a
@@ -119,9 +121,9 @@ pub(crate) struct GuardEntry {
     /// and the `Claimed` holder cannot move it.
     pub(crate) keyholder_pins: u32,
     /// §6.6/§6.7's `HANDSHAKE_GIVEUP` extension past the connection's
-    /// death. Unreachable in slice 2a — both write sites that set it are
-    /// slice 7 — and present so that slice 7 does not have to reshape the
-    /// entry.
+    /// death, written by [`extend_exemption`](TimestampGuard::extend_exemption)
+    /// at the instant the entry's last §17.1 pin is released — which is the
+    /// instant §17.1 dates the window from, for both of the cases it names.
     pub(crate) exempt_until: Option<Instant>,
     /// LRU recency. **Admission only** (mitigation (iii)): it refreshes on
     /// a successful post-`ss` record and never on a failed check, which is
@@ -407,6 +409,40 @@ impl TimestampGuard {
         // runs from is fixed here, by the key-holder, and stays fixed.
         if kind == PinKind::KeyHolder && entry.keyholder_pins == 0 {
             entry.orphaned_at = Some(now);
+        }
+    }
+
+    /// §17.1's `HANDSHAKE_GIVEUP` extension, dated by the caller.
+    ///
+    /// *"An entry written by the internal tie-break's admit step (§6.6 step
+    /// 4) or by a **winner-side record** (§6.7, including §6.4's PENDING
+    /// branch when we are the tie-break winner) stays exempt from orphan
+    /// aging **and** LRU eviction for `HANDSHAKE_GIVEUP` (90 s) after the
+    /// connection it belongs to dies."*
+    ///
+    /// Both halves of that come for free from
+    /// [`exempt_until`](GuardEntry::exempt_until), which was shaped for
+    /// this and is read by [`GuardEntry::age_deadline`] (aging) and by
+    /// [`GuardEntry::pinned`] (the LRU). This is the call the module docs
+    /// promised in place of a migration.
+    ///
+    /// # The instant is the caller's, and it is a floor
+    ///
+    /// The endpoint knows when the connection died; the guard does not,
+    /// and §17.1 dates the window from that death. An existing exemption
+    /// is extended, never shortened — a second tie-break write against a
+    /// static whose first connection has already died must not pull the
+    /// first one's window in.
+    ///
+    /// Absent entries are a no-op: like [`pin`](Self::pin), this **never
+    /// creates an entry**. An extension exists to protect a record, and
+    /// there is nothing to protect where no key-holder ever wrote one.
+    pub(crate) fn extend_exemption(&mut self, key: &[u8], until: Instant) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        if entry.exempt_until.is_none_or(|current| until > current) {
+            entry.exempt_until = Some(until);
         }
     }
 

@@ -140,11 +140,26 @@ impl<I: Identity> Endpoint<I> {
     ///
     /// # Cumulative, not incremental
     ///
-    /// A chain that already carries a mid-state — §6.5's pre-read entry, or
-    /// slice 7's eager-demoted one — returns its cached result at **0
-    /// incremental DH**, and §6.1 is explicit that the cumulative table is
-    /// unchanged either way. Any assertion about cost has to be cumulative
-    /// to be true of both.
+    /// A chain that already carries a mid-state — §6.5 step 3's
+    /// eager-demoted entry — returns its cached result at **0 incremental
+    /// DH**, and §6.1 is explicit that the cumulative table is unchanged
+    /// either way. Any assertion about cost has to be cumulative to be true
+    /// of both. The early returns below are what make §6.5's "and
+    /// `read_identity()` on it returns the cached claim at 0 incremental
+    /// DH" true.
+    ///
+    /// # §6.5 step 4's interception is **not** here
+    ///
+    /// §6.5 makes this verb the backstop for a crossing msg1 whose source
+    /// the hint check missed: the endpoint would run §6.6's internal
+    /// tie-break and answer [`IntroError::Internal`]. §6.6 records a §17.1
+    /// guard entry, [`TimestampGuard::record`] needs the instant, and
+    /// §16.4 gives this verb no `now` — see [`routing`](super::routing)'s
+    /// module docs for the case that needs a ruling. Nothing diverges
+    /// meanwhile; those chains reach the same comparison through §6.4's
+    /// PENDING branch at `accept()`.
+    ///
+    /// [`TimestampGuard::record`]: super::guard::TimestampGuard::record
     ///
     /// # Idempotent (**ruling 74**)
     ///
@@ -362,10 +377,17 @@ impl<I: Identity> Endpoint<I> {
                     // Ruling 72's other half: the peer's bytes really are at
                     // fault, and this is what `HandshakeFailed` is for.
                     IntroError::Malformed => AuthError::HandshakeFailed,
-                    // Neither is reachable from the core — `Internal` is §6.5's
-                    // shell interception and `EndpointDropped` is the driver
-                    // stopping — so answer with the lifecycle variant rather
-                    // than the security one.
+                    // Neither is reachable **from here**, and the reasons
+                    // differ. `EndpointDropped` is the driver stopping, which
+                    // the core cannot report. `Internal` is §6.5 step 4's
+                    // interception, which belongs to the `read_identity()`
+                    // verb and not to ruling 75's drive of the same `es`:
+                    // §18.1 has an `IntroError::Internal` and **no
+                    // `AuthError::Internal`**, so a chain authenticated
+                    // straight from `Parked` is not intercepted — it reaches
+                    // the identical comparison at `accept()`, by §6.4's
+                    // PENDING branch. Either way, answer with the lifecycle
+                    // variant rather than the security one.
                     IntroError::Internal | IntroError::EndpointDropped => AuthError::Expired,
                 })?;
         }
@@ -464,19 +486,37 @@ impl<I: Identity> Endpoint<I> {
     /// The session anchors at the **msg1 source address** (§5.6), which is
     /// what arms §7.3's amplification budget; the budget itself is slice 7.
     ///
-    /// # §5.4's three-valued rule, and this slice's boundary
+    /// # §5.4's three-valued rule, and where each value goes
     ///
-    /// The proven static is looked up in the static map: **LIVE** and
-    /// **PENDING** both return [`AcceptError::Stale`] here. `Stale` is
-    /// already the correct answer for PENDING (§6.4's tie-break-winner
-    /// branch); for LIVE it is a knowing, documented boundary — §6.4's
-    /// replacement admission is slice 7 — and what it preserves meanwhile
-    /// is §16.1's one-session-per-peer invariant, which returning `Stale`
-    /// cannot violate.
+    /// The proven static is looked up in the static map.
     ///
-    /// Either way the chain's provisional guard record is **reverted**:
-    /// §17.1 mitigation (i) names an `accept()` that returns `Stale`
-    /// alongside a dropped chain.
+    /// * **NONE** — the ordinary fresh install below.
+    /// * **PENDING** — §6.4's PENDING branch, which applies **§6.7's
+    ///   comparison over the same ordered pair of statics**. Winner:
+    ///   [`AcceptError::Stale`], the pending left in place, and the guard
+    ///   record **kept**. Loser: the pending is cancelled, its `Connecting`
+    ///   resolves `Err(ConnectError::AlreadyConnected)`, and this call
+    ///   proceeds as an ordinary fresh install with this endpoint as
+    ///   responder. §6.6 calls this "a **different route to the same
+    ///   comparison**", so both halves call the same functions §6.6's
+    ///   internal route does — see [`routing`](super::routing).
+    /// * **LIVE** — still [`AcceptError::Stale`], and that one is a knowing
+    ///   boundary: §6.4's re-home walk and its proven-LIVE replacement
+    ///   admission are a later slice. What `Stale` preserves meanwhile is
+    ///   §16.1's one-session-per-peer invariant, which it cannot violate.
+    ///
+    /// # The guard record, and its one exception
+    ///
+    /// A `Stale` normally **reverts** the chain's provisional record —
+    /// §17.1 mitigation (i) names "an `accept()` that returns
+    /// `AcceptError::Stale`" alongside a dropped chain. §6.4 carves out
+    /// exactly one case: *"the tie-break-**winner** case of the PENDING
+    /// branch below returns `Stale` and **keeps** its record — that record
+    /// *is* the point of the branch (§6.7's winner-side record), the write
+    /// that denies a later replay of that same initiation the vacuous
+    /// guard pass it would otherwise enjoy. **No other `Stale` leaves a
+    /// record behind.**"* The LIVE arm and the not-proven arms therefore
+    /// still revert, and only the winner arm does not.
     pub(crate) fn accept(
         &mut self,
         now: Instant,
@@ -500,9 +540,28 @@ impl<I: Identity> Endpoint<I> {
             }
         };
 
-        if self.statics.get(&peer_key).is_some() {
-            self.discard_chain(now, id);
-            return Err(AcceptError::Stale);
+        // §5.4's three-valued rule. `lost_tiebreak` rides through to the
+        // install because §17.1's `HANDSHAKE_GIVEUP` extension attaches to
+        // the row this call is about to write, not to the one it removed.
+        let mut lost_tiebreak = false;
+        match self
+            .statics
+            .get(&peer_key)
+            .map(|entry| (entry.state, entry.conn))
+        {
+            None => {}
+            Some((StaticState::Live, _)) => {
+                self.discard_chain(now, id);
+                return Err(AcceptError::Stale);
+            }
+            Some((StaticState::Pending, dial)) => {
+                if self.wins_tiebreak(&peer_key) {
+                    self.keep_winner_side_record(now, id, dial, &peer_key, timestamp);
+                    return Err(AcceptError::Stale);
+                }
+                self.cancel_pending_losing_tiebreak(now, dial);
+                lost_tiebreak = true;
+            }
         }
 
         // §16.6: the sub-seed is drawn at connection creation, before the
@@ -547,8 +606,13 @@ impl<I: Identity> Endpoint<I> {
                 // §17.4: established connections contribute no hints.
                 dialled: None,
                 // §17.4: `Some(t)` when **we responded**. Written once and
-                // never updated; §6.4 in slice 7 is its only reader.
+                // never updated; §6.4's admission is its only reader.
                 replacement_basis: Some(timestamp),
+                // §17.1's `HANDSHAKE_GIVEUP` extension — see
+                // `keep_winner_side_record` for the reading this rests on.
+                // An ordinary NONE-path accept is an ordinary staged
+                // admission and gets none.
+                guard_exempt: lost_tiebreak,
             },
         );
 
@@ -594,6 +658,69 @@ impl<I: Identity> Endpoint<I> {
     fn discard_chain(&mut self, now: Instant, id: IntroId) {
         if let Some(entry) = self.intros.remove(id) {
             self.release_chain_guard_state(now, entry.guard_undo, entry.guard_pin);
+        }
+    }
+
+    /// §6.4's PENDING branch, **winner side**: refuse, keep the pending,
+    /// and keep the record.
+    ///
+    /// *"`accept()` returns `AcceptError::Stale`, the pending is **left in
+    /// place**, and the candidate's timestamp is **recorded** in the guard
+    /// exactly as §6.7's winner-side record does (§17.1) — the candidate
+    /// authenticated post-`ss`, so the write is a key-holder write like
+    /// every other."*
+    ///
+    /// # Why this is `discard_chain`'s opposite, and why that is right
+    ///
+    /// [`discard_chain`](Self::discard_chain) reverts §17.1's provisional
+    /// write, which is mitigation (i) and correct for every other refusal.
+    /// Here it would be **wrong**, and §17.1 says so from the other side:
+    /// the winner's record is one of its four write sites, made precisely
+    /// so "a later replay of that same initiation" cannot enjoy "the
+    /// vacuous guard pass it would otherwise enjoy against an endpoint
+    /// that has admitted nothing from this peer". `authenticate()` already
+    /// wrote the candidate's timestamp; **keeping** it — dropping the
+    /// `GuardUndo` unused — *is* the winner-side record. Writing it again
+    /// would be the same value at the same instant.
+    ///
+    /// The chain's **pin** still goes: §17.1 pins an entry while "a staged
+    /// mid-state exists for its static", and this call is where that
+    /// mid-state stops existing. The record is what stays, not the pin.
+    /// The entry survives the release regardless, because the pending
+    /// holds a pin of its own — and if it does not yet, this takes it
+    /// (see [`record_tiebreak_timestamp`]).
+    ///
+    /// Ordering against `unpin` is deliberate: the exemption is armed and
+    /// the pending's pin secured **before** the chain's pin is released,
+    /// so the entry is never momentarily an unpinned, unexempt orphan.
+    ///
+    /// [`record_tiebreak_timestamp`]: Endpoint::record_tiebreak_timestamp
+    fn keep_winner_side_record(
+        &mut self,
+        now: Instant,
+        id: IntroId,
+        dial: ConnectionId,
+        peer_key: &[u8],
+        timestamp: Timestamp,
+    ) {
+        // The **candidate's** timestamp, which `authenticate()` has already
+        // written at this same key — so this is idempotent against that
+        // write, and what it adds is §17.1's `HANDSHAKE_GIVEUP` extension
+        // and the pin `mint_pending` could not take.
+        debug_assert_eq!(
+            self.guard.greatest(peer_key),
+            Some(timestamp),
+            "§17.1: `authenticate()` recorded this candidate before `accept()` ran"
+        );
+        self.record_tiebreak_timestamp(now, dial, peer_key, timestamp);
+
+        if let Some(entry) = self.intros.remove(id) {
+            if let Some(pin) = entry.guard_pin {
+                self.guard.unpin(&pin.key, pin.kind, now);
+            }
+            // **Not** reverted. §6.4: "No other `Stale` leaves a record
+            // behind" — this is the other one.
+            drop(entry.guard_undo);
         }
     }
 }

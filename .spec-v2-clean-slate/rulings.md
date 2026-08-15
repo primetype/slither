@@ -1958,3 +1958,55 @@ case did not arise. The verdict survives on other grounds — loud failure
 over silent non-conformance — but not on the grounds I gave. *An
 orchestrator's reasoning is not evidence, and an agent that adopts it
 instead of checking it has been made useless.*
+
+**Amendment to ruling 91 — §6.4's PENDING branch comes too.** Ruling 91
+attributed the 90-second regression to "the absence of §6.5's routing and
+§6.6's internal tie-break completion". That is **right for the peer side
+and incomplete for the accepting side.** §6.4:1436 says in terms:
+
+> "This is the branch that closes the `read_identity()` → `connect()` →
+> `accept()` ordering — the static was NONE when the chain was staged and
+> became PENDING before it was accepted, so §6.5's interception, which
+> fires when a *parked* `Intro`'s claim turns out to be a pending
+> outbound remote, **cannot fire on a chain the application already
+> holds**."
+
+`staged.rs` returns a flat `AcceptError::Stale` for PENDING, documented
+as a slice-7 boundary. Land §6.5 and §6.6 and leave that arm, and the
+headline property does not hold **at `now`**: the flow self-heals about
+five seconds later off the peer's next retransmit, which §6.5's eager
+path does catch — but §6.4 promises immediately. Both sides of the
+branch are therefore in slice 4, including that the winner-side `Stale`
+is **the one refusal that keeps its §17.1 guard record** (§6.4:1401-1406)
+where every other reverts it.
+
+*Found by the independent test author*, working from the spec in an
+isolated worktree, before the implementer had finished. That isolation
+was added this slice precisely because it leaked in 3b; it paid on its
+first use.
+
+**A gap ruling 90 created that §6.5 predates**, recorded rather than
+resolved: `mint_pending` without `start_attempt` is a pending with **no
+initiation in flight**. §6.5 speaks of "in-flight outbound initiations"
+and §17.4 of "the pending tables' dialled addresses" — those named the
+same set before ruling 90 and no longer do, and the same ambiguity
+reaches §6.4's PENDING branch ("if an in-flight outbound initiation
+exists").
+
+### The pattern is accelerating and that is the finding
+
+*A ruling's blast radius includes the ruling* now has six instances —
+64's own rationale, 70→73, 81→84, 87→90, 90's amendment, and 91's. **The
+last three needed amending within a day of being written, and two of
+those were rulings whose subject was this very defect.** The rate is the
+signal, not the count: rulings written *about* under-scoped constructions
+are not thereby immune to being under-scoped, and writing one while
+holding the pattern in mind demonstrably does not help.
+
+What has caught every instance is the same thing — **an independent agent
+working from the spec text alone, with no sight of the reasoning that
+produced the ruling.** Not review of the ruling, which has never once
+caught one. That is an argument for keeping the blind authors even where
+they look redundant, and against the intuition that a ruling the
+maintainer has just reasoned through carefully needs less checking than
+one they have not.
