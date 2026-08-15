@@ -2099,7 +2099,38 @@ that index inert (§9.2), so the contribution never moves again.
 The sender still stalls at the *stream* window — §16.2 accepts that and
 no slither frame can cure it — but the **connection** window and the
 **cumulative stream allowance** are both released, which closes both
-wedges. §16.2's mechanism sentence is amended to match.
+wedges. §16.2's mechanism sentence is amended to match, and so is §9.7's
+free-condition bullet, which encoded the same overturned rule a third
+time — found by grepping the *rationale* after the two obvious sites were
+already fixed (working rule 4).
+
+**Amended: "later frames are inert by §9.2's watermark" is true for uni
+and false for bidi.** The first draft of this ruling said subsequent
+frames for an abandoned index are inert by the watermark rule. That holds
+for a **peer-opened uni** stream, where the receive half is the only half
+this endpoint holds, so freeing it makes the stream fully closed (§9.7),
+advances the watermark, and earns the peer its MAX_STREAMS grant. It does
+**not** hold for a **bidi** stream: our send half is still live, the
+stream is not fully closed, the watermark does not move, and the index
+stays in the open set. Later frames there are neither implicit opens nor
+watermark no-ops — they are discarded by §16.2's own "arrivals for it are
+discarded", consuming no further credit because §10.3's true-up is
+absolute and that stream's contribution already sits at its maximum. The
+stream-level `FLOW_CONTROL_ERROR` check still runs against the frozen
+limit, which is what stops an abandoned half becoming an unbounded sink.
+
+Relying on the watermark alone **resurrects** an abandoned bidi receive
+half on the next frame and double-charges the cumulative limit; relying
+on a per-half tombstone alone never advances the uni watermark and never
+grants the peer its credit. Both mechanisms are required, and the ruling
+originally named only one.
+
+*Found while checking this round's own amendments, not by review of the
+ruling* — the same method, and the same result, as the seven instances
+the round's closing section counts. **What bounds "subsequent frames are
+inert"? The space does, and the ruling did not say.** That is defect
+class 1 inside a ruling of round 17, which is defect class 2. The two
+classes are the same class seen from two distances.
 
 *Two tests, and the second is the one that matters.*
 `a_dropped_recv_stream_releases_connection_credit_at_once` separates this

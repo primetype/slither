@@ -3041,8 +3041,9 @@ Stream state is freed eagerly:
   acknowledged (`ResetRecvd`);
 - a **receive half** frees when the application has read to the final
   size (`DataRead`), or has observed the reset (`ResetRead`), or — for an
-  abandoned handle — when the final size is reached with no reader
-  (§16.2);
+  abandoned handle — **at the moment of abandonment** (§16.2, ruling 93:
+  it does not wait for a final size that a sender stalled at the stream
+  window has no reason to send);
 - a stream is **fully closed** when its halves (one for uni, two for
   bidi) are freed; full closure is what earns the peer a MAX_STREAMS
   credit (§10.4).
@@ -4353,7 +4354,29 @@ reason to reset; with `STOP_SENDING` deferred (§19) slither cannot ask.
 So no final size was ever pinned, no retirement ever ran, and four
 abandoned 256 KiB streams wedged the 1 MiB connection window for the
 connection's life. §10.3's list, which names "handle abandoned" among the
-retirements, held the correct rule. Dropping every handle stops the driver and every
+retirements, held the correct rule.
+
+*Two different mechanisms make later arrivals inert, and which one applies
+depends on the space.* For a **peer-opened uni** stream the abandoned
+receive half is the only half this endpoint holds, so freeing it makes the
+stream **fully closed** (§9.7): the watermark advances, §9.2 makes every
+later frame naming that index a no-op, and the peer earns its MAX_STREAMS
+grant (§10.4). For a **bidi** stream the send half is still ours and still
+live, so the stream is **not** fully closed, the watermark does **not**
+advance, and the index remains in the open set — later STREAM frames for
+it are neither implicit opens nor watermark no-ops. They are discarded by
+§16.2's own rule ("arrivals for it are discarded"): ACKed, delivered
+nowhere, consuming no further credit, because §10.3's true-up is absolute
+and that stream's contribution is already at its maximum. The stream-level
+`FLOW_CONTROL_ERROR` check still applies against the frozen advertised
+limit, which is what keeps an abandoned half from becoming an unbounded
+sink.
+
+An implementation that relies on the watermark alone re-opens an abandoned
+bidi receive half on the next frame — resurrecting freed state and
+double-charging the cumulative limit — and one that relies on the
+per-half tombstone alone never advances the watermark for uni and never
+grants the peer its MAX_STREAMS credit. **Both are needed.** Dropping every handle stops the driver and every
 connection dies silently — nothing transmitted (§15.4).
 
 **Where those two rules coincide, nothing is transmitted.**
