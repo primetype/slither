@@ -40,11 +40,9 @@
 //! meanwhile is §16.1's **one session per peer static**, which returning
 //! `Stale` cannot violate.
 //!
-//! §6.5's step-4 `read_identity()` interception is also outstanding, for a
-//! reason that is not scheduling: §16.4 gives that verb no `now` and §6.6
-//! cannot record a guard entry without one. [`routing`]'s module docs
-//! state the case, and nothing diverges meanwhile — those chains reach the
-//! same comparison by §6.4's PENDING branch.
+//! §6.5 is complete, step 4 included: **[RATIFIED 2026/08/15 — ruling 92]**
+//! gave `read_identity` the `now` §6.6's guard record needs, which is what
+//! the verb had been blocked on.
 //!
 //! [`poll_output`]: Endpoint::poll_output
 
@@ -54,13 +52,13 @@ pub(crate) mod guard;
 // author working in an isolated git worktree, blind to this directory
 // (working rule 6). Declared at integration so neither agent could reach
 // the other's file.
-#[cfg(test)]
-mod tests;
 pub(crate) mod handshake;
 pub(crate) mod intro_queue;
 pub(crate) mod routing;
 pub(crate) mod staged;
 pub(crate) mod tables;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;

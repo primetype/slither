@@ -751,7 +751,12 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 self.dispatch_intros();
             }
             Command::ReadIdentity(id, reply) => {
-                let result = self.shell.state.borrow_mut().endpoint.read_identity(id);
+                let result = self
+                    .shell
+                    .state
+                    .borrow_mut()
+                    .endpoint
+                    .read_identity(now(), id);
                 drop(reply.send(result));
             }
             Command::Authenticate(id, reply) => {

@@ -457,7 +457,7 @@ fn the_drain_always_terminates_in_timeout() {
     let _ = b.feed(t, v4(4, 4), b"not a slither packet");
 
     // the staged verbs, and reject()
-    let _ = b.ep.read_identity(intro);
+    let _ = b.ep.read_identity(t, intro);
     let _ = b.drain();
     let _ = b.ep.authenticate(t, intro);
     let _ = b.drain();
@@ -667,7 +667,7 @@ fn read_identity_costs_one_dh() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     assert_eq!(b.dhs.get(), 0, "the arrival itself is free");
 
-    let claimed = b.ep.read_identity(id).expect("a real msg1 is readable");
+    let claimed = b.ep.read_identity(t, id).expect("a real msg1 is readable");
     let _ = b.drain();
     assert_eq!(b.dhs.get(), 1, "read_identity is exactly one DH");
     assert_eq!(
@@ -685,7 +685,7 @@ fn reject_at_claimed_costs_one_dh() {
     let (mut a, mut b) = pair(t);
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
 
     b.ep.reject(t, id);
@@ -703,7 +703,7 @@ fn authenticate_costs_two_dh_cumulative() {
     let (mut a, mut b) = pair(t);
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
 
     let (peer, _ts) = b.ep.authenticate(t, id).expect("a real msg1 authenticates");
@@ -721,7 +721,7 @@ fn reject_at_proven_costs_two_dh_and_installs_nothing() {
     let (mut a, mut b) = pair(t);
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -750,7 +750,7 @@ fn accept_fast_path_costs_four_dh() {
     let (mut a, mut b) = pair(t);
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -825,7 +825,7 @@ fn a_completed_dial_costs_four_dh_end_to_end() {
     assert_eq!(a.dhs.get(), 2);
 
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -1357,7 +1357,7 @@ fn read_identity_frees_the_stage0_slot_and_the_chain_is_never_byte_replaced() {
     let original_index = init_sender_index(&msg1);
 
     let consumed = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(consumed).expect("readable");
+    b.ep.read_identity(t, consumed).expect("readable");
     let _ = b.drain();
 
     // A later initiation from the very same SocketAddr.
@@ -1402,9 +1402,12 @@ fn the_per_source_cap_counts_consumed_and_unconsumed_together() {
     }
 
     // Consume two of them — net zero for the count.
-    b.ep.read_identity(ids[0]).expect("readable");
+    // Ruling 92 gave `read_identity` a `now`; the loop's `now` is out of
+    // scope here, so its last value is named rather than re-derived.
+    let consumed_at = t + Duration::from_secs((INTRO_MAX_PER_SOURCE - 1) as u64);
+    b.ep.read_identity(consumed_at, ids[0]).expect("readable");
     let _ = b.drain();
-    b.ep.read_identity(ids[1]).expect("readable");
+    b.ep.read_identity(consumed_at, ids[1]).expect("readable");
     let _ = b.drain();
     // `a` and `b` hold separate counters, so this is the responder's own
     // spend: two `es`, one per consumed chain.
@@ -1445,7 +1448,7 @@ fn an_all_consumed_source_drops_the_arrival() {
     let mut ids = Vec::new();
     for n in 0..INTRO_MAX_PER_SOURCE {
         let id = b.feed(t, v4(ip, 100 + n as u16), &msg1).one_intro().0;
-        b.ep.read_identity(id).expect("readable");
+        b.ep.read_identity(t, id).expect("readable");
         let _ = b.drain();
         ids.push(id);
     }
@@ -1490,7 +1493,7 @@ fn overflow_never_evicts_a_consumed_chain() {
 
     // The oldest entry, consumed.
     let consumed = b.feed(t, v4(11, 11), &msg1).one_intro().0;
-    b.ep.read_identity(consumed).expect("readable");
+    b.ep.read_identity(t, consumed).expect("readable");
     let _ = b.drain();
 
     // A younger unconsumed one fills the queue.
@@ -1539,7 +1542,7 @@ fn a_wholly_consumed_queue_drops_the_arrival() {
     let mut ids = Vec::new();
     for n in 0..2u8 {
         let id = b.feed(t, v4(20 + n, 11), &msg1).one_intro().0;
-        b.ep.read_identity(id).expect("readable");
+        b.ep.read_identity(t, id).expect("readable");
         let _ = b.drain();
         ids.push(id);
     }
@@ -1625,7 +1628,7 @@ fn a_consumed_chain_expires_fifteen_seconds_after_its_initiation() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
 
     let consumed_at = t + Duration::from_secs(10);
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(consumed_at, id).expect("readable");
     let _ = b.timeout(consumed_at);
 
     assert!(b.present(id), "the chain died before its initiation's TTL");
@@ -1656,7 +1659,10 @@ fn the_staged_verbs_on_an_expired_id_report_expired() {
     let after = t + INTRO_TTL;
     let _ = b.timeout(after);
 
-    assert!(matches!(b.ep.read_identity(id), Err(IntroError::Expired)));
+    assert!(matches!(
+        b.ep.read_identity(after, id),
+        Err(IntroError::Expired)
+    ));
     let _ = b.drain();
     assert!(matches!(
         b.ep.authenticate(after, id),
@@ -1726,7 +1732,7 @@ fn an_established_index_still_routes_while_the_queue_is_saturated() {
     // Establish one connection, responder side.
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -1789,7 +1795,8 @@ fn ladder_to_proven(
     msg1: &[u8],
 ) -> (IntroId, Result<Timestamp, AuthError>) {
     let id = b.feed(now, src, msg1).one_intro().0;
-    b.ep.read_identity(id).expect("a real msg1 is readable");
+    b.ep.read_identity(now, id)
+        .expect("a real msg1 is readable");
     let _ = b.drain();
     let r = b.ep.authenticate(now, id).map(|(_pk, ts)| ts);
     let _ = b.drain();
@@ -1933,7 +1940,7 @@ fn authenticate_then_reject_clears_the_record_even_when_another_chain_pins_the_e
     // but a **second pin** on the entry a key-holder just wrote (§17.1's
     // bounded exception).
     let chain_b = b.feed(t, v4(31, 2), &train[0]).one_intro().0;
-    b.ep.read_identity(chain_b)
+    b.ep.read_identity(t, chain_b)
         .expect("a real msg1 is readable");
     let _ = b.drain();
 
@@ -1972,7 +1979,7 @@ fn a_claimed_chain_creates_no_guard_entry() {
 
     // Reach Claimed and stop. train[1] is the *newer* initiation.
     let id = b.feed(t, v4(32, 1), &train[1]).one_intro().0;
-    b.ep.read_identity(id).expect("a real msg1 is readable");
+    b.ep.read_identity(t, id).expect("a real msg1 is readable");
     let _ = b.drain();
     assert_eq!(b.dhs.get(), 1, "Claimed is one DH");
     assert_eq!(
@@ -2043,12 +2050,19 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
     //     creates the entry, and it takes the mid-state's pin.
     let inbound = real_msg1(&mut b, t, &a);
     let at = t + Duration::from_secs(1);
-    // From an address A never dialled: §6.5 sends a crossing msg1 that
-    // arrives at the **dialled** address to §6.6's internal tie-break,
-    // where no staged mid-state is ever created. The shape this test needs
-    // — a dial and a staged mid-state coexisting on one static — survives
-    // §6.5 only through the hint check's false negative.
-    let (_chain, admitted) = ladder_to_proven(&mut a, at, v4(2, 3), &inbound);
+    // Two adjustments, both forced by §6.5/§6.6 and neither touching an
+    // assertion. (a) From an address A never dialled: a crossing msg1 that
+    // arrives at the **dialled** address goes to §6.6's internal tie-break,
+    // where no staged mid-state is ever created. (b) Reached through
+    // ruling 75's `authenticate()` rather than the full ladder: §6.5
+    // step 4 intercepts `read_identity()` when the claim is a pending
+    // outbound remote, and §18.1 gives `authenticate()` no way to report
+    // an interception, so that verb is the route to `Proven` that survives
+    // a live dial. Both leave this test's shape — a dial and a staged
+    // mid-state coexisting on one static — exactly as it was.
+    let chain = a.feed(at, v4(2, 3), &inbound).one_intro().0;
+    let admitted = a.ep.authenticate(at, chain).map(|(_pk, ts)| ts);
+    let _ = a.drain();
     let ts = admitted.expect("we hold no entry for a static we dialled, so this passes vacuously");
     assert_eq!(a.ep.greatest(b.canonical()), Some(ts));
     assert_eq!(
@@ -2113,12 +2127,15 @@ fn a_dialled_static_holds_no_guard_entry() {
     let (_conn, _d) = a.connect(t, b.addr, &peer_b);
 
     // B dials A with a far older timestamp; A receives it **from an
-    // address A never dialled**, so §6.5's hint check misses and the
-    // initiation takes the ordinary staged path. Delivering it from
-    // `b.addr` would be a simultaneous open, which §6.5 routes to the
-    // internal tie-break — a different rule, and not this test's.
+    // address A never dialled**, so §6.5's hint check misses. It is then
+    // driven by ruling 75's `authenticate()` rather than the full ladder,
+    // because §6.5 step 4 intercepts `read_identity()` while the claim is
+    // a pending outbound remote. `authenticate()` is where §17.1's guard
+    // check — the whole subject of this test — runs either way.
     let msg1_from_b = real_msg1(&mut b, t, &a);
-    let (_id, r) = ladder_to_proven(&mut a, t, v4(2, 3), &msg1_from_b);
+    let id = a.feed(t, v4(2, 3), &msg1_from_b).one_intro().0;
+    let r = a.ep.authenticate(t, id).map(|(_pk, ts)| ts);
+    let _ = a.drain();
     assert!(
         r.is_ok(),
         "the dial wrote a guard entry for a static we only dialled: {r:?}"
@@ -2327,7 +2344,7 @@ fn connect_to_a_static_with_a_live_connection_is_already_connected() {
     let msg1 = real_msg1(&mut a, t, &b);
 
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -2384,7 +2401,8 @@ fn forged_resp(initiator: &Ep, sender_index: u32, receiver_index: u32, filler: u
 /// complete.
 fn genuine_msg2(b: &mut Ep, now: Instant, src: SocketAddr, msg1: &[u8]) -> Vec<u8> {
     let id = b.feed(now, src, msg1).one_intro().0;
-    b.ep.read_identity(id).expect("a real msg1 is readable");
+    b.ep.read_identity(now, id)
+        .expect("a real msg1 is readable");
     let _ = b.drain();
     b.ep.authenticate(now, id).expect("authenticates");
     let _ = b.drain();
@@ -2629,7 +2647,7 @@ fn msg2_from_a_different_address_still_completes() {
     let msg1 = real_msg1(&mut a, t, &b);
 
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -2654,7 +2672,7 @@ fn completion_installs_exactly_once() {
     let (mut a, mut b) = pair(t);
     let msg1 = real_msg1(&mut a, t, &b);
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -2882,7 +2900,7 @@ fn the_responder_answers_the_msg1_source_address() {
     assert_ne!(spoofed, a.addr);
 
     let id = b.feed(t, spoofed, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -2907,7 +2925,7 @@ fn the_response_header_answers_the_initiators_index() {
     let initiator_index = init_sender_index(&msg1);
 
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
-    b.ep.read_identity(id).expect("readable");
+    b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
@@ -3032,8 +3050,11 @@ fn a_parked_decision_survives_unrelated_activity_until_its_ttl() {
         let _ = b.datagram(now, v4(61, 1), &data_packet(0xABCD, n, 32));
     }
     assert!(b.present(id), "the parked chain did not survive the churn");
+    // Ruling 92's `now`: the churn loop's last instant, named because the
+    // loop binding has gone out of scope.
+    let after_churn = t + Duration::from_millis(140 * 100);
     assert!(
-        b.ep.read_identity(id).is_ok(),
+        b.ep.read_identity(after_churn, id).is_ok(),
         "the decision could not still be taken"
     );
     let _ = b.drain();

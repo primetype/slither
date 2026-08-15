@@ -47,28 +47,30 @@
 //! `staged.rs`'s `accept()` calls the same three. Two copies of a
 //! two-sided agreement is how the two sides come to disagree.
 //!
-//! # Step 4 is **not implemented in this slice**, and why
+//! # Step 4, and the `now` it took a ruling to get
 //!
-//! §6.5 step 4 — the `read_identity()` interception — requires
-//! [`internal_tiebreak`](Endpoint::internal_tiebreak) to run inside
-//! `read_identity()`. §6.6 steps 3 and 4 both **record** a §17.1 guard
-//! entry, and [`TimestampGuard::record`](super::guard::TimestampGuard::record)
-//! takes the instant: it stamps mitigation (iii)'s LRU recency, stamps
-//! `orphaned_at` on an entry it creates, and drives the LRU sweep. **§16.4
-//! gives `read_identity` no `now`** — it is the one staged verb without
-//! one — and ruling 80 forbids inventing one ("no watermark, no
-//! approximation and no floor to correct one"). This is ruling 80's own
-//! defect a third time: §16.4 states "a `now` on every mutating call" and
-//! then omits it from a mutating call.
+//! §6.5 step 4 — the `read_identity()` interception — is the hint check's
+//! **only** backstop, and §6.5 says so twice over: the false negative "does
+//! **not** self-heal through retransmission — a peer dialling from a
+//! rewritten source port sends every retransmit from that same port (§5.5)
+//! — so the `read_identity()` interception is the only backstop".
 //!
-//! **Nothing diverges meanwhile.** A chain step 4 would have swallowed is
-//! parked, surfaces as an `Intro`, and reaches §6.6's other route — §6.4's
-//! PENDING branch — at `accept()`, which "can never disagree" with this
-//! one. What is lost is that the application *sees* the introduction and
-//! makes a decision §6.5 wanted the endpoint to make for it, so §6.5's
-//! false-negative case (a peer whose source port a NAT rewrote) now needs
-//! the application to do what §6.5 already tells it to do: "**Applications
-//! that dial SHOULD also drain `accept()`**".
+//! It runs §6.6, and §6.6 steps 3 and 4 each **record** a §17.1 entry,
+//! which needs the instant.
+//! [`TimestampGuard::record`](super::guard::TimestampGuard::record) stamps
+//! mitigation (iii)'s LRU recency, stamps `orphaned_at` on an entry it
+//! creates, and drives the LRU sweep. §16.4 listed `read_identity` as the
+//! one staged verb without a `now`, and ruling 80 forbids inventing one
+//! ("no watermark, no approximation and no floor to correct one"), so the
+//! verb could not be written until **[RATIFIED 2026/08/15 — ruling 92]**
+//! gave it the argument its two siblings already had.
+//!
+//! Ruling 92 also records why ruling 80 did not catch it: at slice 2a
+//! `read_identity` genuinely did not need `now`, and that was verified
+//! structurally rather than assumed. Step 4 changes the verb's role from
+//! entry-**removing** to entry-**recording**, and the earlier proof does
+//! not survive the change of role — a proof whose premise expired, not an
+//! oversight repeated.
 //!
 //! [`StaticMap`]: super::tables::StaticMap
 //! [`StaticState::Pending`]: super::tables::StaticState::Pending
@@ -85,8 +87,8 @@ use crate::packet::{Handshake, Mac1Key};
 
 use super::Endpoint;
 use super::guard::{ChainPin, PinKind};
-use super::intro_queue::Arrival;
-use super::staged::{ChainState, MidState};
+use super::intro_queue::{Arrival, IntroEntry};
+use super::staged::{ChainState, IntroId, MidState};
 use super::tables::StaticState;
 
 /// What §6.5 step 3's split intro read produced.
@@ -306,6 +308,82 @@ impl<I: Identity> Endpoint<I> {
                 kind: PinKind::Claimed,
             });
         }
+    }
+
+    /// §6.5 step 4 — the `read_identity()` interception.
+    ///
+    /// *"When a parked `Intro`'s claimed static turns out to be a pending
+    /// outbound remote, the endpoint performs **the same internal
+    /// tie-break** and `read_identity()` returns `Err(IntroError::Internal)`
+    /// — the application learns no identity and makes no decision."*
+    ///
+    /// Called only from [`read_identity`](Endpoint::read_identity), which
+    /// owns both of the conditions bounding it (the chain was `Parked`;
+    /// the claim is a pending outbound remote) and returns the variant.
+    ///
+    /// # The parked entry is **removed**, and the spec does not say
+    ///
+    /// §6.5 step 4 is silent on what becomes of the stage-0 entry once the
+    /// interception has run — reachable and observable, because §6.3's
+    /// per-source cap counts it. Removed, for three reasons and the first
+    /// is decisive:
+    ///
+    /// 1. **The eager route never creates one.** §6.5 step 3: an
+    ///    intercepted packet "never touches the accept queue and the
+    ///    application never sees it". §6.6 step 2 requires the two routes
+    ///    to "never disagree"; leaving an entry behind here would make the
+    ///    backstop cost the peer a stage-0 slot the fast path does not.
+    /// 2. The mid-state is **consumed** by §6.6 step 1's `complete()`, so
+    ///    a retained entry could hold nothing a later verb could use — it
+    ///    would answer `Expired`, or worse, be observable as `Poisoned`.
+    /// 3. §6.3's slot is a scarce, attacker-contested resource (§17.5), and
+    ///    the packet's disposition is now decided.
+    ///
+    /// # Order: the tie-break first, the chain's pin after
+    ///
+    /// [`read_identity`](Endpoint::read_identity) took a
+    /// [`PinKind::Claimed`] pin on the way in (§17.1, ruling 77), and the
+    /// tie-break may **create** the very entry that pin could not — §17.1's
+    /// pin "never creates an entry", so a dial to a static nobody had
+    /// recorded holds none until §6.6 records one. Releasing first would
+    /// hand `unpin` an entry with no record, no pins and no exemption,
+    /// which it deletes. Running the tie-break first means
+    /// [`record_tiebreak_timestamp`](Endpoint::record_tiebreak_timestamp)
+    /// has already given the dial its own pin by the time the chain's goes.
+    pub(super) fn intercept_parked_intro(&mut self, now: Instant, id: IntroId, dial: ConnectionId) {
+        let Some(entry) = self.intros.remove(id) else {
+            debug_assert!(false, "the chain was present when `read_identity` drove it");
+            return;
+        };
+        let IntroEntry {
+            src,
+            sender_index,
+            state,
+            guard_undo,
+            guard_pin,
+            ..
+        } = entry;
+        let ChainState::Claimed { mid, claimed } = state else {
+            debug_assert!(
+                false,
+                "§6.5 step 4 runs on the chain `read_identity` has just driven to `Claimed`"
+            );
+            return;
+        };
+        // A `Parked` chain holds no provisional write — `authenticate()` is
+        // the only writer, and a chain that reached it is `Proven`, which
+        // the caller's `was_parked` test excluded.
+        debug_assert!(
+            guard_undo.is_none(),
+            "§17.1: a chain intercepted at stage 1 has no provisional record"
+        );
+
+        // §5.6: the anchor and the msg2 destination are the **msg1
+        // source**, read live off the entry (ruling 71) — and on this path
+        // that address is by construction *not* the one we dialled, since
+        // a source that matched would have been caught by the hint check.
+        self.internal_tiebreak(now, src, sender_index, dial, claimed, *mid);
+        self.release_chain_guard_state(now, guard_undo, guard_pin);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -633,7 +711,7 @@ mod tests {
     use crate::config::Config;
     use crate::core::endpoint::staged::IntroId;
     use crate::core::{Connection, Disposition};
-    use crate::error::{AcceptError, AuthError};
+    use crate::error::{AcceptError, AuthError, IntroError};
     use crate::identity::Identity;
     use crate::packet::ReferenceSuite;
     use crate::testutil::{CountingIdentity, DhCounter};
@@ -887,7 +965,7 @@ mod tests {
         assert_eq!(a.dhs.get(), 1, "§6.5 step 3: the eager read is one `es`");
 
         let (id, _src) = drained.intros[0];
-        let claimed = a.ep.read_identity(id).expect("the claim is cached");
+        let claimed = a.ep.read_identity(t, id).expect("the claim is cached");
         assert_eq!(
             claimed.as_ref(),
             c.canonical(),
@@ -1133,6 +1211,68 @@ mod tests {
         );
     }
 
+    /// §6.5 step 4 leaves **no stage-0 entry behind**, and the spec does
+    /// not say — the test author's file records the same gap and
+    /// deliberately asserts nothing about it, so the choice is pinned here
+    /// by the side that made it.
+    ///
+    /// **Chosen because the two routes must agree.** §6.5 step 3's eager
+    /// path never creates an entry at all ("the packet never touches the
+    /// accept queue"), and §6.6 step 2 requires the internal route and its
+    /// backstop to reach the same conclusion. A retained entry would make
+    /// the backstop cost the peer a §6.3 slot the fast path does not —
+    /// observable to that peer through the per-source cap, which is why
+    /// this is a decision rather than bookkeeping.
+    ///
+    /// Asserted through §16.4's own accessor (**ruling 71**), which a core
+    /// that kept the entry would still answer `Some`. Run in both key
+    /// orders: the winner drops the packet and the loser consumes it into
+    /// a session, and the queue must end in the same state either way.
+    #[test]
+    fn an_intercepted_intro_leaves_no_stage_zero_entry() {
+        for local_wins in [true, false] {
+            let t = t0();
+            let (small, large) = ordered_pair(t);
+            let (mut local, mut peer) = if local_wins {
+                (small, large)
+            } else {
+                (large, small)
+            };
+
+            // Parked from an address nobody dialled — §6.5's false
+            // negative, the state step 4 exists for.
+            let msg1 = lone_msg1(&mut peer, t, &local);
+            let elsewhere = addr(9, 4009);
+            let drained = local.feed(t, elsewhere, &msg1);
+            let (id, _src) = drained.intros[0];
+            assert_eq!(
+                local.ep.intro_source(id),
+                Some(elsewhere),
+                "precondition: the entry is parked and observable"
+            );
+
+            // Now the claim becomes a pending outbound remote.
+            let (_dial, _) = local.dial(t, peer.addr, &peer.pk);
+            assert!(
+                matches!(local.ep.read_identity(t, id), Err(IntroError::Internal)),
+                "§6.5 step 4 intercepts (local_wins = {local_wins})"
+            );
+            let _ = local.drain();
+
+            assert_eq!(
+                local.ep.intro_source(id),
+                None,
+                "§6.5 step 4: the entry is removed, so the source's stage-0 slot \
+                 is returned exactly as the eager route never took one \
+                 (local_wins = {local_wins})"
+            );
+            assert!(
+                matches!(local.ep.authenticate(t, id), Err(AuthError::Expired)),
+                "and the staged verbs say so"
+            );
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // §6.4's PENDING branch
     // ═══════════════════════════════════════════════════════════════════
@@ -1160,7 +1300,7 @@ mod tests {
         let drained = small.feed(t, elsewhere, &from_large);
         let (id, _src) = drained.intros[0];
 
-        let claimed = small.ep.read_identity(id).expect("readable");
+        let claimed = small.ep.read_identity(t, id).expect("readable");
         assert_eq!(claimed.as_ref(), large.canonical());
         let (_peer, timestamp) = small.ep.authenticate(t, id).expect("authenticates");
 
@@ -1335,7 +1475,7 @@ mod tests {
             // `accept()` runs.
             let drained = a.feed(t, b.addr, &msg1);
             let (id, _src) = drained.intros[0];
-            a.ep.read_identity(id).expect("readable");
+            a.ep.read_identity(t, id).expect("readable");
             a.ep.authenticate(t, id).expect("authenticates");
             let (a_dial, dial_out) = a.dial(t, b.addr, &b.pk);
             let accepted = a.ep.accept(t, id);
@@ -1491,7 +1631,7 @@ mod tests {
 
         let drained = small.feed(t, large.addr, &msg1);
         let (id, _src) = drained.intros[0];
-        small.ep.read_identity(id).expect("readable");
+        small.ep.read_identity(t, id).expect("readable");
         small.ep.authenticate(t, id).expect("authenticates");
         let (_a_dial, dial_out) = small.dial(t, large.addr, &large.pk);
         let refused = small.ep.accept(t, id);

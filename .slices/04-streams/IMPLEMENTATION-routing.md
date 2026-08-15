@@ -445,3 +445,48 @@ orders, **no clock advanced during the exchange**, then driven past
 See §12/13 above for the mutations. The three diffs were applied to file copies,
 run green (313 lib / 12 spec_shell), captured, and the originals restored;
 `git diff --stat` clean on all three afterwards.
+
+---
+
+# Follow-up: ruling 92 and §6.5 step 4
+
+## Ruling 92 applied
+`core::Endpoint::read_identity(&mut self, now: Instant, id: IntroId)`.
+Call sites updated, **mechanically only**:
+- `src/shell/driver.rs:754` — 1.
+- `src/core/tests.rs` — 26 (`t`/`now`/`at`/`consumed_at`/`after`, each taken from
+  the instant the adjacent `feed`/`authenticate`/`accept`/`timeout` on that
+  endpoint uses). Two loop-locals had gone out of scope, so their last value is
+  **named** (`consumed_at`, `after_churn`) — two added `let` bindings, no
+  assertion touched.
+- `src/core/endpoint/routing.rs` — 4 (mine).
+- **`src/core/endpoint/tests.rs` — 10. Not on my permitted list; see the report.**
+  `git diff -U0` on that file is 10 lines, each inserting `now, ` and nothing
+  else.
+
+## §6.5 step 4
+`staged.rs::read_identity` reads `was_parked` **before** the `es`, drives stage 1,
+and — only for a chain that was `Parked` and whose claim is a pending outbound
+remote — calls `routing.rs::intercept_parked_intro` and returns
+`Err(IntroError::Internal)`.
+
+`intercept_parked_intro` removes the stage-0 entry, runs §6.6 on its mid-state at
+the entry's **live** `src`/`sender_index` (ruling 71; §5.6's anchor), then
+releases the chain's `Claimed` pin — **after** the tie-break, because §6.6's
+record may create the very entry §17.1's pin could not, and `unpin` deletes an
+entry with no record, no pins and no exemption.
+
+### GAP 3 (the test author's): the parked entry is **removed**
+The spec is silent. Chosen because §6.5 step 3's eager path never creates an
+entry, and §6.6 step 2 requires the two routes to agree; a retained entry would
+cost the peer a §6.3 slot the fast path does not. Pinned by
+`an_intercepted_intro_leaves_no_stage_zero_entry` (both key orders).
+
+## Mutations, executed
+| Mutation | Reds |
+|---|---|
+| no interception at all | `read_identity_intercepts_a_parked_intro_whose_claim_is_a_pending_remote`, `the_losers_msg2_anchors_at_the_msg1_source_not_the_dialled_address`, `an_intercepted_intro_leaves_no_stage_zero_entry` |
+| interception hoisted above ruling 74's early return (unconditional on chain state) | `a_second_read_identity_after_the_static_became_pending_does_not_intercept` |
+
+The second is the test author's, and it is the one that pins §6.4:1439 — the
+premise §6.4's whole PENDING branch rests on.

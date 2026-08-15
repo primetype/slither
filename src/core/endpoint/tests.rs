@@ -624,7 +624,7 @@ fn a_demoted_intro_returns_its_cached_claim_at_zero_incremental_dh() {
     local.reset_dh();
     let claimed = local
         .ep
-        .read_identity(id)
+        .read_identity(now, id)
         .expect("the demoted chain's claim is already read");
     assert_eq!(
         local.dh(),
@@ -659,7 +659,7 @@ fn a_demoted_intro_keeps_section_6_1s_cumulative_ladder() {
     let (id, _) = d.one_intro();
     assert_eq!(local.dh(), 1, "arrival + eager read: 1 DH cumulative");
 
-    local.ep.read_identity(id).expect("claim already read");
+    local.ep.read_identity(now, id).expect("claim already read");
     assert_eq!(local.dh(), 1, "§6.1: read_identity is 1 DH cumulative");
 
     local
@@ -805,7 +805,7 @@ fn read_identity_intercepts_a_parked_intro_whose_claim_is_a_pending_remote() {
 
         let err = local
             .ep
-            .read_identity(id)
+            .read_identity(now, id)
             .expect_err("§6.5 step 4: the interception denies the application an identity");
         let d = local.drain();
 
@@ -859,7 +859,7 @@ fn a_second_read_identity_after_the_static_became_pending_does_not_intercept() {
 
     let first = local
         .ep
-        .read_identity(id)
+        .read_identity(now, id)
         .expect("an ordinary parked intro reveals its claim");
     assert_eq!(first.as_ref(), peer.canonical());
 
@@ -869,7 +869,7 @@ fn a_second_read_identity_after_the_static_became_pending_does_not_intercept() {
     local.reset_dh();
     let second = local
         .ep
-        .read_identity(id)
+        .read_identity(now, id)
         .expect("ruling 74: idempotent, and §6.4:1439 says the interception cannot fire here");
     let d = local.drain();
 
@@ -1186,7 +1186,7 @@ fn the_losers_msg2_anchors_at_the_msg1_source_not_the_dialled_address() {
 
     let err = local
         .ep
-        .read_identity(id)
+        .read_identity(now, id)
         .expect_err("§6.5 step 4 intercepts");
     assert_eq!(err, IntroError::Internal);
     let d = local.drain();
@@ -1620,7 +1620,7 @@ fn ordinary_ordering(
     let d = local.feed(now, peer.addr, &msg1);
     let (intro, _) = d.one_intro();
 
-    let claimed = local.ep.read_identity(intro).expect("§6.1 stage 1");
+    let claimed = local.ep.read_identity(now, intro).expect("§6.1 stage 1");
     assert_eq!(claimed.as_ref(), peer.canonical());
 
     let (conn, d) = local.dial(now, peer.addr, &peer.public_static);
@@ -1798,7 +1798,7 @@ fn ordinary_api_ordering(local_is_winner: bool) {
     let (intro, _) = d.one_intro();
 
     // 3–5. The documented ordering.
-    let claimed = local.ep.read_identity(intro).expect("§6.1 stage 1");
+    let claimed = local.ep.read_identity(now, intro).expect("§6.1 stage 1");
     assert_eq!(claimed.as_ref(), peer.canonical());
     let (local_conn, d) = local.dial(now, peer.addr, &peer.public_static);
     let (to, msg1_local) = d.one_transmit();
@@ -1945,7 +1945,7 @@ fn the_ordinary_api_ordering_yields_exactly_one_resolution_per_dial() {
         let (_, msg1_peer) = d.one_transmit();
         let d = local.feed(now, peer.addr, &msg1_peer);
         let (intro, _) = d.one_intro();
-        local.ep.read_identity(intro).expect("stage 1");
+        local.ep.read_identity(now, intro).expect("stage 1");
         let (local_conn, d) = local.dial(now, peer.addr, &peer.public_static);
         let (_, msg1_local) = d.one_transmit();
 
@@ -2062,7 +2062,7 @@ fn a_minted_but_unattempted_pending_still_yields_one_connection_for_one_static()
 
         // If it surfaced, the application follows §6.4's ordering on it.
         if let Some((id, _)) = d.intros().first().copied() {
-            if local.ep.read_identity(id).is_ok()
+            if local.ep.read_identity(now, id).is_ok()
                 && local.ep.authenticate(now, id).is_ok()
                 && let Ok((accept_conn, _c)) = local.ep.accept(now, id)
             {

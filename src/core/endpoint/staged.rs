@@ -148,18 +148,45 @@ impl<I: Identity> Endpoint<I> {
     /// `read_identity()` on it returns the cached claim at 0 incremental
     /// DH" true.
     ///
-    /// # §6.5 step 4's interception is **not** here
+    /// # §6.5 step 4 — the interception, and the two things that bound it
     ///
-    /// §6.5 makes this verb the backstop for a crossing msg1 whose source
-    /// the hint check missed: the endpoint would run §6.6's internal
-    /// tie-break and answer [`IntroError::Internal`]. §6.6 records a §17.1
-    /// guard entry, [`TimestampGuard::record`] needs the instant, and
-    /// §16.4 gives this verb no `now` — see [`routing`](super::routing)'s
-    /// module docs for the case that needs a ruling. Nothing diverges
-    /// meanwhile; those chains reach the same comparison through §6.4's
-    /// PENDING branch at `accept()`.
+    /// This verb is the hint check's **only** backstop: when a parked
+    /// `Intro`'s claim turns out to be a pending outbound remote, the
+    /// endpoint runs §6.6's internal tie-break itself
+    /// ([`intercept_parked_intro`]) and answers
+    /// [`IntroError::Internal`] — "the application learns no identity and
+    /// makes no decision". §6.5's false negative, a peer whose source port
+    /// a NAT rewrote, self-heals **here and nowhere else**: it does not
+    /// self-heal through retransmission, because that peer sends every
+    /// retransmit from the same rewritten port.
+    ///
+    /// **It fires only on a chain that was `Parked` at the top of this
+    /// call.** §6.4:1439 is explicit: the interception "fires when a
+    /// *parked* `Intro`'s claim turns out to be a pending outbound remote,
+    /// [and so] cannot fire on a chain the application already holds". That
+    /// is not a nicety — it is the premise §6.4's whole PENDING branch
+    /// rests on, and a core that hoisted the test above ruling 74's early
+    /// returns would delete the ordering §6.4:1436 exists to close.
+    ///
+    /// **It does not fire from [`authenticate`](Self::authenticate)'s
+    /// ruling-75 drive of the same `es`.** §6.5 names this verb; §18.1
+    /// names an `IntroError::Internal` and **no `AuthError::Internal`**,
+    /// and that taxonomy is closed. A chain authenticated straight from
+    /// `Parked` reaches the identical comparison at `accept()`, by §6.4's
+    /// PENDING branch — §6.6 step 2: "a **different route to the same
+    /// comparison** … they can never disagree".
+    ///
+    /// **`now` is [RATIFIED 2026/08/15 — ruling 92].** §6.6 steps 3 and 4
+    /// each record a §17.1 entry and [`TimestampGuard::record`] needs the
+    /// instant. Ruling 80 gave `reject` and `handle_connection_event` the
+    /// same argument for the same reason; this is the third, and §16.4's
+    /// invariant — a `now` on every mutating call — always required it.
+    /// Ruling 92 records why it survived ruling 80: at slice 2a this verb
+    /// genuinely did not need one, and §6.5 step 4 is what changed its role
+    /// from entry-**removing** to entry-**recording**.
     ///
     /// [`TimestampGuard::record`]: super::guard::TimestampGuard::record
+    /// [`intercept_parked_intro`]: Endpoint::intercept_parked_intro
     ///
     /// # Idempotent (**ruling 74**)
     ///
@@ -193,8 +220,33 @@ impl<I: Identity> Endpoint<I> {
     /// the problem handed evidence pointing elsewhere.
     ///
     /// [`Identity::open`]: crate::identity::Identity::open
-    pub(crate) fn read_identity(&mut self, id: IntroId) -> Result<PublicKeyOf<I>, IntroError> {
-        self.read_identity_as(id, "read_identity")
+    pub(crate) fn read_identity(
+        &mut self,
+        now: Instant,
+        id: IntroId,
+    ) -> Result<PublicKeyOf<I>, IntroError> {
+        // Read **before** the `es`, because that is the state §6.5 step 4
+        // is quantified over: a chain the application already holds is
+        // `Claimed` or `Proven` here and takes ruling 74's early return
+        // below, having revealed its static once already.
+        let was_parked = matches!(
+            self.intros.get(id).map(|entry| &entry.state),
+            Some(ChainState::Parked)
+        );
+
+        let claimed = self.read_identity_as(id, "read_identity")?;
+
+        if !was_parked {
+            return Ok(claimed);
+        }
+        // §6.5's probed set: the pending outbound remotes **only**. A LIVE
+        // or NONE claim is answered here, which is §6.5's "LIVE- and
+        // NONE-state claims are parked or demoted to the staged path".
+        let Some(dial) = self.pending_outbound_remote(claimed.as_ref()) else {
+            return Ok(claimed);
+        };
+        self.intercept_parked_intro(now, id, dial);
+        Err(IntroError::Internal)
     }
 
     /// [`read_identity`](Self::read_identity), told which verb the caller
@@ -385,19 +437,19 @@ impl<I: Identity> Endpoint<I> {
                     //
                     // `Internal` is §6.5 step 4's interception, and it is
                     // the **core's**, not the shell's — this comment used
-                    // to say otherwise and was wrong twice over. It is
-                    // unreachable here for two independent reasons, and
-                    // only the second is temporary: (1) §6.5 attaches the
+                    // to say otherwise and was wrong twice over. Step 4 is
+                    // implemented (ruling 92), and it is still unreachable
+                    // *from here*, deliberately: §6.5 attaches the
                     // interception to the `read_identity()` **verb**, not
                     // to ruling 75's drive of the same `es` from this one,
-                    // and §18.1 settles that there is an
-                    // `IntroError::Internal` and **no
-                    // `AuthError::Internal`** — a closed taxonomy, so a
-                    // chain authenticated straight from `Parked` is not
-                    // intercepted and reaches the identical comparison at
-                    // `accept()` by §6.4's PENDING branch; (2) step 4 is
-                    // unimplemented in this build for want of a `now` on
-                    // `read_identity` — see `routing.rs`.
+                    // and §18.1 settles which reading is meant — there is
+                    // an `IntroError::Internal` and **no
+                    // `AuthError::Internal`**, in a taxonomy §18.1 declares
+                    // closed. So a chain authenticated straight from
+                    // `Parked` is not intercepted; it reaches the identical
+                    // comparison at `accept()` by §6.4's PENDING branch,
+                    // which §6.6 step 2 requires to agree with the internal
+                    // route in every case.
                     //
                     // Either way, answer with the lifecycle variant rather
                     // than the security one.
