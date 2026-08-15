@@ -11,7 +11,20 @@
 //! amendment a breaking change afterwards. Ruling 78 then added
 //! `AuthError::Local`, which ruling 72 had missed — and missing it was the
 //! worse half, because the variant a local fault fell through to there is
-//! the taxonomy's one **security signal**. Nine of the ten types here are
+//! the taxonomy's one **security signal**.
+//!
+//! **[RATIFIED 2026/08/15 — ruling 79]** None of the three `Local`
+//! variants carries the provider's error, and none can: these types are
+//! `Clone + PartialEq + Eq + Send + Sync` and
+//! [`Identity::Error`](crate::identity::Identity::Error) is bounded on none
+//! of them — deliberately, since an enclave-backed provider is `!Send`.
+//! The detail is not lost, it is **re-addressed**: the party who can *act*
+//! gets the variant, the party who *diagnoses* gets §18.2's `slither::io`
+//! trace, carrying the provider's own error and the verb that met it. This
+//! is the third question that split has settled here, after rulings 49 and
+//! 59, and it is now the general rule — when a fault is real but the
+//! application cannot act on the detail, the detail is a trace, not a
+//! variant. Nine of the ten types here are
 //! therefore *exhaustive*
 //! Rust enums, which says the same thing in the type system — a consumer
 //! who matches without a `_` arm gets a **compile error** the day a variant
@@ -73,6 +86,9 @@ pub enum ConnectError {
     /// all, and one that transmitted and was not answered is a genuine
     /// [`TimedOut`](ConnectError::TimedOut).
     ///
+    /// **Ruling 79**: the provider's own error rides §18.2's `slither::io`
+    /// trace, not this variant — see the [module docs](self).
+    ///
     /// [`Identity::open`]: crate::identity::Identity::open
     #[error("our own identity provider failed to open")]
     Local,
@@ -109,6 +125,9 @@ pub enum IntroError {
     /// which an application may reasonably act on by denylisting or
     /// alerting.
     ///
+    /// **Ruling 79**: the provider's own error rides §18.2's `slither::io`
+    /// trace, not this variant — see the [module docs](self).
+    ///
     /// [`Identity::open`]: crate::identity::Identity::open
     #[error("our own identity provider failed to open")]
     Local,
@@ -143,6 +162,9 @@ pub enum AuthError {
     /// merely misattribute a local fault to the peer, it **reports the peer
     /// as an attacker**, and teaches an operator to distrust the one
     /// variant that must stay trustworthy.
+    ///
+    /// **Ruling 79**: the provider's own error rides §18.2's `slither::io`
+    /// trace, not this variant — see the [module docs](self).
     #[error("our own identity provider failed to open")]
     Local,
     /// The endpoint driver stopped.

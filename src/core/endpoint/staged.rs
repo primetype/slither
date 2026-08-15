@@ -179,6 +179,23 @@ impl<I: Identity> Endpoint<I> {
     ///
     /// [`Identity::open`]: crate::identity::Identity::open
     pub(crate) fn read_identity(&mut self, id: IntroId) -> Result<PublicKeyOf<I>, IntroError> {
+        self.read_identity_as(id, "read_identity")
+    }
+
+    /// [`read_identity`](Self::read_identity), told which verb the caller
+    /// is so §18.2's trace can name it. **Ruling 79.**
+    ///
+    /// `authenticate()` may drive this same read (ruling 75) and meet the
+    /// same local fault, and §18.2's `slither::io` row asks for "the
+    /// provider's own error **and the verb that met it**". A single event
+    /// naming the application's verb is more use to an operator than two
+    /// events naming an internal call chain, so the name is passed down
+    /// rather than emitted twice.
+    fn read_identity_as(
+        &mut self,
+        id: IntroId,
+        verb: &'static str,
+    ) -> Result<PublicKeyOf<I>, IntroError> {
         let msg1 = {
             let entry = self.intros.get(id).ok_or(IntroError::Expired)?;
             match &entry.state {
@@ -201,14 +218,45 @@ impl<I: Identity> Endpoint<I> {
         // `Local`, and the chain stays parked — note the bare `return`,
         // with no `discard_chain`, which is the whole difference from the
         // hiss arm below.
-        let Ok((provider, our_key)) = self.identity.open() else {
-            return Err(IntroError::Local);
+        //
+        // Ruling 79: the variant cannot carry the provider's error — the
+        // §18.1 types are `Clone + PartialEq + Eq + Send + Sync` and
+        // `Identity::Error` is bounded on none of them, deliberately, since
+        // an enclave provider is `!Send`. So the audiences split: the
+        // application gets the variant it can act on, and the operator gets
+        // the detail on §18.2's `slither::io`.
+        let (provider, our_key) = match self.identity.open() {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::warn!(
+                    target: "slither::io",
+                    verb,
+                    stage = "Identity::open",
+                    %error,
+                    "the identity provider failed to open"
+                );
+                return Err(IntroError::Local);
+            }
         };
-        let Ok(responder) =
-            <I::Suite as Handshake>::responder(provider, constants::PROLOGUE, our_key)
-        else {
-            return Err(IntroError::Local);
-        };
+        let responder =
+            match <I::Suite as Handshake>::responder(provider, constants::PROLOGUE, our_key) {
+                Ok(responder) => responder,
+                Err(error) => {
+                    // Also `Local`, and also ours: this is hiss refusing to
+                    // build a responder on *our* static, with nothing of the
+                    // peer's involved yet. `stage` says which of the two it
+                    // was, so §18.2's row — which names `Identity::open()` —
+                    // stays legible beside it.
+                    tracing::warn!(
+                        target: "slither::io",
+                        verb,
+                        stage = "Handshake::responder",
+                        %error,
+                        "the responder machine would not build on our static"
+                    );
+                    return Err(IntroError::Local);
+                }
+            };
 
         match <I::Suite as Handshake>::read_msg1_intro(responder, &msg1) {
             Ok((claimed, mid)) => {
@@ -244,7 +292,24 @@ impl<I: Identity> Endpoint<I> {
                 // Ruling 72, the other half: the peer's bytes are at fault,
                 // 1 DH is spent and the verdict is definitive — so this arm
                 // alone destroys the entry and frees its stage-0 slot.
-                self.discard_chain(id);
+                //
+                // Not `discard_chain`, and that is the point: ruling 80
+                // left this verb without a `now` on the grounds that it
+                // never has guard state to release, and this arm is the
+                // only place it removes an entry. The entry reaching here
+                // was `Parked` (checked at the top), and a `Parked` entry
+                // holds neither a provisional write nor a pin — both are
+                // written only at this verb's success arm and at
+                // `authenticate()`, and §6.3 never byte-replaces a consumed
+                // entry back into `Parked`. So there is nothing to release
+                // and no instant to release it at.
+                let discarded = self.intros.remove(id);
+                debug_assert!(
+                    discarded
+                        .as_ref()
+                        .is_none_or(|e| e.guard_pin.is_none() && e.guard_undo.is_none()),
+                    "a parked chain holds no guard state"
+                );
                 Err(IntroError::Malformed)
             }
         }
@@ -277,7 +342,6 @@ impl<I: Identity> Endpoint<I> {
         now: Instant,
         id: IntroId,
     ) -> Result<(PublicKeyOf<I>, Timestamp), AuthError> {
-        self.observe(now);
         if matches!(
             self.intros.get(id).map(|entry| &entry.state),
             Some(ChainState::Parked)
@@ -287,22 +351,23 @@ impl<I: Identity> Endpoint<I> {
             // gained `AuthError::Local` (ruling 78). Matched exhaustively:
             // a sixth `IntroError` variant must stop here rather than be
             // swept into a security signal by a `_` arm.
-            self.read_identity(id).map_err(|e| match e {
-                IntroError::Expired => AuthError::Expired,
-                // Ruling 78. Routing *our* locked enclave to
-                // `HandshakeFailed` did not merely misattribute the fault;
-                // it reported the peer as an attacker through the one
-                // variant §18.1 designates a security signal.
-                IntroError::Local => AuthError::Local,
-                // Ruling 72's other half: the peer's bytes really are at
-                // fault, and this is what `HandshakeFailed` is for.
-                IntroError::Malformed => AuthError::HandshakeFailed,
-                // Neither is reachable from the core — `Internal` is §6.5's
-                // shell interception and `EndpointDropped` is the driver
-                // stopping — so answer with the lifecycle variant rather
-                // than the security one.
-                IntroError::Internal | IntroError::EndpointDropped => AuthError::Expired,
-            })?;
+            self.read_identity_as(id, "authenticate")
+                .map_err(|e| match e {
+                    IntroError::Expired => AuthError::Expired,
+                    // Ruling 78. Routing *our* locked enclave to
+                    // `HandshakeFailed` did not merely misattribute the fault;
+                    // it reported the peer as an attacker through the one
+                    // variant §18.1 designates a security signal.
+                    IntroError::Local => AuthError::Local,
+                    // Ruling 72's other half: the peer's bytes really are at
+                    // fault, and this is what `HandshakeFailed` is for.
+                    IntroError::Malformed => AuthError::HandshakeFailed,
+                    // Neither is reachable from the core — `Internal` is §6.5's
+                    // shell interception and `EndpointDropped` is the driver
+                    // stopping — so answer with the lifecycle variant rather
+                    // than the security one.
+                    IntroError::Internal | IntroError::EndpointDropped => AuthError::Expired,
+                })?;
         }
 
         let (mid, claimed) = {
@@ -328,7 +393,7 @@ impl<I: Identity> Endpoint<I> {
         let Ok((payload, read)) = <I::Suite as Handshake>::complete(*mid) else {
             // §6.1: a tail-tag failure is `HandshakeFailed`. It is a
             // security signal and carries no detail, deliberately.
-            self.discard_chain(id);
+            self.discard_chain(now, id);
             return Err(AuthError::HandshakeFailed);
         };
         let timestamp = Timestamp::decode(&payload);
@@ -339,7 +404,7 @@ impl<I: Identity> Endpoint<I> {
         if !self.guard.admits(&key, timestamp) {
             // Mitigation (iii): recency refreshes on a successful record,
             // **never** on a failed check. Nothing is written here.
-            self.discard_chain(id);
+            self.discard_chain(now, id);
             return Err(AuthError::Replay);
         }
         let undo = self.guard.record(&key, timestamp, now);
@@ -417,9 +482,6 @@ impl<I: Identity> Endpoint<I> {
         now: Instant,
         id: IntroId,
     ) -> Result<(ConnectionId, Connection<I::Suite>), AcceptError> {
-        // Ruling 73: this verb carries a `now`, so it starts the orphan
-        // clock for any pin released by a verb that does not.
-        self.observe(now);
         let (peer_key, timestamp, anchor, peer_index) = {
             let entry = self.intros.get(id).ok_or(AcceptError::Stale)?;
             match &entry.state {
@@ -439,7 +501,7 @@ impl<I: Identity> Endpoint<I> {
         };
 
         if self.statics.get(&peer_key).is_some() {
-            self.discard_chain(id);
+            self.discard_chain(now, id);
             return Err(AcceptError::Stale);
         }
 
@@ -465,7 +527,7 @@ impl<I: Identity> Endpoint<I> {
         };
 
         let Ok((msg2, transport)) = <I::Suite as Handshake>::write_msg2(*read) else {
-            self.discard_chain(id);
+            self.discard_chain(now, id);
             return Err(AcceptError::Stale);
         };
         let (seal, open) = <I::Suite as Handshake>::into_datagram(transport, Self::epoch_size());
@@ -516,14 +578,19 @@ impl<I: Identity> Endpoint<I> {
     ///
     /// An unknown or expired `id` is a no-op, which is why §16.4 gives this
     /// verb no `Result`.
-    pub(crate) fn reject(&mut self, id: IntroId) {
-        self.discard_chain(id);
+    /// `now` is **[RATIFIED 2026/08/15 — ruling 80]**: this verb releases
+    /// a §17.1 pin, and ruling 73 measures the orphan TTL from that
+    /// release. §16.4's own invariant already required it — a `now` on
+    /// every mutating call — so the argument closes a gap rather than
+    /// widening the surface.
+    pub(crate) fn reject(&mut self, now: Instant, id: IntroId) {
+        self.discard_chain(now, id);
     }
 
     /// Remove a chain and undo everything it provisionally held.
-    fn discard_chain(&mut self, id: IntroId) {
+    fn discard_chain(&mut self, now: Instant, id: IntroId) {
         if let Some(entry) = self.intros.remove(id) {
-            self.release_chain_guard_state(entry.guard_undo, entry.guard_pin);
+            self.release_chain_guard_state(now, entry.guard_undo, entry.guard_pin);
         }
     }
 }

@@ -152,14 +152,6 @@ pub(crate) struct Endpoint<I: Identity> {
     /// greater.
     last_init_timestamp: Option<Timestamp>,
     next_connection: u64,
-    /// The last instant the core was **told**. **Ruling 73.**
-    ///
-    /// Not a clock — the core still never reads one. It exists because two
-    /// of §16.4's verbs release §17.1 pins with no `now` in hand
-    /// (`handle_connection_event`, `reject`), and ruling 73 measures the
-    /// orphan TTL from the release. This is the lower bound the guard
-    /// stamps with; [`guard::TimestampGuard::observe`] floors it.
-    last_now: Instant,
 }
 
 impl<I: Identity> Endpoint<I> {
@@ -171,7 +163,7 @@ impl<I: Identity> Endpoint<I> {
     /// spend rests on — and that is why this core is crate-internal in this
     /// slice: publishing the constructor is a decision for the slice that
     /// has an opinion about the public surface.
-    pub(crate) fn new(now: Instant, config: Config, identity: I, rng_seed: [u8; 32]) -> Self {
+    pub(crate) fn new(_now: Instant, config: Config, identity: I, rng_seed: [u8; 32]) -> Self {
         let our_static_bytes = identity.public_static().as_ref().to_vec();
         let our_mac1 = Mac1Key::derive(&our_static_bytes);
         let intros = IntroQueue::new(config.intro_queue_cap(), config.intro_max_per_source());
@@ -189,10 +181,6 @@ impl<I: Identity> Endpoint<I> {
             pendings: BTreeMap::new(),
             last_init_timestamp: None,
             next_connection: 0,
-            // §16.4 gives the constructor a `now`, so the watermark is
-            // never unset — there is no "before the first call" case to
-            // represent.
-            last_now: now,
         }
     }
 
@@ -287,11 +275,9 @@ impl<I: Identity> Endpoint<I> {
     /// timer table.
     ///
     /// The guard's own deadline needs no clock at all: ruling 73 stamps an
-    /// orphan with the instant its last pin was released (or with the next
-    /// instant the core is *told*, where §16.4's verb has no `now` —
-    /// [`guard::TimestampGuard::observe`]), so the deadline is a stored
-    /// value plus a constant. An orphan awaiting its stamp announces
-    /// nothing and is swept by nothing, which is the safe direction.
+    /// orphan with the instant its last **key-holder** pin was released,
+    /// and ruling 80 gives every releasing verb a `now` to stamp with, so
+    /// the deadline is a stored value plus a constant.
     fn deadline(&self) -> Option<Instant> {
         let pendings = self
             .pendings
@@ -306,21 +292,6 @@ impl<I: Identity> Endpoint<I> {
 
     fn emit(&mut self, output: EndpointOutput<I::Suite>) {
         self.outputs.push_back(output);
-    }
-
-    /// Take note of the instant this call was made. **Ruling 73.**
-    ///
-    /// Called at the top of every §16.4 verb that carries a `now`. It
-    /// advances the watermark the clockless verbs stamp with, and finalises
-    /// any stamp they have already left provisional. Not a clock read: the
-    /// core is *told* the instant, it never asks for one.
-    ///
-    /// Monotone by construction — a caller that went backwards would
-    /// otherwise shorten a window, which is the one direction ruling 73
-    /// forbids.
-    fn observe(&mut self, now: Instant) {
-        self.last_now = self.last_now.max(now);
-        self.guard.observe(now);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -394,7 +365,6 @@ impl<I: Identity> Endpoint<I> {
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
     ) -> Result<(ConnectionId, Connection<I::Suite>), ConnectError> {
-        self.observe(now);
         let key = remote_static.as_ref().to_vec();
         if self.statics.get(&key).is_some() {
             return Err(ConnectError::AlreadyConnected);
@@ -479,8 +449,24 @@ impl<I: Identity> Endpoint<I> {
         // wire, and a give-up in that state reports `ConnectError::Local`
         // rather than blaming a peer that was never sent anything. See
         // `expire_pendings`.
-        let Ok((provider, our_key)) = self.identity.open() else {
-            return;
+        //
+        // Ruling 79: the detail the variant cannot carry rides §18.2's
+        // `slither::io` instead — the provider's own error and the verb
+        // that met it. The verb is `connect`: §5.5's retransmits all belong
+        // to the one dial the application asked for.
+        let (provider, our_key) = match self.identity.open() {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::warn!(
+                    target: "slither::io",
+                    verb = "connect",
+                    stage = "Identity::open",
+                    conn = ?pending.conn,
+                    %error,
+                    "the identity provider failed to open"
+                );
+                return;
+            }
         };
         let state = <I::Suite as Handshake>::initiator(
             provider,
@@ -489,11 +475,21 @@ impl<I: Identity> Endpoint<I> {
         );
         // Also local: this is our own static's DH under hiss, not anything
         // the peer contributed — nothing has been received at this point.
-        let Ok((msg1, sent)) =
-            <I::Suite as Handshake>::write_msg1(state, our_key, &timestamp.encode())
-        else {
-            return;
-        };
+        let (msg1, sent) =
+            match <I::Suite as Handshake>::write_msg1(state, our_key, &timestamp.encode()) {
+                Ok(written) => written,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "slither::io",
+                        verb = "connect",
+                        stage = "Handshake::write_msg1",
+                        conn = ?pending.conn,
+                        %error,
+                        "msg1 would not write on our static"
+                    );
+                    return;
+                }
+            };
 
         let data = handshake::frame_init(sender_index, &msg1, &pending.peer_mac1);
         pending.attempted = true;
@@ -507,18 +503,15 @@ impl<I: Identity> Endpoint<I> {
     }
 
     /// Release every trace of a pending. Shared by give-up and cancel.
-    fn drop_pending(&mut self, conn: ConnectionId) -> Option<Pending<I>> {
+    fn drop_pending(&mut self, now: Instant, conn: ConnectionId) -> Option<Pending<I>> {
         let pending = self.pendings.remove(&conn)?;
         if let Some(index) = pending.sender_index {
             self.indices.remove_pending(index);
         }
         self.statics.remove(&pending.remote_static_bytes);
         if pending.guard_pinned {
-            self.guard.unpin(
-                &pending.remote_static_bytes,
-                guard::PinKind::KeyHolder,
-                self.last_now,
-            );
+            self.guard
+                .unpin(&pending.remote_static_bytes, guard::PinKind::KeyHolder, now);
         }
         Some(pending)
     }
@@ -534,7 +527,6 @@ impl<I: Identity> Endpoint<I> {
         src: SocketAddr,
         datagram: &[u8],
     ) -> Disposition {
-        self.observe(now);
         // §3.1's gate: `None` **is** the drop — no error, no trace, no
         // counter, and nothing that distinguishes it from a datagram the
         // endpoint handled itself.
@@ -588,7 +580,7 @@ impl<I: Identity> Endpoint<I> {
             // entry has neither a provisional guard write nor a pin — but
             // release both anyway rather than assert, because a leak here
             // is a permanent, silent denial for a real peer.
-            self.release_chain_guard_state(evicted.guard_undo, evicted.guard_pin);
+            self.release_chain_guard_state(now, evicted.guard_undo, evicted.guard_pin);
         }
         match outcome.arrival {
             Arrival::Parked(id) => self.emit(EndpointOutput::IntroReady(id, src)),
@@ -720,8 +712,6 @@ impl<I: Identity> Endpoint<I> {
     /// from that release, so step (3) grants the entry a **fresh** window
     /// instead of finding an expired one.
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
-        self.observe(now);
-
         // (1) Terminal, and it removes state before anything else emits.
         self.expire_pendings(now);
 
@@ -730,7 +720,7 @@ impl<I: Identity> Endpoint<I> {
         // or a real peer is left blocked by a record they never got to use.
         // Before (3), because it releases guard pins that (3) then ages.
         for expired in self.intros.expire(now) {
-            self.release_chain_guard_state(expired.guard_undo, expired.guard_pin);
+            self.release_chain_guard_state(now, expired.guard_undo, expired.guard_pin);
         }
 
         // (3) §17.1 mitigation (ii).
@@ -762,7 +752,7 @@ impl<I: Identity> Endpoint<I> {
             // train that transmitted and was not answered is a genuine
             // `TimedOut`, whatever happened on the intervals in between.
             let attempted = self.pendings.get(&conn).is_some_and(|p| p.attempted);
-            let _ = self.drop_pending(conn);
+            let _ = self.drop_pending(now, conn);
             let why = if attempted {
                 ConnectError::TimedOut
             } else {
@@ -813,23 +803,27 @@ impl<I: Identity> Endpoint<I> {
     /// `AlreadyConnected`. It emits **nothing** — the `Connecting` is
     /// already resolved by its own drop, and a `HandshakeFailed` would be a
     /// second resolution.
-    pub(crate) fn handle_connection_event(&mut self, id: ConnectionId, ev: ToEndpoint) {
+    pub(crate) fn handle_connection_event(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        ev: ToEndpoint,
+    ) {
         match ev {
             ToEndpoint::Retired { our_index } => {
                 self.indices.remove_session(our_index);
                 self.indices.remove_pending(our_index);
                 // Ruling 73: this is the release that starts the orphan
-                // clock, and §16.4 hands this verb no `now` — so it stamps
-                // with the watermark and `observe` floors it at the next
-                // clocked call. See `Endpoint::last_now`.
-                if self.drop_pending(id).is_none()
+                // clock — and ruling 80 is why this verb has a `now` to
+                // stamp it with. §16.4's own invariant already required
+                // one: this is a mutating call.
+                if self.drop_pending(now, id).is_none()
                     && let Some(key) = self.statics.remove_by_connection(id)
                 {
                     // A live connection is a key-holder pin (ruling 77):
                     // reaching it took the peer's key, and this release is
                     // the one ruling 73's security argument is about.
-                    self.guard
-                        .unpin(&key, guard::PinKind::KeyHolder, self.last_now);
+                    self.guard.unpin(&key, guard::PinKind::KeyHolder, now);
                 }
             }
         }
@@ -855,18 +849,16 @@ impl<I: Identity> Endpoint<I> {
     /// that is the whole point of the mitigation.
     fn release_chain_guard_state(
         &mut self,
+        now: Instant,
         undo: Option<guard::GuardUndo>,
         pin: Option<guard::ChainPin>,
     ) {
         if let Some(pin) = pin {
-            // Ruling 73: `reject()` reaches here with no `now` (§16.4), so
-            // the watermark is the stamp and `observe` floors it.
-            //
             // Ruling 77: the kind travels on the pin. A chain refused at
             // `authenticate()` — including a `Replay` — never reached
             // `Proven`, so its pin is still `Claimed` and its release moves
             // no timer.
-            self.guard.unpin(&pin.key, pin.kind, self.last_now);
+            self.guard.unpin(&pin.key, pin.kind, now);
         }
         if let Some(undo) = undo {
             self.guard.revert(undo);

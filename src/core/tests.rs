@@ -459,7 +459,7 @@ fn the_drain_always_terminates_in_timeout() {
     let _ = b.drain();
     let _ = b.ep.accept(t, intro);
     let _ = b.drain();
-    b.ep.reject(intro);
+    b.ep.reject(t, intro);
     let _ = b.drain();
 
     // handle_timeout(), including one far past every deadline.
@@ -467,7 +467,7 @@ fn the_drain_always_terminates_in_timeout() {
     let _ = b.timeout(t + INTRO_TTL * 4);
 
     // handle_connection_event()
-    a.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: 1 });
+    a.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: 1 });
     let _ = a.drain();
 }
 
@@ -642,7 +642,7 @@ fn reject_at_intro_costs_no_dh() {
     let id = b.feed(t, v4(5, 5), &forged_init(&b, 1, 0x11)).one_intro().0;
     assert_eq!(b.dhs.get(), 0);
 
-    b.ep.reject(id);
+    b.ep.reject(t, id);
     let d = b.drain();
     assert_eq!(b.dhs.get(), 0, "reject at Intro spent DH");
     assert!(
@@ -684,7 +684,7 @@ fn reject_at_claimed_costs_one_dh() {
     b.ep.read_identity(id).expect("readable");
     let _ = b.drain();
 
-    b.ep.reject(id);
+    b.ep.reject(t, id);
     let d = b.drain();
     assert_eq!(b.dhs.get(), 1, "reject at Claimed ran a second DH");
     assert!(d.transmits().is_empty());
@@ -722,7 +722,7 @@ fn reject_at_proven_costs_two_dh_and_installs_nothing() {
     b.ep.authenticate(t, id).expect("authenticates");
     let _ = b.drain();
 
-    b.ep.reject(id);
+    b.ep.reject(t, id);
     let d = b.drain();
     assert_eq!(b.dhs.get(), 2, "reject at Proven ran ee/se");
     assert!(d.transmits().is_empty(), "a declined accept sent msg2");
@@ -1002,7 +1002,7 @@ fn the_intro_accessors_answer_none_for_an_absent_entry() {
     assert_eq!(b.ep.intro_source(id), Some(v4(5, 5)));
     assert_eq!(b.ep.intro_sender_index(id), Some(7));
 
-    b.ep.reject(id);
+    b.ep.reject(t, id);
     let _ = b.drain();
     assert_eq!(b.ep.intro_source(id), None, "a rejected id still answers");
     assert_eq!(b.ep.intro_sender_index(id), None);
@@ -1663,7 +1663,7 @@ fn the_staged_verbs_on_an_expired_id_report_expired() {
     // documented "no initiation is parked for this static".
     assert!(matches!(b.ep.accept(after, id), Err(AcceptError::Stale)));
     let _ = b.drain();
-    b.ep.reject(id); // infallible, no-op
+    b.ep.reject(after, id); // infallible, no-op
     assert!(b.drain().is_silent());
 }
 
@@ -1839,7 +1839,7 @@ fn authenticate_then_reject_leaves_the_guard_empty() {
 
     let (id, first) = ladder_to_proven(&mut b, t, v4(21, 1), &train[0]);
     first.expect("first admission");
-    b.ep.reject(id);
+    b.ep.reject(t, id);
     let _ = b.drain();
 
     // The very same initiation, replayed: it must pass vacuously again,
@@ -1871,7 +1871,7 @@ fn authenticate_then_reject_restores_a_prior_value() {
     // A provisional record at train[2], then rejected.
     let (id2, high) = ladder_to_proven(&mut b, t, v4(22, 2), &train[2]);
     high.expect("train[2] is strictly greater than train[0]");
-    b.ep.reject(id2);
+    b.ep.reject(t, id2);
     let _ = b.drain();
 
     // Not empty: train[0] is still refused as an equal replay.
@@ -1934,7 +1934,7 @@ fn authenticate_then_reject_clears_the_record_even_when_another_chain_pins_the_e
     let _ = b.drain();
 
     // Drop A. The entry survives — B pins it — but the RECORD must not.
-    b.ep.reject(chain_a);
+    b.ep.reject(t, chain_a);
     let _ = b.drain();
     assert_eq!(
         b.ep.greatest(a.canonical()),
@@ -2051,7 +2051,7 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
 
     // (3) End the dial. It never pinned this entry and never wrote this
     //     record, so it may disturb neither.
-    a.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
+    a.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: index });
     let _ = a.drain();
     assert_eq!(
         a.ep.guard_pins(b.canonical()),
@@ -2202,7 +2202,7 @@ fn an_orphaned_guard_entry_ages_out_at_ts_guard_orphan_ttl() {
     // Un-pin at the same instant: the entry is an orphan from `t`. §16.4
     // (4499–4505) makes `Retired` the teardown event that releases "the
     // index route and the guard-entry pin".
-    b.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: ours });
+    b.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: ours });
     let _ = b.drain();
 
     // Below the TTL: still guarded.
@@ -2244,7 +2244,7 @@ fn the_endpoint_deadline_covers_guard_orphan_aging() {
     let msg2 = b.drain().one_transmit().1;
     let (ours, _theirs) = resp_indices(&msg2);
 
-    b.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: ours });
+    b.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: ours });
     let d = b.drain();
     assert_eq!(
         d.deadline,
@@ -2931,7 +2931,7 @@ fn retired_cancels_the_pending_and_frees_the_static_for_an_immediate_redial() {
     let index = init_sender_index(&d.one_transmit().1);
     let due = d.deadline.expect("armed");
 
-    a.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
+    a.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: index });
     let d = a.drain();
     assert!(
         d.failures().is_empty(),
@@ -2984,7 +2984,7 @@ fn a_redial_after_cancellation_still_emits_a_strictly_greater_timestamp() {
     let first = d.one_transmit().1;
     let index = init_sender_index(&first);
 
-    a.ep.handle_connection_event(conn, ToEndpoint::Retired { our_index: index });
+    a.ep.handle_connection_event(t, conn, ToEndpoint::Retired { our_index: index });
     let _ = a.drain();
 
     let (_conn2, d) = a.connect(t, b.addr, &peer);

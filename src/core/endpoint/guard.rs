@@ -146,38 +146,17 @@ pub(crate) struct GuardEntry {
     /// deadline and dies at the next sweep with **no orphan window at
     /// all** — precisely when a captured initiation becomes replayable.
     ///
-    /// # The core cannot always know the release instant
+    /// # It is the real instant
     ///
-    /// §16.4 ratifies `handle_connection_event` and `reject` **without** a
-    /// `now`, and both release pins — the first being *the* retirement path
-    /// ruling 73 is about. So [`unpin`](TimestampGuard::unpin) stamps with
-    /// the last instant the core was *told*, and marks the stamp
-    /// [provisional](GuardEntry::provisional_stamp).
+    /// **[RATIFIED 2026/08/15 — ruling 80]** §16.4 now passes `now` to
+    /// `handle_connection_event` and `reject`, the two verbs that release a
+    /// pin. Both are *mutating* calls, so the invariant §16.4 states — a
+    /// `now` on every mutating call, and the cores never read a clock —
+    /// always required it; the block was ratified carrying an invariant it
+    /// did not satisfy, and the two verbs that had to know the time were
+    /// the two not given it. So this stamp is the release instant, with no
+    /// watermark, no approximation and no floor to correct one.
     pub(crate) orphaned_at: Option<Instant>,
-    /// Whether [`orphaned_at`](GuardEntry::orphaned_at) is a **lower
-    /// bound** on the release instant rather than the release instant
-    /// itself. **Ruling 73.**
-    ///
-    /// The true release instant `T` is bracketed by the last instant the
-    /// core was told and the next one it will be told. Taking the lower end
-    /// keeps the deadline announceable the moment the pin drops — §16.5
-    /// names orphan aging as one of the endpoint's three deadline families,
-    /// and a family that goes silent between two calls is not that.
-    ///
-    /// But the lower end alone re-creates ruling 73's own defect one level
-    /// down: a connection dying of `DEAD_TIMEOUT` was last heard from 25 s
-    /// ago, and 25 s stale plus a 15 s TTL is **already in the past**, so
-    /// the entry would again die at the next sweep with no orphan window at
-    /// all. So [`observe`](TimestampGuard::observe) applies a floor at the
-    /// **first** observation after the release: a stamp that has already
-    /// expired by then is re-stamped to that instant. An orphan therefore
-    /// always gets a full `TS_GUARD_ORPHAN_TTL` from the first moment the
-    /// core can see that it *is* one, which is exactly the property ruling
-    /// 73 exists to guarantee.
-    ///
-    /// The floor applies once, not at every observation — otherwise no
-    /// orphan would ever age out.
-    provisional_stamp: bool,
 }
 
 impl GuardEntry {
@@ -252,15 +231,6 @@ pub(crate) struct GuardUndo {
 #[derive(Debug, Default)]
 pub(crate) struct TimestampGuard {
     entries: HashMap<Vec<u8>, GuardEntry>,
-    /// Set when [`unpin`](TimestampGuard::unpin) leaves a provisional stamp
-    /// behind (ruling 73 — see [`GuardEntry::provisional_stamp`]). Cleared
-    /// by the pass that finalises them.
-    ///
-    /// A plain `bool`, so [`observe`](TimestampGuard::observe) is one
-    /// branch on the flood path and scans only in the interval between a
-    /// release and the next clocked call. A stale `true` costs one wasted
-    /// scan and nothing else, so no path has to decrement it.
-    has_provisional: bool,
 }
 
 impl TimestampGuard {
@@ -305,10 +275,8 @@ impl TimestampGuard {
                         exempt_until: None,
                         last_admitted: now,
                         // Born unpinned, so it is an orphan from this
-                        // instant — and `now` is in hand, so the stamp is
-                        // exact rather than provisional (ruling 73).
+                        // instant (ruling 73).
                         orphaned_at: Some(now),
-                        provisional_stamp: false,
                     },
                 );
             }
@@ -375,7 +343,6 @@ impl TimestampGuard {
                 if kind == PinKind::KeyHolder {
                     entry.keyholder_pins = entry.keyholder_pins.saturating_add(1);
                     entry.orphaned_at = None;
-                    entry.provisional_stamp = false;
                 }
                 true
             }
@@ -405,7 +372,6 @@ impl TimestampGuard {
         }
         entry.keyholder_pins += 1;
         entry.orphaned_at = None;
-        entry.provisional_stamp = false;
     }
 
     /// Release a pin taken by [`pin`](Self::pin).
@@ -417,13 +383,11 @@ impl TimestampGuard {
     /// an unauthenticated party naming someone else's static cannot move
     /// the timer.
     ///
-    /// `last_now` is the last instant the core was *told* — §16.4 ratifies
-    /// `handle_connection_event` and `reject` with no `now` and both reach
-    /// this verb, so it is a lower bound rather than the release instant,
-    /// and the stamp is marked provisional until
-    /// [`observe`](Self::observe) can floor it. See
-    /// [`GuardEntry::provisional_stamp`].
-    pub(crate) fn unpin(&mut self, key: &[u8], kind: PinKind, last_now: Instant) {
+    /// **[RATIFIED 2026/08/15 — ruling 80]** `now` is the release instant
+    /// itself. Every verb that reaches this one carries a `now`, including
+    /// `handle_connection_event` and `reject`, which §16.4 now passes it to
+    /// precisely because ruling 73 made them stamp this field.
+    pub(crate) fn unpin(&mut self, key: &[u8], kind: PinKind, now: Instant) {
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
@@ -442,37 +406,8 @@ impl TimestampGuard {
         // `Claimed` chain still suspends aging, but the instant the window
         // runs from is fixed here, by the key-holder, and stays fixed.
         if kind == PinKind::KeyHolder && entry.keyholder_pins == 0 {
-            entry.orphaned_at = Some(last_now);
-            entry.provisional_stamp = true;
-            self.has_provisional = true;
+            entry.orphaned_at = Some(now);
         }
-    }
-
-    /// Finalise every provisional orphan stamp against the first instant
-    /// the core is told about after the release. **Ruling 73.**
-    ///
-    /// Called from each clocked entry point of the core. A provisional
-    /// stamp that has *already* expired by now is floored to `now`, so an
-    /// orphan can never be swept in the same breath as it is first seen to
-    /// be one — which is ruling 73's whole point. A stamp that has not
-    /// expired is left where it is and simply becomes final.
-    pub(crate) fn observe(&mut self, now: Instant) {
-        if !self.has_provisional {
-            return;
-        }
-        for entry in self.entries.values_mut() {
-            if !entry.provisional_stamp {
-                continue;
-            }
-            let expired = entry
-                .orphaned_at
-                .is_none_or(|at| at + constants::TS_GUARD_ORPHAN_TTL <= now);
-            if expired {
-                entry.orphaned_at = Some(now);
-            }
-            entry.provisional_stamp = false;
-        }
-        self.has_provisional = false;
     }
 
     /// Mitigation (ii): age unpinned orphans out at
@@ -481,15 +416,13 @@ impl TimestampGuard {
     /// The constant is ruling 70's — an alias of `INTRO_TTL`, so there is
     /// no second place for 15 s to be written down.
     ///
-    /// Finalises provisional stamps first, then sweeps by
-    /// [`age_deadline`](GuardEntry::age_deadline) — the same function
-    /// §16.5's min-deadline scan announces, so the two cannot disagree.
-    /// Finalising first is also what makes ruling 76's order benign: a
-    /// give-up at step (1) releases a pin, and the aging at step (3) floors
-    /// its stamp and grants it a **fresh** window rather than finding an
-    /// expired one.
+    /// Sweeps by [`age_deadline`](GuardEntry::age_deadline) — the same
+    /// function §16.5's min-deadline scan announces, so the two cannot
+    /// disagree. That shared reader is also what makes ruling 76's order
+    /// benign: a give-up at step (1) releases a pin and stamps it at this
+    /// same `now`, so the aging at step (3) reads a **fresh** window rather
+    /// than an expired one.
     pub(crate) fn age_orphans(&mut self, now: Instant) {
-        self.observe(now);
         self.entries
             .retain(|_, entry| entry.age_deadline().is_none_or(|deadline| deadline > now));
     }

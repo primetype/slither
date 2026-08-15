@@ -259,3 +259,51 @@ All 13 golden-wire / size tests green. No wire byte moved. Nothing committed.
 2. `AuthError` had no `Local` — **CLOSED by ruling 78**.
 3. An unproven mid-state's pin restarting the orphan clock — **CLOSED by ruling 77**.
 4. `Local` carries no source — **still open** (Finding A); needs `Identity::Error: Send + Sync + Clone`.
+
+# ── Rulings 79 and 80 (spec at ac8c567) ──
+
+## R80 — §16.4 passes `now`; the watermark is gone
+`handle_connection_event(now, id, ev)` and `reject(now, id)` per SPEC 4375/4383.
+**Deleted outright**: `Endpoint::last_now`, `Endpoint::observe`, `GuardEntry::provisional_stamp`,
+`TimestampGuard::has_provisional`, `TimestampGuard::observe` and all five call sites.
+`unpin(key, kind, now)` now takes the real release instant. `drop_pending`, `discard_chain` and
+`release_chain_guard_state` thread `now` from their callers. `Endpoint::new`'s `now` is `_now` again.
+
+### `read_identity` needs no `now` — confirmed structurally, not assumed
+Its only entry-removing path is the hiss-read-failure arm, reached **only** from
+`ChainState::Parked` (checked at the top of the verb). A `Parked` entry holds no `guard_pin` and no
+`guard_undo`: both are written solely at this verb's success arm and at `authenticate()`, and §6.3
+never byte-replaces a *consumed* entry back to `Parked`. So that arm no longer calls
+`discard_chain` at all — it calls `intros.remove(id)` directly under a `debug_assert!` that the
+entry carried neither. The claim is now enforced by the code rather than by a comment.
+
+## R79 — `Local` stays a unit variant, detail rides `slither::io`
+`tracing::warn!(target: "slither::io", verb, stage, %error, ...)` at every site that produces a
+`Local`, with fields:
+- `verb` — `"read_identity"` / `"authenticate"` / `"connect"`
+- `stage` — `"Identity::open"` (§18.2's named obligation) or `"Handshake::responder"` /
+  `"Handshake::write_msg1"` (the other faults behind the same variant, labelled so the row stays legible)
+- `error` — the provider's own error, by `Display`
+- `conn` — on the dial path only
+`read_identity` gained a private `read_identity_as(id, verb)`; `authenticate` calls it with
+`"authenticate"`, so one fault yields **one** event naming the application's verb rather than two
+naming an internal call chain. §18.2's row asks for "the verb that met it".
+First use of the `tracing` dependency in the crate; no new target, so ruling 67's bar is untouched.
+
+## Gates after 79/80 — TWO STATES, both reported
+### Final tree (`src/core/tests.rs` untouched, as instructed): does NOT compile `--all-targets`
+`cargo build --all-features --all-targets` -> `error: could not compile 'slither' (lib test) due to
+15 previous errors`, all E0061 at the 15 call sites listed in
+`ruling-80-tests-reconciliation.patch`. Yours to reconcile.
+Everything that does not compile `src/core/tests.rs` is green:
+build (lib) · fmt · clippy (lib) · doc · doc --all-features · +1.96 check (lib) · deny ·
+tests/spec_constants 103 · tests/spec_errors 11 · tests/spec_packet 4.
+
+### Temporary experiment, since reverted with `git checkout src/core/tests.rs`
+Threaded the instant already in scope at each of the 15 sites (`t`, except line 1666 which is
+`after`) — purely mechanical, no assertion touched, and `cargo fmt` produced no churn beyond the
+15 lines. With that patch **every gate is green**: build --all-targets · fmt · clippy --all-targets
+· both docs · `cargo test` 141+103+11+4+4 · `cargo test --all-features` same · +1.96 --all-targets
+· deny. All 13 golden-wire/size tests green; no wire byte moved.
+The patch is saved at `.slices/02-handshake/ruling-80-tests-reconciliation.patch` — it is evidence
+about rulings 79/80, not a proposal about the tests.
