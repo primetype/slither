@@ -164,10 +164,21 @@ the spec rounds.
    the finish order decided who won; in slice 1 the same overlap existed
    and the order happened to favour the tests, which is why it went
    unnoticed. If the implementer needs a module to compile against, it
-   declares `#[cfg(test)] mod tests;` and **creates nothing** — the file
-   is the test author's alone. A brief that hands two concurrent agents
-   one path has a race in it, and "it worked last time" is what a race
-   looks like from the outside.
+   lands `#[cfg(test)] mod tests;` **commented out under an integration
+   header** and **creates nothing** — the file is the test author's alone,
+   and the integrator uncomments the declaration when it arrives. A brief
+   that hands two concurrent agents one path has a race in it, and "it
+   worked last time" is what a race looks like from the outside.
+   **[Amended by ruling 211.]** This clause said "declares … and creates
+   nothing", which contradicted rule 15: **a `mod` declaration naming a
+   missing file is a compile error** — `Cargo.toml`'s `[[test]]` failure
+   one layer down, and rule 15 exists for exactly that. The contradiction
+   had already been discharged by hand without being recognised: slice 7's
+   implementer commented its declaration out to run its gates, restored it
+   before committing, and reported that its gates had run without that
+   module. It did the right thing and nothing in the rules told it to.
+   The partition of **paths** below is untouched and remains absolute;
+   only the instruction about the declaration changed.
 7. **Do not report a gate as green without running it.** Paste the
    command and its output.
 8. **A list in the spec is read as exhaustive whether or not it says so.**

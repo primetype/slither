@@ -5902,3 +5902,100 @@ binding, cited by a brief, not containing what the brief says it
 contains.** There it cost a blind author ten minutes of guessing an API;
 here the planner caught it before any agent was briefed, which is the
 whole value of planning before dispatching.
+
+### 210 — ruling 208 corrected in four places, three of them by the planner declining it
+
+Ruling 208 was ratified on a summary. Planning it surfaced four defects
+**in the ruling itself**, three found by an agent applying working rule 5
+to a brief I wrote. Recorded before any code exists.
+
+**(a) The declination §7.3 records — and the sentence that hides the
+defect.** §7.3:2204-2218 explicitly declines
+`PATH_CHALLENGE`/`PATH_RESPONSE` as *"the one reviewed alternative that
+would move the wire"*, preferring `validation_floor` because it is
+*"wire-free"*. Ruling 208 therefore reverses a **recorded declination**,
+exactly as ruling 168 did — and CLAUDE.md warns that re-proposing a
+declined idea wastes a round. This one is legitimate because the
+declination's **stated ground was wire cost**, and the maintainer has
+weighed a fact the declination never considered: nothing has shipped, so
+the cost is at its lifetime minimum.
+
+More important is what the same passage argues *for* `validation_floor`:
+an ACK covering a counter we chose *"**cannot be manufactured without the
+key**"*. That is true, and it is the whole defect in six words. **The
+peer has the key.** Every comparison in that paragraph is against an
+*off-path attacker*; the threat model for roaming is the *peer*; and the
+paragraph never asks the question. Defect class 1 at its source — and the
+declination was made on a comparison that had already scoped itself out
+of the real adversary.
+
+**(b) Ruling 208's RNG source does not exist.** It says the challenge is
+*"drawn from the endpoint RNG"*. **`Connection` cannot reach
+`Endpoint::rng`** — both arming sites are inside the connection core.
+This is working rule 11 in my own ruling, the same shape as rulings 87
+and 89, and the **third time today** I have named a mechanism without
+opening the file. **Corrected: the challenge is drawn from §16.6's
+per-connection sub-seed**, which `Connection` already holds, has never
+used, and which §16.6 exists for. The planner notes this also deletes
+`set_floor` entirely.
+
+**(c) Ruling 208 closes A1 but not A1b, and must say so.** An on-path
+attacker defeats a challenge exactly as it defeated the ACK — by
+**relaying** one packet rather than forging anything. 208 does not
+mention it. Writing *"return routability is now proven"* would reproduce,
+inside the fix, the unstated-scope defect being fixed. **§7.3 gains an
+honesty clause**: the challenge defeats a peer that never received at the
+address; it does not defeat an attacker that can carry packets to and
+from the real peer.
+
+**(d) My "the wire vectors will go red by design" licence is withdrawn.**
+The brief told the remediation planner to expect the golden-wire vectors
+to fail and update them deliberately. **That is wrong on this design**:
+ruling 208 adds two *new* type codes and moves **no existing byte**, so
+every golden vector must stay byte-identical. The planner declined the
+instruction and was right. A red wire test here is the stop signal in
+full force.
+
+This is ruling 51's guard again — *an agent that declined a blanket
+instruction was right* — and the failure mode is precise: **a licence to
+expect red is a licence to update a red that mattered.** I issued it from
+"this is a wire change" without asking *which* bytes move.
+
+**Two integration hazards the planner raised, recorded so the
+implementer inherits them rather than rediscovering them:**
+
+- **`on_ack_coverage` serves two floors.** It feeds both §7.3's
+  amplification budget and §7.5's contested-probe floor. Deleting it
+  wholesale to remove 168's machinery would **silently disable ruling
+  176's machinery**, and no wire test would catch it. Remove the
+  amplification role only.
+- **Rulings 171 and 208 collide in the one state both were written for.**
+  A pending contested mark returns early from `pump_packets`, so a
+  challenge ranked below it in the priority order is never built. Both
+  rulings are about what happens to an unvalidated address under a scarce
+  budget; neither anticipated the other.
+
+### 211 — CLAUDE.md's working rules 6 and 15 contradict each other
+
+Rule 6: an implementer needing a test module *"declares `#[cfg(test)] mod
+tests;` and **creates nothing**"*. Rule 15: a file valid only once **both**
+blind agents' work exists belongs to the **integrator**, because a tree
+where no gate can run is worse than either failure it prevents.
+
+**A `mod` declaration naming a missing file is a compile error** — it is
+`Cargo.toml`'s `[[test]]` failure one layer down, and rule 15 was written
+about exactly that. The two rules give opposite instructions for the same
+artefact.
+
+This was already observed empirically and not recognised: slice 7's
+ruling-203 implementer had to comment its `mod tests_sizing;` out to run
+its gates, restore it before committing, and **report that its gates ran
+without that module**. That is the contradiction, discharged by hand, by
+an agent that did the right thing and could not have been told to.
+
+**Ruling: rule 15 governs. Rule 6's "declares … and creates nothing"
+clause is amended** — the implementer lands the declaration **commented
+out** under an integration header, and the integrator uncomments it when
+the test author's file arrives. Rule 6's partition of *paths* is
+untouched and remains absolute; only its instruction about the
+declaration changes.
