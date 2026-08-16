@@ -5999,3 +5999,79 @@ out** under an integration header, and the integrator uncomments it when
 the test author's file arrives. Rule 6's partition of *paths* is
 untouched and remains absolute; only its instruction about the
 declaration changes.
+
+### 212 — the §7.3 sweep, and two defects it found that were not ruling 208's
+
+`SPEC.md` swept for ruling 208 across 24 hunks (+467/−122). No wire byte
+moved: `AMPLIFICATION_FACTOR` is still 3, and `IK_MSG1_LEN`,
+`IK_MSG2_LEN`, `INIT_PACKET_LEN`, `RESP_PACKET_LEN`, `VERSION` and
+`PROLOGUE` are untouched. Per ruling 210(d), **a red golden vector under
+this change means the implementation went further than was ratified.**
+
+**(a) §6.9:2045 carried the same defect, in a different section, and
+working rule 4 is the only reason it was found.** Its 588-byte
+amplification bound rested on the premise *"the spoofed source is not the
+peer"* — a statement about **who holds the key**, which is precisely
+ruling 208's defect wearing different words. A sweep that greped
+`validation_floor` would have walked straight past it. Re-grounded on
+*"nothing receives at the spoofed source"*, which is a statement about
+the **address** and survives a key-holding adversary. **Second confirmed
+instance of the ruling-208 defect class in this document**, and evidence
+that the class is a habit of the text rather than one bad paragraph.
+
+**(b) Ruling 186 was never fully swept, and it is mine.** §14.5 said a
+pending contested probe ranks *"ahead of everything"* and §15.4 said it
+*"outranks all other output"* — both written before ruling 186 put CLOSE
+first. §7.3 and §6.9 carried the amendment; these two did not. The
+sweeper was editing both sentences for 208 and corrected them **visibly**,
+naming the old wording so the change is auditable, rather than silently.
+That is working rule 4(a) — *when you correct one clause of a sentence,
+read the other clauses* — applied by an agent to a defect the maintainer
+left behind.
+
+**(c) The ranks collision, resolved.** Ruling 171 ranks a pending
+contested probe second, and `pump_packets` returns early when it cannot
+be sent — so a challenge ranked below it would never be built. The
+sweeper flagged this rather than resolving it, and in doing so found the
+better framing: **nothing in §7.5 or ruling 171 mandates an early
+*return*; they mandate a *rank*.** The early return is the pump's own
+realisation and is strictly stronger than anything specified.
+
+**Ruling: `PATH_CHALLENGE` and `PATH_RESPONSE` rank immediately after
+CLOSE, above the contested probe.** The argument is the one that already
+puts CLOSE first: **everything else in the order competes for the budget;
+the challenge dissolves it.** Ranking the output that removes the
+constraint above the outputs that consume it is not a preference, it is
+the only ordering that terminates. The probe and a challenge together are
+~40 B, inside the 90 B floor a minimal roam funds, so in practice they do
+not compete at all — but the rank must be right for the case where they
+would.
+
+The pump's early return is consequently **wrong as written** and is the
+implementer's to fix: it may not block the one frame that ends the state
+it is protecting.
+
+**(d) Four derived points, ratified as derived.** The sweeper marked
+these as inferred rather than ratified and asked. All four stand:
+retransmission class is `never` **plus a standing obligation** (the
+no-deadlock proof cannot survive "sent once, lost forever"); a mismatched
+`PATH_RESPONSE` is a **semantic no-op**, because `PROTOCOL_VIOLATION`
+there would be a keyless remote kill primitive; **at most one outstanding
+response**, overwritten rather than queued, per §17.5's ceiling
+discipline; and the response obligation is **kept across a roam**.
+
+**(e) The scope extension was necessary and is ratified.** The brief named
+§8.5 and §7.3's priority order. The sweeper also edited §8.3 and §8.4,
+because **without a frame-table entry `0x1a` is an unknown type and §8.2
+requires killing the connection on the very frame §7.3 now mandates
+sending.** It flagged the extension rather than performing it quietly.
+That is the correct handling and the correct judgement.
+
+**(f) Two source comments now quote text that has changed.**
+`src/core/connection/mod.rs:1960` cites `SPEC.md:2172` and `:2002` cites
+`SPEC.md:2170`. Both sentences survive — at 2242–2247 and 2239 — but the
+first now reads *"elicit the `PATH_RESPONSE` that ends it"* rather than
+*"the ACK"*. **The remediation implementer owns these**; the sweeper
+correctly did not touch `src/`. Citing a spec line **by number** from a
+comment is fragile in a document under revision, and the two instances
+here are the argument for citing section and sentence instead.

@@ -16,9 +16,13 @@
 > remains open.** Appendix A.1's no-fallback gate was the last one, and
 > it closed when the staged read shipped in hiss 0.3.2 and Appendix A
 > was reconciled against the shipped API (§1.3, Appendix A); every other
-> flag was ruled in the 2026/08/14 walkthrough. The flag token appears
-> nowhere in this document, and a zero count is part of the ratification
-> check. The two [OPEN] markers draft v1 carried are
+> flag was ruled in the 2026/08/14 walkthrough. The flag token appeared
+> nowhere in this document, and a zero count was part of the ratification
+> check. *(**Amended 2026/08/16 by ruling 208**: the count is now **one**,
+> carrying the bracketed marker `FLAGGED FOR RULING`, at its home in §7.3
+> and reconciled in §1.3. This entry stands as written so the history
+> stays legible.)*
+> The two [OPEN] markers draft v1 carried are
 > resolved (§6.4's re-home rule, §15.2's violation surface); **no [OPEN]
 > markers remain**. British English, Oxford comma, dates `YYYY/MM/DD`.
 >
@@ -400,6 +404,22 @@ dies as a signalled death under §8.2, applying nothing from the packet.
 Accepted, because **nothing was ever released**: the exposure is confined
 to unreleased development builds of the superseded drafts.
 
+**One pre-release addition to this wire.** **[RATIFIED 2026/08/16 —
+rulings 208, 210(d)]** Recorded here because §1.3's freeze is exactly what
+makes it a ruling rather than drift. Ruling 208 adds two frame types —
+`PATH_CHALLENGE` (`0x1a`) and `PATH_RESPONSE` (`0x1b`), §8.3 — replacing
+the address-validation proof §7.3 carried under ruling 168. It is ratified
+as a wire change because **nothing has shipped**: no third party has ever
+seen a slither datagram, so the price is at its lifetime minimum today and
+rises permanently at first publication. The freeze exists to stop casual
+drift, not to make the protocol unfixable before it ships. **Its scope is
+exact, and the exactness is why it is affordable: two new type codes, and
+not one existing byte moved.** Every golden wire vector stays
+byte-identical under it. A red wire vector while implementing this change
+is therefore §1.3's stop signal in full force — it means the change went
+further than it was ratified to go, not that an expectation needs
+updating.
+
 ### 1.2 Scope
 
 This specification covers the whole protocol: the crypto suite seam and
@@ -445,8 +465,23 @@ the ratchet-only ruling), and the no-fallback split-read gate
 That gate is now **closed**: the staged read shipped in hiss 0.3.2, the
 DH ladder it rests on is pinned by test, and Appendix A is reconciled
 against the shipped API (**RECONCILED 2026/08/14**). **No maintainer
-flag remains open in this document** — the marker token appears nowhere
-in it, so a zero count is the ratification check.
+flag remained open in this document at ratification** — the marker token
+appeared nowhere in it, and a zero count was the ratification check.
+
+**[AMENDED 2026/08/16 — ruling 208]** *The count is no longer zero, and
+saying so is the point of keeping the check.* Ruling 208 opened exactly
+one call. It carries the bracketed marker **`FLAGGED FOR RULING`**, which
+appears in bracketed form **exactly once** in this document — at its home,
+never in prose about it, so that grepping the bracketed token still
+answers a count question and **1** is the expected answer. The call:
+§7.3's
+scarce-budget priority order and §7.5's pending contested probe were
+written for the same state and do not compose — a probe that *returns*
+from the send pass suppresses every rank below it, including the
+`PATH_CHALLENGE` that would end the scarcity. It is stated at its home in
+§7.3 with the resolutions that are available and no choice made between
+them. **One** is the expected count until it is ruled; a second appearing
+without a ruling is the same signal a red wire vector is.
 
 ## 2. Crypto suites and `channel!` *(DRAFT 2026/08/13)*
 
@@ -941,14 +976,18 @@ entries.
 The responder anchors an accepted session at the initiation's msg1 source
 address — the one place a peer-supplied address becomes a send target
 before any authenticated data has arrived from it. That anchor arms
-§7.3's anti-amplification budget: until the address validates by traffic,
+§7.3's anti-amplification budget: until the address is **validated**,
 output to it is capped at `AMPLIFICATION_FACTOR` × the authenticated,
 window-fresh bytes received from it (§7.3). **[AMENDED 2026/08/16 —
-rulings 168, 169]** *"Validates by traffic"* is a predicate, not a mood:
-the anchor records `validation_floor` (the counter the next seal will
-use), and the address validates — and the budget disarms — at the first
-authenticated, window-fresh packet from it carrying an ACK covering any
-counter at or above that floor (§7.3).
+rulings 168, 169; the predicate superseded 2026/08/16 — ruling 208]**
+Validation is a predicate, not a mood: the anchor draws an 8-byte
+challenge and owes a `PATH_CHALLENGE` (`0x1a`) to that address, and the
+address validates — and the budget disarms — at the first authenticated,
+window-fresh packet from it carrying the matching `PATH_RESPONSE`
+(`0x1b`) (§7.3, §8.3). The earlier predicate — an ACK covering a
+`validation_floor` counter — is superseded: an ACK's fields are
+assertions by whoever holds the key, and at a peer-supplied address the
+key holder is the party whose claim is in question (§7.3).
 
 ### 5.7 Timer values and their derivations
 
@@ -1847,11 +1886,17 @@ immortal after all. Two rules close it, and neither is optional here:
 other class of output except CLOSE** at an unvalidated address (rulings
 171 and 186 — and a connection sending CLOSE is not a zombie anyone needs
 to reap, so the carve-out cannot weaken this argument), and §7.3's
-`validation_floor` means an off-path injector cannot keep the address
-unvalidated in the first place, since it can never produce an ACK
-covering a counter we sealed after the roam (ruling 168). *"Dies within
-`KEEPALIVE_TIMEOUT` of the probe"* is therefore true, and true for a
-named reason.
+**challenge** means an off-path injector cannot keep the address
+unvalidated in the first place, since it spoofs a source it does not
+receive at and therefore never sees the eight bytes it would have to echo
+(rulings 168, 208). *"Dies within `KEEPALIVE_TIMEOUT` of the probe"* is
+therefore true, and true for a named reason. **[AMENDED 2026/08/16 —
+ruling 208]** The reason survives the change of mechanism intact, and it
+is worth saying why it survives: this attacker is **off-path at the
+address it names**, which is the one adversary both the superseded ACK
+predicate and the challenge defeat. The class ruling 208 exists to close —
+a *connected peer* naming a victim's address — is not this attacker, and
+does not reach this argument.
 
 ### 6.9 DoS accounting
 
@@ -1976,10 +2021,10 @@ packets, the `0x04` packet type is never emitted, CLOSE exists only
 inside the seal and its linger replies only to authenticated,
 window-fresh inbound (§15.2), every staged rejection is local and silent,
 and a peer-supplied anchor or roam target is send-capped by the
-anti-amplification budget until it validates by traffic — §7.3's
-`validation_floor` predicate, an ACK covering a counter we sealed after
-the anchor or the roam, which a spoofed source can never produce
-(§7.3, ruling 168).
+anti-amplification budget until it is validated — §7.3's **challenge**
+predicate, a `PATH_RESPONSE` echoing eight bytes we sent to that address
+after the anchor or the roam, which a spoofed source can never produce
+because it never receives them (§7.3, rulings 168, 208).
 
 **One qualification, since ruling 40 made the beacon reachable.** The
 `ratio < 1` above is a property of the *accept path itself*, and it
@@ -1997,24 +2042,31 @@ received from it,
 so the worst case is 3 × 196 B = 588 B for one replayed msg1 — a ratio
 of 3, the maximum the budget permits anywhere in this document, and
 reached only where the application opted the beacon on. **[AMENDED
-2026/08/16 — ruling 168]** That 588 B bound survives the budget's new
-disarm condition, and the premise is named rather than assumed: the
-spoofed source is not the peer, so nothing at it can produce an ACK
-covering `validation_floor`, the address never validates, and the cap
-therefore binds this case for the session's whole life — exactly as the
-superseded permanent-cap text claimed for every case. The honest
-statement is therefore: **no path to an address that has not proved
-return routability exceeds the 3× budget, and the accept
-path with no beacon configured stays far under it at 0.55×.** The scope
-qualifier is ruling 168's and matters: once an address *has* validated —
-an ACK covering `validation_floor`, which only the genuine peer at that
-address can produce — the budget disarms and the ratio stops being an
-amplification figure at all, because there is no longer a third party to
-reflect toward. Every attacker-relevant case in this table is a case
-that never validates. The
+2026/08/16 — ruling 168; predicate superseded 2026/08/16 — ruling 208]**
+That 588 B bound survives the budget's disarm condition, and the premise
+is named rather than assumed: **nothing receives at the spoofed source**,
+so nothing there can echo the eight challenge bytes, the address never
+validates, and the cap therefore binds this case for the session's whole
+life — exactly as the superseded permanent-cap text claimed for every
+case. Note which premise now carries it. Under ruling 168 the premise was
+*"the spoofed source is not the peer"*, and that premise was the defect:
+it is a statement about **who holds the key**, and the key holder can mint
+any ACK field it likes. The challenge does not ask who the sender is; it
+asks **who received**, and a source nobody receives at fails that question
+whoever holds the key. The honest statement is therefore: **no path to an
+address that has not answered a challenge exceeds the 3× budget, and the
+accept path with no beacon configured stays far under it at 0.55×.** The
+scope qualifier matters: once an address *has* validated — a
+`PATH_RESPONSE` matching a challenge we drew after the anchor, which only
+a party that received at that address can produce — the budget disarms and
+the ratio stops being an amplification figure at all, because there is no
+longer a third party to reflect toward. Every attacker-relevant case in
+this table is a case that never validates. The
 alternative of suppressing the beacon entirely while an address is
 unvalidated — the beacon's NAT-holding job being arguably meaningless
-before return routability is proved — would restore the ratio outright
+before the address has answered a challenge (§7.3; *"before return
+routability is proved"* is how this read before ruling 210(c), and it
+overclaims what any challenge proves) — would restore the ratio outright
 and is **left open** rather than adopted here, because it is a
 behavioural change to the beacon and the budget already bounds the
 exposure.
@@ -2123,9 +2175,10 @@ send allowance toward an address of its choosing, which is the reflector
 this rule exists to prevent. No argument has ever been offered for
 letting duplicates fund a security counter.
 
-**The scope is one session.** **[RATIFIED 2026/08/16 — ruling 170]** Both
-byte counters, and the `validation_floor` below, are **per unvalidated
-address, per session**. They live in `core::Connection` beside the roam
+**The scope is one session.** **[RATIFIED 2026/08/16 — ruling 170;
+restated for ruling 208's state]** Both byte counters, and the
+**outstanding challenge** below, are **per unvalidated address, per
+session**. They live in `core::Connection` beside the roam
 seam (§13.6, §14.6) — the only place they are implementable, and the only
 place §17.5's per-connection state census budgets them; there is no
 endpoint-side per-address table. The residual is stated here rather than
@@ -2137,41 +2190,92 @@ sessions the application accepts — the endpoint's governing scale in §6.9
 and §17.5 — and it is the price of putting the counters where the roam
 seam is.
 
-**Disarming: `validation_floor`, a return-routability proof.**
-**[RATIFIED 2026/08/16 — ruling 168; this reverses a declination recorded
-in the superseded text]** The unvalidated state **ends**, and the text
-now says how. At each address change — a roam, or the first anchor from a
-msg1 source — the connection records, in the same act that arms the
-budget:
+**Disarming: an unforgeable challenge, echoed from the address.**
+**[RATIFIED 2026/08/16 — rulings 208, 210; this supersedes ruling 168's
+`validation_floor` entirely — the two are alternatives, never
+complements, and leaving the ACK predicate in place beside this one would
+be an unlocked bypass around it]** The unvalidated state **ends**, and the
+text says how. At each address change — a roam, or the first anchor from a
+msg1 source — the connection, in the same act that arms the budget, draws
+a challenge and owes it to the new address:
 
-> `validation_floor` = **the counter the next seal will use** —
-> `DatagramSend::next_counter()` (Appendix A.2), the identical
-> construction ruling 41 records as the contested probe's `probe_floor`.
+> `challenge` = **8 opaque bytes**, drawn from the connection core's
+> **per-connection sub-seed** (§16.6) — *not* from the endpoint RNG,
+> which `core::Connection` cannot reach (ruling 210(b)). The connection
+> owes a `PATH_CHALLENGE` (`0x1a`, §8.3/§8.4) carrying those bytes to the
+> new address. **One challenge per arming, never reused across armings**;
+> a fresh one is drawn at every address change.
 
 The address becomes **validated**, and the budget **disarms**, at the
-first **authenticated, window-fresh packet from that address** carrying
-an ACK that covers **any counter ≥ `validation_floor`**. Until that
-moment the 3× cap binds all output exactly as stated above. At validation
-the two byte counters and `validation_floor` are freed and the cap no
-longer applies to that address; they are **re-armed, with a fresh floor
-recorded, at the next address change** — §13.6 lists this among the roam
-seam's per-connection resets, and §7.7's counter space is never reset, so
-a fresh floor is always strictly above every counter already sealed.
+first **authenticated, window-fresh packet from that address** carrying a
+`PATH_RESPONSE` (`0x1b`) whose eight bytes equal the challenge
+outstanding for the current arming. A `PATH_RESPONSE` that does not match
+— stale, drawn from a prior arming, or invented — validates nothing; it
+is **not** a structural error and is otherwise ignored (§8.4). Until the
+match arrives the 3× cap binds all output exactly as stated above. At
+validation the two byte counters and the outstanding challenge are freed
+and the cap no longer applies to that address; they are **re-armed, with
+a fresh challenge drawn, at the next address change** — §13.6 lists this
+among the roam seam's per-connection resets.
 
-An ACK at or above the floor can only have been minted by a peer that
-**received a packet we sent to that address after the change** — which is
-return routability, proved, with no new frame type, no new packet type,
-and no state beyond one `u64` and one `bool` per connection. The argument
-is §7.5's probe-floor argument verbatim: an ACK's coverage derives from
-the peer's replay window (§12.2), which cannot contain a counter the peer
-never received, and an attacker holds only packets we sealed *before* the
-floor. If nothing at the new address ever answers, nothing is validated
+**The arming triggers are unchanged, and so is the ordering.** The
+endpoint still **commits** the roam on the authenticated, window-fresh
+packet that carries it (this section's opening rule), and validates
+**afterwards**, with the budget binding in the interval. slither does not
+probe a candidate path and switch on success — that is QUIC's model, it
+needs a second path's worth of state, and §19 keeps it deferred. Refused
+output is still **held, not dropped**.
+
+A `PATH_RESPONSE` matching the challenge can only have been minted by a
+party that **received the packet we sent to that address after the
+change** — which is what the budget needs, with no state beyond eight
+bytes and one flag per connection. The bytes are unguessable: eight bytes
+from a CSPRNG stream the peer never observes, redrawn at every arming, so
+a party that did not receive at the address has one chance in 2⁶⁴ per
+attempt, cannot accumulate attempts across armings, and cannot mine them
+offline. If nothing at the new address ever answers, nothing is validated
 and the session dies by liveness inside 25 s — unconditionally, since any
 ack-eliciting output we aim at the address arms the death clock by
-itself, even where nothing marking is sent (§7.4). There is no deadlock in
+itself, even where nothing marking is sent (§7.4); `PATH_CHALLENGE` is
+itself ack-eliciting (§8.3), so the very packet that asks the question
+arms the clock on the answer. There is no deadlock in
 either direction: the budget always admits *something* (the anchoring or
-roaming packet funds 3× its own size), and what it admits is enough to
-elicit the ACK that ends it.
+roaming packet funds 3× its own size, and 3× the *smallest* packet that
+can arm the budget — §7.5's 30-byte keepalive, 90 B — still admits a
+packet carrying the challenge, which costs 14 B of header, 9 B of frame
+and a 16 B tag), and what it admits is enough to
+elicit the `PATH_RESPONSE` that ends it.
+
+That last clause is a claim about the **sender**, and it is only true of a
+sender that **sizes** its output to the room the budget admits. A sender
+that builds a full-size packet, finds it refused, and holds it whole has
+made the escape unreachable while satisfying every word of the
+*held-not-dropped* rule — the defect ruling 203 found under the
+superseded predicate, which this design does not repair and does not
+weaken. Sizing to `min(MAX_DATAGRAM, room)` is what makes the no-deadlock
+argument above a fact rather than an aspiration.
+
+**What the challenge proves, and what it does not.** **[RATIFIED
+2026/08/16 — ruling 210(c)]** Stated plainly, because the failure this
+whole change corrects was a sound argument read past its scope. The
+challenge defeats the adversary ruling 208 was written for: **a peer that
+never received at the address it named.** That peer holds the session keys
+and can therefore mint any plaintext field it likes — which is exactly why
+an ACK's `largest` was never a proof — but it cannot echo eight bytes it
+has never seen. The challenge does **not** defeat an **on-path attacker
+able to carry packets to and from the real peer**. Such an attacker names
+a victim's address, relays our `PATH_CHALLENGE` onward to the peer,
+relays the peer's `PATH_RESPONSE` back, and the address validates — and
+it *should*, because at that point packets aimed there genuinely do reach
+the peer, which is all any return-routability check can ask. This is the
+ceiling of the mechanism rather than a gap in slither's use of it; QUIC's
+path validation has the same ceiling (RFC 9000 §9.3). **"Return
+routability is now proven" is therefore false as an unqualified
+sentence**, and writing it that way would reproduce, inside this fix, the
+unstated-scope defect the fix exists to correct: an argument sound against
+one adversary, read as sound against all. What is proven is narrower and
+is enough for what this budget is for — **the address is not a pure
+reflector**, because something there is talking back.
 
 **Why the literal permanent cap could not stand, recorded so the
 reversal is not re-litigated.** The budget arms on *every* first anchor
@@ -2201,21 +2305,61 @@ state**, not the ratio — and RFC 9000 is now cited for what it says: QUIC
 binds that limit *until the address is validated*, and validates it by a
 return-routability proof, which is exactly the shape adopted here.
 
-**Why this is not the declined alternative.** Two alternatives remain
-declined, and `validation_floor` is neither of them. (1) *An
-N-authenticated-packets-over-1-RTT validation unlock* — more state than
-this, and, decisively, **the same reflection property**: N authenticated
-packets can be replayed at us by an off-path attacker, whereas an ACK
-covering a counter *we* chose after the address change cannot be
-manufactured without the key. `validation_floor` is a **single**
-round-trip proof carrying **less** state (one `u64`, one `bool`) and a
-strictly stronger predicate; the declined option was the weaker one,
-which is likely why it was declined. (2) *Explicit
-PATH_CHALLENGE/PATH_RESPONSE validation* — two new frame types, a second
-reset seam alongside the roam seam, and the one reviewed alternative that
-would move the wire; still declined, still recorded in §19 as the
-QUIC-faithful-migration lever. `validation_floor` is wire-free: it adds
-no frame, no packet type, and no byte to any packet.
+**The declination this section recorded, and its reversal.** **[RATIFIED
+2026/08/16 — rulings 208, 210(a)]** This passage is kept rather than
+deleted: the alternative now adopted is one this section explicitly
+declined, and a declination that vanishes when it is reversed teaches
+nothing.
+
+(1) *An N-authenticated-packets-over-1-RTT validation unlock* — **still
+declined**, on a ground ruling 208 does not disturb: N authenticated
+packets can be **replayed** at us by an off-path attacker, so the scheme
+carries the very reflection property it was meant to remove, and it costs
+more state than either alternative.
+
+(2) *Explicit `PATH_CHALLENGE`/`PATH_RESPONSE` validation* — **declined
+by ruling 168, adopted by ruling 208.** The declination's stated ground
+was **wire cost**: two new frame types, wire-affecting, golden-wire pin
+red. Nothing else was held against it. That ground has been weighed again
+against a fact the declination never considered — **nothing has shipped**
+(§1.1) — so the cost is at its lifetime minimum today and rises
+permanently at first publication. Re-proposing a declined idea normally
+wastes a round; this reversal is legitimate because it answers the
+declination's own reason rather than stepping around it. What §19 still
+defers is the *other* half of the QUIC model — validation **before** roam
+commit — not the frames.
+
+**The sentence that made the declination look safe, quoted because it is
+the whole defect.** Against `PATH_CHALLENGE` the superseded text argued
+that an ACK covering a counter we chose after the address change *"cannot
+be manufactured without the key"*. Every word of that is true. **The peer
+has the key.** The comparison was drawn throughout against an *off-path
+attacker*, while §7.3's roaming threat model **is the peer** — the peer is
+the party that tells us where to send — and the paragraph never asked the
+question. An ACK is `{ largest, ack_delay, first_range, ranges }`, four
+plaintext integers under AEAD: `largest` is not evidence of receipt, it is
+an **assertion by whoever holds the key**. So a connected peer announced a
+move to a victim address, waited for one sealed packet, and returned a
+forged ACK spoofed from the victim — **two small packets**, after which
+the budget was gone and reflection at the victim was unbounded, defeating
+this section's own stated purpose (*"forces an attacker to pay a third of
+any flood it reflects"*) at O(1) where the pre-168 rule charged that third
+continuously. The attacker needs source-address spoofing, but it needed
+that to fake the move at all: ruling 168 added no requirement, it removed
+the ongoing cost.
+
+The superseded proof had **scoped itself out of this in its own words**.
+It argued that an ACK's coverage derives from the peer's replay window
+(§12.2), *"which cannot contain a counter the peer never received, and an
+**attacker** holds only packets we sealed before the floor."* That is
+sound — against a **third party**. It says nothing about the peer, and the
+word "attacker" sitting in the middle of it is what disguised the gap.
+This is the spec's most productive defect class — a stated construction
+with an unstated scope (working rule 8) — occurring inside the proof of
+the ruling that reversed a declination. It is recorded at length so the
+reversal is a ruling and not an excavation, and so that the same reading
+is applied to the replacement: see *what the challenge proves, and what it
+does not*, above.
 
 **Priority within a scarce budget.** **[RATIFIED 2026/08/16 — ruling
 171]** The budget binds all output and cannot be waived, so when it
@@ -2225,11 +2369,61 @@ normative rather than left to queue order:
 1. **CLOSE** (§15.2) — **[RATIFIED 2026/08/16 — ruling 186]**.
 2. **A pending contested probe** (§7.5) — ahead of all other output to an
    unvalidated address.
-3. Pure ACKs.
-4. PTO probes (§13.4).
-5. Keepalives — passive and persistent (§7.5).
-6. Retransmissions (§13.5).
-7. New application data — STREAM and DATAGRAM fill (§8.5).
+3. **`PATH_RESPONSE`** (§8.3) — **[RATIFIED 2026/08/16 — ruling 208]**.
+4. **`PATH_CHALLENGE`** (§8.3) — **[RATIFIED 2026/08/16 — ruling 208]**.
+5. Pure ACKs.
+6. PTO probes (§13.4).
+7. Keepalives — passive and persistent (§7.5).
+8. Retransmissions (§13.5).
+9. New application data — STREAM and DATAGRAM fill (§8.5).
+
+**Why the two path frames rank where they do, and why their order
+relative to each other is not load-bearing.** They are the *only* output
+whose delivery **ends** the scarcity every other rank is competing
+inside; every class below them is contending for a budget that a single
+round trip removes, so ranking them under the queue they unblock inverts
+means and ends. They are placed under the contested probe rather than
+above it because the probe's deadline is a **liveness verdict** that a
+delay converts into a death (§7.5, and the argument quoted below), where a
+delayed challenge only prolongs a cap. Between themselves the order is
+free: each costs 9 bytes of frame, so a packet carrying **both** costs
+14 B of header + 18 B of frames + a 16 B tag = 48 B, and the smallest
+budget any arming can produce is 3 × the 30-byte keepalive that armed it =
+90 B (§7.5, ruling 203's arithmetic). They therefore never contend with
+one another under any budget this protocol can construct, and
+`PATH_RESPONSE` is listed first only because answering an obligation
+before raising one is the conventional reading.
+
+**[FLAGGED FOR RULING — 2026/08/16, rulings 171 × 208. The one open call
+in this document; §1.3 counts it.]** An interaction between ranks 2 and 4
+that neither ruling anticipated, recorded rather than resolved.
+
+A **pending** contested probe is realised in the send pump as an **early
+return** — the pump emits the probe and stops, so nothing ranked below it
+is built on that pass. Rank 4 is below it. An address that is
+simultaneously **unvalidated** and holding a **pending** probe therefore
+never builds its `PATH_CHALLENGE` while the probe is pending, and the two
+states co-occur by construction rather than by coincidence: §6.8's
+attacker roams the session to a fresh source *and* is the reason the mark
+was taken, which is the one scenario both rulings were written for. Both
+rulings govern what an unvalidated address may send under a scarce budget;
+neither knew about the other.
+
+**Where the defect lives is itself unsettled, and that is why this is a
+flag and not an erratum.** Nothing in §7.5 or in ruling 171 mandates an
+early *return*; they mandate a **rank**. The early return is the send
+pump's realisation of that rank, and it is a strictly stronger reading —
+rank 2 outranking rank 4 does not mean rank 4 is never built, only that it
+yields when the budget cannot hold both, and here the budget can: probe
+and challenge together cost 14 B of header + 1 B of PING + 9 B of
+challenge + a 16 B tag = **40 B**, inside the 90 B floor computed above.
+So the resolutions available differ in kind — coalesce the challenge into
+the probe's own packet, lift the challenge above the probe, or hold that
+the priority order was never an early return and the pump is simply wrong
+— and they differ in *what they concede*, which is precisely what a
+maintainer decides and an editor must not. **This entry is a flag, not a
+rule**, and an implementation that hits it should stop and ask rather than
+pick.
 
 The probe's place is the load-bearing one, and §7.5 already makes the
 argument exactly once, for the congestion gate: *"a probe the gate could
@@ -2240,12 +2434,18 @@ one small packet just under `DEAD_TIMEOUT` **from a fresh source each
 time**, which refreshes liveness, roams the session (re-arming the
 counters at that one packet's bytes), and leaves too little budget for
 the probe to win against the ACK also owed — making the zombie the probe
-exists to reap immortal, and `Contested` never fire. Ruling 168
-independently defuses that attack's engine, since an off-path injector
-cannot produce an ACK covering `validation_floor` and so cannot keep the
+exists to reap immortal, and `Contested` never fire. **[AMENDED
+2026/08/16 — ruling 208]** The disarm rule independently defuses that
+attack's *engine*, since an injector spoofing a source it does not receive
+at never sees the challenge and so cannot echo it, and cannot keep the
 address unvalidated for free; the priority rule stands anyway, because an
 attacker who *can* keep an address unvalidated must still not be able to
-starve the verdict.
+starve the verdict — and ruling 208 widens that residual class rather than
+narrowing it, because an on-path relay **can** keep answering. Note also
+that the engine's defusal is a claim about this attacker only: the flagged
+rank-2/rank-4 interaction above is a way the verdict can be starved with
+**no attacker at all**, and it is not closed by anything in this
+paragraph.
 
 **Why CLOSE outranks even the probe. [RATIFIED 2026/08/16 — ruling
 186]** §16.5 states the governing principle for exactly this tie: *"a
@@ -2342,8 +2542,9 @@ stays capped by §7.3's anti-amplification budget at 3× the authenticated,
 window-fresh bytes received, so the session emits at most 588 B for the
 replayed
 196 B and then goes quiet until the address validates — §7.3's
-`validation_floor` predicate (ruling 168), which a spoofed source cannot
-satisfy, so here "until" means "never" and the 588 B is the whole
+**challenge** predicate (rulings 168, 208), which a spoofed source cannot
+satisfy because nothing there receives the challenge to echo, so here
+"until" means "never" and the 588 B is the whole
 budget the case ever gets. §6.9 states the
 resulting ratio in full. The claim above is exact for the default
 configuration — the beacon is off unless asked for — and this sentence
@@ -3063,8 +3264,25 @@ gaps are harmless (the type is a varint).
 | `0x11` | MAX_STREAM_DATA | stream_id, max | yes | regenerate | §10.3 |
 | `0x12` | MAX_STREAMS_BIDI | max (cumulative) | yes | regenerate | §10.4 |
 | `0x13` | MAX_STREAMS_UNI | max (cumulative) | yes | regenerate | §10.4 |
+| `0x1a` | PATH_CHALLENGE | data (8 opaque bytes, **not** a varint) | yes | never — see §8.7 | §7.3 |
+| `0x1b` | PATH_RESPONSE | data (8 opaque bytes, **not** a varint) | yes | never — see §8.7 | §7.3 |
 | `0x1c` | CLOSE | error_code, reason_len, reason | no | linger rule (§15.2) | §15 |
 | `0x30`/`0x31` | DATAGRAM | [length (0x31 only)], data | yes | never | §11 |
+
+**[RATIFIED 2026/08/16 — ruling 208]** `0x1a`/`0x1b` are QUIC's own code
+points for these two frames, adopted verbatim so a reader who knows QUIC
+needs no lookup, and they were unused in slither. They are the **only**
+addition ruling 208 makes to this wire: no existing type code, field
+order or packet layout moves, and every golden vector stays byte-identical
+(§1.1, ruling 210(d)). Their payload is eight **opaque** bytes — never
+re-encoded, never interpreted, compared for equality and nothing else.
+That is consistent with §8.1 rather than an exception to it: §8.1 governs
+*integer* fields, and an opaque byte string is what STREAM's `data` and
+CLOSE's `reason` already are. Encoding the challenge as a varint would be
+a defect and not a style choice, because §8.1 admits **non-minimal
+encodings**, so one challenge value would have several valid encodings and
+"the responder returns exactly what it received" — the whole security
+property — would stop being checkable by comparing bytes.
 
 `0x05` is *reserved*, not implemented: like any unknown type, receiving it
 is a structural failure — CLOSE with `PROTOCOL_VIOLATION` (§8.2). The
@@ -3208,6 +3426,48 @@ Cumulative-count credit for the corresponding space (§10.4). Monotone-max
 on receipt. Ack-eliciting; regenerated. Structural error: `max` > 2⁶⁰
 (unrepresentable as a stream index) — §8.2's structural class.
 
+**PATH_CHALLENGE (`0x1a`) / PATH_RESPONSE (`0x1b`)** **[RATIFIED
+2026/08/16 — ruling 208]**
+
+```
+type(0x1a) ‖ data(8 B, opaque)          — the challenge
+type(0x1b) ‖ data(8 B, opaque)          — the same 8 bytes, echoed
+```
+
+Nine bytes each, fixed: no length prefix and no varint anywhere, so
+neither frame can be truncated into a different valid frame and neither
+needs a bound check beyond "eight bytes remain". §7.3 is their normative
+home and the only thing that emits or consumes them. Both are
+**ack-eliciting** (§8.3), which is load-bearing twice over: it is what
+puts the challenge into the sent map so §7.3's death clock arms on it
+(§7.4), and it is what makes the response elicit the peer's own ACK.
+
+Structural error (§8.2's structural class, ⇒ CLOSE with
+`PROTOCOL_VIOLATION`): fewer than 8 bytes remain in the plaintext after
+the type byte. That is the **only** structural error either frame has.
+In particular a `PATH_RESPONSE` whose eight bytes match no outstanding
+challenge is **not** an error — it is a **semantic no-op**: it validates
+nothing, it is traced, and the frame is otherwise ignored, exactly as
+§8.4 treats an ACK whose `largest` exceeds anything sealed. The
+distinction is deliberate and is a security property rather than
+leniency: a mismatched response is what an off-path attacker's guess
+looks like, what a response from a superseded arming looks like after a
+second roam, and what a duplicate looks like after the address has
+already validated. Killing the connection on it would hand any off-path
+party that can guess a frame boundary a **remote kill primitive**
+requiring no key, which is a strictly worse defect than the one this
+mechanism exists to fix.
+
+A received `PATH_CHALLENGE` obliges a `PATH_RESPONSE` carrying its eight
+bytes verbatim. The obligation is unconditional and is **not** gated on
+the challenge being one we expected, on the source having roamed, or on
+anything else: the responder does not interpret the bytes, and a
+responder that filtered them would be answering a question it cannot see
+the point of. It is bounded — one outstanding response, overwritten by a
+newer challenge rather than queued, since the newer one is the only one
+whose answer can still validate anything (§17.5 budgets one, never a
+list).
+
 **CLOSE (`0x1c`)**
 
 ```
@@ -3242,11 +3502,26 @@ unrepresentable (§11.4).
 
 Frames-to-packets is many-to-many: one packet carries many frames, and
 one stream's bytes span many packets. Within a packet the sender packs in
-this order: the ACK first (if owed), then control frames (credit grants,
-RESET_STREAM, CLOSE), then STREAM and DATAGRAM fill, then PING last
+this order: the ACK first (if owed), then control frames — **[AMENDED
+2026/08/16 — ruling 208]** `PATH_RESPONSE` and `PATH_CHALLENGE` **first
+among the control frames**, then credit grants, RESET_STREAM, CLOSE —
+then STREAM and DATAGRAM fill, then PING last
 among **length-prefixed** frames if a
 probe still owes ack-eliciting content. At most one extends-to-end frame
 (¬LEN STREAM, or `0x30` DATAGRAM) per packet, in final position.
+
+**[RATIFIED 2026/08/16 — ruling 208]** *This order and §7.3's priority
+order answer different questions, and the two must not be read as one
+rule.* §8.5 decides **byte placement inside a packet whose size is already
+settled**; §7.3 decides **which class of output gets a scarce budget at
+all**. So §7.3 ranking the path frames above a pure ACK is not in tension
+with the ACK being packed first here: a packet that carries both carries
+both, and nine bytes of path frame plus an ACK fit together in any packet
+either could travel in. What the placement above buys is the case where
+the two orders *could* diverge — a packet shrunk to the budget's admitted
+room. Packing the path frames ahead of every other control frame is what
+keeps the frame that **ends** the scarcity inside the packet the scarcity
+allowed, rather than trimmed out of it by a credit grant.
 
 **[RATIFIED 2026/08/16 — ruling 181]** *Two frames were told to be last;
 the two senses are different and the parser forces the separation.* An
@@ -3300,9 +3575,25 @@ classes:
   its receive half at the moment of emission, so its identity is
   retained at the connection level and re-emitted until acknowledged;
   the discard termination never applies to it.)
-- **never** (PADDING, PING, ACK, DATAGRAM, CLOSE): loss is absorbed by the
+- **never** (PADDING, PING, ACK, DATAGRAM, CLOSE, PATH_CHALLENGE,
+  PATH_RESPONSE): loss is absorbed by the
   next ACK, the next probe, the unreliability contract, or the linger
-  reply rule respectively.
+  reply rule respectively — and, for the two path frames, by a **standing
+  obligation** rather than by loss recovery at all. **[RATIFIED
+  2026/08/16 — ruling 208]** The distinction matters, because "never
+  retransmitted" would otherwise read as "sent once and lost forever",
+  which §7.3's no-deadlock argument cannot survive. `PATH_CHALLENGE` is
+  **owed for as long as the arming lasts**: the sender re-emits it — with
+  the **same** eight bytes, since ruling 208 fixes one challenge per
+  arming — whenever §7.3's budget admits a packet and the address is still
+  unvalidated, and stops owing it the instant the address validates or the
+  next address change draws a fresh challenge. Re-emitting the same bytes
+  to the same address leaks nothing: the secret is *who receives them*,
+  not how many copies were sent. `PATH_RESPONSE` is owed on receipt of a
+  challenge and discharged by one emission; if it is lost, the peer's
+  still-standing challenge asks again and a fresh response is owed. Neither
+  frame is ever re-queued by loss detection, so neither appears in §13.5's
+  retransmission path.
 
 ## 9. Streams *(DRAFT 2026/08/13)*
 
@@ -4279,7 +4570,8 @@ builds against it, so the list is the thing that has to exist.
 | `recovery_start` | **set to the roam instant** — never cleared | §14.6, ruling 139(b) |
 | path generation (`path_gen`) | **incremented** — the pre-roam stamp is what fences the RTT sample and the persistent-congestion walk | §14.6, ruling 172 |
 | amplification byte counters (sent, received) | **reset to zero**, and the address becomes unvalidated | §7.3 |
-| `validation_floor` | **re-recorded** at the roam — the counter the next seal will use; any earlier floor is discarded | §7.3, ruling 168 |
+| the outstanding **challenge** | **re-drawn** at the roam — eight fresh bytes from the connection's §16.6 sub-seed; any earlier challenge is discarded and a `PATH_RESPONSE` echoing it validates nothing thereafter | §7.3, §16.6, rulings 208, 210(b) |
+| an outstanding **`PATH_RESPONSE` obligation** (one we owe the peer) | **kept** — it answers the peer's question about *its* path, which our endpoint moving does not change; like all output it is sent to the new endpoint, and it is capped by the re-armed budget like everything else | §7.3, §8.4, ruling 208 |
 | sent-packet map | **kept** — in-flight ACKs still resolve, `bytes_in_flight` stays consistent | §13.5, above |
 | PTO / loss detection | **undisturbed** — timers continue, no re-arm, no cancel | §13.3, §13.4 |
 | RTT estimator | **kept as a prior** (suspect-but-kept); `min_rtt` re-seeded from the first post-roam sample | §13.1 |
@@ -4396,13 +4688,19 @@ pure ACKs, CLOSE, and keepalives are free of the congestion window, never
 of the budget. **[AMENDED 2026/08/16 — rulings 168, 171]** Two
 consequences follow and are stated here so this list is not read as the
 whole story. First, "unvalidated" is a **state with an exit**: §7.3's
-`validation_floor` disarms the budget on a return-routability proof, and
-these exemptions then face no cap at all. Second, while the budget *is*
-armed and admits less than is owed, §7.3's priority order decides which
-exempt class goes first — a **pending contested probe** ahead of
-everything, because a probe the budget could delay past its own deadline
-would convert a scarce budget into a liveness verdict, which is the same
-argument that earns it the cwnd exemption above.
+**challenge** disarms the budget when the address echoes it (**[AMENDED
+2026/08/16 — ruling 208]**, superseding the `validation_floor` ACK
+predicate), and these exemptions then face no cap at all. Second, while
+the budget *is* armed and admits less than is owed, §7.3's priority order
+decides which exempt class goes first — a **pending contested probe**
+ahead of everything **but CLOSE** (ruling 186; this clause read "ahead of
+everything" and did not carry ruling 186's amendment across — §7.3's list
+is the normative one), because a probe the budget could delay past its own
+deadline would convert a scarce budget into a liveness verdict, which is
+the same argument that earns it the cwnd exemption above. `PATH_RESPONSE`
+and `PATH_CHALLENGE` rank immediately below the probe and above the pure
+ACK, and §7.3 carries a flagged, unresolved interaction between the probe's
+rank and the challenge's — read the order there, not here.
 
 **`app_limited`** (quinn's mechanism, pinned): the send path maintains an
 application-limited flag — set when the sender runs out of queued data
@@ -4595,7 +4893,7 @@ what each side observes:
 | Cause | Transmitted | Local surface | Peer's view |
 |---|---|---|---|
 | liveness — 25 s without an authenticated fresh receive (§7.5) | nothing | `ConnectionLost::TimedOut` | its own liveness fires ≈ symmetrically |
-| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's one PING, at the mark — or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output** to that address (§7.3, ruling 171); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
+| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's one PING, at the mark — or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output but CLOSE** to that address (§7.3, rulings 171 and 186 — this cell read "all other output" and did not carry ruling 186's amendment across; §7.3's list is the normative one, and §7.3 also carries a flagged, unresolved interaction between this rank and ruling 208's `PATH_CHALLENGE`); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
 | nonce exhaustion (§7.9) | nothing | `ConnectionLost::NonceExhausted` | liveness |
 | local `close(code, reason)` / last-handle drop (§16.2) | CLOSE, then ≤ 1 reply/s for 5 s | `ConnectionLost::LocallyClosed` | `PeerClosed { code, reason }` |
 | peer's CLOSE received | nothing (drain only) | `ConnectionLost::PeerClosed { code, reason }` | (it closed) |
@@ -5694,9 +5992,30 @@ The endpoint core owns one seeded RNG (constructor `[u8; 32]`;
 config-supplied for tests, OS entropy otherwise). Every index, jitter
 draw, and — via the forced increment — timestamp draw comes from it. At
 connection creation the endpoint draws a 32-byte **sub-seed** for the
-connection core (drawn even while unused, so later connection-side
-randomness cannot perturb the endpoint's draw order). One root seed
+connection core (drawn unconditionally, so connection-side randomness can
+never perturb the endpoint's draw order). One root seed
 reproduces the whole system.
+
+**[AMENDED 2026/08/16 — rulings 208, 210(b)]** *The sub-seed had no
+consumer when it was specified; it has one now, and this is the seam that
+decides where the draw happens.* §7.3's 8-byte address-validation
+challenge is drawn from the **connection** core's sub-seed, at every
+arming. It could not have come from the endpoint RNG whatever the wording
+preferred: both arming sites — a roam, and the first anchor from a msg1
+source — are inside `core::Connection`, and **`Connection` cannot reach
+`Endpoint`'s RNG**. Ruling 208 as first written said "the endpoint RNG",
+naming a path that does not exist; ruling 210(b) corrects it. The
+unconditional draw above is what makes the correction free: the sub-seed
+was already there, already reproducible from the root seed, and adding a
+consumer perturbs no existing draw order, so every seeded test that passed
+before this change still sees the same endpoint-side sequence.
+
+The challenge inherits §16.6's security posture in full, and the
+inheritance is load-bearing rather than incidental: it must be
+**unpredictable to a party that has not received it**, for the same
+reason session indices must be — so a config-supplied seed makes the
+challenge predictable exactly as it makes indices predictable, and the
+test-only rule below governs both.
 
 Session and pending indices MUST be unpredictable to an off-path
 observer — index unpredictability is load-bearing for §5.5's
@@ -6172,7 +6491,7 @@ policy:
 | stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 220 B raw bytes each, ≈ 225 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
-| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ `INITIAL_MAX_DATA` (1 MiB) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one `validation_floor` (`u64`) and one validated flag, per connection and never per address (ruling 170)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
+| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ `INITIAL_MAX_DATA` (1 MiB) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
 
 **The caveat on the sent map, stated because ruling 43 changed what it
 covers.** "Bounded by cwnd" is exact for congestion-controlled output
@@ -6328,7 +6647,7 @@ ruling 44.)
 | `slither::policy` | guard rejections, internal tie-break outcomes (admissions, tag deaths, winner-side drops), and the **contested-connection probe's three events** — the mark (with its probe floor), the probe's transmission, and the verdict (cleared, or `TimedOut`) — §7.5 |
 | `slither::replay` | replay-window rejections |
 | `slither::frames` | the frame layer's violation CLOSEs (post-AEAD structural failures and semantic violations, §8.2), the **datagram queue-overflow drop counters** (§11.5), and the **message-mode overflow reset** we emit — the stream, its final size, and the mode conflict that caused it (§9.8, ruling 59) |
-| `slither::roam` | endpoint moves (§7.3) |
+| `slither::roam` | endpoint moves (§7.3), and — **[AMENDED 2026/08/16 — ruling 208]** — the address-validation exchange at the same seam: the challenge drawn and sent at each arming, the matching `PATH_RESPONSE` that validates and disarms the budget, and a **mismatched** `PATH_RESPONSE`, which §8.4 makes a silent no-op and which is therefore visible *only* here. The last is the operative one for an operator: it is what an off-path guess, a superseded arming, or a duplicate after validation all look like, and a rate of it is the signal that a mechanism with no error surface is nevertheless being exercised |
 | `slither::io` | `Wire::send_to` failures, against the connection whose datagram it was, with the destination address and the underlying `io::Error` — a trace obligation and nothing more: the protocol never acts on a send failure (§16.3, §7.4). **[RATIFIED 2026/08/15 — ruling 79]** Also **`Identity::open()` failures**, with the provider's own error and the verb that met it, behind the `Local` variants of §18.1 (rulings 72, 78) |
 
 The targets are operator-visible contract: renaming or dropping one is a
@@ -6380,7 +6699,7 @@ its future home.
 | packet-number truncation | the per-packet-overhead lever; safe against hiss's commit-and-cap, couples to the replay-window width (§3.4, §7.2) |
 | PMTUD | `MAX_DATAGRAM` is fixed at 1200 (§3.5) |
 | cookies / mac2 | packet type `0x05`; WireGuard's under-load model is the template; answers §6.3's occupancy exposure, §6.5's hint-set spoof, and §6.9's ungated eager-`es` rate (§4.3) |
-| PATH_CHALLENGE / PATH_RESPONSE | the QUIC-faithful upgrade of §7.3's anti-amplification budget: **explicit** address validation **before** roam commit, where §7.3's `validation_floor` validates implicitly and *after* (ruling 168) — two frame types from the reserved space plus a second reset seam alongside the roam seam (§7.3, §14.6) |
+| ~~PATH_CHALLENGE / PATH_RESPONSE~~ → **validation *before* roam commit** (QUIC's full path-migration model) | **[AMENDED 2026/08/16 — ruling 208. The frames are no longer deferred; half of this row shipped and the other half did not, so the row is narrowed rather than deleted.]** The **frames** now exist and are normative: `0x1a`/`0x1b`, §8.3/§8.4, and §7.3 validates a roamed address with them. What stays deferred is QUIC's *ordering*: probing a candidate path while continuing to send on the old one and **committing only on success**. §7.3 keeps its arming triggers — it commits the roam on the authenticated packet and validates **after**, with the budget binding in the interval — so the deferred work is a second path's worth of state (a second congestion controller and RTT estimate, §14.6) plus a second reset seam alongside the roam seam (§7.3, §13.6, §14.6), not two frame types |
 | the range-tracker ACK | decouples ACK fidelity from the replay window; wire-compatible (§7.2, §12.2) |
 | per-peer `ss` precomputation | needs a hiss seam or a bounded memoising provider; re-opens the DH-cost table (§6.1) |
 | persistence | nothing in this specification survives a process restart by design (§5.4: restart is a replacement or a fresh accept, never a merge) |
@@ -6851,17 +7170,43 @@ clock (§16.10); no test sleeps.
   included — at 3× **authenticated, window-fresh** bytes received until
   the address validates; a silent address dies by
   liveness having received at most 3× what it sent.
-  - **The disarm, and the re-arm** (rulings 168, 170). Assert the
+  - **The disarm, and the re-arm** (rulings 168, 170, 208). Assert the
     positive: a genuine roam validates the address and **disarms** the
     budget within ~1 RTT, at the first authenticated, window-fresh packet
-    from the new address whose ACK covers `validation_floor` — after
+    from the new address carrying a `PATH_RESPONSE` matching the
+    challenge — after
     which output to it is no longer capped at all. Assert the negative
-    from the side that separates it (working rule 9): with the ACK
-    **withheld** — the peer answering only with packets that acknowledge
-    nothing at or above the floor — the cap must still bind. And assert
-    the re-arm: roam again, and a **fresh** floor is recorded and the cap
+    from the side that separates it (working rule 9): with the response
+    **withheld** — the peer answering with ordinary traffic and ACKs but
+    never echoing the challenge — the cap must still bind. **That negative
+    is the whole of ruling 208 and is the one assertion the superseded
+    design fails**: an implementation still validating on an ACK covering
+    a floor passes every other item in this list and fails only this one.
+    Assert it in its adversarial form too: a peer that **forges an ACK**
+    naming any counter it likes, spoofed from the new address, must not
+    validate it — that is the two-packet O(1) reflector ruling 208 exists
+    to close, and it is a wire-level assertion, not a unit-level one.
+    Assert the challenge is **unguessable and per-arming**: two armings on
+    one connection must not draw the same eight bytes, and a
+    `PATH_RESPONSE` replaying the **previous** arming's bytes must
+    validate nothing (working rule 9 again — an implementation that
+    re-used one challenge for the connection's life passes a
+    "validation happens" test and fails only this one). And assert
+    the re-arm: roam again, a **fresh** challenge is drawn and the cap
     binds again, with no credit carried across from the old address
-    (§13.6). The load-bearing regression is the asymmetric transfer: an
+    (§13.6).
+  - **A mismatched `PATH_RESPONSE` is a no-op, not a death** (ruling 208,
+    §8.4). Deliver eight bytes matching nothing and assert the connection
+    **survives**, validates nothing, and traces. The inverted
+    implementation — `PROTOCOL_VIOLATION` on mismatch — is a remote kill
+    primitive available to any off-path party, and it is the natural thing
+    to write if the frame is treated like every other structural error in
+    §8.2.
+  - **The honesty clause is not testable and is stated so it is not
+    mistaken for one** (ruling 210(c)). An on-path relay that carries the
+    challenge to the real peer and the response back **does** validate the
+    address, correctly. No test asserts otherwise; a test that did would be
+    asserting a property the mechanism does not have. The load-bearing regression is the asymmetric transfer: an
     **accepting** endpoint serving a download, whose peer replies with
     ACKs only, must reach full send rate — under the superseded permanent
     cap it could never exceed 3× ~40 B per ~2400 B and could not serve at
@@ -6989,7 +7334,7 @@ rulings).**
 | `MAX_DATAGRAM` / `MAX_PLAINTEXT` | 1200 / 1170 B | §3.5 |
 | `REKEY_EPOCH_MSGS` / `MAX_EPOCH_JUMP` | 65 536 / 2 (hiss-fixed) | §7.7 |
 | `REPLAY_WINDOW` | 2048 bits | §7.2 |
-| frame types | 0x00, 0x01, 0x02, 0x04, 0x08–0x0f, 0x10–0x13, 0x1c, 0x30/0x31; 0x05 reserved | §8.3 |
+| frame types | 0x00, 0x01, 0x02, 0x04, 0x08–0x0f, 0x10–0x13, 0x1a/0x1b, 0x1c, 0x30/0x31; 0x05 reserved | §8.3 |
 | `STREAM_OFF` / `STREAM_LEN` / `STREAM_FIN` | 0x04 / 0x02 / 0x01 | §8.4 |
 | `INITIAL_MAX_DATA` | 1 048 576 B (1 MiB) | §10.2 |
 | `INITIAL_MAX_STREAM_DATA` | 262 144 B (256 KiB) | §10.2 |
@@ -7013,7 +7358,7 @@ rulings).**
 | `HANDSHAKE_GIVEUP` | 90 s | §5.5 |
 | `KEEPALIVE_TIMEOUT` / `DEAD_TIMEOUT` | 10 s / 25 s | §7.5 |
 | `PERSISTENT_KEEPALIVE` (default, per-connection) | 10 s; admissible range **[1 s, `DEAD_TIMEOUT`)** — handle-rejected **below 1 s** (floor, ruling 42) and **at or above** `DEAD_TIMEOUT` (ceiling, ruling 40) | §7.5 |
-| `AMPLIFICATION_FACTOR` | 3 (× authenticated, window-fresh bytes received, per unvalidated address, per session; disarmed by an ACK covering `validation_floor` — rulings 168–170) | §7.3 |
+| `AMPLIFICATION_FACTOR` | 3 (× authenticated, window-fresh bytes received, per unvalidated address, per session; disarmed by a `PATH_RESPONSE` echoing the arming's 8-byte challenge — rulings 168–170, superseded in the disarm predicate only by ruling 208) | §7.3 |
 | `INTRO_QUEUE_CAP` / `INTRO_MAX_PER_SOURCE` / `INTRO_TTL` | 1024 / 4 / 15 s | §6.3 |
 | `TS_GUARD_ORPHAN_CAP` | 1024 | §17.1 |
 | `TS_GUARD_ORPHAN_TTL` | `= INTRO_TTL` (15 s) | §17.1 |
