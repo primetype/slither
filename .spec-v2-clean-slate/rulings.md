@@ -7016,3 +7016,175 @@ slice ever puts on an agent's path"*; this round shows `SPEC.md`'s
 **header** has the same problem for the opposite reason — every agent is
 told never to read the file whole (working rule 1), so nobody ever sees
 the top of it.
+
+---
+
+## Round 39 — the post-slice review: API surface, coverage, throughput
+
+Two API reviewers (Opus, Sonnet) ran blind to each other over `cd12ed7`, a
+third measured coverage, and the maintainer built the throughput benchmark.
+Rulings 243–247 are the findings that needed no new decision — the spec or an
+approved story already said what to do and the code did not match. The
+findings that *do* need a decision are listed at 248 and left open.
+
+### 243 — **ruling 238 was ratified into the spec and never applied to the code.** Both reviewers found it independently
+
+`src/compat/io.rs`'s `write_kind` still carried `#[allow(unreachable_patterns)]`
+and a `_ => io::ErrorKind::Other` arm, with a comment arguing ruling 227's
+position. Ruling 238 reversed 227 four days earlier: *"the arm is deleted and
+the match is exhaustive"*, and §16.11.1 carries the correction with a
+`[CORRECTED 2026/08/16 — ruling 238]` banner. SPEC.md's amendment table names
+it. The code was the one artefact of the three that never moved.
+
+**Ruling: the arm is deleted, as 238 said.** No behaviour changes today —
+the arm was unreachable, which is why nothing was red. What is restored is
+the compile error on the day `Stopped` lands.
+
+**The process finding is the valuable half, and it is a new shape.** The
+existing hazard, working rule 4, is *"grep for the rationale, not only the
+token"* — a **stale** statement left behind by a change. This is the mirror:
+a **fresh** statement that landed in two artefacts out of three. Ruling 238
+was authored while reviewing an agent's report on `io.rs`, so the file was in
+hand; the ruling was written, the spec was corrected, and the edit the ruling
+was *about* was never made. Nothing catches this. The wire pins do not move,
+no test is red, and the reviewer who ratifies is the reviewer who would have
+had to notice.
+
+**Working rule 4 gains clause (c): a ruling that changes code is not
+discharged until the code is opened.** Ruling 11 says *whichever artefact a
+claim is about is the artefact that must be opened* — that rule was written
+for **claims**, and this is the same duty for **conclusions**. When a ruling
+says "delete X", the ruling is not finished when it is written down; it is
+finished when `X` is gone. Grep for the thing you just ruled on.
+
+### 244 — `#[must_use]` on the three staged accept objects, which S8 names literally
+
+`Intro`, `Claimed` and `Proven` carried no `#[must_use]`. S8's acceptance
+reads *"It is `#[must_use]` and not `Clone`, so a parked chain cannot be
+forked."* The `Clone` half held; the other half did not. **Both reviewers
+found this independently** — the second convergence of the round.
+
+`STORIES.md` is the acceptance criteria by `CLAUDE.md`'s own statement, so
+this needed no decision. It is also the case the attribute exists for:
+§6.2 makes **dropping a staged object the rejection**, so an unused one is
+not a no-op the way an unused value usually is — it silently declines an
+inbound peer. The message says so rather than saying "unused".
+
+Impact was narrowed by `Result` already being `#[must_use]` at every verb
+that returns one of these, which is why no test caught it and why it is a
+should-fix rather than a blocker.
+
+### 245 — two module docs describing a shape the code does not have
+
+Both are documentation-only and both are working rule 4's shape.
+
+**(a) `shell/wire.rs` claimed `Endpoint<W: Wire>`.** That type has never
+existed: `EndpointBuilder<I, W>` carries the wire and `build()` **erases**
+it, because the wire moves into the spawned driver and never surfaces on a
+handle. The constraint the paragraph describes — no `Box<dyn Wire>`, so the
+wire is a type parameter — is real and lands one type earlier than claimed.
+Found by both reviewers.
+
+**(b) `compat/mod.rs` asserted *"Every adapter borrows"*.** Ruling 239 landed
+`OpenBiOwned`, an adapter that owns a counted handle, **in the same slice**,
+and the heading two screens above it was not revisited. This is working rule
+4(a) exactly — *when you correct one clause, read the other clauses* — with
+the scope widened from a sentence to a module. The rule is restated with its
+exception and the reason the exception is sound (`UnsyncBoxService::new`
+requires `'static`, so S33 is unsatisfiable on the borrowed form).
+
+### 246 — `clone_handle` is dead code without the `tower` feature, and **no gate builds a combination that would say so**
+
+`cargo clippy --features test-util --all-targets -- -D warnings` fails on
+`cd12ed7`: `clone_handle` (ruling 239) is `pub(crate)`, its only caller is
+`compat/tower.rs`, and that module is `#[cfg(feature = "tower")]`.
+
+**The interesting part is why nine green gates missed it.** The two
+lint-bearing gates run `--all-features`, where `tower` is on. `cargo test`
+runs default features but without `-D warnings`. So the gate table builds
+exactly two points on the feature lattice — `""` and *everything* — and this
+defect lives at every point in between. The coverage reviewer reached the
+same conclusion from the other direction, reporting the feature-combination
+axis as verified by neither CI nor the coverage run; it named the gap and
+this names an instance of it, found the same afternoon.
+
+**Ruling: the narrow fix is `#[cfg(feature = "tower")]` on the method**, and
+all eight combinations of the four features now pass clippy at `-D warnings`
+(run and pasted in the session). **The general fix is a feature-matrix CI
+job and it is not made here** — it changes the gate table, which is the
+maintainer's call, and it is recorded at 248.
+
+### 247 — the throughput benchmark, and what it found
+
+`benches/throughput.rs`, `harness = false`, no `criterion` (`cargo deny` is a
+gate and `Cargo.lock` is uncommitted, so every dev dependency is re-resolved
+surface; the harness reports min/median/max itself). `test = false`, because
+a bench target's `test` flag defaults to **true** and `harness = false` would
+otherwise make `cargo test` run the benchmark on every gate.
+
+Three results are worth keeping.
+
+**(a) Throughput is window-limited on any real path, not CPU-limited.**
+`flow.rs` builds both windows with `CreditWindow::new(<constant>)` and
+regrants at half — **there is no auto-tuning anywhere**, so a receiver never
+advertises more than `INITIAL_MAX_STREAM_DATA` (256 KiB) per stream or
+`INITIAL_MAX_DATA` (1 MiB) per connection however fast the path proves to be.
+That makes single-stream throughput `window / RTT`. Measured with a 20 ms RTT
+injected into the fabric: **8.4 MiB/s against a 12.5 MiB/s prediction**, while
+the same code carries 36–52 MiB/s locally. The local figures cannot show this
+— loopback RTT makes `256 KiB / RTT` far larger than the CPU can seal, so the
+window never binds — which is precisely why "fast locally" and "fast on a
+real path" are different claims. No constant is touched here: they are
+ratified, and whether slither wants window auto-tuning is 248's question.
+
+**(b) One stream leaves most of the connection on the table.** Four parallel
+streams carry **86 MiB/s** where one carries 36, same total bytes, same
+fabric, same thread. So the per-stream path serialises something the
+connection does not, and S13's independent-streams promise is a throughput
+lever and not only a head-of-line-blocking one. Single-shot messages reach
+167 MiB/s, still above the four-stream figure; that gap is unexplained and
+is left open rather than guessed at.
+
+**(c) Two hypotheses were killed by measuring.** The stream/message gap
+looked like a read path handing back one frame at a time — instrumenting
+`read` shows a **mean fill of ~45–56 KB** against a 1169-byte wire payload,
+so it coalesces and that explanation is dead. And `testutil::FlakyWire` is
+**not** a zero-cost fabric: `send_to` pushes a `Spied { bytes: buf.to_vec() }`
+into the tap on every datagram and queues a second copy for delivery, two
+heap allocations per datagram that no real wire performs, retained until
+drained. The kernel-free fabric therefore measures *slower* than real UDP
+loopback. It is a floor, not a ceiling, and the benchmark says so where a
+reader will meet it.
+
+### 248 — open for the maintainer, from this round
+
+Not decided here. Each needs a call the reviewers correctly declined to make.
+
+1. **§16.4's `ConnEvent` block lists 13 variants and §16.2 re-enumerates 10;
+   the code has 14.** The missing one is `SendCreditAvailable`, which
+   **ruling 150 explicitly authorised** and which appears nowhere in
+   `SPEC.md` — `grep SendCreditAvailable SPEC.md` returns nothing. Working
+   rule 8's defect class, in the section that rule was written about. Needs a
+   spec amendment, not a code change.
+2. **`BiStream::join` has two different signatures in the spec.** §16.2 gives
+   `Result<Self, (SendStream, RecvStream)>` (ruling 120); §16.11 gives
+   `-> Self`. The code follows §16.2. Reported, not resolved — working rule 3.
+3. **`ConnectionId` and `IntroId` are re-exported at the crate root, appear
+   in no public signature, and have no public constructor or accessor.**
+   `lib.rs` also says "three identifiers" and re-exports five. Dead surface
+   about to be frozen under semver.
+4. **No public route to a second `Connection` handle.** `clone_handle` is
+   `pub(crate)` and the crate uses it for its own owned `Service`;
+   `Rc<Connection>` is the answer, is used in `tests/story_lifecycle.rs:850`,
+   and is mentioned in no rustdoc.
+5. **11 public types lack `Debug`** — all eight `compat::stream` adapters plus
+   `Connect`, `OpenBi`, `OpenBiOwned` (and seven in `testutil`). Rust API
+   guideline C-DEBUG.
+6. **STORIES.md S18 is stale**: it has the application observing
+   `ConnEvent::AddressMoved`, which is `pub(crate)`; ruling 46 routed it to
+   `Notification`. The code is right and the story text was not swept.
+7. **A feature-matrix CI job**, per 246. Eight combinations currently pass;
+   nothing keeps them passing.
+8. **Window auto-tuning**, per 247(a). Today's constants cap a single stream
+   at `256 KiB / RTT` — about 2.5 MiB/s at 100 ms — with no way for a
+   consumer to raise them. `Config` exposes no flow-control knob.

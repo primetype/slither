@@ -47,6 +47,14 @@ use super::shared::{Command, Shell};
 /// Nothing has been spent on it: it is msg1's bytes plus the address they
 /// came from, and it has passed §3.1's length gate and mac1 and nothing
 /// else. Drop is a silent reject.
+///
+/// **S8** — `#[must_use]` because dropping this *is* the reject, and a
+/// silent one. The attribute is S8's acceptance criterion verbatim —
+/// *"it is `#[must_use]` and not `Clone`, so a parked chain cannot be
+/// forked"* — and it guards the one mistake this type's own docs describe:
+/// an unused staged object is not a no-op, it declines an inbound peer.
+#[must_use = "dropping a staged accept object silently rejects the inbound \
+              connection; call read_identity(), or drop it deliberately"]
 pub struct Intro<I: Identity> {
     shell: Shell<I>,
     id: IntroId,
@@ -220,6 +228,11 @@ impl<I: Identity> std::fmt::Debug for Intro<I> {
 /// cumulative.
 ///
 /// The claim is not proof. Drop is a silent reject.
+///
+/// **S8** — `#[must_use]`, see [`Intro`]. This is the stage S8 names
+/// explicitly, the one parked across turns while a human is asked.
+#[must_use = "dropping a staged accept object silently rejects the inbound \
+              connection; call authenticate(), or drop it deliberately"]
 pub struct Claimed<I: Identity> {
     shell: Shell<I>,
     id: IntroId,
@@ -289,6 +302,11 @@ impl<I: Identity> std::fmt::Debug for Claimed<I> {
 /// cumulative.
 ///
 /// Drop is a silent reject.
+///
+/// **S8** — `#[must_use]`, see [`Intro`]. S9 is the story that makes this
+/// stage's drop meaningful: *prove an identity, then still decline*.
+#[must_use = "dropping a staged accept object silently rejects the inbound \
+              connection; call accept(), or drop it deliberately"]
 pub struct Proven<I: Identity> {
     shell: Shell<I>,
     id: IntroId,

@@ -44,8 +44,16 @@ use std::net::SocketAddr;
 /// `impl Future`. That is what makes the returned future `Send` *iff* the
 /// implementation's future is — `!Send` is admitted by construction rather
 /// than required — and it is what §16.3's normative code block writes. The
-/// price is that there is no `Box<dyn Wire>`: **an endpoint is generic over
-/// its wire (`Endpoint<W: Wire>`), not erased.** This is recorded here
+/// price is that there is no `Box<dyn Wire>`: **the wire is a type
+/// parameter, not an erased object.**
+///
+/// It is [`EndpointBuilder<I, W>`](super::EndpointBuilder) that carries the
+/// `W`, and [`build`](super::EndpointBuilder::build) **erases it** — the
+/// built [`Endpoint<I>`](super::Endpoint) names only its identity, because
+/// the wire is moved into the spawned driver and never surfaces on a handle
+/// again. This paragraph said `Endpoint<W: Wire>`, a type that has never
+/// existed; the constraint it describes is real and lands one type earlier
+/// than it claimed. This is recorded here
 /// because there is no way to assert dyn-incompatibility in a test, and a
 /// later slice should meet the constraint as documentation rather than as a
 /// compiler error.

@@ -58,20 +58,26 @@ fn read_kind(err: &ReadError) -> io::ErrorKind {
 /// [`io::ErrorKind::TimedOut`] exists and a `DEAD_TIMEOUT` death is exactly
 /// what it names; collapsing it would make every death look alike to a
 /// consumer whose only view is an [`io::Error`].
-// **`#[non_exhaustive]` is inert inside the defining crate**, so rustc sees
-// the `_` arm below as unreachable and `-D warnings` would reject it. The arm
-// is required all the same: ruling 227 rules that `WriteError`'s conversion
-// carries one, mapping to `Other` and **not** `unreachable!()`, because a
-// future minor version adds a variant (ruling 61 reserves `Stopped`) and a
-// panic there is worse than a defensive arm that costs nothing. The lint is
-// right about today's crate and wrong about the day that variant lands, which
-// is the day this arm exists for.
 //
-// Worth recording precisely, because ruling 227's rationale reads *"`WriteError`
-// is `#[non_exhaustive]`, **so** the conversion needs a `_ =>` arm"* — and that
-// implication does not hold **where this code lives**. In-crate, the match is
-// already exhaustive. The conclusion survives; only the reason does.
-#[allow(unreachable_patterns)]
+// **[RATIFIED 2026/08/16 — ruling 238.]** This match is **exhaustive** and
+// carries no `_ =>` arm. It read the other way until that ruling: ruling 227
+// required a fallback mapping to `Other`, reasoning that `WriteError` is
+// `#[non_exhaustive]` (ruling 61 reserves `Stopped`) ***so*** the conversion
+// needs one.
+//
+// The *"so"* is false. **`#[non_exhaustive]` is inert inside the defining
+// crate**, and this conversion can only live here — the orphan rule puts
+// `impl From<WriteError> for io::Error` in slither or nowhere — so the
+// attribute never bites and rustc reports the arm as unreachable.
+// `error.rs`'s `write_error_is_exhaustive_in_crate` already proves it.
+//
+// Ruling 238 moved the **conclusion** as well as the reasoning, which is why
+// the arm is gone rather than merely `#[allow]`ed. A `_ =>` arm does not
+// future-proof this conversion, it **hides** the future: it would silently
+// map `Stopped` to `Other` on the day that variant lands. An exhaustive match
+// makes that day a compile error at the one site that must be updated — which
+// is what ruling 227's own *"must not be `unreachable!()`"* clause was
+// reaching for. **A variant that cannot compile cannot panic.**
 fn write_kind(err: &WriteError) -> io::ErrorKind {
     match err {
         WriteError::Reset(_) => io::ErrorKind::ConnectionReset,
@@ -85,11 +91,6 @@ fn write_kind(err: &WriteError) -> io::ErrorKind {
             ConnectionLost::Replaced => io::ErrorKind::BrokenPipe,
             ConnectionLost::EndpointDropped => io::ErrorKind::NotConnected,
         },
-        // **[ruling 227]** `WriteError` is `#[non_exhaustive]` (ruling 61
-        // reserves `Stopped`), so this arm is required — and it maps to
-        // `Other` rather than being `unreachable!()`, which would be a panic
-        // on a variant a future minor version adds.
-        _ => io::ErrorKind::Other,
     }
 }
 

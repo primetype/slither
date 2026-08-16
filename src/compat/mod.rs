@@ -60,15 +60,27 @@
 //! spins.** `Incoming` is the exception — its item is not a `Result` and
 //! its `None` means *the endpoint is closed*.
 //!
-//! # Every adapter borrows — **ruling 231**
+//! # Adapters borrow, with one accounted exception — **rulings 231, 239**
 //!
 //! Neither [`Connection`](crate::Connection) nor [`Endpoint`](crate::Endpoint)
 //! is `Clone`, and a `Connection`'s last-handle drop performs
 //! `close(NO_ERROR, "")`, so an owning adapter would change when a
-//! connection ends. Every adapter therefore carries a lifetime, and the
+//! connection ends. Every adapter here therefore carries a lifetime, and the
 //! consequence a consumer meets is that a **borrowed adapter cannot be moved
 //! into `spawn_local`**: move the handle into the task and build the adapter
 //! inside it.
+//!
+//! **The exception is `OpenBiOwned`** in the `tower` module (ruling 239),
+//! and it does not weaken the rule above. `UnsyncBoxService::new` requires
+//! `'static`, so S33's *"an `UnsyncBoxService` composes"* is unsatisfiable
+//! on a borrowed adapter — the owned `Service` shape has to exist. It is
+//! sound because `Connection`'s drop counts handles in an explicit field
+//! rather than by `Rc::strong_count`, so the future holds a **counted**
+//! handle and §16.2's last-handle rule is untouched.
+//!
+//! This heading read *"Every adapter borrows"* until ruling 239 landed the
+//! owned impl in the same slice — the sentence was true when written and
+//! was not revisited when its subject changed.
 
 pub mod io;
 pub mod rt;

@@ -299,3 +299,30 @@ required-features = ["test-util", "tower"]
 [[test]]
 name = "spec_compat"
 required-features = ["test-util", "sink"]
+
+# ── Benchmarks ────────────────────────────────────────────────────────────
+# Throughput measurement, not a gate. Three things about this stanza are
+# load-bearing:
+#
+# `harness = false` — there is no `criterion` dependency, deliberately.
+# `cargo deny check` is a release gate and `Cargo.lock` is not committed, so
+# every run re-resolves from the index; criterion's ~40-crate dev tree is
+# that much more surface for a semver-compatible break, and it must hold the
+# 1.96 MSRV under `--all-targets` too. The benchmark reports min/median/max
+# itself. Revisit if these ever become regression gates.
+#
+# `test = false` — a bench target's `test` flag defaults to **true**, and
+# with `harness = false` that means `cargo test` would execute `main()` and
+# spend minutes moving 24 MiB through two endpoints on every gate run. The
+# compile is still checked, because `cargo build --all-features
+# --all-targets` is itself a gate.
+#
+# `required-features` — it drives two endpoints over `testutil::Network`.
+# The same auto-discovery trap ruling 194 recorded for `[[test]]` applies:
+# without the stanza, cargo would discover the file *without* its features
+# and the feature-less build would fail outright rather than skip it.
+[[bench]]
+name = "throughput"
+harness = false
+test = false
+required-features = ["test-util"]

@@ -110,6 +110,17 @@ impl<S: Handshake> Connection<S> {
     /// **accounted**: `shell.acquire()` plus `cell.handles += 1`, exactly
     /// mirroring `Drop`, so the count is balanced and a future outliving its
     /// caller's handle cannot make `handles` reach zero early or late.
+    ///
+    /// # Why the `cfg`
+    ///
+    /// `compat::tower` is its only caller and that module is
+    /// `#[cfg(feature = "tower")]`, so **without** the feature this is dead
+    /// code and `-D warnings` rejects it. The gate table hid that: the two
+    /// lint-bearing gates run `--all-features`, and `cargo test` runs
+    /// default features without `-D warnings`, so no gate builds a
+    /// combination in which this warns. The narrow fix is the `cfg`; the
+    /// general one is a feature-matrix job, recorded separately.
+    #[cfg(feature = "tower")]
     pub(crate) fn clone_handle(&self) -> Self {
         Self::new(
             Rc::clone(&self.shell),
