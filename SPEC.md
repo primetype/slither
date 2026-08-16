@@ -2255,7 +2255,24 @@ increment):
   sends), and the keepalive (§7.5).
 - **`seal_quiet`** does not touch `last_send` — the **quiet set**: pure
   ACKs, PTO probes, retransmissions, the credit frames (MAX_DATA,
-  MAX_STREAM_DATA, MAX_STREAMS_BIDI/UNI), RESET_STREAM, and CLOSE.
+  MAX_STREAM_DATA, MAX_STREAMS_BIDI/UNI), RESET_STREAM, CLOSE, and **the
+  contested-connection probe's PING (§7.5)**.
+
+  **[RATIFIED 2026/08/16 — ruling 190] Which half of this rule decides,
+  and why the list is not the answer.** The marking side above is a
+  **closed characterisation** — application intent — and the quiet side is
+  an **enumeration**, which a reader takes as exhaustive whether or not it
+  says so. When a new frame appears, those two shapes disagree: it fails
+  the characterisation (so it is quiet) and is absent from the list (so it
+  is undefined). **The characterisation decides; this list is illustrative
+  of the classes that arise, not a definition.** Every send not covered by
+  the marking rule is quiet.
+  The contested PING is named explicitly because slice 7 introduced it and
+  it **must** be quiet: a marking probe would drag `last_send` forward and
+  suppress the very passive keepalive whose absence the probe exists to
+  diagnose. Found by a blind test author told (ruling 182) to *quote* this
+  section rather than re-derive it — who then found the frame it needed
+  missing from the list it was told to quote.
 
 Ack-eliciting and liveness-marking remain independent axes: credit frames
 are ack-eliciting (they need loss recovery — §8.7) yet do not touch
@@ -4665,6 +4682,9 @@ impl Connection {
         &self,
         interval: Option<Duration>,
     ) -> Result<(), ConfigError>;
+    /// **[RATIFIED 2026/08/16 — ruling 189]** The configured beacon
+    /// interval, or `None` when the beacon is off.
+    pub fn persistent_keepalive(&self) -> Option<Duration>;
     // awaitables (ruling 46):
     pub async fn closed(&self) -> ConnectionLost;              // resolves when this connection ends
     pub async fn notified(&self) -> Result<Notification, ConnectionLost>;   // claim one notification
@@ -4777,7 +4797,20 @@ resolves when the FIN is accepted into the stream's send state (errors
 surface as `WriteError`) — **not** when the peer has it, which is what
 ruling 47's two `acked()` verbs below are for; `close()` resolves once the
 CLOSE frame is sealed and the closing state is entered (§15.2), and truncates `reason`
-at `CLOSE_REASON_MAX` (§8.4). `set_persistent_keepalive` admits exactly
+**[RATIFIED 2026/08/16 — ruling 189]** `persistent_keepalive()` is the
+setter's reader, and it exists because ruling 44 made *"a rejected call
+leaves the interval **unchanged**"* an acceptance criterion that **nothing
+in this surface could observe**. Without it the obligation is testable
+only by inferring the interval from beacon cadence across a
+3 × `DEAD_TIMEOUT` window, bracketed from both sides so that neither an
+upward nor a downward clamp survives — which a blind test author did, and
+should not have had to. A configuration setter whose effect cannot be read
+back is the defect; the getter is the fix. *Note the shape for Appendix
+B's sweep before slice 9: ruling 44 was ratified with a test obligation
+whose **observability was never checked** — working rule 11's cousin,
+applied to an obligation rather than to a mechanism.*
+
+`set_persistent_keepalive` admits exactly
 the range **[1 s, `DEAD_TIMEOUT`)**: it rejects an interval **below 1 s**
 (the floor — ruling 42, which keeps the beacon from becoming an
 unthrottled load generator on a class §14.5 exempts from the congestion

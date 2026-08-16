@@ -5002,3 +5002,131 @@ were not asked for:
   connection that validates and then roams to an attacker's address
   re-arms from zero and carries no credit across. That is correct, and it
   is the property most worth attacking.
+
+## Round 31 — slice 7's blind agents report (2026/08/16)
+
+### 188 (T-K's K1) — ruling 175 reinstated a phrase ruling 43 had **denied**, and did not say why it may
+
+Test author T-K, working blind, found this by applying working rule 4 to a
+ruling rather than to the spec — grepping for the *rationale* behind the
+number, not the number:
+
+> Ruling 43 did not merely state a bound, it **denied a
+> characterisation** — *"not by 'the application's own accept rate', which
+> was false because the attacker supplies the Intros"* — and **ruling 175
+> reinstates that exact phrase** (*"the refusal rate is the application's
+> own `accept()` rate"*) without addressing 43's stated reason.
+
+That is exactly right, and it is my defect. Ruling 175 corrected ruling
+43's *number* and silently restored the *characterisation* 43 had rejected,
+which is the one the security argument rests on.
+
+**Ruling: both are true, and the reconciliation must be stated rather than
+left for a reader to reconstruct.**
+
+- The **rate ceiling** is the application's own `accept()` calls. A
+  refusal cannot occur without one, and no attacker can cause one. Ruling
+  175's number is right.
+- **Which** of those calls becomes a refusal-and-probe is
+  **attacker-influenced**, because the attacker supplies the parked
+  `Intro`s that the call refuses against. Ruling 43's objection is right.
+
+So the honest statement is *"bounded above by the application's own
+`accept()` rate, though which calls within it produce a probe is
+attacker-chosen"* — and **43's original target stays dead**: the claim
+§7.5 once made, *"bounded by … nothing an attacker controls"*, remains
+false and must not return. §7.5, §6.9 and §6.3 all carry the reconciled
+form; `CONTRACT-7.md` §0's ruling-43 row gets a supersession marker, which
+it was missing while ruling 40's row beside it carried one.
+
+**What this says:** working rule 4 has been applied to the spec eleven
+times and this is the first time an agent has applied it to the **rulings
+file** — and it found a defect there on the first attempt. A ruling that
+reverses another's conclusion inherits the duty to address its reasoning.
+
+### 189 (T-K's gap 2) — the shell gains a reader for the configured beacon
+
+Ruling 44 makes *"a rejected call leaves the interval **unchanged**"* an
+explicit acceptance criterion, and S5 names it. **§16.2's shell surface
+has no way to observe it**: `set_persistent_keepalive` is a setter with no
+getter, and the core's `persistent_keepalive()` is `pub(crate)`. T-K
+tested it behaviourally — inferring the interval from beacon cadence over
+a 3 × `DEAD_TIMEOUT` window, bracketed from **both** sides so that neither
+an upward nor a downward clamp survives — which is good work on a bad
+seam.
+
+**Ruling:** add `Connection::persistent_keepalive() -> Option<Duration>`
+to §16.2. Wire-free, no core change (the value exists and is already
+tracked), and it turns a ratified acceptance criterion from a
+three-timer-cycle inference into one assertion.
+
+**Why now rather than at slice 8's API review:** a configuration setter
+whose effect cannot be read back is the kind of surface that review would
+flag anyway, and leaving it means every future test of ruling 44 pays
+T-K's cost. The addition is additive and breaks nothing.
+
+Note the shape: ruling 44 was ratified with an acceptance criterion whose
+**observability was never checked**. That is a cousin of working rule 11 —
+a rationale naming a mechanism that does not exist — applied to a *test
+obligation* rather than to a mechanism. Appendix B should be swept for
+others before slice 9.
+
+### 190 (T-K's K2) — the contested PING joins §7.4's quiet set explicitly
+
+§7.4's liveness model has two halves of different logical shape, and the
+frame slice 7 introduces falls between them:
+
+- the **`seal`** (marking) side is a **closed positive characterisation** —
+  application intent — which a PING-only packet fails, so it is quiet by
+  construction;
+- the **`seal_quiet`** side is an **enumeration** — pure ACKs, PTO probes,
+  retransmissions, credit frames, RESET_STREAM, CLOSE — which working rule
+  8 reads as exhaustive, **and the contested PING is not in it.**
+
+Ruling 182 said in terms that the contract must *"quote §7.4, not
+re-derive it"*, so an agent obeying 182 finds the frame it needs absent
+from the list it was told to quote.
+
+**Ruling:** the contested probe's PING is **quiet** — it does not move
+`S`, and it is added to §7.4's enumeration by name. It must be quiet: a
+marking probe would drag `last_send` forward and suppress the very passive
+keepalive whose absence the probe is trying to diagnose.
+
+**And the enumeration is given a stated scope** so it stops being a trap:
+*"every send not covered by the marking characterisation above is quiet;
+the list is illustrative of the classes that arise, not a definition."*
+That inverts which half is authoritative — the closed characterisation
+decides, and the list follows it — which is what §7.4 already meant and
+what makes the two halves stop disagreeing about frames neither anticipated.
+
+Nothing was blocked by this: T-K noted the contract lands on the right
+side, and no test depended on the class. It is filed because the next
+frame to arrive will hit it again.
+
+### T-K's own limits, recorded
+
+Working rule 13, self-reported and verified by arithmetic rather than
+asserted: **the `Contested::Pending` gap is not constructible from an
+integration test.** After a roam `budget_sent == 0`, and the probe is
+~31 B against `3 ×` the roam trigger (itself ≥ a ~30 B keepalive), so
+~90 B admits it outright; and driving the spend up is self-defeating,
+because every small packet the peer sends raises the cap by 3× what a
+reply costs. `CONTRACT-7.md` §8.3 calls the mark/transmission separation
+*"the single most testable property in the slice"* — **it is not testable
+at that level at all.** It is reachable only where a connection is already
+spending into an unvalidated address, which is a core-level construction.
+
+**Integration owes this coverage, and it must not be written by anyone who
+has seen the implementation** (working rule 6). If the implementer's own
+tests do not reach it, the integrator dispatches a **fresh blind agent**
+against the contract rather than writing it directly.
+
+Also unreached and correctly declined: §5.5's three `slither::policy`
+traces (no `tracing` subscriber in dev-dependencies — *"adding one is not
+a test author's call"*, and it is the same debt slice 9 already carries
+from rulings 162/164), and *"nothing is transmitted at the verdict"*,
+which cannot be sampled atomically.
+
+**`cargo clippy` was blocked twice by this environment's permission
+classifier, and T-K did not claim it green.** Working rule 7 observed
+exactly.

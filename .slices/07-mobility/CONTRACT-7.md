@@ -36,7 +36,7 @@ round of rulings.
 | **40** | `PERSISTENT_KEEPALIVE`'s bound is a **ceiling, not a floor** — reject at or above `DEAD_TIMEOUT`. Default 25 s → **10 s**. The beacon **stays in the marking set**. Ruling 38 is reversed in part; its derivation is retained as the proof. |
 | **42** | The beacon also needs a **floor**: reject below **1 s**. Admissible range **`[1 s, DEAD_TIMEOUT)`** — 1 s inclusive, 25 s exclusive. |
 | **41** | The probe's predicate is a **counter high-water mark, not a packet identity**. Clear on **any ACK covering any counter ≥ `probe_floor`**. Collapse concurrent marks into a **single** contested state, one floor, one deadline. Declined: retransmittable PING; clearing on any post-mark ACK without a floor. |
-| **43** | The probe is bounded at **one per `KEEPALIVE_TIMEOUT` per connection** by ruling 41's collapse — *not* by "the application's own accept rate", which was false because **the attacker supplies the Intros**. The probe **is counted in the sent map** and in `bytes_in_flight`. |
+| **43** | ⛔ **Its rate bound is SUPERSEDED by ruling 175; its accounting clause is LIVE.** ~~one per `KEEPALIVE_TIMEOUT` per connection~~ — see 175 below. **Still binding:** the probe **is counted in the sent map** and in `bytes_in_flight`, so §17.5's cwnd bound stays true. **Also still binding, and reconciled by ruling 188:** 43 denied the characterisation *"bounded by the application's own accept rate"* because **the attacker supplies the Intros**, and that denial stands against §7.5's original *"bounded by … nothing an attacker controls"*. Ruling 175 restores the accept-rate phrase in a **narrower** sense — the application's `accept()` calls are the **rate ceiling** (no attacker can cause one), while **which** of those calls becomes a probe is **attacker-chosen** (the attacker supplies the parked `Intro`s each one refuses against). Both halves are true; state both. |
 | **44** | `set_persistent_keepalive` returns **`Result<(), ConfigError>`** with `ConfigError::{KeepaliveTooShort, KeepaliveTooLong}`. **Never a panic** (reachable across bubble-ffi to iOS, where unwinding is UB), **never a silent clamp** (reports success while giving a beacon that does not do what was asked). A rejected call leaves the interval **unchanged**. |
 | **45 → 46** | Ruling 45's `ConnEvent::Contested { under_probe: bool }` **is repaired by 46**: the core enum reaches no application. The shell gets `closed()` and `notified()`. **FAB-6**: emit at **probe transmission**, not at marking, and split the variants — `under_probe: false` read as the *pending* state while meaning *cleared*, and the three real states do not map onto one bool. |
 | **90** | `core::Endpoint::connect()` is **split** into `mint_pending` (0 DH, synchronous) and `start_attempt` (2 DH, on the driver). `connect` is **deleted, not kept as a wrapper**. `start_attempt` is a **no-op for an unknown `ConnectionId`**. |
@@ -747,6 +747,22 @@ impl<S: Handshake> Connection<S> {
         &self,
         interval: Option<Duration>,
     ) -> Result<(), ConfigError>;
+
+    /// **[ADDED post-dispatch — ruling 189]** The configured beacon
+    /// interval, or `None` when the beacon is off.
+    ///
+    /// Added because ruling 44 makes *"a rejected call leaves the interval
+    /// **unchanged**"* an acceptance criterion that **nothing in this
+    /// surface could observe** — so the obligation was testable only by
+    /// inferring the interval from beacon cadence across a
+    /// 3 × `DEAD_TIMEOUT` window. A setter whose effect cannot be read
+    /// back is the defect; this is the fix. Same shared-cell read as the
+    /// accessors below.
+    ///
+    /// **Integrator's note:** this postdates the worktree cut, so the
+    /// implementer's brief does not contain it. It is additive and lands
+    /// at integration.
+    pub fn persistent_keepalive(&self) -> Option<Duration>;
 
     /// The address this connection's datagrams go to.
     ///
