@@ -95,6 +95,20 @@ pub(crate) struct SendHalf {
     fin_sent: bool,
     fin_acked: bool,
     reset: Option<ResetState>,
+    /// §9.8's **receiver**-emitted RESET_STREAM, arriving on a half we own.
+    ///
+    /// Separate from `reset`, and the difference is what is owed: ours is a
+    /// frame we must regenerate until acknowledged, theirs is a frame that
+    /// has already arrived and leaves us owing **nothing on the wire**. The
+    /// code is the peer's, which is the one §18.1 surfaces as
+    /// `WriteError::Reset`.
+    ///
+    /// Retained rather than freed, on the receive half's own terms: the
+    /// half has to survive the reset long enough for the application to
+    /// observe it, or `write()` answers `Finished` and the sender learns
+    /// *"you called this after finishing"* for a stream the **peer**
+    /// abandoned — §9.8's loud failure delivered as the wrong diagnosis.
+    peer_reset: Option<u64>,
     /// Set when a write was refused for want of credit, cleared when the
     /// credit arrives. What makes `StreamWritable` precise instead of a
     /// broadcast.
@@ -120,6 +134,7 @@ impl SendHalf {
             fin_sent: false,
             fin_acked: false,
             reset: None,
+            peer_reset: None,
             blocked: false,
             queued: false,
         }
@@ -155,6 +170,13 @@ impl SendHalf {
 
     /// Whether the fill loop has anything to take.
     pub(crate) fn has_pending(&self) -> bool {
+        if self.peer_reset.is_some() {
+            // §9.6: *"pending and in-flight data for the stream stop being
+            // retransmitted"*. Without this the cleared sets would still
+            // leave `fin && !fin_sent` true and the fill would emit an
+            // empty FIN frame for a stream the peer has already abandoned.
+            return false;
+        }
         self.has_data_pending() || (self.reset.is_none() && self.fin && !self.fin_sent)
     }
 
@@ -198,6 +220,13 @@ impl SendHalf {
     /// [`on_ack_range`]: SendHalf::on_ack_range
     /// [`on_reset_acked`]: SendHalf::on_reset_acked
     pub(crate) fn is_terminal(&self) -> bool {
+        // §9.8's peer reset: nothing is owed and nothing further can be
+        // acknowledged, so the half has reached its end — though nothing
+        // *frees* it here, because only an observation can (see
+        // [`peer_reset`](Self::peer_reset)).
+        if self.peer_reset.is_some() {
+            return true;
+        }
         if let Some(reset) = self.reset {
             return reset.acked;
         }
@@ -224,6 +253,13 @@ impl SendHalf {
     /// credit-driven — so it would owe a new event, a new waker map and a
     /// new wakeup path that no section describes.
     pub(crate) fn write(&mut self, data: &[u8], conn_room: u64) -> Result<usize, WriteError> {
+        // **Above** the finish/reset check: a stream the peer abandoned and
+        // one the application finished are different facts, and §18.1 gives
+        // the first its own variant precisely so the sender can tell them
+        // apart. §9.8's whole purpose is that this answer names the hazard.
+        if let Some(code) = self.peer_reset {
+            return Err(WriteError::Reset(code));
+        }
         if self.fin || self.reset.is_some() {
             return Err(WriteError::Finished);
         }
@@ -253,6 +289,9 @@ impl SendHalf {
     /// statement of intent that is already true. After a `reset()` it is
     /// `Finished`: the half is gone.
     pub(crate) fn finish(&mut self) -> Result<(), WriteError> {
+        if let Some(code) = self.peer_reset {
+            return Err(WriteError::Reset(code));
+        }
         if self.reset.is_some() {
             return Err(WriteError::Finished);
         }
@@ -291,6 +330,35 @@ impl SendHalf {
         self.blocked = false;
     }
 
+    /// §9.8's receiver-emitted RESET_STREAM, applied to this half.
+    ///
+    /// Returns whether it newly applied — a repeat, or one arriving after
+    /// the application's own `reset()`, changes nothing and must not emit a
+    /// second `ConnEvent::StreamReset`.
+    ///
+    /// Everything buffered is discarded: §9.6 stops pending and in-flight
+    /// data from being retransmitted, and the peer that sent this frame has
+    /// already freed the half that would have received it. **No frame is
+    /// owed in reply** — unlike [`reset`](Self::reset), which owes a
+    /// RESET_STREAM of our own until acknowledged.
+    pub(crate) fn stopped_by_peer(&mut self, error_code: u64) -> bool {
+        if self.reset.is_some() || self.peer_reset.is_some() {
+            return false;
+        }
+        self.peer_reset = Some(error_code);
+        self.fresh.clear();
+        self.retransmit.clear();
+        self.unacked.clear();
+        self.buf = Vec::new();
+        self.blocked = false;
+        true
+    }
+
+    /// The peer's §9.8 reset code, if one arrived.
+    pub(crate) fn peer_reset(&self) -> Option<u64> {
+        self.peer_reset
+    }
+
     // ── the wire ────────────────────────────────────────────────────────
 
     /// Take one round-robin quantum's worth of stream data (§8.5).
@@ -298,7 +366,7 @@ impl SendHalf {
     /// Retransmissions are served before fresh data: a peer waiting on a
     /// gap is waiting on those bytes and nothing else.
     pub(crate) fn next_chunk(&mut self, max_len: usize) -> Option<Chunk> {
-        if self.reset.is_some() {
+        if self.reset.is_some() || self.peer_reset.is_some() {
             return None;
         }
 
@@ -467,7 +535,14 @@ impl SendHalf {
     /// terminate on a stream the application intends to keep open.
     /// `SendStream::acked()` is the verb that includes the FIN.
     pub(crate) fn settled_to(&self, offset: u64) -> bool {
-        self.reset.is_some() || offset == 0 || self.acked.covers(0..offset)
+        // §9.8's peer reset joins §9.6's local one for the same stated
+        // reason: *"an abandoned byte is never acknowledged, and waiting on
+        // one would never terminate"*. It abandons the bytes whichever end
+        // asked for it.
+        self.reset.is_some()
+            || self.peer_reset.is_some()
+            || offset == 0
+            || self.acked.covers(0..offset)
     }
 
     /// §9.6's RESET_STREAM acknowledged — `ResetRecvd`.

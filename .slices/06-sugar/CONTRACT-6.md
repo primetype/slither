@@ -20,6 +20,8 @@ resolved by **Round 26 (rulings 150–158)**.
 | **154** | §10.3's fifth retirement trigger ("final size reached with no reader") is **struck** — §9.7 never contained it. **Retention until claimed is the rule.** |
 | **155** | **One datagram per packet, packed before the stream fill.** Datagrams-after-the-fill is the smallest diff and the worst outcome: a saturated stream starves them entirely and the bounded queue evicts continuously — silent loss with no distinguishing counter. Also: `MAX_DATAGRAM_PAYLOAD` (1169) + type + length exceeds `MAX_PLAINTEXT` (1170), so **the `0x30` extends-to-end form is mandatory**, not an optimisation — without it the ratified maximum datagram cannot be sent at all. |
 | **156** | The pending-claim flag is cleared by a `recv_message()` returning `Some`. **Two** drop counters (send and recv). `earns_stream_credit` stays `true` everywhere. |
+| **163** | `core::send_message` returns **`Result<SendMessage, MessageError>`** with `enum SendMessage { Sent, Blocked }`. "Not now" was never an error — it is `write`'s `Ok(0)` and `accept`'s `None`, in the success type. §18.1 stays closed and untouched. `Blocked` carries no reason: one `message_senders` map, three wake sources. |
+| **164** | The overflow predicate's second clause (**highest received offset, no final size pinned**) is now stated in §15.3's registry and §9.8's prose too. §9.8's *"which it cannot be, having no FIN"* argued as fact the thing ruling 153 had to add — do not take it as the argument. |
 
 ---
 

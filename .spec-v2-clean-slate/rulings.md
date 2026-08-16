@@ -4049,3 +4049,81 @@ exists. Working rule 4 again, and the second time in two days that the
 sweep had to be done by hand after the ruling landed. The still-running
 message author was messaged directly, because a stale marker told it to
 ship a ratified obligation `#[ignore]`d.
+
+---
+
+## Round 28 — slice 6's blind message author (2026/08/16)
+
+Fifteen tests, and an **unsatisfiable triple in ratified text** that no
+amount of careful implementation could have resolved.
+
+**Ruling 163 — `core::send_message` returns `Result<SendMessage,
+MessageError>`, where `enum SendMessage { Sent, Blocked }`.**
+
+Three ratified statements could not all hold: §16.4 gives the core verb
+`Result<(), MessageError>`; ruling 150 requires it to say *"not now"*; and
+§18.1's `MessageError` is **closed** — `CONTRACT-6.md` §2.6 says so itself
+and `spec_errors` pins it. The contract papered over the gap by writing
+`Result<SendMessage, MessageError>` with **`SendMessage` defined nowhere**,
+which is the shape of a problem deferred rather than solved.
+
+The resolution is that *"not now"* was never an error. It is an ordinary
+outcome of a verb that admits atomically, in the same family as
+`write`'s `Ok(0)` and `accept`'s `None` — both of which this core already
+uses to mean *the state is not ready*, neither of which is an error. So the
+success type carries it and §18.1 stays closed, untouched: no variant is
+added, no public error surface moves, and `spec_errors`' pins hold.
+
+`Blocked` carries **no reason**, deliberately. The shell parks in one
+`message_senders` map fed by three wake sources — `StreamsAvailable
+{ dir: Uni }` for allowance, ruling 150's new event for connection credit,
+and the death latch — so distinguishing the cause would buy the caller
+nothing and cost a second slot to release. §16.4 is amended; it is the
+**core** API, `pub(crate)`, and this is an internal change of exactly the
+kind ruling 150 already made when it minted a `ConnEvent` variant.
+
+**Ruling 164 — ruling 153's second clause is swept into the two places
+that still stated the predicate without it.**
+
+§15.3's code registry describes `MESSAGE_OVERFLOW` as *"an unclaimed uni
+stream reached `MESSAGE_RECV_MAX` while a claim was pending"* — the
+version **without** the final-size clause. An implementer looking up what
+`0x06` means gets the rule that resets a conforming maximum-size message.
+Appendix B states it correctly; the registry did not.
+
+Worse, §9.8's own prose contained a parenthetical — *"nor surfaceable by
+`recv_message()`, **which it cannot be, having no FIN**"* — that argues as
+an established fact the very thing ruling 153 had to add as an independent
+clause. It is true only of a sender that has not yet sent its FIN, which
+is the case the rule is *for*; it does not establish that the predicate is
+safe, because a conforming `send_message` of exactly `MESSAGE_RECV_MAX`
+bytes reaches the bound at the same instant. **A reader who takes the
+parenthetical as the argument builds the version that resets its own
+protocol's largest legal message.**
+
+Both swept. This is working rule 4 for the third time in two days —
+grep for the rationale, not only the token — and the first time the
+un-swept text was not merely stale but *actively persuasive in the wrong
+direction*.
+
+**Recorded, not ruled: ruling 59's receiver-side tracing MUST is
+uncoverable, and the asymmetry is the finding.** The author reports that
+the **sender** half of §9.8's diagnosis is pinned five times over in its
+file, and the **receiver** half — the MUST that exists because *"the end
+that actually chose the conflicting mode learns nothing at all"* — is
+pinned nowhere in any slice, because `testutil` has no tracing capture and
+`Tap` yields sealed datagrams. Ruling 162 already sent this to slice 9;
+what Round 28 adds is that the gap is **one-sided**, and that the
+unpinned side is the one the obligation exists to protect. Slice 9 gets a
+tracing fixture, not a note.
+
+### The pattern worth naming
+
+Both blind authors, working on disjoint halves and blind to each other,
+independently reported the same stale `RULING REQUIRED` markers. Neither
+could see the other's report; both read the contract exhaustively enough
+to notice that §0's table answered questions §2 still called open. **A
+document defect that two independent readers both trip over is not a
+readability problem, it is a correctness problem** — and the process
+surfaced it twice in one slice without either author knowing the other
+existed.

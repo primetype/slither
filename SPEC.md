@@ -3144,10 +3144,24 @@ is precisely this case.
 
 The rule: an **unclaimed** uni stream — neither claimed by
 `accept_uni()`, nor surfaceable by `recv_message()`, which it cannot be,
-having no FIN — that reaches `MESSAGE_RECV_MAX` is **reset** by the
-receiver, so its sender learns through
+having no FIN — that reaches `MESSAGE_RECV_MAX` **at its highest received
+offset, with no final size pinned**, is **reset** by the receiver, so its
+sender learns through
 `WriteError::Reset(MESSAGE_OVERFLOW)` (§18.1) instead of stalling. The
-receive half retires (its bytes count as consumed at the connection
+**[AMENDED 2026/08/16 — ruling 164]** *"which it cannot be, having no
+FIN" was arguing as an established fact the very thing ruling 153 had to
+add as an independent clause.* It is true only of a sender that has not
+yet sent its FIN — which is exactly the case this rule is for — and it
+does **not** establish that the predicate is safe, because a conforming
+`send_message` of precisely `MESSAGE_RECV_MAX` bytes reaches the bound at
+the same instant. What makes the predicate safe is ruling 153's other
+half: `send_message` **carries the FIN on its final data frame**, so
+reaching the bound implies the final size is already pinned and the rule
+above cannot fire. A reader who takes the parenthetical as the argument
+will build the version that resets its own protocol's largest legal
+message.
+
+The receive half retires (its bytes count as consumed at the connection
 level, §10.3) and the receiver emits RESET_STREAM (`0x04`, §8.3, §8.4 —
 **no new frame type**) with **error code `MESSAGE_OVERFLOW` = `0x06`**,
 the one receiver-emitted reset (§9.6), retained and
@@ -4064,7 +4078,7 @@ reserved cleartext close packet type (`0x04`) stays dead.
 | `0x03` | `STREAM_LIMIT_ERROR` | cumulative stream limit exceeded (§10.4) |
 | `0x04` | `STREAM_STATE_ERROR` | a frame for a stream its sender could not touch (§8.4) |
 | `0x05` | `FINAL_SIZE_ERROR` | final-size disagreement (§9.5, §9.6) |
-| `0x06` | `MESSAGE_OVERFLOW` | **[RATIFIED 2026/08/14 — ruling 52]** the receiver-emitted overflow reset of §9.6/§9.8: an unclaimed uni stream reached `MESSAGE_RECV_MAX` while a `recv_message()` claim was pending. Carried in RESET_STREAM's `error_code`, never in CLOSE |
+| `0x06` | `MESSAGE_OVERFLOW` | **[RATIFIED 2026/08/14 — ruling 52; predicate completed 2026/08/16 — ruling 164]** the receiver-emitted overflow reset of §9.6/§9.8: an unclaimed uni stream reached `MESSAGE_RECV_MAX` **at its highest received offset, with no final size pinned**, while a `recv_message()` claim was pending. The second clause is not decoration: without it this row describes a rule that resets a *conforming* maximum-size message whose FIN is still in flight. Carried in RESET_STREAM's `error_code`, never in CLOSE |
 | `0x07`–`0x0f` | reserved | transport-reserved; never sent |
 | ≥ `0x10` | application | application-defined codes via `close()` |
 
@@ -4861,7 +4875,9 @@ impl core::Connection {
     fn reset(&mut self, now: Instant, r: StreamRef, error_code: u64);
     fn read(&mut self, r: StreamRef, buf: &mut [u8]) -> Result<Option<usize>, ReadError>;
     fn stream_id(&self, r: StreamRef) -> Option<StreamId>;   // ruling 95; §16.9's accessor
-    fn send_message(&mut self, now: Instant, msg: &[u8]) -> Result<(), MessageError>;
+    fn send_message(&mut self, now: Instant, msg: &[u8])
+        -> Result<SendMessage, MessageError>;                // ruling 163
+    // enum SendMessage { Sent, Blocked }  — NOT an error; §18.1 stays closed
     fn send_datagram(&mut self, now: Instant, data: &[u8]) -> Result<(), DatagramError>;
     fn close(&mut self, now: Instant, code: u64, reason: &[u8]);
     // claim verbs — the pull model (§10.6, §11.3, §9.8):

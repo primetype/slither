@@ -65,6 +65,48 @@ Blind test authors (isolated worktrees): `tests/story_datagram.rs` (§11),
 
 ## 4. Conflicts found
 
+### F1 — the §9.8 reset is rejected by `check_peer_may_send` and kills the connection
+
+**Found by running it, not by reading.** With everything else in place, S30's
+sequence produces `ConnectionLost::ProtocolViolation { code: 4 }`
+(`STREAM_STATE_ERROR`) on the **sender**, not
+`WriteError::Reset(MESSAGE_OVERFLOW)`.
+
+`Streams::check_peer_may_send` (`streams.rs`, slice 4) reads:
+
+> The peer may send STREAM/RESET_STREAM on any bidi stream, and on a uni
+> stream only if the peer opened it.
+
+`SPEC.md:2686-2689` states the rule **with an exception the generalisation
+dropped**:
+
+> a `stream_id` naming a stream the sender of the frame could not send on
+> (their receive-only half) ⇒ `STREAM_STATE_ERROR` — **with exactly one
+> exception, the message-mode overflow reset of §9.8, in which the
+> *receiver* of a uni stream emits RESET_STREAM as its abandonment signal
+> (§9.6)**
+
+This is working rule 8's shape exactly: a stated construction whose stated
+scope the code widened. It was invisible until this slice because the case
+was not constructible — `driver.rs:519-525` and `IMPLEMENTATION-5b.md`
+§4-C1 both say so in terms.
+
+**Consequence, and why it is mine.** Without the fix S30 cannot pass:
+`CONTRACT-6.md` is silent on the sender's side of the reset, but STORIES.md
+S30 requires *"the sender observes `WriteError::Reset(MESSAGE_OVERFLOW)`"*
+and §9.8 requires *"the sender's stream frees instead of wedging"*. The
+observed behaviour is the opposite of §9.8's intent — the whole connection
+dies with a violation code accusing the peer.
+
+### F2 — the sender-side handling of the receiver-emitted reset is in nobody's contract
+
+`CONTRACT-6.md` §2.7 lists what slice 6 must not build and does not reach
+this; §2.1–§2.5 describe the receiver's side of §9.8 only. But §18.1 names
+`WriteError::Reset` as *"the stream was reset — by the local application,
+**or by the peer's message-mode overflow reset (§9.8, the one
+receiver-emitted RESET_STREAM)**"*, and slice 5b recorded the case as
+deferred to this slice. Built; see §3.
+
 ## 5. Mechanisms named that do not exist
 
 ## 6. Fixture capabilities needed and not added
