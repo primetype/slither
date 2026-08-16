@@ -160,6 +160,17 @@ impl Drained {
             .collect()
     }
 
+    /// §6.4's LIVE branch: the connections this drain replaced (§5.4).
+    fn replaced(&self) -> Vec<ConnectionId> {
+        self.outs
+            .iter()
+            .filter_map(|o| match o {
+                EndpointOutput::Replaced(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The single intro this drain surfaced. Panics on zero or two — a
     /// count assertion phrased as an extractor, because "surfaced exactly
     /// once" is the property most of §6.3 turns on.
@@ -2291,13 +2302,22 @@ fn the_endpoint_deadline_covers_guard_orphan_aging() {
 /// `Intro` … and surfaces through the staged accept. The live connection
 /// keeps running untouched."
 ///
-/// Plan §1.4 bounds slice 2a to the **NONE** row, returning
+/// Plan §1.4 bounded slice 2a to the **NONE** row, returning
 /// `AcceptError::Stale` for LIVE — knowingly incomplete, and pinned here
-/// so the gap is visible rather than latent, and so slice 7 has a test to
-/// *change* rather than a behaviour to discover. What must hold in both
-/// slices is §16.1's one-session-per-peer-static invariant.
+/// so the gap was visible rather than latent, and so slice 7 had *"a test
+/// to change rather than a behaviour to discover"*.
+///
+/// **[amended by slice 7 — §5.4, §6.4]** It is changed, exactly as the
+/// author's note anticipated. `b` **accepted** the first initiation, so its
+/// replacement basis is `Some(t)` (§17.4) and a strictly newer candidate is
+/// a replacement: `accept()` returns `Ok`, the old connection is torn down
+/// with `ConnectionLost::Replaced`, and the new one takes its place.
+///
+/// What holds in both slices, and is still the point of the test, is
+/// §16.1's **one session per peer static**: exactly one connection carries
+/// this static at every instant, before and after.
 #[test]
-fn accept_on_a_live_static_returns_stale_and_installs_nothing() {
+fn accept_on_a_live_static_replaces_it_against_a_newer_basis() {
     let t = t0();
     let (mut a, mut b) = pair(t);
     let train = msg1_train(&mut a, t, &b, 2);
@@ -2315,22 +2335,66 @@ fn accept_on_a_live_static_returns_stale_and_installs_nothing() {
         "a replacement candidate must still reach Proven: {proven:?}"
     );
 
-    // … and slice 2a refuses it.
-    assert!(matches!(b.ep.accept(t, second), Err(AcceptError::Stale)));
+    // … and, its timestamp being strictly newer than the basis, it replaces.
+    let (replacement, _core) = b
+        .ep
+        .accept(t, second)
+        .expect("§6.4: a strictly newer candidate against a Some(t) basis replaces");
+    assert_ne!(replacement, live, "a **fresh** connection, never the old one");
+
     let d = b.drain();
-    assert!(d.transmits().is_empty(), "a refused accept sent msg2");
+    assert_eq!(
+        d.replaced(),
+        vec![live],
+        "§5.4: the teardown fires at the act that installs the replacement"
+    );
+    assert_eq!(d.transmits().len(), 1, "and msg2 goes out for the new one");
     assert!(
         d.installs().is_empty(),
-        "a refused accept installed a session"
+        "§16.4: `accept()` returns an established connection and is never followed by an `Install`"
+    );
+    let replaced_at = d
+        .outs
+        .iter()
+        .position(|o| matches!(o, EndpointOutput::Replaced(_)))
+        .expect("the teardown");
+    let msg2_at = d
+        .outs
+        .iter()
+        .position(|o| matches!(o, EndpointOutput::Transmit(_)))
+        .expect("msg2");
+    assert!(
+        replaced_at < msg2_at,
+        "§16.4's generation order: the teardown, then the replacement's msg2"
     );
 
-    // §16.1: the live connection is untouched, and there is still exactly
-    // one session for this static — its index still routes to it.
+    // §16.1: the old connection's index still routes to **it** until its
+    // own `Retired` arrives — the endpoint core never learned the index,
+    // and dropping the route is that event's job (§16.4). What has already
+    // moved is the static: it names the replacement now.
     let (disp, _d) = b.datagram(t, a.addr, &data_packet(ours, 1, 64));
     assert_eq!(
         disp,
         Disposition::ForConnection(live),
-        "the refused accept disturbed the live connection"
+        "the index route outlives the teardown by exactly one event"
+    );
+
+    // And once it does arrive, the old route is gone — while the static
+    // still names the replacement, which is what keeps §16.1's invariant
+    // true at every instant rather than only at the ends.
+    b.ep.handle_connection_event(
+        t,
+        live,
+        ToEndpoint::Retired { our_index: ours },
+    );
+    let (disp, _d) = b.datagram(t, a.addr, &data_packet(ours, 2, 64));
+    assert_eq!(disp, Disposition::Done, "the retired index routes nowhere");
+    assert!(
+        matches!(
+            b.ep.mint_pending(t, a.addr, a.public_static),
+            Err(ConnectError::AlreadyConnected)
+        ),
+        "§16.1: the static is the replacement's, and the old `Retired` did not release it"
     );
 }
 

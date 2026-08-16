@@ -2198,6 +2198,36 @@ impl<C: Handshake> Connection<C> {
     /// candidate proving the same static with a verifying tail tag may reach
     /// here, or an attacker able to park mac1-valid rubbish provokes marks
     /// with no key material at all.
+    /// §5.4's replacement teardown, fired by §6.4's replacing `accept()`.
+    ///
+    /// *"A fresh connection with fresh transport state on both sides … no
+    /// stream, flow-control, recovery, or congestion state ever crosses a
+    /// handshake"* — so this connection dies **whole**, and in-flight stream
+    /// data on it is lost. §15.4's replaced row transmits **nothing**: there
+    /// is no CLOSE and no linger, because the peer is not the party being
+    /// told (it reconnected, and its new connection is already running).
+    ///
+    /// `Closed(Replaced)` is followed **within the same drain** by
+    /// `ToEndpoint::Retired` (§16.4, ruling 81's no-linger case).
+    ///
+    /// A second call, or one against a connection already dying with its own
+    /// cause, surfaces no second `Closed` (§16.4 emits it once) and only
+    /// takes the state away.
+    pub(crate) fn replaced(&mut self, now: Instant) {
+        // The replaced row seals nothing (§15.4), so there is no instant to
+        // seal at — but §16.4 puts a `now` on every mutating call, and a
+        // signature that omits it is one a later slice has to widen.
+        let _ = now;
+        if self.lifecycle.is_dead() {
+            return;
+        }
+        if self.closed_emitted {
+            self.drop_state();
+            return;
+        }
+        self.die(ConnectionLost::Replaced);
+    }
+
     pub(crate) fn mark_contested(&mut self, now: Instant) {
         // **[ruling 179]** The carve-out, enforced on both sides: §6.4 takes
         // the mark and §7.5 describes the state, and a rule enforced only in

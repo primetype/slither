@@ -436,11 +436,44 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                     }
                 }
                 EndpointOutput::HandshakeFailed(id, error) => self.fail_pending(id, error),
+                // §6.4's LIVE branch reaching the connection it names. Both
+                // arms are one call into the core plus the dirty flag: the
+                // effects — `Closed(Replaced)` and `Retired`, or the PING
+                // and `Contested` — come out of that core's own drain, in
+                // this same `serve()` pass, because `serve` loops while
+                // anything is dirty.
+                EndpointOutput::Replaced(id) => {
+                    self.deliver_to_core(id, CoreConnection::replaced);
+                }
+                EndpointOutput::Contested(id) => {
+                    self.deliver_to_core(id, CoreConnection::mark_contested);
+                }
             }
         }
         panic!(
             "core::Endpoint::poll_output did not reach Timeout in {DRAIN_BOUND} outputs (§16.4)"
         );
+    }
+
+    /// Run one mutating verb against a named connection core, and mark it
+    /// dirty so this pass drains whatever it produced.
+    ///
+    /// An unknown id is a no-op: the endpoint core learns of a connection's
+    /// death through `Retired`, and the shell releases its record in the
+    /// same pass, so a stale id is reachable and is not an error.
+    fn deliver_to_core(
+        &mut self,
+        id: ConnectionId,
+        verb: impl FnOnce(&mut CoreConnection<I::Suite>, std::time::Instant),
+    ) {
+        let Some(record) = self.conns.get(&id) else {
+            return;
+        };
+        let mut cell = record.cell.borrow_mut();
+        if let Some(core) = cell.core.as_mut() {
+            verb(core, now());
+        }
+        cell.dirty = true;
     }
 
     /// Drain one connection core (§16.4), publishing its events.

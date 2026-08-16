@@ -962,6 +962,8 @@ impl<I: Identity> ShellState<I> {
                             crate::core::EndpointOutput::IntroReady(..) => "IntroReady",
                             crate::core::EndpointOutput::ToConnection(..) => "ToConnection",
                             crate::core::EndpointOutput::HandshakeFailed(..) => "HandshakeFailed",
+                            crate::core::EndpointOutput::Replaced(_) => "Replaced",
+                            crate::core::EndpointOutput::Contested(_) => "Contested",
                             crate::core::EndpointOutput::Timeout(_) => unreachable!(),
                         }
                     );
