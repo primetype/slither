@@ -30,6 +30,7 @@
 //! forger who observed a cleartext counter poison the window by minting a
 //! packet that never authenticates.
 
+use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::time::Instant;
 
@@ -375,6 +376,21 @@ impl<C: Handshake> Session<C> {
     /// The completed session §16.4's `Install` carried.
     pub(crate) fn established(&self) -> &EstablishedSession<C> {
         &self.established
+    }
+
+    /// §7.3's roam: move §5.6's anchor, returning the address it left.
+    ///
+    /// Deliberately **narrow** rather than a blanket `established_mut()`.
+    /// The anchor is the only field of an established session that ever
+    /// moves — the cipher states, both indices and §7.7's epoch are fixed
+    /// for the session's life (§7.8) — and a `&mut` to the whole struct
+    /// would be a second way to reach them.
+    ///
+    /// The caller owns the predicate: this performs no check at all, because
+    /// §7.3's four conjuncts and §15.2's lifecycle carve-out are stated
+    /// where the packet is, not where the field is.
+    pub(crate) fn roam_to(&mut self, addr: SocketAddr) -> SocketAddr {
+        std::mem::replace(&mut self.established.anchor, addr)
     }
 
     /// §7.2's window — also §12.2's received-packet record.

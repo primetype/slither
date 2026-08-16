@@ -116,8 +116,8 @@ use crate::packet::Handshake;
 
 use super::connection::Connection;
 use super::shared::{
-    Command, ConnCell, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers, now, resolve_slot,
-    wake_settled,
+    Command, ConnCell, NotificationSlots, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers,
+    now, resolve_slot, wake_settled,
 };
 use super::staged::Intro;
 use super::wire::Wire;
@@ -595,6 +595,48 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                     waker.wake();
                 }
             }
+
+            // §16.2's three notifications (ruling 46). Each fills its slot
+            // and wakes the one set; the slot is what makes the fact
+            // **retained** rather than dropped on the floor between the
+            // application's two visits, and the wake is what releases a
+            // `notified()` that is parked right now.
+            //
+            // `AddressMoved` also moves the accessor: `remote_address()`
+            // reads this field, and §7.3's roam is the only thing that ever
+            // changes it after the install.
+            ConnEvent::AddressMoved { from, to } => {
+                Self::notify(cell, |slots| slots.address_moved(from, to), Some(to));
+            }
+            ConnEvent::Contested => {
+                Self::notify(cell, NotificationSlots::contested, None);
+            }
+            ConnEvent::ContestCleared => {
+                Self::notify(cell, NotificationSlots::contest_cleared, None);
+            }
+        }
+    }
+
+    /// Fill one notification slot, optionally move the anchor mirror, and
+    /// wake the waiters **outside** the borrow (finding F10).
+    ///
+    /// [`wake_stream`](Self::wake_stream)'s sibling: that one only selects a
+    /// set, and these three arms have to write before they wake.
+    fn notify(
+        cell: &Rc<RefCell<ConnCell<I::Suite>>>,
+        fill: impl FnOnce(&mut NotificationSlots),
+        anchor: Option<SocketAddr>,
+    ) {
+        let woken = {
+            let mut borrow = cell.borrow_mut();
+            if let Some(anchor) = anchor {
+                borrow.remote_address = anchor;
+            }
+            fill(&mut borrow.notifications);
+            borrow.notification_wakers.take_all()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 
@@ -1099,6 +1141,14 @@ impl<I: Identity, W: Wire> Driver<I, W> {
             }
             borrow.closed = Some(lost);
             let mut woken = borrow.closed_wakers.take_all();
+            // `notification_wakers` is taken here, beside `closed_wakers`
+            // and for the same reason: a `notified()` parked with every slot
+            // empty can only ever resolve from the latch, so nothing else
+            // would release it. It is **not** in
+            // `take_all_stream_wakers` — a notification survives the death
+            // and the slots outlive it, so the sweep that frees the stream
+            // verbs is the wrong place to say so.
+            woken.extend(borrow.notification_wakers.take_all());
             // §16.8's four stream maps sweep here too, and this is the only
             // thing that wakes a cell-parked stream waiter on **driver**
             // death: [`stop`] calls this, and `Drop for Driver` calls

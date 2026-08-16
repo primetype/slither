@@ -137,8 +137,8 @@ pub use error::{
 pub use identity::{CurveOf, Identity, PrivateKeyOf, PublicKeyOf, SoftwareIdentity};
 pub use packet::{Channel, Handshake};
 pub use shell::{
-    BiStream, Claimed, Connecting, Connection, Endpoint, EndpointBuilder, Intro, Proven,
-    RecvStream, SendStream,
+    BiStream, Claimed, Connecting, Connection, Endpoint, EndpointBuilder, Intro, Notification,
+    Proven, RecvStream, SendStream,
 };
 
 /// A completed session's channel binding — **hiss's type, re-exported**.

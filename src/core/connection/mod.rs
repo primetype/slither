@@ -40,6 +40,7 @@ pub(crate) mod congestion;
 pub(crate) mod datagram;
 pub(crate) mod flow;
 pub(crate) mod frame;
+pub(crate) mod mobility;
 pub(crate) mod recovery;
 pub(crate) mod recv;
 pub(crate) mod send;
@@ -74,6 +75,12 @@ mod tests_ack;
 #[cfg(test)]
 mod tests_recovery;
 
+// Slice 7's own unit tests — the **implementer's**, and deliberately named
+// so that no story file could ever collide with them (`CONTRACT-7.md` §11).
+// The slice's acceptance tests are two blind authors' and live in `tests/`.
+#[cfg(test)]
+mod tests_roam;
+
 // ── slice 6's core tests, at integration ─────────────────────────────────
 //
 // Written from `SPEC.md` §9.8/§11 and `CONTRACT-6.md` by two authors who
@@ -91,10 +98,12 @@ mod tests_recovery;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::constants;
-use crate::error::{ConnectionLost, DatagramError, MessageError, ReadError, WriteError};
+use crate::error::{
+    ConfigError, ConnectionLost, DatagramError, MessageError, ReadError, WriteError,
+};
 use crate::packet::{Handshake, Inbound, classify};
 
 use self::ack::{AckAction, AckState};
@@ -103,6 +112,7 @@ use self::congestion::{Controller, NewReno};
 use self::datagram::Datagrams;
 use self::flow::Flow;
 use self::frame::{Close, Frame, Packing, Structural};
+use self::mobility::{Amplification, Contested};
 use self::recovery::{AckOutcome, Recovery, SentFrame, SentPacket};
 use self::session::Session;
 use self::timers::{TimerKind, Timers};
@@ -154,6 +164,14 @@ pub(crate) struct Connection<C: Handshake> {
     /// §14's controller. NewReno is v1's one implementation (§14.1);
     /// CUBIC and BBR are §19's, behind the same trait.
     congestion: NewReno,
+    /// §7.3's anti-amplification budget, **per session** (ruling 170).
+    amplification: Amplification,
+    /// §7.5's contested mark (rulings 36, 41, 45/46, 175–177, 179).
+    contested: Contested,
+    /// §7.5's beacon interval. `None` disables it, which is the default:
+    /// the *passive* keepalive dance needs no opt-in (ruling 39), and this
+    /// knob is only for a link that is mutually idle.
+    persistent_keepalive: Option<Duration>,
 }
 
 /// What a received, authenticated, window-fresh packet turned out to be.
@@ -188,6 +206,12 @@ impl<C: Handshake> Connection<C> {
             ack: AckState::new(),
             recovery: Recovery::new(),
             congestion: NewReno::new(),
+            // §7.3: a `connect()`-supplied address is **not** armed — a
+            // dialled connection starts validated. The budget arms at
+            // exactly two events and this is neither.
+            amplification: Amplification::validated(),
+            contested: Contested::No,
+            persistent_keepalive: None,
         }
     }
 
@@ -205,6 +229,23 @@ impl<C: Handshake> Connection<C> {
         role: Role,
     ) -> Self {
         let mut conn = Self::connecting(sub_seed);
+        // §7.3's second arming event: an **accepted initiation's msg1
+        // anchor**. The msg1 qualifies as authenticated — *"its handshake
+        // tail tags having verified at admission"* — so it credits the
+        // received counter, and it is window-fresh by construction (nothing
+        // has been received on this session yet), which is what ruling 169
+        // requires of anything that funds the budget.
+        //
+        // The credit is `INIT_PACKET_LEN` rather than a length threaded down
+        // from the endpoint because §3.1's gate admits initiations at
+        // **exactly** that size: there is no other length an accepted msg1
+        // can have had.
+        //
+        // Armed **before** the install so the pump inside it cannot slip a
+        // datagram past an unarmed budget. `install` records the floor once
+        // the session exists, which is the first moment `next_counter()`
+        // means anything.
+        conn.amplification = Amplification::arm(0, constants::INIT_PACKET_LEN as u64);
         conn.install(now, session, role);
         conn
     }
@@ -248,6 +289,78 @@ impl<C: Handshake> Connection<C> {
         self.timers.get(kind)
     }
 
+    /// The address this connection's datagrams go to — §5.6's anchor, moved
+    /// by §7.3's roaming.
+    ///
+    /// `None` before a session is installed; **total after the install**, and
+    /// the shell's `remote_address()` mirrors it.
+    pub(crate) fn remote_address(&self) -> Option<SocketAddr> {
+        self.session().map(|session| session.anchor)
+    }
+
+    /// **[ruling 137]** §14.6's path-generation stamp. `0` at construction;
+    /// `+= 1` at each **committed** roam, never at a rejected one.
+    #[cfg(test)]
+    pub(crate) fn path_generation(&self) -> u32 {
+        self.recovery.path_gen()
+    }
+
+    /// §7.3's budget, for tests. `None` when the address is **validated**
+    /// (no budget armed); `Some((sent, received))` in **datagram bytes**
+    /// when it is unvalidated.
+    #[cfg(test)]
+    pub(crate) fn amplification_budget(&self) -> Option<(u64, u64)> {
+        self.amplification.counters()
+    }
+
+    /// §7.3's validation floor (ruling 168), for tests.
+    #[cfg(test)]
+    pub(crate) fn validation_floor(&self) -> u64 {
+        self.amplification.floor()
+    }
+
+    /// §7.5's contested mark, for tests.
+    #[cfg(test)]
+    pub(crate) fn contested(&self) -> Contested {
+        self.contested
+    }
+
+    /// §7.5's beacon interval, or `None` if disabled.
+    pub(crate) fn persistent_keepalive(&self) -> Option<Duration> {
+        self.persistent_keepalive
+    }
+
+    /// §7.5's beacon. `None` disables it.
+    ///
+    /// Returns `Err(ConfigError::KeepaliveTooShort)` for an interval
+    /// **strictly below** `PERSISTENT_KEEPALIVE_MIN` (1 s), and
+    /// `Err(ConfigError::KeepaliveTooLong)` for one **at or above**
+    /// `DEAD_TIMEOUT` (25 s) — the ceiling gets no constant of its own
+    /// (ruling 63: *"a second place `DEAD_TIMEOUT` is written down is a
+    /// place it can drift"*).
+    ///
+    /// On `Err` the current interval is **unchanged**: no clamp, no panic
+    /// (ruling 44 — a panic is undefined behaviour across bubble-ffi to iOS,
+    /// and a clamp reports success while giving a beacon that does not do
+    /// what was asked).
+    ///
+    /// `None` is accepted at all times, including on a dead connection.
+    pub(crate) fn set_persistent_keepalive(
+        &mut self,
+        now: Instant,
+        interval: Option<Duration>,
+    ) -> Result<(), ConfigError> {
+        // The beacon arms from §7.4's `last_send`, not from the call, so
+        // `now` names no instant this verb uses. It is an argument because
+        // §16.4 puts one on every mutating call and a signature that omits
+        // it is one the next slice has to widen.
+        let _ = now;
+        validate_persistent_keepalive(interval)?;
+        self.persistent_keepalive = interval;
+        self.sync_liveness_timer();
+        Ok(())
+    }
+
     /// §16.4's endpoint→connection event. `Install` only, **exactly
     /// once**: a second one is a driver bug and is ignored rather than
     /// replacing a live session (§7.8 — no transport state ever crosses a
@@ -269,12 +382,25 @@ impl<C: Handshake> Connection<C> {
 
     /// §16.4's `handle_datagram`.
     ///
-    /// `src` is the datagram's source address. Slice 3 does not read it:
-    /// §6.5's roaming is slice 7, and §15.2 is explicit that the closing
-    /// state "does not roam; never to the triggering packet's source".
+    /// `src` is the datagram's source address, and §7.3's roaming is what
+    /// reads it.
+    ///
+    /// # The roam predicate, exhaustively
+    ///
+    /// A roam is committed **iff all four hold**, and **iff** the
+    /// connection's [`Lifecycle`] is `Live`:
+    ///
+    /// 1. the packet is a **Data** packet — handshake packets never reach
+    ///    this core, and §7.3 forbids them roaming a live session anyway;
+    /// 2. `session.open(..)` returned `Some` — the **AEAD tag verified**;
+    /// 3. the replay window **marked** it: a duplicate, or a counter more
+    ///    than `REPLAY_WINDOW` behind, is **not** fresh;
+    /// 4. `src` differs from the current anchor.
+    ///
+    /// §15.2 is explicit that a **closing or draining** connection *"does
+    /// not roam; never to the triggering packet's source"*, which is the
+    /// fifth conjunct and the one that is not about the packet.
     pub(crate) fn handle_datagram(&mut self, now: Instant, src: SocketAddr, datagram: &[u8]) {
-        let _ = src;
-
         if self.lifecycle.is_dead() {
             return;
         }
@@ -286,7 +412,7 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
-        let (counter, prev_greatest, received) = {
+        let (counter, prev_greatest, received, roamed) = {
             let Some(Inbound::Data {
                 header,
                 ad,
@@ -295,6 +421,7 @@ impl<C: Handshake> Connection<C> {
             else {
                 return;
             };
+            let live = self.lifecycle.is_live();
 
             let session = self
                 .session
@@ -318,6 +445,18 @@ impl<C: Handshake> Connection<C> {
                 return;
             };
 
+            // §7.3's roam, taken **here** and nowhere else: `open` is the one
+            // place that has authenticated the packet *and* marked it
+            // window-fresh, and §7.2 gives those two together — *"no replayed
+            // packet ever moves the endpoint or refreshes liveness"*. The
+            // roam and the liveness refresh are the same predicate, so they
+            // are taken at the same point.
+            let roamed = if live && src != session.established().anchor {
+                Some(session.roam_to(src))
+            } else {
+                None
+            };
+
             let received = if plaintext.is_empty() {
                 // §3.4: "An empty plaintext … is the keepalive — it
                 // bypasses the frame layer entirely and is the only
@@ -330,16 +469,32 @@ impl<C: Handshake> Connection<C> {
                     Err(error) => Received::Structural(error),
                 }
             };
-            (counter, prev_greatest, received)
+            (counter, prev_greatest, received, roamed)
         };
 
         // The packet is authenticated and window-fresh; the borrow of the
         // plaintext is over, so state may move now.
+        match roamed {
+            // §13.6's roam seam, in §16.4's generation order.
+            Some(from) => self.commit_roam(now, from, src, datagram.len() as u64),
+            // **[ruling 169]** Only **authenticated and window-fresh** bytes
+            // fund the budget. §7.3's exclusion list said only
+            // "unauthenticated or undecryptable", which on the literal text
+            // let a *replayed* packet replenish a security counter — this is
+            // credited at exactly the point §7.2's window marks the packet,
+            // and nowhere else.
+            None => self.amplification.on_recv(datagram.len() as u64),
+        }
         self.sync_liveness_timer();
         self.fold_ack_policy(now, counter, prev_greatest, &received);
 
         if self.lifecycle.is_live() {
-            self.apply_live(now, received);
+            // A roam commits only on a live connection, so `src` is the
+            // anchor here whenever the packet reached one — but ruling 168's
+            // proof is stated *"from that address"*, and a closing connection
+            // that does not roam can still receive from elsewhere.
+            let from_anchor = self.remote_address() == Some(src);
+            self.apply_live(now, received, from_anchor);
         } else {
             self.apply_post_mortem(now, received);
         }
@@ -385,9 +540,27 @@ impl<C: Handshake> Connection<C> {
                 }
                 // §12.4: the ACK becomes owed; the pump packs it.
                 TimerKind::AckDelay => self.ack.on_delay_expired(),
-                // Armed by no path in this slice: §7.5's three timers are
-                // slice 7's and arrive with the section that defines them.
-                TimerKind::Contested | TimerKind::Keepalive | TimerKind::PersistentKeepalive => {}
+                // §7.5's contested verdict. §15.4's contested row: the same
+                // `TimedOut` variant as liveness — **no new one** — and
+                // **nothing is transmitted**. No third notification either:
+                // the death arrives on `closed()` (ruling 45).
+                TimerKind::Contested => {
+                    tracing::debug!(
+                        target: "slither::policy",
+                        floor = ?self.contested.floor(),
+                        "contested verdict: timed out"
+                    );
+                    self.contested = Contested::No;
+                    self.die(ConnectionLost::TimedOut);
+                }
+                // §7.5's two keepalives. Both send §3.4's **empty
+                // plaintext** via the **marking** seal, and both are
+                // therefore arming sends: a connection whose entire output
+                // is beacons still dies at `R + DEAD_TIMEOUT` (ruling 40 —
+                // *"arming enables death, never defers it"*).
+                TimerKind::Keepalive | TimerKind::PersistentKeepalive => {
+                    self.transmit_keepalive(now);
+                }
             }
 
             if self.lifecycle.is_dead() {
@@ -960,15 +1133,143 @@ impl<C: Handshake> Connection<C> {
         }
     }
 
+    /// §13.6 and §14.6's roam seam, with the anchor already moved.
+    ///
+    /// # What a roam does, in §16.4's generation order
+    ///
+    /// The anchor has moved (step 1, in `handle_datagram` where the packet
+    /// is). Then: the path generation, `Recovery::on_roam`, `NewReno::reset`,
+    /// the budget, the trace, the event.
+    ///
+    /// # What a roam does **not** do
+    ///
+    /// Stated because a list is read as exhaustive (working rule 8), and
+    /// ruling 173 exists because §13.6's title claimed a scope its body did
+    /// not cover:
+    ///
+    /// * it does **not** clear the sent map — *"ACKs for packets in flight
+    ///   to the old address still resolve"* — and does **not** reset
+    ///   `bytes_in_flight`, `pto_count`, `loss_time` or `last_ack_eliciting`:
+    ///   loss detection and PTO *"continue undisturbed"*;
+    /// * it does **not** clear `smoothed_rtt` or `rttvar` — the estimator is
+    ///   *"suspect-but-kept"*. Only `min_rtt` is re-seeded, and the PTO floor
+    ///   **may rise** as a result;
+    /// * it does **not** reset the replay window, the flow-control state, any
+    ///   stream, §7.1's counter or the session keys;
+    /// * it does **not** re-handshake and does **not** touch the endpoint —
+    ///   §17.4: *"the endpoint tracks no per-connection address"*;
+    /// * **[ruling 176]** it leaves a **pending contested mark intact, with
+    ///   its floor unchanged**. The counter space is never reset (§7.7), so
+    ///   the floor stays meaningful across the roam; a roam changes the
+    ///   pending probe's budget prospects, not the question it asks.
+    fn commit_roam(&mut self, now: Instant, from: SocketAddr, to: SocketAddr, datagram_len: u64) {
+        // Saturating rather than wrapping: `u32::MAX` roams is not reachable,
+        // and a wrap to 0 would alias the *initial* generation, un-fencing
+        // the oldest packets in the map. Saturation degrades to "nothing is
+        // fenced from here on", which is the direction that cannot report a
+        // stale RTT sample as fresh.
+        self.recovery.on_roam(now);
+        self.congestion.reset(now);
+        // **[rulings 168, 169, 173]** Both counters reset and the floor is
+        // re-recorded, then the **triggering packet** credits the received
+        // side: it is authenticated and window-fresh by §7.3, which is
+        // exactly what ruling 169 requires of anything that funds the
+        // budget. Without the reset the old address's credit would carry to
+        // the new one — *"the reflector §7.3 exists to prevent,
+        // reconstructed out of a missing line"*.
+        let floor = self.next_counter().unwrap_or(0);
+        self.amplification = Amplification::arm(floor, datagram_len);
+        tracing::debug!(
+            target: "slither::roam",
+            %from,
+            %to,
+            path_generation = self.recovery.path_gen(),
+            "the session re-homed to a new peer address"
+        );
+        self.events.push(ConnEvent::AddressMoved { from, to });
+    }
+
     /// §12.5's processing of one received ACK.
-    fn on_ack_frame(&mut self, now: Instant, ack: &frame::Ack) {
+    fn on_ack_frame(&mut self, now: Instant, ack: &frame::Ack, from_anchor: bool) {
         let Some(highest_sealed) = self.next_counter().and_then(|next| next.checked_sub(1)) else {
             // Nothing has ever been sealed, so every counter this frame
             // names is above the highest sealed: §12.5 ignores it whole.
             return;
         };
+        // §12.5's *"ignore whole"* is **whole**: an ACK above the highest
+        // counter we have sealed is not evidence of anything, so it must not
+        // clear a mark or validate an address either. `Recovery::on_ack`
+        // applies the same test and traces it; this one is silent because
+        // the trace would be the same event twice.
+        if ack.largest <= highest_sealed {
+            self.on_ack_coverage(ack.largest, from_anchor);
+        }
         let outcome = self.recovery.on_ack(now, ack, highest_sealed);
         self.apply_ack_outcome(now, outcome);
+    }
+
+    /// The two **high-water-mark** predicates one ACK can satisfy.
+    ///
+    /// `largest` is the greatest counter the frame covers, so *"covers any
+    /// counter at or above the floor"* is exactly `largest >= floor` for
+    /// both of them. They are two independent floors recorded at different
+    /// moments — §7.3's [`Amplification`] floor at the arming, §7.5's probe
+    /// floor at the mark — and they are deliberately **not** one field.
+    ///
+    /// # Ruling 176's two exits from the pending state
+    ///
+    /// | state when the covering ACK lands | effect |
+    /// |---|---|
+    /// | `Armed` | ⇒ `No`; disarm `Contested`; emit `ContestCleared` |
+    /// | `Pending` | ⇒ `No`; **cancel the probe**; emit **nothing** |
+    /// | `No` | nothing |
+    ///
+    /// The pending exit is not exotic: the floor is *"the counter the next
+    /// seal will use"*, so **any** post-mark seal — a keepalive, a
+    /// retransmission, a pure ACK, application Data — lands at or above it.
+    /// On the literal pre-ruling text `ContestCleared` would fire **with no
+    /// preceding `Contested`**, which is the unmatched-notification mis-read
+    /// ruling 46 deleted `under_probe: bool` to prevent; and the
+    /// unconditional send rule would emit a **stray probe**, arming a
+    /// `KEEPALIVE_TIMEOUT` verdict for a mark that no longer exists.
+    ///
+    /// In every clearing case the §6.4 refusal **stands**; the basis rule is
+    /// untouched.
+    fn on_ack_coverage(&mut self, largest: u64, from_anchor: bool) {
+        // **[ruling 168]** The return-routability proof. Only an ACK from
+        // the address in question can validate it: this ACK could only have
+        // been produced by a peer that received something we sent *there*,
+        // after the change.
+        if from_anchor {
+            self.amplification.on_ack_covering(largest);
+        }
+
+        match self.contested {
+            Contested::Armed { floor, .. } if largest >= floor => {
+                self.contested = Contested::No;
+                self.timers.disarm(TimerKind::Contested);
+                self.events.push(ConnEvent::ContestCleared);
+                tracing::debug!(
+                    target: "slither::policy",
+                    floor,
+                    largest,
+                    "contested verdict: cleared"
+                );
+            }
+            Contested::Pending { floor } if largest >= floor => {
+                self.contested = Contested::No;
+                // **[ruling 176]** *"`ContestCleared` is emitted only where
+                // `Contested` was."* The mark-pending gap emits nothing, and
+                // so does its exit.
+                tracing::debug!(
+                    target: "slither::policy",
+                    floor,
+                    largest,
+                    "contested verdict: cleared (pending) — the probe is cancelled and never sent"
+                );
+            }
+            Contested::No | Contested::Pending { .. } | Contested::Armed { .. } => {}
+        }
     }
 
     /// Apply one §12.5 or §13.2 evaluation: §8.7's classes, then §14's
@@ -1062,9 +1363,24 @@ impl<C: Handshake> Connection<C> {
     // ═══════════════════════════════════════════════════════════════════
 
     /// Apply a received packet to a **live** connection (§8.2).
-    fn apply_live(&mut self, now: Instant, received: Received) {
+    ///
+    /// `from_anchor` is whether the packet's source is this connection's
+    /// current anchor — ruling 168's *"from that address"*.
+    fn apply_live(&mut self, now: Instant, received: Received, from_anchor: bool) {
         let frames = match received {
-            Received::Keepalive => return,
+            Received::Keepalive => {
+                // §3.4's keepalive carries no frames, so there is nothing to
+                // apply — but its **arrival** can have committed a roam
+                // (§7.3), and S18's mover re-homes by exactly this packet.
+                // Draining and pumping here is §16.4's generation order for
+                // the empty frame stream: *"the events a packet caused, then
+                // the packet its arrival made us owe"*. Without it a
+                // keepalive-driven roam would hold its `AddressMoved` until
+                // some unrelated event drained it.
+                self.drain_events();
+                self.pump(now);
+                return;
+            }
             Received::Structural(error) => {
                 // §8.2: one trace, then CLOSE(`PROTOCOL_VIOLATION`) and the
                 // closing state. Nothing from the packet is applied — the
@@ -1099,7 +1415,7 @@ impl<C: Handshake> Connection<C> {
                 Frame::Ping => {}
                 // §12.5's processing: the sent-packet map, the RTT sample,
                 // §13.2's loss evaluation and §14's controller.
-                Frame::Ack(ack) => self.on_ack_frame(now, &ack),
+                Frame::Ack(ack) => self.on_ack_frame(now, &ack, from_anchor),
                 Frame::Stream(stream) => {
                     if let Err(violation) =
                         self.streams
@@ -1302,6 +1618,20 @@ impl<C: Handshake> Connection<C> {
             "a CLOSE is at most 260 bytes and MAX_PLAINTEXT is 1170"
         );
         let plaintext = packing.into_plaintext();
+        let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        // §7.3 binds CLOSE as well, and ruling 171 puts it **last** in the
+        // priority order — a scarce budget serves everything else first.
+        //
+        // A held CLOSE is not lost: §15.2's linger keeps receiving, and its
+        // reply rule — *"CLOSE's only reliability mechanism"* — re-sends on
+        // the next authenticated, window-fresh packet, which is also the
+        // packet that credits the budget. So the hold is a deferral to the
+        // very event that clears it, and `Ok` is the honest answer: this is
+        // not a seal failure, nothing moved, and the connection must still
+        // enter the closing state.
+        if !self.amplification.admits(size) {
+            return Ok(());
+        }
 
         let sealed = session.seal_quiet(now, &plaintext, false)?;
         let to = session.established().anchor;
@@ -1310,6 +1640,7 @@ impl<C: Handshake> Connection<C> {
             to,
             data: sealed.datagram,
         }));
+        self.amplification.on_sent(size);
         Ok(())
     }
 
@@ -1372,6 +1703,14 @@ impl<C: Handshake> Connection<C> {
         self.role = Some(role);
         self.streams.set_role(role);
         self.session = Some(Session::install(now, session));
+        // Ruling 168's floor, for a budget armed by [`established`] before
+        // the session existed. A no-op on the `Install` path: a dialled
+        // connection is validated, and `arm` is the only thing that clears
+        // that.
+        if !self.amplification.is_validated() {
+            let floor = self.next_counter().unwrap_or(0);
+            self.amplification.set_floor(floor);
+        }
         self.sync_liveness_timer();
         self.outputs
             .push_back(ConnOutput::Event(ConnEvent::Established));
@@ -1433,6 +1772,14 @@ impl<C: Handshake> Connection<C> {
         if !self.lifecycle.is_live() || self.session.is_none() {
             // §16.9: *"no frame is emitted before install (nothing sends
             // until a session exists)"*.
+            return;
+        }
+
+        // **[ruling 171]** Priority 1, ahead of everything. A pending probe
+        // the budget cannot admit stops the pump: anything sent underneath
+        // it would spend budget the probe is waiting for, and the probe's
+        // deadline does not exist until it leaves.
+        if !self.pump_contested_probe(now) {
             return;
         }
 
@@ -1514,10 +1861,28 @@ impl<C: Handshake> Connection<C> {
             let size =
                 (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
 
+            // §7.3's anti-amplification budget, **outside** the `!probe`
+            // guard below and outside the `ack_eliciting` one: it *"binds
+            // all output … explicitly including the §14.5 and §13.4
+            // congestion-window exemptions"*, because *"those exemptions are
+            // scoped to cwnd, never to this budget."*
+            //
+            // The datagram is **held** — not dropped, not truncated, not an
+            // error. Nothing was sealed, so §16.7's *"on seal failure
+            // nothing moved"* holds here too, and the next credited receive
+            // re-plans it.
+            if !self.amplification.admits(size) {
+                self.streams.restore(&mut packed);
+                if let Some(data) = sent_datagram.take() {
+                    self.datagrams.unpop_send(data);
+                }
+                break;
+            }
+
             // §14.5's admission gate. **Exemptions, exhaustively**: PTO
             // probes (§13.4 — a black-holed path with a full window must
-            // stay probeable); the contested-connection probe (§7.5, slice
-            // 7); and non-ack-eliciting control packets, which are never
+            // stay probeable); the contested-connection probe (§7.5, sent
+            // above); and non-ack-eliciting control packets, which are never
             // tracked in flight and never gated.
             //
             // The exemption is from **admission only** — the probe is still
@@ -1597,6 +1962,7 @@ impl<C: Handshake> Connection<C> {
                 to,
                 data: sealed.datagram,
             }));
+            self.amplification.on_sent(size);
             self.sync_liveness_timer();
 
             if ack_packed {
@@ -1611,8 +1977,10 @@ impl<C: Handshake> Connection<C> {
                     time_sent: now,
                     size,
                     app_limited,
-                    // **[ruling 137]** Held at 0 until slice 7's roaming.
-                    path_gen: 0,
+                    // **[ruling 137]** Live since slice 7: §14.6's stamp,
+                    // taken at seal time. Ruling 172's 2/2 split puts the
+                    // RTT sample and the persistent-congestion walk on it.
+                    path_gen: self.recovery.path_gen(),
                     frames,
                 });
                 self.congestion.on_sent(now, size);
@@ -1657,6 +2025,13 @@ impl<C: Handshake> Connection<C> {
             return;
         }
         let plaintext = packing.into_plaintext();
+        let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        // §7.3 binds pure ACKs too — §14.5's third exemption is from the
+        // congestion window and from nothing else. The ACK stays **owed**,
+        // so it rides the next packet the budget does admit.
+        if !self.amplification.admits(size) {
+            return;
+        }
 
         let Some(session) = self.session.as_mut() else {
             return;
@@ -1670,6 +2045,7 @@ impl<C: Handshake> Connection<C> {
             to,
             data: sealed.datagram,
         }));
+        self.amplification.on_sent(size);
         self.ack.on_ack_packed();
         self.timers.disarm(TimerKind::AckDelay);
         self.sync_liveness_timer();
@@ -1683,17 +2059,255 @@ impl<C: Handshake> Connection<C> {
         self.recovery.bytes_in_flight().saturating_add(size) <= self.congestion.window()
     }
 
-    /// Re-derive the `Liveness` deadline from §7.4's clocks.
+    /// Re-derive the `Liveness` deadline and §7.5's two keepalives from
+    /// §7.4's clocks.
     ///
-    /// The deadline is not stored twice: it is a function of
-    /// `last_authenticated_recv` and the arming flag, and this is the one
-    /// place the timer table is told about it.
+    /// None of the three is stored twice: each is a function of
+    /// `last_authenticated_recv`, `last_send` and the arming flag, and this
+    /// is the one place the timer table is told about any of them. They are
+    /// re-derived **together** because they read the same two clocks, and a
+    /// build that synchronised one without the others would arm a keepalive
+    /// against a `last_send` that had already moved.
+    ///
+    /// # §7.5's passive rule
+    ///
+    /// With `S = last_send` (the **marking** clock) and
+    /// `R = last_authenticated_recv`: arm `Keepalive` at
+    /// `S + KEEPALIVE_TIMEOUT` **iff `R > S`**.
+    ///
+    /// **[ruling 182]** `S` counts **marking sends only**, which is §7.4's
+    /// formal definition and *not* §7.5's prose *"has not sent"*. This is
+    /// the first case in this project where the formal rule held the intent
+    /// and the prose held the bug, and the reason is that the beacon's
+    /// soundness proof rests on *"every send that can establish `S > R` is a
+    /// marking send, so the death clock is armed there"* — which the prose
+    /// reading collapses into an immortal half-open session. A `seal_quiet`
+    /// send — a PTO probe, a credit frame, a retransmission, the contested
+    /// PING — therefore neither advances `S` nor suppresses the keepalive.
+    ///
+    /// # §7.5's beacon
+    ///
+    /// Arm `PersistentKeepalive` at `S + interval`. It re-arms from every
+    /// marking send, is **not** reset by receives, and fires
+    /// **unconditionally** — it does not consult `R`.
+    ///
+    /// # The connection that emits nothing
+    ///
+    /// A connection with **no authenticated receive since install** has
+    /// `S == R` at the install (§7.4 pins both clocks there), so `R > S` is
+    /// false from the start: it transmits nothing and dies at
+    /// install + `DEAD_TIMEOUT`. That is ruling 39's *"a connection with no
+    /// authenticated receive since install dies in silence"*, delivered by
+    /// the predicate rather than by a special case.
     fn sync_liveness_timer(&mut self) {
         if !self.lifecycle.is_live() {
             return;
         }
-        let deadline = self.session.as_ref().and_then(|s| s.liveness().deadline());
+        let clocks = self.session.as_ref().map(Session::liveness).copied();
+        let deadline = clocks.and_then(|liveness| liveness.deadline());
         self.timers.set(TimerKind::Liveness, deadline);
+
+        let passive = clocks.filter(|l| l.last_authenticated_recv() > l.last_send());
+        self.timers.set(
+            TimerKind::Keepalive,
+            passive.map(|l| l.last_send() + constants::KEEPALIVE_TIMEOUT),
+        );
+
+        let beacon = self.persistent_keepalive;
+        self.timers.set(
+            TimerKind::PersistentKeepalive,
+            clocks
+                .zip(beacon)
+                .map(|(liveness, interval)| liveness.last_send() + interval),
+        );
+    }
+
+    /// §7.5's keepalive: §3.4's **empty plaintext**, sealed **marking**.
+    ///
+    /// A 16-byte tag-only ciphertext — a **30-byte datagram** — carrying no
+    /// frames at all, so it bypasses §8's layer entirely. It never enters
+    /// the sent map, is never ack-eliciting, never occupies the congestion
+    /// window (§8.7, §14.5) and is **never retransmitted**. It is admitted
+    /// to the peer's replay window and appears opportunistically in ACK
+    /// ranges.
+    ///
+    /// Serves both timers: §7.5 gives them one action and distinguishes them
+    /// only by when they arm.
+    fn transmit_keepalive(&mut self, now: Instant) {
+        if !self.lifecycle.is_live() {
+            return;
+        }
+        let size = (constants::DATA_HEADER_LEN + constants::AEAD_TAG_LEN) as u64;
+        // §7.3 binds **all** output, and a keepalive sits at priority 5 in
+        // ruling 171's order — below a pending contested probe, which
+        // outranks everything.
+        if self.contested.is_pending() || !self.amplification.admits(size) {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let sealed = match session.seal(now, &[], false) {
+            Ok(sealed) => sealed,
+            Err(_) => {
+                self.die(ConnectionLost::NonceExhausted);
+                return;
+            }
+        };
+        debug_assert_eq!(
+            sealed.datagram.len() as u64,
+            size,
+            "§3.4: the empty plaintext is a 30-byte datagram"
+        );
+        let to = session.established().anchor;
+        self.outputs.push_back(ConnOutput::Transmit(Transmit {
+            to,
+            data: sealed.datagram,
+        }));
+        self.amplification.on_sent(size);
+        // Re-derives both keepalives from the `last_send` this seal just
+        // moved: the beacon re-arms one interval on, and the passive rule
+        // goes false because `R > S` no longer holds.
+        self.sync_liveness_timer();
+    }
+
+    /// §7.5's contested mark, taken by §6.4's refusal against a `None`
+    /// basis (ruling 36).
+    ///
+    /// # The four cases, exhaustively
+    ///
+    /// | current state | effect |
+    /// |---|---|
+    /// | `No`, connection `Live` | record the floor, state ⇒ `Pending`, trace. **No PING, no timer, no event.** |
+    /// | `No`, **closing or draining** | **total no-op** (ruling 179) |
+    /// | `Pending` | **total no-op** — floor unchanged |
+    /// | `Armed` | **total no-op** — floor unchanged, **deadline NOT re-armed** |
+    ///
+    /// The `Armed` row is a **security property**, not an optimisation:
+    /// re-arming on a second refusal would hand the attacker — who supplies
+    /// the `Intro`s — a way to postpone the verdict for ever.
+    ///
+    /// **[ruling 175]** There is **no cooldown**, and every re-mark records a
+    /// **fresh** floor. A live peer ACKs in ~1 RTT and clears the mark, so
+    /// the next refusal is a full second mark; ruling 43's *"one probe per
+    /// `KEEPALIVE_TIMEOUT`"* is superseded. The honest bound is *"at most one
+    /// probe per mark, at most one mark per uncontested refusal, and marks
+    /// cannot overlap"*.
+    ///
+    /// **[ruling 177]** The caller owes the *admission* precondition: only a
+    /// candidate proving the same static with a verifying tail tag may reach
+    /// here, or an attacker able to park mac1-valid rubbish provokes marks
+    /// with no key material at all.
+    pub(crate) fn mark_contested(&mut self, now: Instant) {
+        // **[ruling 179]** The carve-out, enforced on both sides: §6.4 takes
+        // the mark and §7.5 describes the state, and a rule enforced only in
+        // one of the two is a rule that gets missed.
+        if !self.lifecycle.is_live() || !matches!(self.contested, Contested::No) {
+            return;
+        }
+        let Some(floor) = self.next_counter() else {
+            return;
+        };
+        self.contested = Contested::Pending { floor };
+        tracing::debug!(
+            target: "slither::policy",
+            floor,
+            "the connection is marked contested (§6.4's refusal against a None basis)"
+        );
+        // The transmission is a **separate** moment, and on an unvalidated
+        // address §7.3's budget can hold it — which is the whole of the
+        // pending gap. On a validated address the two coincide, and the
+        // pump below is where they do.
+        self.pump(now);
+        self.drain_events();
+    }
+
+    /// §7.5's contested probe: the transmission, and the four things pinned
+    /// to that one instant.
+    ///
+    /// §15.4: the PING goes out *"at the first instant §7.3's budget admits
+    /// it, **which is also when the deadline arms and when `Contested` is
+    /// emitted**"*. So this sends the PING, arms `TimerKind::Contested`,
+    /// queues `ConnEvent::Contested` and traces — as one step, never four.
+    ///
+    /// Returns `false` iff a mark is pending and the budget would not admit
+    /// the probe. **[ruling 171]** A pending probe *"takes priority over all
+    /// other output to an unvalidated address"* — ahead of ACKs, keepalives,
+    /// PTO probes, retransmissions and new Data — so a `false` stops the
+    /// pump dead rather than letting lower-priority output spend the budget
+    /// the probe is waiting for. §7.5's congestion-gate argument transfers
+    /// verbatim, and the budget cannot be waived, so priority is the only
+    /// lever: a probe the budget could delay past its own deadline *"would
+    /// silently convert congestion into a liveness verdict"*.
+    fn pump_contested_probe(&mut self, now: Instant) -> bool {
+        let Contested::Pending { floor } = self.contested else {
+            return true;
+        };
+
+        let mut packing = Packing::new();
+        let fits = packing.ping();
+        debug_assert!(fits, "a PING is one byte and MAX_PLAINTEXT is 1170");
+        let plaintext = packing.into_plaintext();
+        let size =
+            (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        if !self.amplification.admits(size) {
+            return false;
+        }
+
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        // §7.4's quiet set: the probe is not fresh application intent, so it
+        // does not move `last_send` and cannot suppress a keepalive. It
+        // **is** ack-eliciting, which arms the death deadline.
+        let sealed = match session.seal_quiet(now, &plaintext, true) {
+            Ok(sealed) => sealed,
+            Err(_) => {
+                self.die(ConnectionLost::NonceExhausted);
+                return false;
+            }
+        };
+        let to = session.established().anchor;
+        self.outputs.push_back(ConnOutput::Transmit(Transmit {
+            to,
+            data: sealed.datagram,
+        }));
+        self.amplification.on_sent(size);
+        self.sync_liveness_timer();
+
+        // **[ruling 43]** The probe is exempt from §14.5's admission gate and
+        // is nonetheless **counted in the sent map and in
+        // `bytes_in_flight`** — or loss recovery would hold a packet in
+        // flight it could not see.
+        self.recovery.on_sent(SentPacket {
+            counter: sealed.counter,
+            time_sent: now,
+            size,
+            app_limited: false,
+            path_gen: self.recovery.path_gen(),
+            frames: Vec::new(),
+        });
+        self.congestion.on_sent(now, size);
+
+        let deadline = now + constants::KEEPALIVE_TIMEOUT;
+        self.contested = Contested::Armed {
+            floor,
+            armed_at: now,
+            deadline,
+        };
+        self.timers.arm(TimerKind::Contested, deadline);
+        // Pushed straight to the drain rather than through `events`: §8.1
+        // pins the order *`Transmit` then `Event(Contested)`*, and this is
+        // reached from inside the pump, after the callers that drain
+        // `events`.
+        self.outputs
+            .push_back(ConnOutput::Event(ConnEvent::Contested));
+        tracing::debug!(
+            target: "slither::policy",
+            floor,
+            "the contested probe was transmitted; the verdict is due one KEEPALIVE_TIMEOUT on"
+        );
+        true
     }
 
     /// Entering closing or draining disarms every timer but `CloseLinger`.
@@ -1724,6 +2338,37 @@ impl<C: Handshake> Connection<C> {
         self.outputs
             .push_back(ConnOutput::Event(ConnEvent::Closed(lost)));
     }
+}
+
+/// §7.5's admissible persistent-keepalive band, as one function.
+///
+/// | argument | result |
+/// |---|---|
+/// | `None` | `Ok(())` — the beacon is disabled |
+/// | `Duration::ZERO` … `999 ms` | `Err(KeepaliveTooShort)` |
+/// | **`1 s` exactly** | **`Ok(())`** — the floor is **inclusive** (ruling 42) |
+/// | `1 s + 1 ms` … `24.999 s` | `Ok(())` |
+/// | **`25 s` exactly** | **`Err(KeepaliveTooLong)`** — the ceiling is **exclusive** (ruling 40) |
+/// | `30 s`, `Duration::MAX` | `Err(KeepaliveTooLong)` |
+///
+/// Written once and used twice — the core's setter and the shell's — so the
+/// band cannot be stated in two places and drift. The ceiling is
+/// `DEAD_TIMEOUT` itself and gets **no named constant** (ruling 63: *"a
+/// named ceiling would be a second place `DEAD_TIMEOUT` is written down, and
+/// therefore a place it can drift"*).
+pub(crate) fn validate_persistent_keepalive(
+    interval: Option<Duration>,
+) -> Result<(), ConfigError> {
+    let Some(interval) = interval else {
+        return Ok(());
+    };
+    if interval < constants::PERSISTENT_KEEPALIVE_MIN {
+        return Err(ConfigError::KeepaliveTooShort);
+    }
+    if interval >= constants::DEAD_TIMEOUT {
+        return Err(ConfigError::KeepaliveTooLong);
+    }
+    Ok(())
 }
 
 /// §16.2's acknowledgement snapshot — opaque, and taken at one instant.
@@ -1839,6 +2484,32 @@ pub(crate) enum ConnEvent {
     /// **new** item is claimable. Never one for the evicted datagram, and
     /// never one for a locally-*sent* datagram.
     DatagramReadable,
+    /// §7.3's roam committed: `from` is the previous anchor, `to` the new
+    /// one.
+    ///
+    /// Fires only where **the peer** moved. Our own rebind is invisible to
+    /// us — we did not change where we send — so a local `AddressMoved` is
+    /// something that can never happen (§7.3, S19).
+    AddressMoved {
+        /// The anchor the session left.
+        from: SocketAddr,
+        /// The anchor it moved to.
+        to: SocketAddr,
+    },
+    /// §7.5's contested probe **went out** (rulings 45/46).
+    ///
+    /// **Never at the mark.** The two instants separate whenever §7.3's
+    /// budget holds the PING, which is exactly when the connection has just
+    /// roamed to an unvalidated address; on a validated one they coincide.
+    /// A unit variant, and permanently so: ruling 46 removed
+    /// `under_probe: bool` because *"the three real states (marked-pending,
+    /// probing, cleared) do not map onto one bool at all."*
+    Contested,
+    /// An ACK covered the probe floor; the mark cleared (ruling 41).
+    ///
+    /// Emitted **only where `Contested` was** (ruling 176): a mark cleared
+    /// while still pending emits neither.
+    ContestCleared,
     /// The connection ended, with §18.1's cause. Emitted **once**.
     ///
     /// Not `Copy`, and neither is [`ConnOutput`] any more:
