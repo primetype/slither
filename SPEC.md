@@ -7409,6 +7409,54 @@ clock (§16.10); no test sleeps.
   transmits nothing and dies at `DEAD_TIMEOUT` (25 s) — ruling 39's reap
   case (§7.4), which is the cost this ruling accepts.
 
+**The composability surface (§16.11, rulings 55–58, 226, 227).**
+
+**[RATIFIED 2026/08/16 — ruling 232.]** Ruling 58 ends *"Pinned by
+Appendix B"* and §16.11 says *"Appendix B pins it"*. **Until this entry,
+Appendix B contained no composability obligation at all** — the appendix
+ran wire pins, handshake, frames, streams, ACK, liveness, CLOSE, the
+shell surface (rulings 46/47/49/50) and the validation gates, and none of
+them reached §16.11. Two documents asserted a pin that did not exist, for
+the invariant §16.11 itself calls *"the easiest way to get the
+composability layer wrong"*. Working rule 11 in the maintainer's own text.
+
+- **An adapter claims at most one item, and only inside `poll_next`**
+  (ruling 58 — **normative**). The assertion must separate a prefetcher
+  from a correct adapter, and the obvious one does not: *polling once and
+  asserting one item arrived passes a prefetching adapter.* Send
+  **three** items, poll the adapter **exactly once** (`Waker::noop()`),
+  then assert the underlying verb — `recv_message`, `recv_datagram`,
+  `accept_bi` — yields the **second** item **immediately**, on its first
+  poll. A prefetcher has swallowed items two and three, so that call
+  parks. Keep the adapter alive across the assertion, or a build that
+  prefetches and hands back on drop passes.
+- **The `io::ErrorKind` table, row by row** (§16.11.1, ruling 227), in
+  both directions, plus: the split is **by variant, not by direction**
+  (some rows agree across read and write, some differ — assert both
+  sides, since neither alone separates a direction-split build from a
+  shared-conversion one); `into_inner().downcast()` recovers the original
+  error including a reset's `u64` code, which an `io::Error::from(kind)`
+  build fails while satisfying every kind assertion; and the
+  `#[non_exhaustive]` fallback is `Other` and **never** a panic.
+- **`poll_flush` is `Ready` with bytes unacknowledged** (ruling 56), and
+  still `Ready` *after the connection dies* — the second case is what
+  makes "it touches nothing" observable, separating *Ready because there
+  is nothing to do* from *Ready because it asked*.
+- **`poll_shutdown` is `finish()` and then `acked()`** (ruling 57):
+  `Pending` immediately after a write with no driver turn — where a
+  `finish()`-alone build is `Ready` — resolving **in error** on the
+  connection's death rather than waiting for ever, and idempotent across
+  repeated polls.
+- **The `Result`-carrying adapters never end** (ruling 226): poll
+  **repeatedly** after the first error and assert `Some(Err(..))` every
+  time. A single post-error poll passes the one-`bool` build that ends.
+- **The empty-buffer and EOF conventions** (rulings 110, 119, 121): an
+  empty `ReadBuf` consumes nothing and does not latch EOF; a drained but
+  open stream is `Pending`, **never** a zero-length fill — that inversion
+  makes `read_to_end` report a truncation as success; EOF is sticky and
+  survives the connection's death; an empty write is `Ok(0)` while a
+  blocked non-empty write parks.
+
 **Post-implementation validation obligations (gates on the flagged
 rulings).**
 - **The ACK-loss-burst simulation** (the §7.2/D-5 gate): FlakyWire on

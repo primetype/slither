@@ -6650,3 +6650,111 @@ moved into `spawn_local`** — the `Connection` moves in and the adapter is
 built inside the task. That is workable, it is what the rustdoc must show,
 and it is not a defect. Making `Connection: Clone` would change a ratified
 handle's semantics and is emphatically not slice 8's to do.
+
+## Round 37 — slice 8's blind returns (2026/08/16)
+
+### 232 (Agent C) — **two documents cited a pin in Appendix B that Appendix B did not contain**
+
+Ruling 58 ends *"Pinned by Appendix B"*; `SPEC.md:6284` says *"Appendix B
+pins it"*. Appendix B's nine sections are wire pins, handshake and routing,
+the frame layer, streams/flow control/messages/datagrams, ACK/recovery/
+congestion, liveness and amplification, CLOSE, the shell surface (rulings
+46, 47, 49, 50), and the post-implementation validation gates. **None of
+them reaches §16.11.** Verified independently of the agent's report by
+reading the appendix's headings and grepping its whole span.
+
+This is working rule 11's shape in the maintainer's own text, and it is
+the **third** time in this project a rationale has named a mechanism that
+was not there — after rulings 87 and 89. What makes it worse than those:
+the citation was attached to the one invariant §16.11 itself calls *"the
+easiest way to get the composability layer wrong"*, so the missing pin was
+missing precisely where the document says the risk is highest.
+
+**Ruling: Appendix B gains the composability section**, written from what
+Agent C actually built rather than from the claim — the ruling-58
+three-item/one-poll separation including the *keep the adapter alive*
+clause, §16.11.1's table with its by-variant-not-by-direction two-sided
+check and its `downcast` recovery, ruling 56's after-death `Ready`, ruling
+57's `Pending`-then-error-on-death, ruling 226's **repeated** post-error
+poll, and the empty-buffer/EOF conventions.
+
+**The agent found this by taking a citation as a claim to be checked**,
+which is the discipline ruling 206 was written to install. It is the first
+time an agent has applied it to Appendix B.
+
+### 233 (from Agent C, **conclusion corrected**) — `Incoming`'s documented `None` names the one route the borrow closes
+
+Agent C reported that `Incoming`'s `None` *"looks unreachable in safe
+code"*: §4.2 and §16.11 say the stream ends when `driver_stopped` is set;
+that flag is set only by `Driver::stop`; and ruling 231 makes
+`Incoming<'a, I>` **borrow** the endpoint, which is not `Clone` and has no
+`close()`. So the endpoint cannot be dropped while the adapter lives.
+
+**The observation is right and the conclusion is too strong.** Opening
+`src/shell/driver.rs` shows `stop()` has exactly one caller — `Drop` — but
+`Drop` has **three** routes: the event loop ending (the last handle
+dropped), **a panic unwinding through the driver**, and the `Driver`
+future being dropped without ever being polled (*"a `LocalSet` dropped out
+from under it"*). The borrow closes the first. The panic route stays open,
+and the `Drop` impl's own rustdoc is written about exactly that
+degradation — *"the same panic degrades to `ConnectionLost::
+EndpointDropped`"*.
+
+So `None` **is** reachable. What is wrong is the documentation: §4.2 and
+§16.11 give the endpoint-dropped reason, which ruling 231's borrow makes
+unreachable for this adapter, and never mention the reason that is not.
+**A stated construction with a contradicted scope** — working rule 8, and
+the fourth instance this round.
+
+Recorded for the integrator, not fixed here: the wording is Agent A's file
+and the section is the integrator's, and neither is settled until A lands.
+
+**Why this is worth more than a correction.** CLAUDE.md working rule 13
+says the fixture bounds the coverage, and names *"this driver panics"* as
+one of the two faults `FlakyWire` cannot express **by construction**. The
+one route by which this `None` is reachable is the one route no test in
+this repository can reach. The agent was right that nothing it could write
+would get there; it attributed that to the code rather than to the
+harness.
+
+### 234 — I left the contradicted prose standing in the amendment that contradicted it
+
+`CONTRACT-8.md` §8 opened with *"⚠ This section is the one part of the
+contract that is not fully derivable from a ratified source"* and marked
+fifteen rows *"recommended"*. Ruling 227 ratified those rows and I wrote
+§0.0 to say so — **and did not touch §8's banner**, so the file told a
+reader on its first screen that the question was open and on a later one
+that it was closed.
+
+This is **working rule 4 committed inside an amendment whose entire
+purpose was to record an answer**: *grep for the rationale, not only the
+token*. I added a section and did not read the section it superseded.
+Agent C hit it as *"the header a reader hits first"* — which is the right
+severity: harmless to a careful reader, decisive for a hurried one, and
+exactly how ruling 175's reinstated characterisation survived.
+
+**Corrected in place, struck through rather than deleted**, with the
+supersession stamped above it — the same treatment ruling 224 gave
+boundary 2, and for the same reason: a reader who finds the old text
+persuasive should find the reason it lost.
+
+### 235 (Agent C) — three dev-dependency gaps the manifest owes, and one that will hit both authors
+
+`futures-util`'s `sink` module is **not in its default features**. A plain
+`futures-util = "0.3"` gives `futures_util::stream::Stream` but not
+`futures_util::sink::Sink`, and rustc reports it as *"found an item that
+was configured out"* — which reads like a version problem and is not.
+`CONTRACT-8.md` §10 offers `SinkExt::send` to **both** test authors, so
+this is not Agent C's problem alone; the story author's suite meets it
+too, and neither can fix it, because `Cargo.toml` is the integrator's by
+working rule 15.
+
+Owed at integration, alongside the four `[[test]]` stanzas:
+`futures-util = { version = "0.3", features = ["sink"] }`, and `io-util`
+on the `tokio` dev-dependency. Both are promised by `CONTRACT-8.md` §10
+and neither is in the manifest at `704a4ae`.
+
+**Ruling 194 applies to the stanzas and is the sharp edge**: with no
+`autotests = false`, cargo auto-discovers each new test file *without* its
+`required-features`, so the feature-less `cargo test` gate breaks until
+every stanza lands. The gate does not degrade — it fails outright.

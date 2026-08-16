@@ -681,9 +681,18 @@ never appear in a test that asserts a timer.
 
 ## 8. Error-mapping tables
 
-**⚠ This section is the one part of the contract that is not fully derivable
-from a ratified source.** §16.11 gives exactly two mappings for two enums
-totalling nine variants:
+**[SUPERSEDED 2026/08/16 — ruling 227. The tables below are RATIFIED as
+`SPEC.md` §16.11.1. Every "recommended" marking in them is obsolete; read
+the tables as binding, and ignore the ⚠ below.]**
+
+*Agent C found this banner still standing after §0.0 was written, which is
+**working rule 4 in the amendment itself** — I added a section recording
+that the question was answered and left the prose arguing that it was open,
+in the same file, for the reader to hit first. Ruling 234.*
+
+**⚠ (obsolete, retained for the record) This section is the one part of the
+contract that is not fully derivable from a ratified source.** §16.11 gives
+exactly two mappings for two enums totalling nine variants:
 
 ```rust
 impl From<ReadError>  for std::io::Error {}   // Reset → ConnectionReset
