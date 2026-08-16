@@ -98,20 +98,21 @@ mod tests_contested;
 #[cfg(test)]
 mod tests_sizing;
 
-// ── slice 6's core tests, at integration ─────────────────────────────────
+// ── slice 6's core tests: NEVER WRITTEN, block retired ───────────────────
 //
-// Written from `SPEC.md` §9.8/§11 and `CONTRACT-6.md` by two authors who
-// never saw this file, split by **behaviour** rather than by layer (ruling
-// 157). Declared here so neither author ever names a path the other could
-// reach, and left **commented out** because the files land with them and a
-// `mod` for a missing file reds every gate at once — the same reason ruling
-// 126 leaves `Cargo.toml`'s two `[[test]]` stanzas commented. The
-// integrator uncomments both lines.
+// **[ruling 216]** These two declarations sat commented here since slice 6
+// waiting for files that do not exist and never did — `git log --all`
+// knows no `tests_datagram.rs` or `tests_message.rs`. Slice 6's authors
+// wrote *integration* tests instead (`tests/story_datagram.rs`, 11 tests;
+// `tests/story_message.rs`, 15), which have passed every gate since.
+// Nothing was lost.
 //
-// #[cfg(test)]
-// mod tests_datagram;
-// #[cfg(test)]
-// mod tests_message;
+// Retired rather than left, because **a commented `mod` for a file that
+// was never written is indistinguishable from one whose file was lost**,
+// and the comment asserted the second (*"the files land with them"*). That
+// is the standing hazard of ruling 211's mechanism, found on its first use
+// — the integrator's uncomment step is the only thing that ever
+// distinguishes the two, and nothing fails if it is skipped.
 
 // ── slice 7b's core tests, at integration ────────────────────────────────
 //
@@ -121,12 +122,13 @@ mod tests_sizing;
 // compile error, which is `Cargo.toml`'s `[[test]]` failure one layer down.
 // The integrator uncomments these when the authors' files arrive.
 //
-// #[cfg(test)]
-// mod tests_path;
-// #[cfg(test)]
-// mod tests_livelock;
-// #[cfg(test)]
-// mod tests_reassembly;
+// Uncommented by the integrator, 2026/08/16, all three files present.
+#[cfg(test)]
+mod tests_path;
+#[cfg(test)]
+mod tests_livelock;
+#[cfg(test)]
+mod tests_reassembly;
 //
 // **Integrator — `testfix.rs` has aged out again, and it is the reason 13
 // lib tests are red on this commit.** `parse_frames`' fallback arm panics
@@ -2134,7 +2136,23 @@ impl<C: Handshake> Connection<C> {
             // (`owe_challenge`), and only while something is actually owed
             // to the address. A pending contested probe counts as owed —
             // it is output waiting on exactly this budget.
-            let offer = owe_challenge && (self.owes_output() || self.contested.is_pending());
+            // **[ruling 217]** `self.ack.is_owed()` belongs in this
+            // disjunction and its absence was the defect. §8.7 owes the
+            // challenge *"whenever §7.3's budget admits **a packet**"* — an
+            // owed ACK builds one, so the challenge rides it. Without this
+            // the commonest post-roam packet in the protocol goes out
+            // carrying no challenge at all, draws an ACK that under ruling
+            // 208 proves nothing, and the address stays unvalidated: ruling
+            // 203's stall, one indirection later.
+            //
+            // It stops short of manufacturing. An empty keepalive is not
+            // ack-eliciting, so it owes no ACK, so no packet is built and no
+            // challenge is offered — which is the blind author's
+            // `an_idle_unvalidated_connection_owing_nothing_emits_no_challenge`,
+            // and the reason this is a disjunct rather than an unconditional
+            // `owe_challenge`.
+            let offer = owe_challenge
+                && (self.owes_output() || self.contested.is_pending() || self.ack.is_owed());
             let path = self.pack_path_frames(&mut packing, offer);
             // Stages 2 and 3 — credit grants and RESET_STREAM, then the
             // STREAM and DATAGRAM fill.
@@ -2423,6 +2441,55 @@ impl<C: Handshake> Connection<C> {
             if !self.owes_output() && !self.ack.is_owed() {
                 break;
             }
+        }
+
+        // **[RATIFIED 2026/08/16 — ruling 217]** The challenge is owed by
+        // the **arming**, not by having something else to send.
+        //
+        // Both blind agents reported this boundary as unresolved and they
+        // disagreed on it, which is the split working. The implementer kept
+        // the PING's boundary 1 — *nothing owed ⇒ no challenge* — carried
+        // over from `CONTRACT-7b.md` §1.4. The test author wrote to §8.7's
+        // *"whenever §7.3's budget admits a packet and the address is still
+        // unvalidated"* and pinned the roam itself emitting one.
+        //
+        // §8.7 wins, on working rule 3's tiebreak: §7.3's no-deadlock proof
+        // depends on it. Boundary 1 was sound under ruling 168, where any
+        // ack-eliciting packet drew the ACK that validated — so waiting for
+        // real output cost nothing. Under ruling 208 an ACK proves
+        // **nothing**, and the only packet that can validate is one we
+        // choose to send. Deferring it until output exists means the output
+        // arrives into a budget still capped at 3× the roaming packet and
+        // pays a round trip to escape: **ruling 203's stall, one
+        // indirection later**, which is precisely what the test author
+        // named.
+        //
+        // The implementer's own counter-argument does not survive its own
+        // code: it feared *"an unprompted probe train on every pump"*, but
+        // `owe_challenge` is cleared the moment the challenge is sealed, so
+        // an arming emits exactly **one** — 39 bytes against the 90 B floor
+        // the smallest arming funds, and against msg2's 107 on the accept
+        // path. There is no train to fear.
+        // **[ruling 217, amended]** A *response* we owe is manufactured;
+        // a *challenge* is not.
+        //
+        // The first draft of 217 manufactured a packet for the challenge
+        // too, and was wrong twice. It hung the suite — `owe_challenge` is a
+        // local, `true` on every entry, so every pump emitted a fresh
+        // dedicated packet and nothing driving a pair to quiescence ever
+        // reached it. And the blind test author had already forbidden it in
+        // writing: §8.7 owes the challenge *"whenever §7.3's budget admits
+        // **a packet**"*, which is a rule about packets being built and
+        // **does not ask the pump to manufacture one**.
+        //
+        // Its two tests are consistent and I misread them as a conflict:
+        // the roam that must carry a challenge is ack-eliciting, so a reply
+        // packet exists for it to ride; the roam that must not is an empty
+        // keepalive, where no packet is built at all. What 217 correctly
+        // settles is the *ride-along* — §8.7's condition, not the
+        // contract's `!elicits`.
+        if self.owed_path_response.is_some() {
+            self.pump_path_frames(now);
         }
     }
 

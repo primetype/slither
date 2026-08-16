@@ -75,11 +75,10 @@ use std::time::{Duration, Instant};
 
 use super::testfix::*;
 use super::timers::TimerKind;
-use super::*;
 
 use crate::constants::{
     AEAD_TAG_LEN, AMPLIFICATION_FACTOR, DATA_HEADER_LEN, DEAD_TIMEOUT, INIT_PACKET_LEN,
-    KEEPALIVE_TIMEOUT,
+    KEEPALIVE_TIMEOUT, RESP_PACKET_LEN,
 };
 use crate::error::ConnectionLost;
 
@@ -106,14 +105,28 @@ const PROBE_LEN: u64 = KEEPALIVE_LEN + 1;
 const BEACON: Duration = Duration::from_secs(1);
 
 /// A core installed as the **responder**, i.e. anchored from a msg1 source:
-/// §3.2's second arming event, `budget = (0, 196)`, cap 588.
+/// §3.2's second arming event, `budget = (107, 196)`, cap 588, room 481.
+///
+/// **[Integrator, ruling 218 — premise migrated, not weakened.]** This
+/// author wrote `(0, 196)` against a tree where the arming charged nothing
+/// for msg2. The adversarial review's A2 found that msg2's 107 bytes are
+/// emitted endpoint-side and were charged to **nothing**, making the real
+/// responder ratio 3.55× against a normative MUST of 3; the remediation
+/// implementer fixed it in the same slice, blind to this file.
+///
+/// So this red was the fixture premise doing precisely its job — the author
+/// wrote it to *"make the premise visible rather than silently weakening
+/// every bound below it"*, and it caught a deliberate change to the very
+/// quantity it pins. Every test here derives its room through
+/// [`room`]/[`spend_to`] rather than hardcoding, so nothing below this line
+/// needed touching.
 fn responder_at(now: Instant) -> Solo {
     let s = Solo::installed_from_msg1_at(now);
     assert_eq!(
         s.conn.amplification_budget(),
-        Some((0, INIT_PACKET_LEN as u64)),
+        Some((RESP_PACKET_LEN as u64, INIT_PACKET_LEN as u64)),
         "fixture: a msg1-anchored responder starts unvalidated with the \
-         initiation's bytes credited (§3.2)"
+         initiation's bytes credited and **msg2's charged** (§3.2, A2)"
     );
     s
 }
@@ -164,12 +177,28 @@ fn spend_leaving(s: &mut Solo, now: Instant, target: u64) {
         packet > KEEPALIVE_LEN + 2,
         "fixture: the shaping packet must hold a datagram frame; got {packet}"
     );
+    // **[Integrator, ruling 217]** An unvalidated address offers its
+    // 9-byte `PATH_CHALLENGE` at stage 2, *ahead* of the stage-3 datagram
+    // fill (§8.5). Sized without it, the shaping datagram no longer fits the
+    // room and `packing.datagram()` refuses it — so the drain yields a
+    // 39-byte challenge-only packet and the whole calibration is wrong.
+    // This author wrote the helper against a tree with no path frames in it.
+    //
+    // Nine bytes, not a guess: 1 type byte + 8 opaque (§8.3, ruling 208).
+    // Subtracting it here keeps the helper's contract exactly as written —
+    // **one** packet, of **exactly** `packet` bytes — rather than relaxing
+    // the assertions, which is what would hide the next such change.
+    let challenge_cost: u64 = if s.conn.amplification_budget().is_some() {
+        1 + 8
+    } else {
+        0
+    };
     let payload = {
-        let one = packet - KEEPALIVE_LEN - 1 - 1;
+        let one = packet - KEEPALIVE_LEN - 1 - 1 - challenge_cost;
         if one < 64 {
             one
         } else {
-            packet - KEEPALIVE_LEN - 1 - 2
+            packet - KEEPALIVE_LEN - 1 - 2 - challenge_cost
         }
     };
     assert!(

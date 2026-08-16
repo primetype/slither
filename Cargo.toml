@@ -233,3 +233,12 @@ required-features = ["test-util"]
 [[test]]
 name = "story_mobility"
 required-features = ["test-util"]
+
+# Slice 7b (ruling 208's path validation). Landed by the integrator, not by
+# either blind agent: cargo does not warn about a `[[test]]` whose file is
+# missing, it **refuses to parse the manifest**, so an implementer adding a
+# stanza for its partner's not-yet-written file commits a tree on which no
+# gate can run at all (working rule 15).
+[[test]]
+name = "story_path"
+required-features = ["test-util"]
