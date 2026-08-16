@@ -117,6 +117,7 @@ use crate::packet::Handshake;
 use super::connection::Connection;
 use super::shared::{
     Command, ConnCell, PendingOutcome, PendingSlot, Shell, ShellLink, Wakers, now, resolve_slot,
+    wake_settled,
 };
 use super::staged::Intro;
 use super::wire::Wire;
@@ -511,8 +512,21 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             // surfaces `Err(ReadError::Reset)`. In slice 4 a peer cannot
             // reset our send half — §9.9's STOP_SENDING is deferred — so
             // there is no blocked writer this could concern.
+            //
+            // `acked()`'s two maps are woken as well, because
+            // `CONTRACT-5b.md` §2.5 names this event beside
+            // `StreamFinished` for both. It is a **wake and not a
+            // verdict**: this event is §9.6's peer-emitted RESET_STREAM,
+            // which `Streams::on_reset_stream` applies to the *receive*
+            // half alone, so on a bidi stream our send half is untouched
+            // by it and `poll_acked` must go on waiting. The one reset of
+            // ours a peer can cause — §9.8's receiver-emitted overflow
+            // reset — is not representable in this build; see
+            // `IMPLEMENTATION-5b.md` §4-C1.
             ConnEvent::StreamReset { r, .. } => {
                 Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
+                Self::wake_stream(cell, |cell| cell.blocked_ackers.get_mut(&r));
+                wake_settled(cell);
             }
             // **All of them, not one.** Ruling 99 emits one event per
             // newly-opened stream, and §9.2's implicit open of index 5 opens
@@ -526,10 +540,24 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             ConnEvent::StreamsAvailable { dir } => {
                 Self::wake_stream(cell, |cell| Some(&mut cell.stream_openers[dir.slot()]));
             }
-            // `acked()` is slice 5 (ruling 122b) and this event never fires
-            // in slice 4 — reaching §9.7's `DataRecvd` needs §12's ACK
-            // processing. Nothing parks on it, so there is nothing to wake.
-            ConnEvent::StreamFinished { .. } => {}
+            // **Ruling 47's `acked()`.** The event is §9.7's `DataRecvd`:
+            // every byte of this send half **and its FIN** acknowledged.
+            // It is latched as well as woken — see
+            // [`ConnCell::finished_senders`] for why a wake alone hangs the
+            // ordinary sequence — and the connection-level snapshot is
+            // re-polled beside it, since a stream reaching `DataRecvd` is
+            // one of the two things that can settle one.
+            ConnEvent::StreamFinished { r } => {
+                let woken = {
+                    let mut borrow = cell.borrow_mut();
+                    let mut woken = borrow.note_send_finished(r);
+                    woken.extend(borrow.settled_wakers.take_all());
+                    woken
+                };
+                for waker in woken {
+                    waker.wake();
+                }
+            }
         }
     }
 
@@ -727,11 +755,19 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         if let Disposition::ForConnection(id) = disposition
             && let Some(record) = self.conns.get(&id)
         {
-            let mut cell = record.cell.borrow_mut();
-            if let Some(core) = cell.core.as_mut() {
-                core.handle_datagram(now, src, datagram);
+            let cell = Rc::clone(&record.cell);
+            {
+                let mut borrow = cell.borrow_mut();
+                if let Some(core) = borrow.core.as_mut() {
+                    core.handle_datagram(now, src, datagram);
+                }
+                borrow.dirty = true;
             }
-            cell.dirty = true;
+            // §12's ACK was applied inside that call. A `Connection::acked()`
+            // snapshot can be settled by it with **no** `ConnEvent` behind
+            // it — see [`wake_settled`], which is where the enumeration
+            // lives.
+            wake_settled(&cell);
         }
     }
 

@@ -18,12 +18,13 @@
 //!
 //! # What is not here
 //!
-//! [`AsyncRead`]/[`AsyncWrite`] are slice 8 (ruling 96) and
-//! `SendStream::acked()` is slice 5 (ruling 122b) — **absent rather than
-//! stubbed**, on this module tree's standing rule that an unimplemented verb
-//! is a claim about the protocol. `acked()` in particular needs
-//! `ConnEvent::StreamFinished`, which needs §12's ACK processing, which
-//! slice 4 does not have.
+//! [`AsyncRead`]/[`AsyncWrite`] are slice 8 (ruling 96) — **absent rather
+//! than stubbed**, on this module tree's standing rule that an
+//! unimplemented verb is a claim about the protocol.
+//!
+//! [`SendStream::acked`] arrived here in slice 5, with §12's ACK
+//! processing: it resolves on `ConnEvent::StreamFinished`, which is §9.7's
+//! `DataRecvd`, which nothing before slice 5 could reach.
 //!
 //! [`AsyncRead`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html
 //! [`AsyncWrite`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html
@@ -38,7 +39,7 @@ use crate::core::{ConnectionId, StreamId, StreamRef};
 use crate::error::{ConnectionLost, ReadError, WriteError};
 use crate::packet::Handshake;
 
-use super::shared::{ConnCell, ShellLink, close_now, now, release_waker_slot};
+use super::shared::{ConnCell, ShellLink, close_now, now, release_waker_slot, wake_settled};
 
 /// The terminal outcome a [`RecvStream`] latches — **ruling 121**.
 ///
@@ -123,6 +124,14 @@ pub struct SendStream<S: Handshake> {
     r: StreamRef,
     /// This handle's slot in `ConnCell::blocked_writers[r]`.
     key: u64,
+    /// This handle's slot in `ConnCell::blocked_ackers[r]` — ruling 47's
+    /// [`acked`](Self::acked).
+    ///
+    /// A second key rather than a shared one: the two maps are woken by
+    /// different events (`StreamWritable` versus `StreamFinished`), and one
+    /// key in two maps would make a cancelled `write()` evict a live
+    /// `acked()`'s waker.
+    ack_key: u64,
     /// This half's terminal state — **ruling 124 step 1**, which answers
     /// ahead of the connection's death latch.
     ///
@@ -145,8 +154,15 @@ pub(crate) enum LocalEnd {
     Live,
     /// `finish()` succeeded: the FIN is in send state.
     Finished,
-    /// `reset()` was called, before or after a `finish()`.
-    Reset,
+    /// `reset()` was called, before or after a `finish()`, with the code it
+    /// carried.
+    ///
+    /// The code is held because [`SendStream::acked`] reports it
+    /// (§16.2:4425 — *"it returns `Reset(code)` if the stream was reset
+    /// before its data was acknowledged"*), and the core cannot supply it
+    /// afterwards: `SendHalf::take_reset` hands the code to the frame
+    /// layer once, and the half is freed outright at `ResetRecvd`.
+    Reset(u64),
 }
 
 impl<S: Handshake> SendStream<S> {
@@ -169,12 +185,18 @@ impl<S: Handshake> SendStream<S> {
         shell.acquire();
         cell.handles += 1;
         let key = cell.blocked_writers.entry(r).or_default().key();
+        // Created here and not on first park, exactly like the writers'
+        // slot: the entry's presence is what tells the driver a handle
+        // exists that could ask about this stream, which is what bounds
+        // `ConnCell::finished_senders`.
+        let ack_key = cell.blocked_ackers.entry(r).or_default().key();
         Self {
             shell,
             cell: cell_rc,
             conn,
             r,
             key,
+            ack_key,
             local_end: LocalEnd::Live,
             // **Filled eagerly, not lazily — ruling 143.** Ruling 116 said
             // "cached the first time the core answers `Some`", which is too
@@ -332,7 +354,7 @@ impl<S: Handshake> SendStream<S> {
             // does not un-accept it.
             match self.local_end {
                 LocalEnd::Finished => return Poll::Ready(Ok(())),
-                LocalEnd::Reset => return Poll::Ready(Err(WriteError::Finished)),
+                LocalEnd::Reset(_) => return Poll::Ready(Err(WriteError::Finished)),
                 LocalEnd::Live => {}
             }
             // Then the connection's death (ruling 124 step 2).
@@ -359,6 +381,91 @@ impl<S: Handshake> SendStream<S> {
         Poll::Ready(outcome)
     }
 
+    /// Resolve once every byte written to **this** stream *and its FIN* are
+    /// acknowledged by the peer's transport (**ruling 47**).
+    ///
+    /// It is legal and expected **after** [`finish`](Self::finish), and
+    /// never returns [`WriteError::Finished`] for that reason (§16.2).
+    ///
+    /// # Before `finish()` it parks and never resolves
+    ///
+    /// **[RATIFIED 2026/08/15 — ruling 139(e)]** §16.2 requires every byte
+    /// *and its FIN*, and a FIN that was never queued cannot be
+    /// acknowledged. So this —
+    ///
+    /// ```text
+    /// stream.write(&data).await?;   // no finish()
+    /// stream.acked().await?;        // hangs for ever
+    /// ```
+    ///
+    /// — is a permanent park on a healthy connection, and it looks exactly
+    /// like a transport hang. It is written down because it is the one
+    /// shape a caller reaches for by accident. Call
+    /// [`finish`](Self::finish) first; or, if the stream is meant to stay
+    /// open, use [`Connection::acked`], whose snapshot is FIN-free.
+    ///
+    /// # Every outcome
+    ///
+    /// * `Ok(())` — §9.7's `DataRecvd`: all bytes and the FIN acknowledged.
+    ///   **This outranks the connection's death latch** (ruling 135): a
+    ///   stream whose bytes were acknowledged completed, and the connection
+    ///   dying afterwards does not un-complete it.
+    /// * `Err(WriteError::Reset(code))` — [`reset`](Self::reset) was called
+    ///   on this handle. Outranks everything, including a `DataRecvd` that
+    ///   preceded it: the handle reports what the application last told it
+    ///   to do with the stream.
+    /// * `Err(WriteError::ConnectionLost(..))` — the connection ended with
+    ///   this half unacknowledged. It **never parks** on a dead connection:
+    ///   nothing further can be acknowledged (ruling 128).
+    ///
+    /// # Cancel-safety
+    ///
+    /// **Cancel-safe: a dropped future has claimed nothing.** It observes;
+    /// nothing is consumed, and the waker slot is this handle's for its
+    /// whole life rather than the future's.
+    ///
+    /// [`Connection::acked`]: super::Connection::acked
+    pub async fn acked(&mut self) -> Result<(), WriteError> {
+        poll_fn(|cx| self.poll_acked(cx)).await
+    }
+
+    /// The one implementation of [`acked`](Self::acked) (§16.3, ruling 53).
+    ///
+    /// A pure read: it mutates no core state, so unlike every other verb in
+    /// this file it neither marks the cell dirty nor wakes the driver.
+    pub(crate) fn poll_acked(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WriteError>> {
+        let mut cell = self.cell.borrow_mut();
+        // **Ruling 124 step 1** — this half's own terminal state first.
+        // Only `Reset` is terminal for *this* verb: `Finished` means the
+        // FIN is in send state, which is the beginning of what `acked()`
+        // waits for, and answering `WriteError::Finished` for it is what
+        // §16.2:4372 forbids in terms.
+        if let LocalEnd::Reset(code) = self.local_end {
+            return Poll::Ready(Err(WriteError::Reset(code)));
+        }
+        // **[RATIFIED 2026/08/16 — ruling 135]** Then the acknowledgement,
+        // **above** the death latch. The peer's ACK and the peer's CLOSE
+        // can arrive in one driver pass and the application is woken after
+        // the latch is set, so a latch-first order reports
+        // `ConnectionLost` over a transfer that was fully delivered and
+        // fully acknowledged — in a race the sender cannot win. This is
+        // ruling 128's defect on the sender's side.
+        if cell.finished_senders.contains(&self.r) {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(WriteError::ConnectionLost(lost)));
+        }
+        if cell.core.is_none() {
+            return Poll::Ready(Err(WriteError::ConnectionLost(no_core())));
+        }
+        cell.blocked_ackers
+            .entry(self.r)
+            .or_default()
+            .park(self.ack_key, cx);
+        Poll::Pending
+    }
+
     /// Abandon the stream abruptly with `error_code` (§9.6).
     ///
     /// Synchronous, infallible and **idempotent — the first code wins**.
@@ -372,6 +479,10 @@ impl<S: Handshake> SendStream<S> {
     /// why this handle's `Drop` must not reset a stream that was finished.
     ///
     /// On a connection that has already ended it is a silent no-op.
+    ///
+    /// After it, [`acked`](Self::acked) reports
+    /// `Err(WriteError::Reset(error_code))` — the code recorded here, not
+    /// the peer's.
     pub fn reset(&mut self, error_code: u64) {
         let dirty = {
             let mut cell = self.cell.borrow_mut();
@@ -386,9 +497,14 @@ impl<S: Handshake> SendStream<S> {
         };
         // Set even when the connection is dead: this handle has been closed
         // locally either way, and `Drop` must not go on to reset it.
-        self.local_end = LocalEnd::Reset;
+        self.local_end = LocalEnd::Reset(error_code);
         if dirty {
             self.shell.mark_dirty(self.conn);
+            // §16.2 settles an abandoned byte as well as an acknowledged
+            // one, so this can complete a `Connection::acked()` snapshot
+            // with no `ConnEvent` behind it — the third row of
+            // [`wake_settled`]'s enumeration.
+            wake_settled(&self.cell);
         }
     }
 }
@@ -423,6 +539,13 @@ impl<S: Handshake> Drop for SendStream<S> {
         let dirty = {
             let mut cell = self.cell.borrow_mut();
             release_waker_slot(&mut cell.blocked_writers, self.r, self.key);
+            // Ruling 47's two slots go with it. This handle is the sole
+            // owner of both — `SendStream` is not `Clone` — so removing
+            // the latch here is what bounds `finished_senders` by the
+            // number of live handles rather than by the number of streams
+            // the connection has ever finished.
+            release_waker_slot(&mut cell.blocked_ackers, self.r, self.ack_key);
+            cell.finished_senders.remove(&self.r);
             match (self.local_end, cell.core.as_mut()) {
                 (LocalEnd::Live, Some(core)) => {
                     core.reset(now(), self.r, constants::NO_ERROR);
@@ -437,6 +560,9 @@ impl<S: Handshake> Drop for SendStream<S> {
         };
         if dirty {
             self.shell.mark_dirty(self.conn);
+            // The reset above abandons every unacknowledged byte, which
+            // §16.2 counts as settled — [`wake_settled`]'s third row again.
+            wake_settled(&self.cell);
         }
         release_handle(&self.shell, &self.cell, self.conn);
     }
@@ -536,6 +662,38 @@ impl<S: Handshake> RecvStream<S> {
     /// gone: `Ok(Some(0))` cannot mean "wait", because waiting is spelt
     /// pending.
     ///
+    /// # After the connection dies you can still drain — **ruling 128**
+    ///
+    /// Bytes that arrived **before** the death are still delivered, and the
+    /// FIN behind them still surfaces as `Ok(None)`. Only when nothing is
+    /// left does this report `ConnectionLost`; it never parks on a dead
+    /// connection, because nothing further can arrive. The case it exists
+    /// for is the ordinary one — a sender that writes, finishes and drops
+    /// its handles closes implicitly, and the receiver's driver processes
+    /// the data and the CLOSE in the same pass — where the alternative
+    /// loses a stream that arrived in full, in a race the receiver cannot
+    /// win.
+    ///
+    /// **The window is not unbounded**, and it is exactly as long as the
+    /// core keeps the stream state:
+    ///
+    /// * a peer CLOSE — `CLOSE_LINGER` (5 s), the drain §15.2 holds open
+    ///   for this;
+    /// * liveness timeout, nonce exhaustion, `Replaced`, endpoint dropped —
+    ///   **no drain at all**. Those deaths drop the session at once and the
+    ///   driver releases the core, so the first read after one of them
+    ///   reports `ConnectionLost` however many bytes had arrived. Ruling
+    ///   133 states that consequence rather than leaving it to be found,
+    ///   and it is honest rather than unfortunate: a path that produced no
+    ///   CLOSE produced no finished sender either;
+    /// * a **local** `close()` — the drain currently lasts the linger here
+    ///   too. Ruling 133 says a closing endpoint may free stream state at
+    ///   once, because calling `close()` while a receive half holds unread
+    ///   bytes *is* a decision to discard them; the core does not yet do
+    ///   it, and until it does, a local closer can still drain what had
+    ///   already arrived. Do not build on this: it is the one row of the
+    ///   window that is expected to change.
+    ///
     /// # Cancel-safety
     ///
     /// **Cancel-safe: a dropped future has claimed nothing.** Pending is
@@ -570,31 +728,67 @@ impl<S: Handshake> RecvStream<S> {
                 Some(Ended::Reset(code)) => return Poll::Ready(Err(ReadError::Reset(code))),
                 None => {}
             }
-            // Then the connection's death (ruling 124 step 2).
-            if let Some(lost) = cell.closed.clone() {
-                return Poll::Ready(Err(ReadError::ConnectionLost(lost)));
-            }
             // Then ruling 119's empty-buffer short-circuit, before the core
-            // is touched. It sits *below* the death latch deliberately:
-            // its purpose is to avoid parking, and a dead connection does
-            // not park — answering `Ok(Some(0))` here would report success
-            // on a corpse.
+            // is touched.
+            //
+            // **It is now above the death latch, not below it — ruling
+            // 128.** It was below, on the argument that "a dead connection
+            // does not park, so `Ok(Some(0))` would report success on a
+            // corpse". That argument assumed the latch answered next; it no
+            // longer does, and the check has to stay above the core call
+            // either way, because ruling 119's whole point is that an empty
+            // buffer never reaches the core. What it now says on a dead
+            // connection is the same thing it says on a live one: *you
+            // asked for no bytes and got none*, which claims nothing about
+            // the connection.
             if buf.is_empty() {
                 return Poll::Ready(Ok(Some(0)));
             }
+
+            // **[RATIFIED 2026/08/15 — ruling 128]** Then the **core**, and
+            // the death latch only after it. This inverts ruling 124 step 2
+            // for this verb and `accept_*`, and for no other: received,
+            // unclaimed stream state survives the connection's death, so a
+            // reader drains the bytes that already arrived and then reaches
+            // the FIN's `Ok(None)`. Answering from the latch first loses
+            // data that arrived in full, in a race the receiver cannot win
+            // — the sender's driver delivers the data and the CLOSE in one
+            // pass and wakes the application afterwards.
+            //
+            // The drain window is the core's: `CLOSE_LINGER` after a peer
+            // CLOSE, and **zero** on the deaths with no linger (ruling
+            // 133), where the core is released and the `None` arm below
+            // answers.
             let Some(core) = cell.core.as_mut() else {
-                return Poll::Ready(Err(ReadError::ConnectionLost(no_core())));
+                return Poll::Ready(match cell.closed.clone() {
+                    Some(lost) => Err(ReadError::ConnectionLost(lost)),
+                    None => Err(ReadError::ConnectionLost(no_core())),
+                });
             };
 
             match core.read(now(), self.r, buf) {
-                Ok(Some(0)) => {
-                    cell.blocked_readers
-                        .entry(self.r)
-                        .or_default()
-                        .park(self.key, cx);
-                    cell.dirty = true;
-                    (Poll::Pending, true)
-                }
+                // "No data available" — the one answer that would park.
+                //
+                // **The latch is re-checked here, and it has to be**
+                // (ruling 128: *"parking is never permitted on a dead
+                // connection"*). The core's own `lost` is not the same
+                // fact as this cell's `closed`: `Driver::stop` latches
+                // every cell — on an unwind as well as an ordinary exit —
+                // over cores that are still perfectly live and still
+                // answer `Ok(Some(0))`. Trusting the core's guard alone
+                // parks a reader that nothing will ever wake, which is the
+                // failure this whole rule exists to prevent.
+                Ok(Some(0)) => match cell.closed.clone() {
+                    Some(lost) => (Poll::Ready(Err(ReadError::ConnectionLost(lost))), false),
+                    None => {
+                        cell.blocked_readers
+                            .entry(self.r)
+                            .or_default()
+                            .park(self.key, cx);
+                        cell.dirty = true;
+                        (Poll::Pending, true)
+                    }
+                },
                 Ok(Some(n)) => {
                     cell.dirty = true;
                     (Poll::Ready(Ok(Some(n))), true)

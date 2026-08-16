@@ -17,7 +17,7 @@
 //! [`driver`]: super::driver
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::{Context, Waker};
@@ -201,6 +201,46 @@ pub(crate) struct ConnCell<S: Handshake> {
     pub(crate) blocked_readers: BTreeMap<StreamRef, Wakers>,
     /// §16.8's blocked-writers map, on the same terms.
     pub(crate) blocked_writers: BTreeMap<StreamRef, Wakers>,
+    /// §16.2's `SendStream::acked()` waiters — **ruling 47**, one entry per
+    /// live [`SendStream`](super::SendStream), on
+    /// [`blocked_writers`](Self::blocked_writers)' terms exactly: created by
+    /// that handle's constructor, removed by its `Drop`, keyed by
+    /// [`StreamRef`] and never by `StreamId` (ruling 117).
+    ///
+    /// Woken by `ConnEvent::StreamFinished` and `ConnEvent::StreamReset`,
+    /// and by the death latch.
+    pub(crate) blocked_ackers: BTreeMap<StreamRef, Wakers>,
+    /// Which send halves have reached §9.7's `DataRecvd` — the latch
+    /// `SendStream::acked()` answers from.
+    ///
+    /// # Why a latch and not the event alone
+    ///
+    /// `ConnEvent::StreamFinished` is a **wakeup**, and an `acked()` that
+    /// only ever resolved on the wake would hang on the ordinary sequence:
+    /// the peer's ACK arrives, the driver publishes the event with nobody
+    /// parked, and the application calls `acked()` afterwards. That is not
+    /// an unlikely interleaving — it is `write; finish; acked()` whenever
+    /// the ACK beats the application to the call, which on a paused clock
+    /// is *most* of the time. Ruling 135 needs it too: the ACK and the
+    /// peer's CLOSE can arrive in one driver pass, and the fact that the
+    /// transfer completed has to outlive the latch that says the
+    /// connection did not.
+    ///
+    /// **Bounded by the number of live `SendStream` handles**, not by the
+    /// number of streams the connection has ever finished: the driver
+    /// records a stream here only while
+    /// [`blocked_ackers`](Self::blocked_ackers) holds that stream's slot —
+    /// i.e. only while a handle that could ask exists — and the handle's
+    /// `Drop` removes both. Without that gate this map would grow once per
+    /// finished stream for the connection's life, which for §9.8's message
+    /// streams is once per message.
+    pub(crate) finished_senders: BTreeSet<StreamRef>,
+    /// §16.2's `Connection::acked()` waiters — rulings 47 and 54.
+    ///
+    /// `closed_wakers`' sibling and not a per-`StreamRef` map: the verb is
+    /// a **connection-level snapshot**, so every waiter re-polls on any
+    /// change to any stream's settledness.
+    pub(crate) settled_wakers: Wakers,
     /// `open_bi`/`open_uni` futures parked on §10.4's cumulative limit,
     /// indexed by `Dir::slot()`.
     ///
@@ -235,9 +275,31 @@ impl<S: Handshake> ConnCell<S> {
             handles: 0,
             blocked_readers: BTreeMap::new(),
             blocked_writers: BTreeMap::new(),
+            blocked_ackers: BTreeMap::new(),
+            finished_senders: BTreeSet::new(),
+            settled_wakers: Wakers::default(),
             stream_openers: Default::default(),
             stream_acceptors: Default::default(),
         }
+    }
+
+    /// Record §9.7's `DataRecvd` for `r`, and hand back the waiters to be
+    /// woken **outside** the borrow (finding F10).
+    ///
+    /// The latch is written only when [`blocked_ackers`] holds `r`'s
+    /// slot — see [`finished_senders`] for why that gate is what bounds
+    /// the map.
+    ///
+    /// [`blocked_ackers`]: Self::blocked_ackers
+    /// [`finished_senders`]: Self::finished_senders
+    #[must_use = "the wakers must be woken after the cell borrow ends (§16.8)"]
+    pub(crate) fn note_send_finished(&mut self, r: StreamRef) -> Vec<Waker> {
+        let Some(wakers) = self.blocked_ackers.get_mut(&r) else {
+            return Vec::new();
+        };
+        let woken = wakers.take_all();
+        self.finished_senders.insert(r);
+        woken
     }
 
     pub(crate) fn is_established(&self) -> bool {
@@ -261,6 +323,14 @@ impl<S: Handshake> ConnCell<S> {
         for wakers in self.blocked_writers.values_mut() {
             woken.extend(wakers.take_all());
         }
+        // Ruling 128's *"parking is never permitted on a dead
+        // connection"* reaches both `acked()` verbs: neither can resolve
+        // from anything but the latch once the connection is gone, so
+        // both must be woken to see it.
+        for wakers in self.blocked_ackers.values_mut() {
+            woken.extend(wakers.take_all());
+        }
+        woken.extend(self.settled_wakers.take_all());
         for wakers in &mut self.stream_openers {
             woken.extend(wakers.take_all());
         }
@@ -314,6 +384,43 @@ pub(crate) fn release_waker_slot(map: &mut BTreeMap<StreamRef, Wakers>, r: Strea
     entry.get_mut().unpark(key);
     if entry.get().is_empty() {
         entry.remove();
+    }
+}
+
+/// Re-poll every parked [`Connection::acked`] on this connection.
+///
+/// [`Connection::acked`]: super::Connection::acked
+///
+/// # Why this needs a wake source `CONTRACT-5b.md` does not name
+///
+/// The contract wakes `settled_wakers` on `ConnEvent::StreamFinished`,
+/// `ConnEvent::StreamReset` and the death latch. Those three do not cover
+/// the case §16.2 states in terms — *"`acked()` terminates on a live
+/// connection even while a bulk stream is still being written"*. A stream
+/// with no FIN never reaches §9.7's `DataRecvd`, so it emits **no**
+/// `StreamFinished` however much of it is acknowledged, and the snapshot
+/// the verb took can become settled with no event of any kind behind it.
+///
+/// Three things settle a snapshot entry, and this is the enumeration a
+/// later change has to re-check rather than a claim about one call site:
+///
+/// 1. bytes acknowledged (`SendHalf::on_ack_range`) — reachable only from
+///    an **inbound datagram**, which is one of the two callers;
+/// 2. the send half freed at `DataRecvd`/`ResetRecvd`, or its whole entry
+///    removed — also inbound, and covered by the `StreamFinished` arm too;
+/// 3. a **local** reset, which `SendHalf::settled_to` counts as settled
+///    (§16.2: *"acknowledged **or abandoned by a reset**"*) —
+///    [`SendStream::reset`](super::SendStream::reset) and that handle's
+///    `Drop`, the other caller.
+///
+/// Waking is always safe: a woken `poll_acked` re-reads the core and parks
+/// again if nothing changed. Missing one is not — it is a verb that never
+/// resolves, which is the failure `acked()` exists to prevent.
+pub(crate) fn wake_settled<S: Handshake>(cell: &RefCell<ConnCell<S>>) {
+    // Taken inside the borrow, woken outside it (§16.8, finding F10).
+    let woken = cell.borrow_mut().settled_wakers.take_all();
+    for waker in woken {
+        waker.wake();
     }
 }
 

@@ -513,16 +513,47 @@ impl<C: Handshake> Connection<C> {
     /// peer-opened uni stream fully closes the stream and owes a MAX_STREAMS
     /// (§10.4). The second reason stands even if §10.3's re-grant never
     /// fires.
+    ///
+    /// # It keeps serving after the connection has died — **ruling 128**
+    ///
+    /// This used to open with an unconditional `self.lost` check, which
+    /// hid data that had already arrived: `drop_state` drops the session
+    /// and the timers and leaves `streams` and `flow` alone, and §15.2's
+    /// draining endpoint keeps them for the whole `CLOSE_LINGER`. So a
+    /// sender that writes, finishes and closes — the fire-and-forget
+    /// pattern §16.2 makes reachable by accident — delivered every byte to
+    /// a peer that could never read one.
+    ///
+    /// Now the half is served normally while anything is left, and the
+    /// death is reported only when nothing is: the `Ok(Some(0))` that means
+    /// *"no data available"* becomes `Err(ConnectionLost)` rather than the
+    /// shell's park, because **parking is never permitted on a dead
+    /// connection** — nothing further can arrive, so a park would be
+    /// permanent.
+    ///
+    /// `Ok(None)` is passed through unchanged: reaching the FIN after the
+    /// death is the drain succeeding, and it is what ruling 128 asks for in
+    /// terms (*"`read` serves buffered bytes then `Ok(None)`"*).
+    ///
+    /// **No `pump` on the dead path.** Nothing can be emitted anyway —
+    /// `pump_packets` returns at once unless the lifecycle is live — and
+    /// `pump` also re-derives §13's `Loss`/`Pto` deadlines, which on a dead
+    /// connection would announce a deadline the driver schedules and the
+    /// core then declines to act on: ruling 141's spin, from a new
+    /// direction.
     pub(crate) fn read(
         &mut self,
         now: Instant,
         r: StreamRef,
         buf: &mut [u8],
     ) -> Result<Option<usize>, ReadError> {
-        if let Some(lost) = self.lost.clone() {
-            return Err(ReadError::ConnectionLost(lost));
-        }
         let out = self.streams.read(r, buf, &mut self.flow);
+        if let Some(lost) = self.lost.clone() {
+            return match out {
+                Ok(Some(0)) => Err(ReadError::ConnectionLost(lost)),
+                served => served,
+            };
+        }
         self.pump(now);
         out
     }

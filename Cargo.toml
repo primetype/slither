@@ -203,3 +203,15 @@ required-features = ["test-util"]
 [[test]]
 name = "spec_streams"
 required-features = ["test-util"]
+
+# ── slice 5b integration (ruling 126) ────────────────────────────────
+# The blind author's `tests/story_reliability.rs` lands with the
+# integration, and cargo *refuses to parse this manifest* when a
+# `[[test]]` names a file that is not there -- which reds every gate at
+# once, including the ones that have nothing to do with it. Committed
+# commented out by 5b's implementer; the integrator uncomments it in the
+# same commit that adds the file.
+#
+# [[test]]
+# name = "story_reliability"
+# required-features = ["test-util"]

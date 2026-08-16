@@ -1,11 +1,11 @@
 //! §16.2's `Connection` handle — the subset slice 3 builds.
 //!
-//! `close()`, ruling 46's `closed()`, and the four accessors. Every other
-//! §16.2 verb — `open_*`, `accept_*`, `send_message`, `recv_*`, `acked`,
-//! `notified`, `set_persistent_keepalive` — belongs to slices 4–7 and is
-//! **absent rather than stubbed**: in this module tree an unimplemented verb
-//! is a claim about the protocol, and an `unimplemented!()` on a public
-//! surface is a worse claim than an absence.
+//! `close()`, ruling 46's `closed()`, the four accessors, slice 4's stream
+//! verbs and slice 5's `acked()`. Every other §16.2 verb —
+//! `send_message`, `recv_*`, `notified`, `set_persistent_keepalive` —
+//! belongs to slices 6–7 and is **absent rather than stubbed**: in this
+//! module tree an unimplemented verb is a claim about the protocol, and an
+//! `unimplemented!()` on a public surface is a worse claim than an absence.
 //!
 //! # Where the work happens
 //!
@@ -24,7 +24,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::constants;
-use crate::core::{ConnectionId, Dir, StreamRef};
+use crate::core::connection::AckSnapshot;
+use crate::core::{Connection as CoreConnection, ConnectionId, Dir, StreamRef};
 use crate::error::ConnectionLost;
 use crate::packet::{Channel, Handshake};
 
@@ -189,6 +190,115 @@ impl<S: Handshake> Connection<S> {
         }
     }
 
+    /// Resolve once everything handed to this connection **so far** has
+    /// been acknowledged by the peer's transport (**rulings 47 and 54**).
+    ///
+    /// This is the verb behind `send(msg).await; acked().await;
+    /// close(NO_ERROR, "").await` — §15.2 lets `close()` drop stream,
+    /// recovery and congestion state immediately, so without it a
+    /// write-then-close loses its tail at the path's loss rate, silently.
+    ///
+    /// # It is a snapshot, taken at the call
+    ///
+    /// Every byte handed to the connection at this instant, across **every**
+    /// stream — including the message streams §9.8 never surfaces a handle
+    /// for. Bytes written *after* the call do not extend it, which is what
+    /// makes it terminate on a live connection even while a bulk stream is
+    /// still being written. A byte **abandoned by a reset** counts as
+    /// settled (§9.6: an abandoned byte is never acknowledged, and waiting
+    /// on one would never terminate).
+    ///
+    /// **The FIN is not part of it.** A snapshot that waited for FINs would
+    /// never terminate on a stream the application intends to keep open;
+    /// [`SendStream::acked`] is the per-stream verb that includes the FIN.
+    ///
+    /// # After the connection dies
+    ///
+    /// A snapshot that is **settled** resolves `Ok(())` even once the
+    /// connection has died — **ruling 135**. The peer's ACK and the peer's
+    /// CLOSE can arrive in one driver pass, and the application is woken
+    /// after the latch is set, so the alternative reports `ConnectionLost`
+    /// over a transfer that was fully delivered and fully acknowledged, in
+    /// a race the sender cannot win. An **unsettled** snapshot reports
+    /// `Err(ConnectionLost)`: nothing further can be acknowledged, so it
+    /// never parks (ruling 128).
+    ///
+    /// Once the driver has released the core there is no snapshot left to
+    /// test and this reports `Err(ConnectionLost)` unconditionally.
+    ///
+    /// # Cancel-safety
+    ///
+    /// **Cancel-safe: a dropped future has claimed nothing.** It observes;
+    /// it consumes no bytes and mutates no core state, and its waker slot
+    /// is released by the guard's `Drop`.
+    ///
+    /// [`SendStream::acked`]: super::SendStream::acked
+    pub async fn acked(&self) -> Result<(), ConnectionLost> {
+        // **Taken here, in the body — not inside `poll_acked`** (rulings
+        // 47/54). §16.2 fixes the snapshot at the instant of the call;
+        // re-reading the send offsets on every poll is the implementation
+        // that never terminates under a writer loop, which is the case
+        // §16.2 spells out. There is no `await` between this and the first
+        // poll, so "at the call" and "at the first poll" are the same
+        // instant on this runtime.
+        let snapshot = self
+            .cell
+            .borrow()
+            .core
+            .as_ref()
+            .map(CoreConnection::ack_snapshot);
+        let slot = self.settled_slot();
+        poll_fn(|cx| self.poll_acked(cx, snapshot.as_ref(), slot.key())).await
+    }
+
+    /// The one implementation of [`acked`](Self::acked) (§16.3, ruling 53).
+    fn poll_acked(
+        &self,
+        cx: &mut Context<'_>,
+        snapshot: Option<&AckSnapshot>,
+        key: u64,
+    ) -> Poll<Result<(), ConnectionLost>> {
+        let mut cell = self.cell.borrow_mut();
+        // **[RATIFIED 2026/08/16 — ruling 135]** The settled snapshot
+        // outranks the death latch, exactly as ruling 124's terminal state
+        // does on a stream handle: *a stream whose bytes were acknowledged
+        // completed, and the connection dying afterwards does not
+        // un-complete it.* An empty snapshot — nothing was ever written —
+        // is settled vacuously and resolves here on the first poll, live or
+        // dead.
+        if let Some(snap) = snapshot
+            && cell
+                .core
+                .as_ref()
+                .is_some_and(|core| core.snapshot_settled(snap))
+        {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(lost));
+        }
+        if cell.core.is_none() {
+            debug_assert!(
+                false,
+                "a connection cell held neither a core nor a close reason (§16.3)"
+            );
+            return Poll::Ready(Err(ConnectionLost::EndpointDropped));
+        }
+        cell.settled_wakers.park(key, cx);
+        Poll::Pending
+    }
+
+    /// Mint this future's slot in §16.8's settled-waiter set, released on
+    /// drop — [`closed`](Self::closed)'s shape, for the same reason: any
+    /// number of `acked()` futures can coexist on one `&self`.
+    fn settled_slot(&self) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().settled_wakers.key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().settled_wakers.unpark(key)
+        })
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // §16.2's stream verbs
     // ═══════════════════════════════════════════════════════════════════
@@ -240,11 +350,33 @@ impl<S: Handshake> Connection<S> {
     /// open several streams from one frame; each becomes claimable
     /// separately and each `accept_bi` claims exactly one.
     ///
-    /// Once the connection has ended this reports `Err` **immediately, with
-    /// nothing drained first** (ruling 118). That is not an oversight of the
-    /// pull model: §15.2 lets `close()` drop stream state at once, so there
-    /// is nothing left to hand over, and handing back a handle on which
-    /// every `read` fails would be worse than saying so.
+    /// # After the connection ends — **ruling 128**
+    ///
+    /// Streams the peer opened **before** the death are still handed over,
+    /// and the handle they come back on is usable: ruling 128's drain
+    /// applies to [`RecvStream::read`] too. Ruling 118 said the opposite,
+    /// and was reasoning about the **closing** endpoint, where §15.2 really
+    /// does free stream state; a *draining* endpoint — one that received an
+    /// authenticated CLOSE — keeps it for `CLOSE_LINGER` precisely so this
+    /// can happen. The case that forces it is the ordinary one: a sender
+    /// that writes, finishes and drops its handles closes implicitly, the
+    /// peer's driver processes the data and the CLOSE in one pass, and the
+    /// peer's application is woken **after** the latch is set. It is not a
+    /// race the receiver can win.
+    ///
+    /// When nothing is left to claim this reports `Err(ConnectionLost)` on
+    /// the first poll and **never parks**: nothing further can arrive.
+    ///
+    /// The drain window is the core's own: `CLOSE_LINGER` (5 s) after a
+    /// peer CLOSE, and **zero** on the deaths that have no linger —
+    /// liveness timeout, nonce exhaustion, `Replaced`, endpoint dropped
+    /// (ruling 133). A receiver killed by `DEAD_TIMEOUT` mid-transfer
+    /// cannot drain, which is honest: a path that produced no CLOSE
+    /// produced no finished sender either. After a **local** `close()` the
+    /// window is the linger as well — see [`RecvStream::read`] for the one
+    /// row of it ruling 133 expects to change.
+    ///
+    /// [`RecvStream::read`]: super::RecvStream::read
     ///
     /// Cancel-safe: a dropped future has claimed no stream. The claim and
     /// the handle are one step, which matters more here than for `open_*` —
@@ -381,11 +513,30 @@ impl<S: Handshake> Connection<S> {
         }
     }
 
-    /// `accept_bi`/`accept_uni`, on the same terms.
+    /// `accept_bi`/`accept_uni`, on the same terms as
+    /// [`poll_open_with`](Self::poll_open_with) — **except for the death
+    /// latch, which is where the two verbs part company.**
     ///
-    /// The latch is checked **before** the pop, not after: a `poll_accept`
-    /// that popped and then noticed the connection had died would orphan the
-    /// stream it had just claimed.
+    /// # The core is asked first — ruling 128, and this verb only
+    ///
+    /// Ruling 124's precedence (terminal state → death latch → the core)
+    /// governs every other verb on this handle and is unchanged. Here the
+    /// order is inverted: `accept(dir)` first, the latch only if it handed
+    /// back `None`. A stream the peer opened before the death is *in the
+    /// core*, and answering `ConnectionLost` over it loses data that
+    /// arrived in full — ruling 47's problem seen from the receiving end.
+    /// The core needs no change to allow it: `core::Connection::accept` has
+    /// no `lost` guard and never had one.
+    ///
+    /// **Nothing here may return `Pending` once the latch is set.** No
+    /// further stream can ever be opened on a dead connection, so a park
+    /// would be permanent — *"parking is never permitted on a dead
+    /// connection"* (ruling 128).
+    ///
+    /// The claim is still one synchronous step with the handle's
+    /// construction, so a `poll_accept` that popped can never be dropped
+    /// before the handle exists — the orphan the old latch-first order was
+    /// wrongly credited with preventing.
     ///
     /// The park is woken by `ConnEvent::StreamOpened`, of which ruling 99
     /// emits **one per stream** — so a wake is not a promise of a stream,
@@ -404,32 +555,32 @@ impl<S: Handshake> Connection<S> {
         ) -> T,
     ) -> Poll<Result<T, ConnectionLost>> {
         let mut cell = self.cell.borrow_mut();
+        // The core first (ruling 128). `None` covers both "nothing
+        // unclaimed" and "the driver has released the core", and the latch
+        // below answers each of them.
+        let claimed = cell.core.as_mut().and_then(|core| core.accept(dir));
+        if let Some(r) = claimed {
+            let handle = build(
+                Rc::clone(&self.shell),
+                Rc::clone(&self.cell),
+                &mut cell,
+                self.id,
+                r,
+            );
+            return Poll::Ready(Ok(handle));
+        }
         if let Some(lost) = cell.closed.clone() {
             return Poll::Ready(Err(lost));
         }
-        let Some(core) = cell.core.as_mut() else {
+        if cell.core.is_none() {
             debug_assert!(
                 false,
                 "a connection cell held neither a core nor a close reason (§16.3)"
             );
             return Poll::Ready(Err(ConnectionLost::EndpointDropped));
-        };
-        match core.accept(dir) {
-            Some(r) => {
-                let handle = build(
-                    Rc::clone(&self.shell),
-                    Rc::clone(&self.cell),
-                    &mut cell,
-                    self.id,
-                    r,
-                );
-                Poll::Ready(Ok(handle))
-            }
-            None => {
-                cell.stream_acceptors[dir.slot()].park(key, cx);
-                Poll::Pending
-            }
         }
+        cell.stream_acceptors[dir.slot()].park(key, cx);
+        Poll::Pending
     }
 
     /// The peer's static public key — **proven**, not claimed (§6.1).
