@@ -1,10 +1,10 @@
 //! §16.2's `Connection` handle — the subset slice 3 builds.
 //!
 //! `close()`, ruling 46's `closed()`, the four accessors, slice 4's stream
-//! verbs and slice 5's `acked()`. Every other §16.2 verb —
-//! `send_message`, `recv_*`, `notified`, `set_persistent_keepalive` —
-//! belongs to slices 6–7 and is **absent rather than stubbed**: in this
-//! module tree an unimplemented verb is a claim about the protocol, and an
+//! verbs, slice 5's `acked()` and slice 6's four sugar verbs. The §16.2
+//! verbs still absent — `notified`, `set_persistent_keepalive` — belong to
+//! slice 7 and are **absent rather than stubbed**: in this module tree an
+//! unimplemented verb is a claim about the protocol, and an
 //! `unimplemented!()` on a public surface is a worse claim than an absence.
 //!
 //! # Where the work happens
@@ -24,12 +24,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::constants;
-use crate::core::connection::AckSnapshot;
+use crate::core::connection::{AckSnapshot, SendMessage};
 use crate::core::{Connection as CoreConnection, ConnectionId, Dir, StreamRef};
-use crate::error::ConnectionLost;
+use crate::error::{ConnectionLost, DatagramError, MessageError};
 use crate::packet::{Channel, Handshake};
 
-use super::shared::{ConnCell, ShellLink, WakerSlot, close_now};
+use super::shared::{ConnCell, ShellLink, WakerSlot, close_now, now};
 use super::stream::{BiStream, RecvStream, SendStream};
 
 /// The static public key type of a suite — §2.4's canonical octets.
@@ -430,6 +430,329 @@ impl<S: Handshake> Connection<S> {
         self.poll_accept_with(cx, key, Dir::Uni, RecvStream::install)
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // §9.8's messages and §11's datagrams
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Send one reliable-unordered message (§9.8).
+    ///
+    /// Sugar over an auto-managed unidirectional stream: the next outbound
+    /// uni stream is allocated, the whole payload written, the FIN set, and
+    /// the stream garbage-collected once the FIN'd range is acknowledged.
+    /// **No stream handle surfaces**, so [`acked`](Self::acked) is how an
+    /// application awaits that acknowledgement — the idiom is
+    /// `send_message(m).await; acked().await; close().await`.
+    ///
+    /// Payloads above `MESSAGE_RECV_MAX` (262 144 B) are rejected here with
+    /// [`MessageError::TooLarge`], **at the handle** and before the core is
+    /// consulted: a larger sugar send could stall for ever against a
+    /// sugar-consuming receiver, which never extends credit.
+    ///
+    /// It resolves *"as soon as the payload entered send state"* (§9.8) —
+    /// not on delivery, and not on acknowledgement.
+    ///
+    /// # Waiting, and what it waits for
+    ///
+    /// It waits for §10.4's stream allowance or for enough §10.3
+    /// connection credit to admit the **whole** payload. §10.6 makes credit
+    /// the buffer commitment, so partial admission is not available:
+    /// accepting beyond the peer's credit would buffer up to 32 MiB per
+    /// connection, a term §17.5's ceiling table does not contain (ruling
+    /// 150).
+    ///
+    /// # Cancel-safety — **load-bearing here**
+    ///
+    /// **Cancel-safe: a dropped future has sent nothing.** No stream is
+    /// opened, no index spent and no byte buffered until the whole payload
+    /// is admitted, which happens in one synchronous core call.
+    ///
+    /// This is worth stating because the natural decomposition — open,
+    /// write in a loop, finish — is **not** cancel-safe in a way that
+    /// matters: a dropped future would leave a **FIN-less half-written uni
+    /// stream** on the wire, which against a message-mode receiver is
+    /// exactly §9.8's overflow case. An application's own
+    /// `timeout(d, send_message(..))` would then manufacture the failure
+    /// this protocol's diagnostics exist to attribute to a mixing error.
+    pub async fn send_message(&self, msg: &[u8]) -> Result<(), MessageError> {
+        let slot = self.message_sender_slot();
+        poll_fn(|cx| self.poll_send_message(cx, msg, slot.key())).await
+    }
+
+    /// Claim the oldest complete unclaimed message (§9.8).
+    ///
+    /// Each incoming unidirectional stream is one message; the payload
+    /// surfaces only when reassembly is complete — **FIN and every byte** —
+    /// and the stream is freed by the claim. *"Oldest"* is **open order**
+    /// (ruling 112): a complete stream sitting behind an incomplete one is
+    /// surfaced, because messages are reliable-**unordered**.
+    ///
+    /// `Ok(payload)` with an empty `Vec` is a delivered **empty message**,
+    /// not an absence.
+    ///
+    /// # Mixing this with `accept_uni()` is a programming error
+    ///
+    /// Both verbs draw from the same incoming-uni supply and the wire
+    /// carries **no discriminator** between the two modes, so the receiving
+    /// application's verb choice alone decides how a stream is interpreted
+    /// and no implementation can repair a mixture. Calling this verb puts
+    /// the connection in message mode: from the first call, an unclaimed uni
+    /// stream that fills its initial window without pinning a final size is
+    /// **reset** with `MESSAGE_OVERFLOW`, and its sender sees
+    /// `WriteError::Reset(0x06)`. Use bidi streams alongside messages, or
+    /// tag in band. §9.8 states both safe patterns.
+    ///
+    /// # After the connection ends — **ruling 152**
+    ///
+    /// Messages that arrived complete **before** the death are still
+    /// handed over, and the death is reported only once none is left.
+    /// Ruling 128's enumeration named `read` and `accept_*` and predates
+    /// this verb; the obligation it serves is Appendix B's
+    /// `send_message` → `acked` → `close`, where the receiver's driver
+    /// processes the data and the CLOSE in one pass and cannot win the race
+    /// by being prompt.
+    ///
+    /// Cancel-safe: the claim and the return are one expression, so a
+    /// dropped future has claimed nothing.
+    pub async fn recv_message(&self) -> Result<Vec<u8>, ConnectionLost> {
+        let slot = self.message_reader_slot();
+        poll_fn(|cx| self.poll_recv_message(cx, slot.key())).await
+    }
+
+    /// Queue one unreliable datagram (§11).
+    ///
+    /// **Not `async`, and it never waits.** §11.3's send queue is bounded at
+    /// 64 with a drop-oldest discipline, so pressure evicts the *oldest*
+    /// queued datagram rather than blocking the caller or rejecting the new
+    /// one — and `Ok(())` therefore promises only that the datagram entered
+    /// the queue. §11.1 promises nothing beyond that: no delivery, no
+    /// ordering, no retransmission, no sequence identity at all.
+    ///
+    /// A payload above `MAX_DATAGRAM_PAYLOAD` (1169 B) is
+    /// [`DatagramError::TooLarge`], rejected **before any queue** (§11.4):
+    /// nothing is queued and nothing is evicted.
+    ///
+    /// Its cancel-safety is vacuous — there is no future to drop.
+    pub fn send_datagram(&self, data: &[u8]) -> Result<(), DatagramError> {
+        // §11.4's bound is checked at the handle. Doing it before the borrow
+        // keeps the oversize path from marking the cell dirty for a call
+        // that changed nothing.
+        if data.len() > constants::MAX_DATAGRAM_PAYLOAD {
+            return Err(DatagramError::TooLarge);
+        }
+        let sent = {
+            let mut cell = self.cell.borrow_mut();
+            if let Some(lost) = cell.closed.clone() {
+                return Err(DatagramError::ConnectionLost(lost));
+            }
+            let Some(core) = cell.core.as_mut() else {
+                debug_assert!(
+                    false,
+                    "a connection cell held neither a core nor a close reason (§16.3)"
+                );
+                return Err(DatagramError::ConnectionLost(ConnectionLost::EndpointDropped));
+            };
+            let sent = core.send_datagram(now(), data);
+            if sent.is_ok() {
+                cell.dirty = true;
+            }
+            sent
+        };
+        if sent.is_ok() {
+            self.shell.mark_dirty(self.id);
+        }
+        sent
+    }
+
+    /// Claim the oldest queued datagram (§11), waiting for one to arrive.
+    ///
+    /// FIFO over §11.3's receive queue, which is bounded at 64 with the same
+    /// drop-oldest discipline: a datagram this end never claimed can be
+    /// evicted by a newer arrival, and nothing reports that to the
+    /// application — §11.1 promises no delivery, and §11.5's counters are an
+    /// operator signal on `slither::frames`, not an error.
+    ///
+    /// Drains after the connection's death on
+    /// [`recv_message`](Self::recv_message)'s terms (ruling 152), and is
+    /// cancel-safe for the same reason.
+    pub async fn recv_datagram(&self) -> Result<Vec<u8>, ConnectionLost> {
+        let slot = self.datagram_reader_slot();
+        poll_fn(|cx| self.poll_recv_datagram(cx, slot.key())).await
+    }
+
+    /// The one implementation of [`send_message`](Self::send_message)
+    /// (ruling 122a).
+    ///
+    /// Precedence, in order — the house order of ruling 124, with §9.8's
+    /// handle-side bound ahead of it:
+    ///
+    /// 1. `msg.len() > MESSAGE_RECV_MAX` → `TooLarge`. §9.8 puts the check
+    ///    *"at the handle"*, and the core re-checks only because its own
+    ///    unit tests call it directly. Ruling 110's `buf.is_empty()` check
+    ///    is the house precedent for a shell-side guard;
+    /// 2. the death latch → `ConnectionLost`. **Latch first**, unlike the
+    ///    claim verbs below: there is nothing buffered for a *send* to
+    ///    drain, so ruling 128's inversion has nothing to protect here;
+    /// 3. no core → `debug_assert!` and `EndpointDropped`;
+    /// 4. the core admits the payload → `Ok(())`;
+    /// 5. the core says *not now* → park in `message_senders`.
+    pub(crate) fn poll_send_message(
+        &self,
+        cx: &mut Context<'_>,
+        msg: &[u8],
+        key: u64,
+    ) -> Poll<Result<(), MessageError>> {
+        if msg.len() as u64 > constants::MESSAGE_RECV_MAX {
+            return Poll::Ready(Err(MessageError::TooLarge));
+        }
+        let admitted = {
+            let mut cell = self.cell.borrow_mut();
+            if let Some(lost) = cell.closed.clone() {
+                return Poll::Ready(Err(MessageError::ConnectionLost(lost)));
+            }
+            let Some(core) = cell.core.as_mut() else {
+                debug_assert!(
+                    false,
+                    "a connection cell held neither a core nor a close reason (§16.3)"
+                );
+                return Poll::Ready(Err(MessageError::ConnectionLost(
+                    ConnectionLost::EndpointDropped,
+                )));
+            };
+            match core.send_message(now(), msg) {
+                Err(error) => return Poll::Ready(Err(error)),
+                Ok(SendMessage::Blocked) => {
+                    // Ruling 150: nothing happened, so parking is the whole
+                    // of the retry. Woken by `StreamsAvailable { Uni }` or
+                    // `SendCreditAvailable`, and by the death latch.
+                    cell.message_senders.park(key, cx);
+                    false
+                }
+                Ok(SendMessage::Sent) => {
+                    cell.dirty = true;
+                    true
+                }
+            }
+        };
+        if !admitted {
+            return Poll::Pending;
+        }
+        self.shell.mark_dirty(self.id);
+        Poll::Ready(Ok(()))
+    }
+
+    /// The one implementation of [`recv_message`](Self::recv_message).
+    ///
+    /// Precedence, in order — **the core first**, which is ruling 128's
+    /// inversion extended to this verb by ruling 152:
+    ///
+    /// 1. `core.recv_message(now())` → `Ready(Ok(payload))` on `Some`;
+    /// 2. the death latch → `Ready(Err(lost))`, **only** if the core had
+    ///    nothing;
+    /// 3. no core → `debug_assert!` and `EndpointDropped`;
+    /// 4. otherwise park in `message_readers`.
+    ///
+    /// **Parking is never permitted on a dead connection** (ruling 128):
+    /// nothing further can arrive, so step 4 is unreachable past the latch.
+    pub(crate) fn poll_recv_message(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<Vec<u8>, ConnectionLost>> {
+        let outcome = {
+            let mut cell = self.cell.borrow_mut();
+            // Every call — `Some` or `None` — can have run §9.8's overflow
+            // scan and emitted a RESET_STREAM, and a claim retires a half
+            // that owes MAX_DATA and MAX_STREAMS. So the cell is dirtied on
+            // the strength of the *call*, not of the answer.
+            let claimed = cell.core.as_mut().map(|core| core.recv_message(now()));
+            if claimed.is_some() {
+                cell.dirty = true;
+            }
+            match claimed {
+                Some(Some(payload)) => Some(Ok(payload)),
+                _ => match cell.closed.clone() {
+                    Some(lost) => Some(Err(lost)),
+                    None if cell.core.is_none() => {
+                        debug_assert!(
+                            false,
+                            "a connection cell held neither a core nor a close reason (§16.3)"
+                        );
+                        Some(Err(ConnectionLost::EndpointDropped))
+                    }
+                    None => {
+                        cell.message_readers.park(key, cx);
+                        None
+                    }
+                },
+            }
+        };
+        // Outside the borrow (finding F10): waking and driving both re-enter
+        // the cell.
+        self.shell.mark_dirty(self.id);
+        match outcome {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
+    }
+
+    /// The one implementation of [`recv_datagram`](Self::recv_datagram).
+    ///
+    /// [`poll_recv_message`](Self::poll_recv_message)'s precedence exactly,
+    /// with one difference: **the core call takes no `now` and dirties
+    /// nothing** (ruling 151). Claiming a datagram emits no frame —
+    /// datagrams are flow-control exempt (§10.7), so there is no credit
+    /// true-up and nothing to seal — and marking the cell dirty for it would
+    /// wake the driver to discover that nothing is owed.
+    pub(crate) fn poll_recv_datagram(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<Vec<u8>, ConnectionLost>> {
+        let mut cell = self.cell.borrow_mut();
+        if let Some(payload) = cell.core.as_mut().and_then(CoreConnection::recv_datagram) {
+            return Poll::Ready(Ok(payload));
+        }
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(lost));
+        }
+        if cell.core.is_none() {
+            debug_assert!(
+                false,
+                "a connection cell held neither a core nor a close reason (§16.3)"
+            );
+            return Poll::Ready(Err(ConnectionLost::EndpointDropped));
+        }
+        cell.datagram_readers.park(key, cx);
+        Poll::Pending
+    }
+
+    /// Mint this future's slot in §9.8's message-reader set.
+    fn message_reader_slot(&self) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().message_readers.key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().message_readers.unpark(key)
+        })
+    }
+
+    /// Mint this future's slot in §11's datagram-reader set.
+    fn datagram_reader_slot(&self) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().datagram_readers.key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().datagram_readers.unpark(key)
+        })
+    }
+
+    /// Mint this future's slot in §9.8's message-sender set.
+    fn message_sender_slot(&self) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().message_senders.key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().message_senders.unpark(key)
+        })
+    }
+
     /// Mint this future's slot in §16.8's opener map, released on drop.
     ///
     /// `open_*`/`accept_*` keep the per-future [`WakerSlot`] shape that
@@ -627,6 +950,18 @@ impl<S: Handshake> Connection<S> {
     #[cfg(test)]
     pub(crate) fn stream_waker_entries(&self) -> (usize, usize) {
         self.cell.borrow().stream_waker_entries()
+    }
+
+    /// How many futures are parked in slice 6's three sets, in
+    /// `(message readers, datagram readers, message senders)` order.
+    ///
+    /// [`stream_waker_entries`](Self::stream_waker_entries)' reason, for the
+    /// sets §9.8 and §11 add. It is **additive rather than an extension of
+    /// that accessor**, whose arity tests this slice does not own already
+    /// name.
+    #[cfg(test)]
+    pub(crate) fn sugar_waker_entries(&self) -> (usize, usize, usize) {
+        self.cell.borrow().sugar_waker_entries()
     }
 
     /// Whether a session is installed.

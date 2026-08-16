@@ -3973,3 +3973,79 @@ The `SentFrame`/DATAGRAM paragraph is `CONTRACT-5b.md` §2.7, not 5a's —
 Neither changes a decision, and both are the kind of thing an agent is
 right to correct rather than absorb. **Fifteen of sixteen agents that
 declined or corrected an instruction here have been right.**
+
+---
+
+## Round 27 — slice 6 mid-flight findings (2026/08/16)
+
+The blind datagram author returned four items before the other two agents
+finished. Ruled now, because two of them change what is being built.
+
+**Ruling 159 — the `0x30`-not-final check already exists, and slice 6 must
+not build a second one.** `CONTRACT-6.md` §2.2 says the check *"has nowhere
+to live today"*, that it *"belongs in `Frame::parse`'s loop"*, and that the
+analogous ¬LEN STREAM case is accepted **silently** at `frame.rs:298-306`.
+**All three claims are wrong**, and I checked rather than took them:
+`frame.rs:705` holds exactly that check, in exactly that loop, returning
+`Structural::TrailingFrame` — and its own comment explains that it is *"dead
+by construction and deliberately written"*, because an extends-to-end body
+consumes `cursor.rest()` and the loop condition is already false.
+
+So the DATAGRAM case is covered the moment `Frame::Datagram` answers
+`extends_to_end()` truthfully, which `CONTRACT-6.md` §2.2 already lists as
+one of its five dispatch points. **Implement that and add nothing else.** A
+second check inside `parse_body` would be unreachable at best and wrong at
+worst, and it is what a careful implementer builds when a binding contract
+tells it the guard is missing.
+
+Working rule 11 is usually aimed at *my* rationales; this is the same rule
+applied to a planner's survey. A claim that the code does not do something
+is exactly as checkable as a claim that it does, and rather less often
+checked.
+
+**Ruling 160 — `finished_senders` must not grow for handle-less message
+streams.** It is bounded today by the rule *"written only while
+`blocked_ackers` holds that stream's slot"*, and a §9.8 message stream has
+**no `SendStream` handle**, therefore no `blocked_ackers` entry and no
+`Drop` to remove one. Left alone, every message ever sent leaves a
+permanent entry — an unbounded map keyed by a value the *peer's* traffic
+rate controls. §17.5's ceiling table has no term for it. Slice 6 either
+excludes handle-less streams from the map or removes the entry when the
+message's send half retires; the implementer picks, and says which in its
+report.
+
+**Ruling 161 — the datagram packing decision never evicts; §11.3's queue
+pressure is the only eviction trigger.** The author found that a
+maximum-size (1169-byte) datagram at the head of the queue cannot fit a
+packet that already carries an ACK, since §8.5 packs the ACK first — so it
+waits. That much is correct and acceptable. What must **not** happen is
+that waiting causing a drop: eviction is `send_datagram`'s, on enqueue,
+under §11.3's drop-oldest, and a packing pass that cannot fit the head
+**leaves it queued**.
+
+The residual property is real and is to be documented rather than
+engineered away: **a maximum-size datagram is preferentially delayed** by
+any packet that carries control frames. It is bounded — §12.4 does not put
+an ACK on every packet — and the alternative, reordering the queue to fit
+a smaller datagram first, trades a bounded delay for a silent reordering
+that §11.1 permits but nobody has ruled on. Not this slice.
+
+**Ruling 162 — §11.5's trace obligation is pinned by nothing, and that is
+recorded rather than papered over.** The drop counters are `#[cfg(test)]`,
+§2.7 forbids a public accessor, and no planned test asserts a trace line —
+so **a build with both counters correct and no trace at all passes every
+test in this slice**, while §11.5 exists precisely because *"a silent drop
+is a known operability weakness"*. The same gap covers ruling 59's tracing
+MUST. `testutil` has no tracing capture and building one is not slice 6's
+job. **It becomes a named slice-9 obligation** — slice 9 owns the five
+documentation obligations and Appendix B's completion, and a tracing
+fixture belongs with them. Recorded here so it is inherited rather than
+rediscovered.
+
+**Also swept:** three stale ⚠ markers in `CONTRACT-6.md` and one in
+`PLAN-6.md` still described Q1/Q2/Q5 as open after Round 26 ruled them,
+including one asserting *"no ruling says so"* about a rule that now
+exists. Working rule 4 again, and the second time in two days that the
+sweep had to be done by hand after the ruling landed. The still-running
+message author was messaged directly, because a stale marker told it to
+ship a ratified obligation `#[ignore]`d.

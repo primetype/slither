@@ -137,6 +137,56 @@ impl RecvHalf {
         self.reset_observed || self.final_size == Some(self.read_offset)
     }
 
+    /// §9.8's message predicate: *"reassembly is complete (FIN and all
+    /// bytes)"*.
+    ///
+    /// A **reset** half is never complete, however its final size was
+    /// pinned. §9.6 pins one from a RESET_STREAM too, and the reassembly is
+    /// discarded with it — so without the first clause a reset stream would
+    /// surface as an empty message, inventing a delivery the peer withdrew.
+    ///
+    /// Zero bytes with the FIN at offset 0 **is** complete: an empty message
+    /// is a message, and answering "not yet" would park a message-mode
+    /// reader on a payload that has fully arrived.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.reset.is_none()
+            && self.final_size.is_some_and(|size| {
+                self.read_offset + self.reassembly.contiguous_at(self.read_offset) == size
+            })
+    }
+
+    /// §9.8's claim: take the whole message and leave the half drained.
+    ///
+    /// `None` unless [`is_complete`](Self::is_complete). The bytes are
+    /// counted exactly as [`read`](Self::read) counts them, so the
+    /// retirement true-up that follows finds `counted == final_size` and
+    /// adds nothing on top (§10.3's *"absolute, not additive"*).
+    ///
+    /// **[`take_grant`](Self::take_grant) is deliberately not called.**
+    /// §10.3: *"Sugar-consumed streams never earn stream-level credit
+    /// (§9.8); their reads still earn connection-level credit."* The
+    /// mechanism is this omission and **not** the `earns_stream_credit`
+    /// flag, which ruling 156c leaves `true` everywhere: a message stream is
+    /// never `read()`, so the flag has nothing to gate.
+    pub(crate) fn take_message(&mut self) -> Option<Vec<u8>> {
+        if !self.is_complete() {
+            return None;
+        }
+        let size = self.final_size?;
+        let remaining = usize::try_from(size - self.read_offset).ok()?;
+        let mut buf = vec![0u8; remaining];
+        let got = self.reassembly.read(self.read_offset, &mut buf);
+        debug_assert_eq!(
+            got, remaining,
+            "a complete half holds every byte to its final size"
+        );
+        buf.truncate(got);
+        self.read_offset += got as u64;
+        self.credit.consume(got as u64);
+        self.counted = self.counted.saturating_add(got as u64);
+        Some(buf)
+    }
+
     // ── §8.4/§9.5's semantic checks ─────────────────────────────────────
 
     /// Ruling 97's step 4 then step 5, for a STREAM frame — final size

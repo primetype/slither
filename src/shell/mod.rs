@@ -1260,4 +1260,208 @@ mod tests {
         drop(b);
         drop(pair);
     }
+
+    // ── slice 6's seam, from inside ─────────────────────────────────────
+    //
+    // S15, S16 and S30 are two independent authors' (working rule 6) and
+    // live in `tests/story_datagram.rs` and `tests/story_message.rs`. What
+    // is here is the *seam*: the three new waker sets, whose occupancy is
+    // the one thing `LocalSet::run_until` can hide — it re-polls its body
+    // on any local-task wake, so a build that never wired `MessageReadable`
+    // to `message_readers` can still pass an `.await`-based test, woken
+    // incidentally by the driver (`PLAN-6.md` §9).
+
+    /// A parked `recv_message()` and a parked `recv_datagram()` each hold
+    /// exactly one slot, and dropping the future gives it back.
+    ///
+    /// Asserted from **both** sides: nonzero while parked separates this
+    /// from a build that never parks at all, and zero after the drop
+    /// separates it from one that never releases (working rule 9).
+    #[tokio::test(start_paused = true)]
+    async fn the_claim_verbs_park_in_their_own_sets_and_release_on_drop() {
+        local(async {
+            let pair = Pair::seeded(0x6_0001);
+            let (_a, b) = pair.establish().await;
+
+            assert_eq!(b.sugar_waker_entries(), (0, 0, 0), "nothing parked yet");
+            {
+                let mut message = Box::pin(b.recv_message());
+                let mut datagram = Box::pin(b.recv_datagram());
+                assert!(futures_lite_poll_once(&mut message).is_none());
+                assert!(futures_lite_poll_once(&mut datagram).is_none());
+                assert_eq!(
+                    b.sugar_waker_entries(),
+                    (1, 1, 0),
+                    "each parked future holds exactly its own slot"
+                );
+            }
+            assert_eq!(
+                b.sugar_waker_entries(),
+                (0, 0, 0),
+                "a dropped future leaves the sets as it found them"
+            );
+        })
+        .await;
+    }
+
+    /// One datagram out, one datagram in, and the claim wakes a future that
+    /// parked before it arrived.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_crosses_and_wakes_a_parked_claim() {
+        local(async {
+            let pair = Pair::seeded(0x6_0002);
+            let (a, b) = pair.establish().await;
+
+            let mut waiting = Box::pin(b.recv_datagram());
+            assert!(futures_lite_poll_once(&mut waiting).is_none());
+
+            a.send_datagram(b"unreliable").expect("send_datagram");
+            settle().await;
+
+            assert_eq!(waiting.await.expect("the datagram arrived"), b"unreliable");
+        })
+        .await;
+    }
+
+    /// §11.4's bound is checked **at the handle, before any queue** — so an
+    /// oversize send is an error and the next claim still sees only the
+    /// datagram that was legal.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversize_datagram_is_rejected_and_queues_nothing() {
+        local(async {
+            let pair = Pair::seeded(0x6_0003);
+            let (a, b) = pair.establish().await;
+
+            a.send_datagram(b"first").expect("send_datagram");
+            let over = vec![0xAB; crate::constants::MAX_DATAGRAM_PAYLOAD + 1];
+            assert!(matches!(
+                a.send_datagram(&over),
+                Err(crate::error::DatagramError::TooLarge)
+            ));
+            settle().await;
+
+            assert_eq!(b.recv_datagram().await.expect("the legal one"), b"first");
+        })
+        .await;
+    }
+
+    /// §16.2's own idiom, end to end: `send_message`, `acked`, `close` —
+    /// and the receiver still drains the message **after** the latch
+    /// (ruling 152).
+    #[tokio::test(start_paused = true)]
+    async fn a_message_survives_the_senders_close() {
+        local(async {
+            let pair = Pair::seeded(0x6_0004);
+            let (a, b) = pair.establish().await;
+
+            a.send_message(b"one whole message").await.expect("send");
+            a.acked().await.expect("the peer acknowledged it");
+            a.close(0, b"").await;
+            settle().await;
+
+            assert_eq!(
+                b.recv_message().await.expect("drained after the latch"),
+                b"one whole message"
+            );
+            assert!(
+                b.recv_message().await.is_err(),
+                "with nothing left to claim the death is reported"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tmp_a_maximum_size_datagram_crosses() {
+        local(async {
+            let pair = Pair::seeded(0x6_9001);
+            let (a, b) = pair.establish().await;
+            let big = vec![0x5A; crate::constants::MAX_DATAGRAM_PAYLOAD];
+            a.send_datagram(&big).expect("send");
+            settle().await;
+            assert_eq!(b.recv_datagram().await.expect("arrived"), big);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tmp_overflow_resets_the_mixing_sender() {
+        local(async {
+            let pair = Pair::seeded(0x6_9002);
+            let (a, b) = pair.establish().await;
+            // b demonstrates message mode.
+            let mut claim = Box::pin(b.recv_message());
+            assert!(futures_lite_poll_once(&mut claim).is_none());
+            settle().await;
+
+            let mut send = a.open_uni().await.expect("open_uni");
+            let payload = vec![7u8; crate::constants::MESSAGE_RECV_MAX as usize];
+            let mut at = 0usize;
+            let mut err = None;
+            for _ in 0..4000 {
+                if at >= payload.len() {
+                    settle().await;
+                    match send.write(&payload[..1]).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                match send.write(&payload[at..]).await {
+                    Ok(n) => at += n,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            settle().await;
+            println!("TMP overflow err = {err:?} wrote={at}");
+            assert!(
+                matches!(err, Some(crate::error::WriteError::Reset(code)) if code == crate::constants::MESSAGE_OVERFLOW),
+                "expected MESSAGE_OVERFLOW, got {err:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tmp_a_maximum_size_message_is_not_falsely_reset() {
+        local(async {
+            let pair = Pair::seeded(0x6_9003);
+            let (a, b) = pair.establish().await;
+            let mut claim = Box::pin(b.recv_message());
+            assert!(futures_lite_poll_once(&mut claim).is_none());
+            settle().await;
+
+            let msg = vec![9u8; crate::constants::MESSAGE_RECV_MAX as usize];
+            a.send_message(&msg).await.expect("send_message");
+            for _ in 0..40 {
+                settle().await;
+            }
+            let got = claim.await.expect("the message arrived intact");
+            assert_eq!(got.len(), msg.len());
+            assert_eq!(got, msg);
+        })
+        .await;
+    }
+
+    /// A payload above `MESSAGE_RECV_MAX` never reaches the core.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversize_message_is_rejected_at_the_handle() {
+        local(async {
+            let pair = Pair::seeded(0x6_0005);
+            let (a, _b) = pair.establish().await;
+
+            let over = vec![0u8; crate::constants::MESSAGE_RECV_MAX as usize + 1];
+            assert!(matches!(
+                a.send_message(&over).await,
+                Err(crate::error::MessageError::TooLarge)
+            ));
+        })
+        .await;
+    }
 }

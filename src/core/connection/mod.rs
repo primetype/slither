@@ -37,6 +37,7 @@
 pub(crate) mod ack;
 pub(crate) mod close;
 pub(crate) mod congestion;
+pub(crate) mod datagram;
 pub(crate) mod flow;
 pub(crate) mod frame;
 pub(crate) mod recovery;
@@ -73,17 +74,33 @@ mod tests_ack;
 #[cfg(test)]
 mod tests_recovery;
 
+// ── slice 6's core tests, at integration ─────────────────────────────────
+//
+// Written from `SPEC.md` §9.8/§11 and `CONTRACT-6.md` by two authors who
+// never saw this file, split by **behaviour** rather than by layer (ruling
+// 157). Declared here so neither author ever names a path the other could
+// reach, and left **commented out** because the files land with them and a
+// `mod` for a missing file reds every gate at once — the same reason ruling
+// 126 leaves `Cargo.toml`'s two `[[test]]` stanzas commented. The
+// integrator uncomments both lines.
+//
+// #[cfg(test)]
+// mod tests_datagram;
+// #[cfg(test)]
+// mod tests_message;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::constants;
-use crate::error::{ConnectionLost, ReadError, WriteError};
+use crate::error::{ConnectionLost, DatagramError, MessageError, ReadError, WriteError};
 use crate::packet::{Handshake, Inbound, classify};
 
 use self::ack::{AckAction, AckState};
 use self::close::{Closing, Lifecycle};
 use self::congestion::{Controller, NewReno};
+use self::datagram::Datagrams;
 use self::flow::Flow;
 use self::frame::{Close, Frame, Packing, Structural};
 use self::recovery::{AckOutcome, Recovery, SentFrame, SentPacket};
@@ -118,6 +135,9 @@ pub(crate) struct Connection<C: Handshake> {
     role: Option<Role>,
     /// §9's four ID spaces and both halves of every open stream.
     streams: Streams,
+    /// §11.3's two bounded queues and §11.5's counters. **Core state**, not
+    /// shell state — §11.3 says so in terms.
+    datagrams: Datagrams,
     /// §10's two credit ledgers and the cumulative stream limits.
     flow: Flow,
     /// Events generated while a packet is being applied, drained into
@@ -161,6 +181,7 @@ impl<C: Handshake> Connection<C> {
             scratch: Vec::new(),
             role: None,
             streams: Streams::new(),
+            datagrams: Datagrams::default(),
             flow: Flow::new(),
             events: Vec::new(),
             lost: None,
@@ -393,6 +414,15 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
+        // §11: a queued datagram is **discarded**, never flushed into the
+        // CLOSE packet. §15.2 lets `close()` drop state immediately and
+        // §11.1 promises nothing about delivery, so there is nothing owed —
+        // and flushing is the thing a reader of §8.5 alone might try, since
+        // the datagram fill sits in the same stage as the STREAM fill that
+        // §15.2 *does* keep for the linger. Stated as code so it is not
+        // rediscovered as a question (`PLAN-6.md` §6 U-9).
+        self.datagrams.discard_send();
+
         if self.session.is_none() {
             // §16.9 makes pre-establishment work ordinary, and there is no
             // seal capability yet: no CLOSE can be emitted and there is
@@ -580,6 +610,193 @@ impl<C: Handshake> Connection<C> {
     /// allocated across every receive half.
     pub(crate) fn reassembly_capacity(&self) -> u64 {
         self.streams.reassembly_capacity()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §9.8's messages and §11's datagrams — §16.4's four sugar verbs
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §16.4's `send_message`: allocate the next outbound uni stream, write
+    /// the whole payload, set FIN (§9.8).
+    ///
+    /// # Whole payload or nothing — **ruling 150**
+    ///
+    /// [`SendMessage::Blocked`] means **nothing happened**: no stream was
+    /// opened, no byte was buffered, no index was spent. §10.6 makes credit
+    /// the buffer commitment, so admitting a payload the peer has not
+    /// credited would make sender-side buffering `(uncredited message
+    /// streams) × MESSAGE_RECV_MAX` — at `INITIAL_MAX_STREAMS_UNI` = 128,
+    /// **32 MiB, a term §17.5's ceiling table does not contain**. That is a
+    /// memory-bound change requiring its own ratification, not an
+    /// implementation choice.
+    ///
+    /// Not in tension with ruling 134: 134 lets [`write`](Self::write)
+    /// outrun the **congestion** window, which is not a buffer bound. Flow
+    /// control is, and it still gates admission.
+    ///
+    /// # The FIN rides the last data frame, and that is normative
+    ///
+    /// **[ruling 153]** §9.8's overflow predicate is the highest *received*
+    /// offset, so a conforming `MESSAGE_RECV_MAX`-sized message whose FIN
+    /// travelled in a **separate** empty frame would satisfy that predicate
+    /// for one RTT and be reset with `MESSAGE_OVERFLOW` — the *"transfers
+    /// die at exactly 256 KiB"* post-mortem ruling 59 describes, pointing at
+    /// the wrong cause.
+    ///
+    /// The requirement is met by ordering, not by a flag:
+    /// [`SendHalf::next_chunk`](send::SendHalf::next_chunk) attaches the FIN
+    /// to the chunk that ends at the final size, so `finish` must be applied
+    /// **before** anything is packed. That is why this calls
+    /// `streams.write`/`streams.finish` directly rather than
+    /// [`write`](Self::write) and [`finish`](Self::finish), each of which
+    /// pumps: an intervening pump would put the last data frame on the wire
+    /// with no FIN on it and manufacture exactly the race above.
+    pub(crate) fn send_message(
+        &mut self,
+        now: Instant,
+        msg: &[u8],
+    ) -> Result<SendMessage, MessageError> {
+        // Widening, never narrowing: `MESSAGE_RECV_MAX` is a `u64` and
+        // `msg.len()` a `usize`, and a cast the other way is a silent bound
+        // change on a 32-bit target (`PLAN-6.md` §9 R7).
+        if msg.len() as u64 > constants::MESSAGE_RECV_MAX {
+            return Err(MessageError::TooLarge);
+        }
+        if let Some(lost) = self.lost.clone() {
+            return Err(MessageError::ConnectionLost(lost));
+        }
+
+        // Connection credit **before** the open. `Streams::open` spends an
+        // index against §10.4's cumulative limit and there is no un-open, so
+        // checking after it would leave a spent index and a live send half
+        // behind on the refusal path — which is precisely the "nothing
+        // happened" ruling 150 requires.
+        //
+        // The stream-level window needs no check of its own: a fresh uni
+        // half advertises `INITIAL_MAX_STREAM_DATA`, and
+        // `constants.rs`'s `MESSAGE_RECV_MAX == INITIAL_MAX_STREAM_DATA`
+        // const-assert makes the payload fit it by construction.
+        if msg.len() as u64 > self.flow.send_room() {
+            return Ok(SendMessage::Blocked);
+        }
+        let Ok(r) = self.streams.open(Dir::Uni, &self.flow) else {
+            return Ok(SendMessage::Blocked);
+        };
+
+        let written = self
+            .streams
+            .write(r, msg, &mut self.flow)
+            .expect("a freshly opened send half is neither finished nor reset");
+        debug_assert_eq!(
+            written,
+            msg.len(),
+            "ruling 150: the credit check above admits the whole payload"
+        );
+        self.streams
+            .finish(r)
+            .expect("a freshly opened send half is neither finished nor reset");
+        self.pump(now);
+        Ok(SendMessage::Sent)
+    }
+
+    /// §16.4's `recv_message`: claim the oldest **complete unclaimed** uni
+    /// stream as one payload, then free the stream (§9.8).
+    ///
+    /// # It takes `now`, and that is **not** symmetric with `recv_datagram`
+    ///
+    /// **[ruling 151]** §16.4's own signature omits the instant, and the
+    /// omission is ruling 71's shape. This verb **retires a receive half**
+    /// — owing MAX_DATA under §10.3 and, through full closure, MAX_STREAMS
+    /// under §10.4 — and it can **emit RESET_STREAM**, because §9.8's
+    /// overflow check runs *"at the instant such a claim is made"*. §16.7
+    /// puts sealing inside the mutating call, and this core has no `Instant`
+    /// field to fall back on. Without `now`, S30's reset would wait for the
+    /// next `now`-bearing call — on an idle connection, a timer — delaying
+    /// by **seconds** the one path whose whole purpose is to fail promptly
+    /// instead of stalling. [`abandon_recv`](Self::abandon_recv) already
+    /// takes `now` for the weaker of those two reasons.
+    ///
+    /// Contrast [`recv_datagram`](Self::recv_datagram), which takes none.
+    ///
+    /// # It keeps serving after the connection has died — **ruling 152**
+    ///
+    /// Ruling 128's enumeration names `read` and `accept_*` and was written
+    /// before this verb existed. Appendix B ratifies an obligation the short
+    /// list cannot satisfy — *"`send_message(m)`, then `acked()`, then
+    /// `close()`, then drop every handle. Assert endpoint B receives `m` in
+    /// full from `recv_message()`"* — and B's driver processes the data and
+    /// the CLOSE in one pass, so the claim runs after the latch. The core
+    /// therefore does not consult `self.lost`; the death check is the
+    /// shell's, and only once this has returned `None`.
+    ///
+    /// `Some(Vec::new())` is a **delivered empty message**, never "nothing
+    /// to claim": a shell that conflated them would park for ever on a
+    /// message that had arrived.
+    pub(crate) fn recv_message(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let claimed = self.streams.recv_message(&mut self.flow);
+        // §9.8's scan can have emitted a RESET_STREAM whether or not
+        // anything was claimed, and the retirement owes credit either way —
+        // so the pump is not conditional on the claim. It is skipped only
+        // for a dead connection, on `read`'s reasoning: nothing can be
+        // emitted, and re-deriving §13's deadlines there announces a
+        // deadline the core will then decline to act on (ruling 141's spin).
+        if self.lost.is_none() {
+            self.pump(now);
+        }
+        claimed
+    }
+
+    /// §16.4's `send_datagram` (§11). **Never blocks** — §11.3's drop-oldest
+    /// discipline absorbs pressure, and §11.1 promises nothing about
+    /// delivery, so a full queue is still `Ok(())`.
+    ///
+    /// The size check is §11.4's *"at the handle, **before any queue**"*: an
+    /// oversize payload queues nothing and evicts nothing.
+    ///
+    /// A **zero-length** datagram is queued and sent. §8.4 admits `0x31`
+    /// with `length = 0` and §11 states no minimum; stated here so that no
+    /// one invents one.
+    pub(crate) fn send_datagram(&mut self, now: Instant, data: &[u8]) -> Result<(), DatagramError> {
+        if let Some(lost) = self.lost.clone() {
+            return Err(DatagramError::ConnectionLost(lost));
+        }
+        if data.len() > constants::MAX_DATAGRAM_PAYLOAD {
+            return Err(DatagramError::TooLarge);
+        }
+        self.datagrams.push_send(data.to_vec());
+        // §16.7: sealing happens **inside the mutating call that triggers
+        // it**, and this call can put a frame on the wire.
+        self.pump(now);
+        Ok(())
+    }
+
+    /// §16.4's `recv_datagram`: claim the oldest queued datagram (FIFO).
+    ///
+    /// # It takes no `now`, and that is not an oversight
+    ///
+    /// **[ruling 151]** Claiming a datagram emits nothing. Datagrams are
+    /// flow-control **exempt** (§10.7), so there is no credit true-up, no
+    /// retirement and nothing to seal — the asymmetry with
+    /// [`recv_message`](Self::recv_message) is the difference between the
+    /// two ledgers, and adding an unused `now` here to make the pair look
+    /// alike would be an invented emission point.
+    ///
+    /// Like `recv_message`, it **drains after the connection's death**
+    /// (ruling 152): the core does not consult `self.lost`, and the shell
+    /// reports the death only once this has returned `None`.
+    pub(crate) fn recv_datagram(&mut self) -> Option<Vec<u8>> {
+        self.datagrams.pop_recv()
+    }
+
+    /// §11.5's two counters.
+    ///
+    /// `#[cfg(test)]`: §16.2's accessor list is exhaustive (working rule 8)
+    /// and does not contain this, and §11.5 asks only for the **trace**. It
+    /// is here so a core test can pin the eviction discipline, which the
+    /// trace cannot be asserted on with today's fixtures.
+    #[cfg(test)]
+    pub(crate) fn datagram_drops(&self) -> datagram::DatagramDrops {
+        self.datagrams.drops()
     }
 
     /// Emit anything owed on the wire.
@@ -904,6 +1121,13 @@ impl<C: Handshake> Connection<C> {
                 Frame::MaxData(max) => {
                     let raised = self.flow.on_max_data(max);
                     self.streams.on_max_data(raised, &mut self.events);
+                    // **[ruling 150]** The connection-level companion to the
+                    // per-half `StreamWritable`s above: a `send_message`
+                    // refused for connection credit holds no stream, so
+                    // none of them names it.
+                    if raised {
+                        self.events.push(ConnEvent::SendCreditAvailable);
+                    }
                 }
                 Frame::MaxStreamData(grant) => {
                     if let Err(violation) =
@@ -916,6 +1140,18 @@ impl<C: Handshake> Connection<C> {
                 }
                 Frame::MaxStreamsBidi(max) => self.on_max_streams(Dir::Bi, max),
                 Frame::MaxStreamsUni(max) => self.on_max_streams(Dir::Uni, max),
+                // §11: the unreliable path. Flow-control exempt (§10.7), so
+                // nothing is charged and nothing is checked — §11.4's
+                // receiver oversize rule is unrepresentable, the frame's
+                // data lying inside one plaintext by construction.
+                //
+                // The event fires for the **admitted** datagram even when
+                // the queue was full, because a new item is claimable; the
+                // evicted one gets no event and no second wake.
+                Frame::Datagram(datagram) => {
+                    self.datagrams.push_recv(datagram.data);
+                    self.events.push(ConnEvent::DatagramReadable);
+                }
                 Frame::Close(close) => {
                     // §15.2: surface `PeerClosed`, emit **nothing**, hold a
                     // drain for `CLOSE_LINGER`, then drop all state.
@@ -1164,6 +1400,19 @@ impl<C: Handshake> Connection<C> {
         self.pump_inner(now, false);
     }
 
+    /// Whether anything is owed on the wire, over **both** stage-3
+    /// contributors.
+    ///
+    /// Written once and used twice, because the two call sites disagree in
+    /// opposite directions if they drift: the loop's exit condition would
+    /// stop building packets with datagrams still queued, and §14.5's
+    /// `app_limited` would stamp *"we stopped because there was nothing more
+    /// to send"* on a packet sent while the send queue was full — growing
+    /// the congestion window off a sender that is not actually idle.
+    fn owes_output(&self) -> bool {
+        self.streams.has_output() || self.datagrams.has_send()
+    }
+
     /// [`pump`](Self::pump), optionally owing §13.4's probe.
     ///
     /// The two deadlines §13 owns are re-derived at the end, from the map
@@ -1193,10 +1442,35 @@ impl<C: Handshake> Connection<C> {
             // (packing order §8.5)"*.
             let ack_packed = self.pack_ack(now, &mut packing);
             // Stages 2 and 3 — credit grants and RESET_STREAM, then the
-            // STREAM fill.
+            // STREAM and DATAGRAM fill.
             self.streams
                 .pack_control(&mut self.flow, &mut packing, &mut packed);
-            let marking = self.streams.fill(&mut packing, &mut packed);
+            // **[ruling 155]** One datagram per packet, packed **before**
+            // the stream fill. §8.5 names the two contributors and orders
+            // neither, and the three readings differ by which side starves.
+            // Appending after `streams.fill(...)` is the smallest diff and
+            // the worst outcome: a saturated stream fills all 1170 bytes of
+            // every packet, datagrams never go out, and §11.3's bounded
+            // queue evicts continuously — **silent data loss, with no
+            // counter that distinguishes it from ordinary pressure**.
+            // Draining the whole queue instead starves a bulk stream for up
+            // to 64 packets. One-per-packet-first is the only order whose
+            // starvation is bounded in both directions and statable: a
+            // stream waits at most one packet per queued datagram, a
+            // datagram at most one packet per predecessor.
+            let mut sent_datagram = None;
+            if let Some(data) = self.datagrams.peek_send()
+                && packing.datagram(data)
+            {
+                sent_datagram = self.datagrams.pop_send();
+            }
+            // §7.4:1953-1954 — `seal` marks `last_send` for a packet
+            // carrying a first-transmission STREAM frame **or DATAGRAM
+            // frame**. Every datagram is a first transmission (§8.7's
+            // `never` class), so there is no retransmission case to exclude;
+            // a build that sealed these quiet would send keepalives it does
+            // not owe.
+            let marking = self.streams.fill(&mut packing, &mut packed) | sent_datagram.is_some();
             // Stage 4 — §13.4: *"A firing PTO sends one ack-eliciting
             // packet: pending retransmittable frames oldest-first if any
             // exist, else a bare PING."* The PING is owed only when the
@@ -1235,6 +1509,13 @@ impl<C: Handshake> Connection<C> {
                 // re-planned when the window opens. Nothing was sealed, so
                 // §16.7's "on seal failure nothing moved" holds here too.
                 self.streams.restore(&mut packed);
+                // The datagram goes back to the **front**: §11.3's eviction
+                // is drop-oldest, so returning it to the back would let a
+                // repeatedly-refused datagram age to the head of the
+                // eviction order and be dropped ahead of newer ones.
+                if let Some(data) = sent_datagram.take() {
+                    self.datagrams.unpop_send(data);
+                }
                 // A pure ACK is not gated. If one was owed it still goes
                 // out, alone, rather than waiting on a window it does not
                 // consume.
@@ -1254,10 +1535,13 @@ impl<C: Handshake> Connection<C> {
             // has already gone idle) lets a bulk sender holding the queue
             // one packet ahead grow the window while effectively idle,
             // which is the case §14.5 reasons about.
-            let app_limited = !self.streams.has_output()
+            let app_limited = !self.owes_output()
                 && self.recovery.bytes_in_flight().saturating_add(size) < self.congestion.window();
 
             let Some(session) = self.session.as_mut() else {
+                if let Some(data) = sent_datagram.take() {
+                    self.datagrams.unpop_send(data);
+                }
                 break;
             };
             // §7.4's quiet set: retransmissions, credit frames,
@@ -1273,7 +1557,12 @@ impl<C: Handshake> Connection<C> {
                 Ok(sealed) => sealed,
                 Err(_) => {
                     // §7.9: the only reachable seal failure is nonce
-                    // exhaustion, and it is terminal.
+                    // exhaustion, and it is terminal. §16.7's *"on seal
+                    // failure nothing moved"* still holds for the queue,
+                    // even though a dead connection will never drain it.
+                    if let Some(data) = sent_datagram.take() {
+                        self.datagrams.unpop_send(data);
+                    }
                     self.die(ConnectionLost::NonceExhausted);
                     return;
                 }
@@ -1312,7 +1601,7 @@ impl<C: Handshake> Connection<C> {
             // §13.4: **one** ack-eliciting packet per firing.
             probe = false;
 
-            if !self.streams.has_output() && !self.ack.is_owed() {
+            if !self.owes_output() && !self.ack.is_owed() {
                 break;
             }
         }
@@ -1504,12 +1793,66 @@ pub(crate) enum ConnEvent {
         /// The peer's application code.
         error_code: u64,
     },
+    /// Connection-level send credit arrived and actually raised the limit
+    /// (§10.3).
+    ///
+    /// **[ruling 150]** Minted for `send_message`, which is the one verb
+    /// that can be refused for connection credit while holding **no
+    /// stream**: `StreamWritable { r }` fires only for a half with a blocked
+    /// writer, and a message refused before its `open` has no half to name.
+    /// Without this event a blocked `send_message` is woken by nothing.
+    ///
+    /// A companion to `StreamWritable`, not a replacement: MAX_DATA emits
+    /// both, one per blocked half and one for the connection.
+    SendCreditAvailable,
+    /// A complete message is claimable through `recv_message()`. §16.4.
+    ///
+    /// **One per uni stream that becomes complete while unclaimed** — the
+    /// one-per-item discipline ruling 99 fixed for `StreamOpened`. Not one
+    /// per STREAM frame, not one for a stream `accept_uni()` has already
+    /// claimed, and never one for a locally-*sent* message.
+    MessageReadable,
+    /// A datagram is claimable through `recv_datagram()`. §16.4.
+    ///
+    /// **One per DATAGRAM frame admitted to the receive queue**, including
+    /// one that evicted an older datagram: the queue went full → full, but a
+    /// **new** item is claimable. Never one for the evicted datagram, and
+    /// never one for a locally-*sent* datagram.
+    DatagramReadable,
     /// The connection ended, with §18.1's cause. Emitted **once**.
     ///
     /// Not `Copy`, and neither is [`ConnOutput`] any more:
     /// `ConnectionLost::PeerClosed` carries the peer's reason phrase, which
     /// is `Vec<u8>` because §8.4 carries it as bytes.
     Closed(ConnectionLost),
+}
+
+/// What [`Connection::send_message`] did with the payload. §9.8.
+///
+/// **[ruling 150]** §16.4 types the core verb `Result<(), MessageError>`,
+/// and `MessageError` is exhaustive, already shipped and pinned by
+/// `tests/spec_errors.rs` — `TooLarge` and `ConnectionLost`, nothing else.
+/// So *"not now"* cannot be a `MessageError`, and it is not an error in any
+/// case: it is a **park**, on the shell's side of the seam. This enum is
+/// the third answer the ruling requires and the return type reports it, in
+/// exactly the shape [`StreamsExhausted`] takes for `open` — a `pub(crate)`
+/// condition the shell converts into a wait and no application ever sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendMessage {
+    /// The whole payload was admitted: a uni stream was opened, every byte
+    /// buffered and the FIN pinned.
+    Sent,
+    /// **Nothing happened.** No index was spent, no half exists, no byte was
+    /// buffered — so a shell future dropped on this answer has sent nothing
+    /// and the verb is trivially cancel-safe.
+    ///
+    /// The wake comes from `ConnEvent::StreamsAvailable { dir: Dir::Uni }`
+    /// (refused for §10.4's stream allowance) or
+    /// `ConnEvent::SendCreditAvailable` (refused for §10.3's connection
+    /// credit). Which of the two refused is deliberately **not** reported:
+    /// the shell parks both on one waker set, and a distinction no consumer
+    /// acts on is a second thing to keep in step.
+    Blocked,
 }
 
 /// A two-core smoke check for the §9/§10 machinery.

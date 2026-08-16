@@ -37,6 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::constants;
 use crate::error::{ReadError, WriteError};
 
 use super::ConnEvent;
@@ -105,6 +106,16 @@ struct Stream {
     /// Ruling 93's second tombstone, left when a receive half is freed on a
     /// stream that is **not** fully closed.
     recv_tomb: Option<RecvTombstone>,
+    /// Whether this stream is still in [`Streams::unclaimed`].
+    ///
+    /// A **mirror of the deque's membership**, kept because §9.8 asks the
+    /// question once per inbound STREAM frame and the deque is bounded by
+    /// §10.4's *cumulative* limit, not a concurrent count — so a linear
+    /// membership test is a peer-controlled cost per frame (`PLAN-6.md` §9
+    /// R3). Written in exactly the three places the deque is: the implicit
+    /// open that pushes it, [`Streams::accept`], and §9.8's claim. Full
+    /// closure removes the entry, so there is no fourth.
+    unclaimed: bool,
 }
 
 impl Stream {
@@ -122,6 +133,7 @@ impl Stream {
             send,
             recv,
             recv_tomb: None,
+            unclaimed: false,
         }
     }
 
@@ -263,6 +275,69 @@ pub(crate) struct Streams {
     /// §8.5's round-robin rotation over streams with pending data.
     rotation: VecDeque<StreamRef>,
     owed: Regenerate,
+    /// §9.8's *"while a `recv_message()` claim is pending"*.
+    ///
+    /// **[ruling 156a]** Set by a `recv_message()` — the claim is being made
+    /// at that instant, which is the second half of §9.8's own trigger — and
+    /// cleared by one that returns `Some`. Never cleared by a dropped
+    /// future: the core cannot observe that, and once an application has
+    /// demonstrated message mode a concurrent `accept_uni()` user is
+    /// committing ruling 51's programming error anyway.
+    message_claim_pending: bool,
+    /// §9.8's window-full unclaimed uni streams, **maintained incrementally
+    /// rather than scanned**.
+    ///
+    /// §9.8 applies the overflow check to *"every unclaimed window-full
+    /// stream"*, and the obvious implementation walks [`unclaimed`] on every
+    /// `recv_message()` **and on every inbound STREAM frame while a claim is
+    /// pending**. That deque is bounded by the *cumulative* MAX_STREAMS_UNI
+    /// (§10.4), not by a concurrent count, so a peer flooding one-byte
+    /// streams inside the connection window makes it very long and the walk
+    /// quadratic in peer-controlled work — the amplification §10.6 and
+    /// §11.3 both already refuse elsewhere (`PLAN-6.md` §9 R3).
+    ///
+    /// A stream **enters** when its high-water crosses `MESSAGE_RECV_MAX`
+    /// with no final size pinned, and **leaves** when a final size is
+    /// pinned (ruling 153's in-flight-FIN case), when `accept_uni()` claims
+    /// it, when §9.8's claim takes it, or when the reset frees it. Every
+    /// transition is O(log n) and none of them is per-frame work on a
+    /// stream that is not itself at the bound.
+    ///
+    /// [`unclaimed`]: Self::unclaimed
+    overflow_candidates: BTreeSet<StreamRef>,
+    /// §9.8's receiver-emitted resets, **retained past the half they name**.
+    ///
+    /// *"retained and regenerated until acknowledged despite the retired
+    /// half"* — and the half is retired at once, taking its whole entry with
+    /// it, because a peer-opened uni stream has only that one half and
+    /// freeing it fully closes the stream. So this cannot live in
+    /// [`SendHalf`]'s `ResetState`: there is no send half to put it in, and
+    /// `ResetState` is terminated by the half being freed, which is exactly
+    /// what has already happened here.
+    retained_resets: BTreeMap<StreamRef, RetainedReset>,
+}
+
+/// One §9.8 overflow reset, outliving the stream it names.
+///
+/// §8.7 puts RESET_STREAM in the `regenerate` class and §8.7's *"the
+/// discard termination never applies to it"* is why `acked` is the only
+/// terminal: a lost one re-owes itself, and nothing but an acknowledgement
+/// removes it.
+#[derive(Debug, Clone, Copy)]
+struct RetainedReset {
+    /// The wire id, captured **before** the entry was freed —
+    /// [`Streams::stream_id`] reads `entries`, and the entry is about to go.
+    id: StreamId,
+    /// `MESSAGE_OVERFLOW` (§15.3, ruling 52). Held rather than assumed so
+    /// the frame is built from recorded state and not from a constant at
+    /// the pack site.
+    error_code: u64,
+    /// §9.6's field: the highest received offset. Informational — the
+    /// sender already knows what it sent.
+    final_size: u64,
+    /// Whether a transmission is owed. A packet too full to carry it defers
+    /// rather than drops it.
+    pending: bool,
 }
 
 impl Streams {
@@ -276,6 +351,9 @@ impl Streams {
             unclaimed: Default::default(),
             rotation: VecDeque::new(),
             owed: Regenerate::default(),
+            message_claim_pending: false,
+            overflow_candidates: BTreeSet::new(),
+            retained_resets: BTreeMap::new(),
         }
     }
 
@@ -331,7 +409,84 @@ impl Streams {
     /// second claim verb, which draws from this same supply, in a defined
     /// order.
     pub(crate) fn accept(&mut self, dir: Dir) -> Option<StreamRef> {
-        self.unclaimed[dir.slot()].pop_front()
+        let r = self.unclaimed[dir.slot()].pop_front()?;
+        // §9.8: *"Streams claimed by `accept_uni()` are untouched: real
+        // streams extend credit normally."* Leaving it a candidate would
+        // let a later `recv_message()` reset a stream the application is
+        // already reading.
+        self.overflow_candidates.remove(&r);
+        if let Some(stream) = self.entries.get_mut(&r) {
+            stream.unclaimed = false;
+        }
+        Some(r)
+    }
+
+    /// §16.4's `recv_message`: claim the oldest **complete unclaimed** uni
+    /// stream as one payload, then free the stream (§9.8).
+    ///
+    /// *"Oldest"* is **open order**, not completion order (ruling 112): the
+    /// walk is over [`unclaimed`](Self::unclaimed) in queue order and takes
+    /// the first *complete* entry, so a complete stream sitting behind an
+    /// incomplete one **is** surfaced. Messages are reliable-**unordered**
+    /// and that is what the word means.
+    ///
+    /// §9.8's overflow scan runs on **every** call, including one that
+    /// returns `Some` — *"while a claim is pending, **and at the instant
+    /// such a claim is made**"*.
+    ///
+    /// Draws from `unclaimed[Uni]` **only**. §9.8 is uni sugar, and
+    /// §9.8's own advice makes bidi the safe alternative precisely because
+    /// it never collides with the message supply.
+    pub(crate) fn recv_message(&mut self, flow: &mut Flow) -> Option<Vec<u8>> {
+        // Set **before** the scan: this call is the *"instant such a claim
+        // is made"*, so the check runs on it whatever the answer turns out
+        // to be.
+        self.message_claim_pending = true;
+        self.scan_overflow(flow);
+
+        let r = *self.unclaimed[Dir::Uni.slot()].iter().find(|r| {
+            self.entries
+                .get(r)
+                .and_then(|s| s.recv.as_ref())
+                .is_some_and(RecvHalf::is_complete)
+        })?;
+
+        let payload = self
+            .entries
+            .get_mut(&r)
+            .and_then(|s| s.recv.as_mut())
+            .and_then(RecvHalf::take_message)
+            .expect("the walk selected a complete half");
+
+        // §10.6: consumption is the application taking bytes **out of the
+        // connection core**, and this is that moment for a message.
+        // Stream-level credit is deliberately not re-granted — see
+        // [`RecvHalf::take_message`].
+        let consumed = payload.len() as u64;
+        if consumed > 0 {
+            flow.recv_window().consume(consumed);
+            if flow.recv_window().take_grant().is_some() {
+                self.owed.max_data = true;
+            }
+        }
+
+        self.unclaimed[Dir::Uni.slot()].retain(|&q| q != r);
+        self.overflow_candidates.remove(&r);
+        if let Some(stream) = self.entries.get_mut(&r) {
+            stream.unclaimed = false;
+        }
+        // §10.3's *"surfaced as a message (§9.8)"* retirement. The half is
+        // already drained, so the true-up finds `counted == final_size` and
+        // adds nothing; what it does do is free the half, which fully
+        // closes a peer-opened uni stream and owes the peer +1
+        // MAX_STREAMS_UNI (§10.4).
+        self.retire_recv(r, flow);
+
+        // **[ruling 156a]** A successful claim clears the flag. The failure
+        // mode of this choice is a bounded delay before the next check, not
+        // a reset the application did not earn.
+        self.message_claim_pending = false;
+        Some(payload)
     }
 
     /// The final size a send half has pinned, if any — read by the ACK
@@ -501,6 +656,14 @@ impl Streams {
     /// §9.6's RESET_STREAM acknowledged — `ResetRecvd`, and the send half is
     /// freed.
     pub(crate) fn on_reset_acked(&mut self, r: StreamRef, flow: &mut Flow) {
+        // §9.8's retained reset: **acknowledgement is its only terminal**.
+        // §8.7 — *"the discard termination never applies to it"* — so
+        // nothing else, and certainly not the freeing of the half it names,
+        // may remove it. The `StreamRef` stays a valid key here after
+        // `entries` has stopped holding one.
+        if self.retained_resets.remove(&r).is_some() {
+            return;
+        }
         let Some(stream) = self.entries.get_mut(&r) else {
             return;
         };
@@ -580,12 +743,27 @@ impl Streams {
         let delta = new_high.saturating_sub(recv.high_water());
         flow.check_recv_charge(delta)?;
 
+        let was_complete = recv.is_complete();
         let charged = recv.apply_stream(f.offset, &f.data, f.fin)?;
         flow.charge_recv(charged);
 
         if recv.is_readable() {
             events.push(ConnEvent::StreamReadable { r });
         }
+
+        // §9.8's seam. `MessageReadable` and `StreamReadable` are **both**
+        // emitted for a completing message stream, and that is not a
+        // duplicate signal: the wire carries no discriminator between the
+        // two receive modes (ruling 51), so the core cannot know which verb
+        // the application will use and owes a wake to whichever is parked.
+        if self.note_message_progress(r, was_complete) {
+            events.push(ConnEvent::MessageReadable);
+        }
+        // §9.8's second trigger point: *"while a `recv_message()` claim is
+        // pending"*. Guarded twice over — `scan_overflow` returns at once
+        // unless a claim is pending, and the candidate set is empty unless
+        // some stream is actually at the bound.
+        self.scan_overflow(flow);
         Ok(())
     }
 
@@ -624,6 +802,11 @@ impl Streams {
 
         let (charged, newly) = recv.apply_reset(f.final_size, f.error_code);
         flow.charge_recv(charged);
+        // §9.6 pins a final size too, and a reset half can never complete as
+        // a message — either way it is no longer §9.8's window-full
+        // candidate, and resetting a stream the peer has already reset would
+        // be a frame owed to nobody.
+        self.overflow_candidates.remove(&r);
         if newly {
             events.push(ConnEvent::StreamReset {
                 r,
@@ -794,6 +977,33 @@ impl Streams {
                 }
             }
         }
+
+        // §9.8's receiver-emitted resets, whose halves are already gone.
+        // Same stage and same discipline as the loop above: the identity is
+        // cleared only once its frame is accepted, so a full packet defers
+        // rather than drops it.
+        let retained: Vec<StreamRef> = self
+            .retained_resets
+            .iter()
+            .filter(|(_, state)| state.pending)
+            .map(|(r, _)| *r)
+            .collect();
+        for r in retained {
+            let Some(state) = self.retained_resets.get(&r).copied() else {
+                continue;
+            };
+            let frame = Frame::ResetStream(frame::ResetStream {
+                id: state.id,
+                error_code: state.error_code,
+                final_size: state.final_size,
+            });
+            if packing.control(frame) {
+                if let Some(state) = self.retained_resets.get_mut(&r) {
+                    state.pending = false;
+                }
+                packed.resets.push(r);
+            }
+        }
     }
 
     /// Stage 3 — §8.5's STREAM fill, round-robin, one quantum per stream per
@@ -889,6 +1099,7 @@ impl Streams {
                 .entries
                 .values()
                 .any(|s| s.send.as_ref().is_some_and(SendHalf::reset_pending))
+            || self.retained_resets.values().any(|state| state.pending)
     }
 
     /// Put back everything one packing pass took — §14.5's refused packet.
@@ -916,11 +1127,11 @@ impl Streams {
         for r in packed.max_stream_data.drain(..) {
             self.owed.max_stream_data.insert(r);
         }
-        for r in packed.resets.drain(..) {
-            if let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) {
-                send.on_reset_lost();
-            }
-            self.requeue(r);
+        for r in std::mem::take(&mut packed.resets) {
+            // §9.8's retained resets go back through the same door: the
+            // identity was cleared when it was packed, and a refused packet
+            // is not an acknowledgement.
+            self.on_reset_lost(r);
         }
         // Reverse order so a half's own chunks unwind exactly as they were
         // taken. `RangeSet` coalesces, so the result is order-independent —
@@ -937,6 +1148,15 @@ impl Streams {
     /// §8.7 `regenerate`: a lost RESET_STREAM re-queues its identity, and
     /// the retransmission re-reads the **current** value.
     pub(crate) fn on_reset_lost(&mut self, r: StreamRef) {
+        // §9.8's retained reset re-owes itself. An implementer who edits
+        // only the send-half path below ships a reset that is never
+        // re-emitted, and the sender's stream wedges for the connection's
+        // life — which is the failure §9.8's *"even when the reset itself is
+        // lost"* clause exists to forbid.
+        if let Some(state) = self.retained_resets.get_mut(&r) {
+            state.pending = true;
+            return;
+        }
         if let Some(send) = self.entries.get_mut(&r).and_then(|s| s.send.as_mut()) {
             send.on_reset_lost();
         }
@@ -990,6 +1210,126 @@ impl Streams {
     // ═══════════════════════════════════════════════════════════════════
     // Internals
     // ═══════════════════════════════════════════════════════════════════
+
+    /// §9.8's overflow check, over every unclaimed window-full stream.
+    ///
+    /// A no-op unless a claim is pending — *"the guard is deliberate, and
+    /// the unguarded form is worse: a receiver in stream mode that is merely
+    /// slow to call `accept_uni()` is exercising §16.4's
+    /// backpressure-by-retention, and resetting its stream the moment the
+    /// sender filled the initial window would break an ordinary lazy accept
+    /// loop."*
+    ///
+    /// *"Every unclaimed window-full stream, not merely the oldest — a
+    /// stream sitting behind a slower one must not evade it"* is delivered
+    /// by draining the whole candidate set, and the set is what keeps that
+    /// from being a walk of `unclaimed`.
+    fn scan_overflow(&mut self, flow: &mut Flow) {
+        if !self.message_claim_pending || self.overflow_candidates.is_empty() {
+            return;
+        }
+        let victims: Vec<StreamRef> = self.overflow_candidates.iter().copied().collect();
+        for r in victims {
+            self.reset_for_overflow(r, flow);
+        }
+    }
+
+    /// Emit §9.8's one receiver-emitted RESET_STREAM for `r`.
+    ///
+    /// The order is load-bearing: the wire id is read **before** anything is
+    /// freed, because [`stream_id`](Self::stream_id) reads `entries` and the
+    /// entry does not survive the retirement two lines below.
+    fn reset_for_overflow(&mut self, r: StreamRef, flow: &mut Flow) {
+        self.overflow_candidates.remove(&r);
+        let Some(id) = self.stream_id(r) else {
+            return;
+        };
+        let Some(final_size) = self
+            .entries
+            .get(&r)
+            .and_then(|s| s.recv.as_ref())
+            .map(RecvHalf::high_water)
+        else {
+            return;
+        };
+
+        // Ruling 59 is a **MUST**, and this is the only trace either end
+        // gets that names the *cause*: the sender learns `MESSAGE_OVERFLOW`
+        // and nothing else, and the receiver is the end whose verb choice
+        // created the conflict. All three of §18.2's fields — the stream,
+        // its final size, and the mode conflict — are named.
+        tracing::warn!(
+            target: "slither::frames",
+            stream = id.as_u64(),
+            final_size,
+            error_code = constants::MESSAGE_OVERFLOW,
+            "unclaimed uni stream reached MESSAGE_RECV_MAX with no FIN; \
+             resetting it (§9.8) — this connection is consuming uni streams \
+             as messages while the peer is writing one as an incremental \
+             stream (ruling 51's mixing error)"
+        );
+
+        if let Some(stream) = self.entries.get_mut(&r) {
+            stream.unclaimed = false;
+        }
+        // §9.8: *"The receive half retires (its bytes count as consumed at
+        // the connection level, §10.3)"*. It has no final size and never
+        // will, so ruling 93's true-up target is the advertised window —
+        // which is what releases the connection credit the stall was
+        // holding.
+        self.retire_recv(r, flow);
+
+        self.retained_resets.insert(
+            r,
+            RetainedReset {
+                id,
+                error_code: constants::MESSAGE_OVERFLOW,
+                final_size,
+                pending: true,
+            },
+        );
+    }
+
+    /// §9.8's seam on the receive path: what an arriving STREAM frame does
+    /// to a peer-opened uni stream's message state. All O(1).
+    ///
+    /// Returns whether the stream **became** a complete message on this
+    /// frame — the one-per-item discipline ruling 99 fixed for
+    /// `StreamOpened`, applied to `MessageReadable`. A duplicate frame on an
+    /// already-complete stream signals nothing, and neither does a stream
+    /// `accept_uni()` has claimed.
+    fn note_message_progress(&mut self, r: StreamRef, was_complete: bool) -> bool {
+        let Some(stream) = self.entries.get(&r) else {
+            return false;
+        };
+        if stream.dir != Dir::Uni || stream.local || !stream.unclaimed {
+            return false;
+        }
+        let Some(recv) = stream.recv.as_ref() else {
+            return false;
+        };
+
+        if recv.final_size().is_some() {
+            // **Ruling 153's other half, on the receiving side.** A final
+            // size makes the stream surfaceable, so it is no longer a
+            // candidate however much of the window it consumed — which is
+            // what stops a conforming 262 144-byte message being reset the
+            // moment its last frame lands.
+            self.overflow_candidates.remove(&r);
+            return !was_complete && recv.is_complete();
+        }
+        // §9.8's predicate: an unclaimed uni stream that *"consumes its full
+        // initial window without pinning a final size"*. **Ruling 153**: the
+        // quantity is the **highest received offset**, not the contiguous
+        // reassembled prefix — the contiguous reading never fires when a
+        // middle byte is lost, which is exactly when the sender is stalled
+        // at the window and needs rescuing (ruling 51's permanent stall,
+        // reintroduced).
+        if recv.high_water() >= constants::MESSAGE_RECV_MAX {
+            self.overflow_candidates.insert(r);
+        }
+        false
+    }
 
     /// Put a half back in §8.5's rotation if it has anything owed.
     fn requeue(&mut self, r: StreamRef) {
@@ -1083,7 +1423,9 @@ impl Streams {
             let table = self.table(local, dir);
             table.open.insert(i, r);
             table.ever_opened = i + 1;
-            self.entries.insert(r, Stream::new(dir, i, false));
+            let mut stream = Stream::new(dir, i, false);
+            stream.unclaimed = true;
+            self.entries.insert(r, stream);
             self.unclaimed[dir.slot()].push_back(r);
             events.push(ConnEvent::StreamOpened { dir });
         }

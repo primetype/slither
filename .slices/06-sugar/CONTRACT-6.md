@@ -28,9 +28,9 @@ resolved by **Round 26 (rulings 150–158)**.
 *House style of `CONTRACT-5a/5b`: a **BINDING** banner, §0's rulings table,
 signature blocks, then the algorithms, then the appendix of prohibitions. Style
 rule carried from `CONTRACT-5a.md:35-40`: **every return value is stated for
-every state, including the ones that look obvious.** Three items below are marked
-⚠ **RULING REQUIRED** — they are not the planner's to decide, and they are §8's
-Q1–Q3.*
+every state, including the ones that look obvious.** Three items below were marked
+⚠ **RULING REQUIRED**; Round 26 ruled all three (150, 151, 155) and §0's table
+is the answer. Round 27 adds 159–162.*
 
 ### 2.1 New module: `src/core/connection/datagram.rs` (§11)
 
@@ -117,8 +117,15 @@ pub(crate) fn extends_to_end(&self) -> bool {
 | type `0x31`, `length` overruns the remaining plaintext | `Err(Structural::…)` — §8.4's *"`length` overrunning the plaintext"* |
 | type `0x30` **and it is not the final frame** | `Err(Structural::…)` — §8.4's second structural error |
 
-⚠ **The `0x30`-not-final check has nowhere to live today, and this must be said
-out loud.** `parse_body` receives a `&[u8]` and returns bytes consumed; a `0x30`
+**[CORRECTED 2026/08/16 — ruling 159]** *The check exists.* `frame.rs:705`
+returns `Structural::TrailingFrame` for exactly this, in exactly the loop this
+paragraph proposes, and its comment records that it is deliberately
+dead-by-construction. The ¬LEN STREAM case is **not** accepted silently. So the
+DATAGRAM case is covered as soon as `Frame::Datagram` answers `extends_to_end()`
+truthfully — **implement that and add nothing else.** The paragraph below is kept
+for its reasoning, which is sound, and its conclusion, which is wrong:
+
+> ⚠ *(superseded)* **The `0x30`-not-final check has nowhere to live today.** `parse_body` receives a `&[u8]` and returns bytes consumed; a `0x30`
 body by definition consumes the rest, so "not final" is **unrepresentable inside
 `parse_body`** — after it returns, the cursor is at the end and the loop
 terminates. The check belongs in `Frame::parse`'s **loop**. This is the same
@@ -146,14 +153,17 @@ pub(crate) fn send_datagram(&mut self, now: Instant, data: &[u8])
 pub(crate) fn recv_datagram(&mut self) -> Option<Vec<u8>>;
 
 // ── §9.8 messages ────────────────────────────────────────────────────────
-/// §16.4's `send_message`.  ⚠ RULING REQUIRED on the return type — §8 Q1.
+/// §16.4's `send_message`. **Ruled: ruling 150** — whole-payload atomic
+/// admission; the "not now" is a non-`MessageError` outcome, and a refusal
+/// for connection credit is woken by the new `pub(crate)` `ConnEvent`.
 pub(crate) fn send_message(&mut self, now: Instant, msg: &[u8])
     -> Result<SendMessage, MessageError>;
 
 /// §16.4's `recv_message`: claim the oldest **complete unclaimed** uni stream
 /// as one payload, then free the stream.
 ///
-/// ⚠ RULING REQUIRED: **`now` is added to §16.4's signature** — §8 Q2 / §7 C-1.
+/// **Ruled: ruling 151** — `now` is added to §16.4's signature.
+/// `recv_datagram` stays `now`-free (§10.7 exempts datagrams).
 pub(crate) fn recv_message(&mut self, now: Instant) -> Option<Vec<u8>>;
 
 // ── observability ────────────────────────────────────────────────────────
@@ -183,7 +193,7 @@ put a frame on the wire, and §16.7 seals inside the mutating call.
 |---|---|
 | the recv queue is non-empty | `Some(payload)`, front removed (FIFO — §16.4's *"claim the oldest queued datagram"*) |
 | the recv queue is empty | `None` |
-| **the connection is dead but the queue is non-empty** | `Some(payload)` — the core does **not** consult `self.lost`. The death check is the shell's, *after* the core returns `None`. ⚠ see §8 Q5. |
+| **the connection is dead but the queue is non-empty** | `Some(payload)` — the core does **not** consult `self.lost`. The death check is the shell's, *after* the core returns `None`. **Ruled: ruling 152** — the drain covers `recv_message` and `recv_datagram`. |
 
 **`recv_message` — every outcome**
 
@@ -192,7 +202,7 @@ put a frame on the wire, and §16.7 seals inside the mutating call.
 | some unclaimed peer-opened **uni** stream is complete (FIN pinned **and** every byte to the final size received) | `Some(payload)` of the **oldest such stream in open order** (ruling 112's FIFO, filtered to complete). The stream leaves `unclaimed`, its receive half is **retired**, its bytes count as consumed for connection credit (§10.3), and MAX_STREAMS_UNI credit is owed to the peer (§10.4). |
 | no unclaimed uni stream is complete | `None`, **and the pending-claim flag is set** (§4.2) |
 | a complete unclaimed stream carries a **zero-byte** payload (FIN at offset 0) | `Some(Vec::new())` — an empty message is a message. **Not** `None`; `None` must mean "nothing to claim" or the shell parks on a delivered message for ever. |
-| the connection is dead but a complete unclaimed stream remains | `Some(payload)` — the core does not consult `self.lost`. ⚠ **§8 Q5 / §7 C-2: Appendix B's message-then-close obligation requires this and no ruling says so.** |
+| the connection is dead but a complete unclaimed stream remains | `Some(payload)` — the core does not consult `self.lost`. **Ruled: ruling 152.** Appendix B's message-then-close obligation requires it, and ruling 152 now says so — the sentence that read *"no ruling says so"* predated Round 26. |
 | a **bidi** stream completes | never surfaced here. `recv_message` draws from `unclaimed[Dir::Uni]` **only** — §9.8 is uni sugar, and §9.8:3113-3116 makes bidi the *safe* alternative precisely because it never collides. |
 
 **Every call to `recv_message` — including one that returns `Some` — first runs
@@ -283,7 +293,7 @@ return are the same expression.
 2. death latch → `Ready(Err(MessageError::ConnectionLost(l)))`;
 3. `core.is_none()` → `debug_assert!(false)` + `ConnectionLost`;
 4. the core call → `Ready(Ok(()))` on acceptance;
-5. the core says *not now* → park → `Pending`. ⚠ **Q1 decides what "not now" is
+5. the core says *not now* → park → `Pending`. **Ruled by 150: "not now" is
    and which waker catches it.**
 
 **`send_message`'s cancel-safety is load-bearing and the contract must state it
@@ -304,7 +314,7 @@ and every row names every wake source:
 |---|---|---|
 | `message_readers` | `Wakers` | `ConnEvent::MessageReadable` (new `publish` arm); **the death latch** via `take_all_stream_wakers` (`shared.rs:318-341`) |
 | `datagram_readers` | `Wakers` | `ConnEvent::DatagramReadable` (new `publish` arm); **the death latch** via `take_all_stream_wakers` |
-| `message_senders` | `Wakers` | `ConnEvent::StreamsAvailable { dir: Dir::Uni }` (extend the existing arm at `driver.rs:540-542`); **the death latch**; ⚠ **and whatever Q1 rules for the credit wake** |
+| `message_senders` | `Wakers` | `ConnEvent::StreamsAvailable { dir: Dir::Uni }` (extend the existing arm at `driver.rs:540-542`); **the death latch**; **and ruling 150's new `pub(crate)` `ConnEvent` for the credit wake** |
 
 All three **must** be added to `ConnCell::new` (`shared.rs:267-284`) **and** to
 `take_all_stream_wakers` (`shared.rs:318-341`). Omitting the sweep is ruling
@@ -322,7 +332,9 @@ messages should work with **no new wake source** — *provided* `StreamFinished`
 in fact emitted for handle-less streams. But `finished_senders` is bounded by the
 rule *"written only while `blocked_ackers` holds that stream's slot"*
 (`shared.rs:237`), and a handle-less message stream has **no** `blocked_ackers`
-entry and no `Drop for SendStream` to remove it. ⚠ **Unbounded growth — §9 R4.**
+entry and no `Drop for SendStream` to remove it. **Ruled: ruling 160** — the map must
+not grow for handle-less streams. Either exclude them or remove the entry when
+the message's send half retires; say which in the implementation report.
 
 ### 2.6 Errors and constants — **already landed; `src/error.rs` is on nobody's path**
 

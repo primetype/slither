@@ -107,8 +107,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::constants;
 use crate::core::{
-    ConnEvent, ConnOutput, Connection as CoreConnection, ConnectionId, Disposition, EndpointOutput,
-    IntroId, ToEndpoint, Transmit,
+    ConnEvent, ConnOutput, Connection as CoreConnection, ConnectionId, Dir, Disposition,
+    EndpointOutput, IntroId, ToEndpoint, Transmit,
 };
 use crate::error::{AcceptError, ConnectError, ConnectionLost};
 use crate::identity::{Identity, PublicKeyOf};
@@ -537,8 +537,32 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             ConnEvent::StreamOpened { dir } => {
                 Self::wake_stream(cell, |cell| Some(&mut cell.stream_acceptors[dir.slot()]));
             }
+            // **Both sets, for `Dir::Uni`.** §10.4's allowance is what
+            // `open_uni()` waits on *and* what a `send_message()` refused
+            // before its own `open` waits on — §9.8's stream is allocated
+            // from the same cumulative limit and surfaces no handle, so
+            // nothing else would ever wake it.
             ConnEvent::StreamsAvailable { dir } => {
                 Self::wake_stream(cell, |cell| Some(&mut cell.stream_openers[dir.slot()]));
+                if dir == Dir::Uni {
+                    Self::wake_stream(cell, |cell| Some(&mut cell.message_senders));
+                }
+            }
+            // **[ruling 150]** §10.3's connection credit, for the one verb
+            // that can be refused for it while holding no stream.
+            // `StreamWritable` covers every *half* with a blocked writer;
+            // this covers the message that has not opened one yet.
+            ConnEvent::SendCreditAvailable => {
+                Self::wake_stream(cell, |cell| Some(&mut cell.message_senders));
+            }
+            // §9.8 and §11's claim verbs. One event per claimable item
+            // (§2.4's emission scope), and a wake is still not a promise:
+            // several parked readers all re-poll and at most one claims.
+            ConnEvent::MessageReadable => {
+                Self::wake_stream(cell, |cell| Some(&mut cell.message_readers));
+            }
+            ConnEvent::DatagramReadable => {
+                Self::wake_stream(cell, |cell| Some(&mut cell.datagram_readers));
             }
             // **Ruling 47's `acked()`.** The event is §9.7's `DataRecvd`:
             // every byte of this send half **and its FIN** acknowledged.

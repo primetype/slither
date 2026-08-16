@@ -1192,7 +1192,7 @@ contract. Oversize input is `DatagramError::TooLarge`, not a silent truncation.*
 | SD3 | **drop-oldest, weak form.** After a burst larger than the queue, B receives a **suffix** of the burst and never a stale head. | A FIFO-reject build delivers the head and drops the tail → fails. **Deliberately weaker than D1**: the strong form needs the send queue to back up, which requires closing the congestion window, and working rule 13 says to name that rather than build a fragile fixture. The exact-eviction pin lives at D1. |
 | SD4 | **unreliable and unordered by contract.** `drop_at([2])`, five datagrams; B receives four; drive past 3 × PTO and assert **no fifth arrival**. | A build retransmitting datagrams delivers all five → fails. Uses `drop_at`, **not** `lossy()` (ruling 148). |
 | SD5 | **`recv_datagram` is cancel-safe.** Park it, drop the future, then send; the next call yields the datagram. | A build that claims on poll and discards on drop loses it → fails. |
-| SD6 | **post-death drain** — ⚠ gated on Q5. Ship `#[ignore]`d with the question named; **the integrator un-ignores** once ruled. Slice 5's precedent (`PLAN-5.md:610-615`). | — |
+| SD6 | **post-death drain.** **Ruled: ruling 152** — ships **live**, not `#[ignore]`d. `recv_datagram` drains what arrived before the death, then reports it; it never parks with the latch set. | A build applying ruling 128's short two-verb list refuses a datagram that had already arrived. |
 
 ---
 

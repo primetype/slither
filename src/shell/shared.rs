@@ -96,6 +96,16 @@ impl Wakers {
         self.parked.is_empty()
     }
 
+    /// How many futures are parked here.
+    ///
+    /// §16.8's bound made assertable for the sets that have no per-handle
+    /// `Drop` to point at — see
+    /// [`ConnCell::sugar_waker_entries`](ConnCell::sugar_waker_entries).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.parked.len()
+    }
+
     /// Take everyone parked here, clearing the map.
     ///
     /// Clearing is not an optimisation: a woken task re-polls and parks
@@ -250,6 +260,30 @@ pub(crate) struct ConnCell<S: Handshake> {
     /// `accept_bi`/`accept_uni` futures parked on an empty unclaimed queue.
     /// Same shape, same reason.
     pub(crate) stream_acceptors: [Wakers; 2],
+    /// §9.8's `recv_message()` futures parked with nothing complete to
+    /// claim.
+    ///
+    /// Woken by `ConnEvent::MessageReadable` and by **the death latch**, via
+    /// [`take_all_stream_wakers`](Self::take_all_stream_wakers).
+    ///
+    /// Not a per-`StreamRef` map: §9.8 surfaces no stream handle, so there
+    /// is no key an application could hold and nothing to bound such a map
+    /// by. One set per connection, exactly like
+    /// [`settled_wakers`](Self::settled_wakers).
+    pub(crate) message_readers: Wakers,
+    /// §11's `recv_datagram()` futures parked on an empty receive queue.
+    /// Woken by `ConnEvent::DatagramReadable` and by the death latch.
+    pub(crate) datagram_readers: Wakers,
+    /// §9.8's `send_message()` futures parked on §10.4's stream allowance or
+    /// §10.3's connection credit.
+    ///
+    /// **One set for both conditions**, and woken by three sources:
+    /// `ConnEvent::StreamsAvailable { dir: Dir::Uni }`,
+    /// `ConnEvent::SendCreditAvailable` (ruling 150's new event) and the
+    /// death latch. A waiter re-polls and re-asks the core, so a wake is
+    /// never a promise that admission will now succeed — which is what lets
+    /// the two conditions share a set.
+    pub(crate) message_senders: Wakers,
 }
 
 impl<S: Handshake> ConnCell<S> {
@@ -280,6 +314,9 @@ impl<S: Handshake> ConnCell<S> {
             settled_wakers: Wakers::default(),
             stream_openers: Default::default(),
             stream_acceptors: Default::default(),
+            message_readers: Wakers::default(),
+            datagram_readers: Wakers::default(),
+            message_senders: Wakers::default(),
         }
     }
 
@@ -337,6 +374,15 @@ impl<S: Handshake> ConnCell<S> {
         for wakers in &mut self.stream_acceptors {
             woken.extend(wakers.take_all());
         }
+        // Slice 6's three. Ruling 147's defect verbatim if any is omitted —
+        // *"a verb parked there when the connection dies is woken by
+        // nothing"* — and all three are reachable from a dead connection:
+        // `recv_message`/`recv_datagram` park only after the core has
+        // handed back nothing, and `send_message` parks on credit that a
+        // dead peer will never grant.
+        woken.extend(self.message_readers.take_all());
+        woken.extend(self.datagram_readers.take_all());
+        woken.extend(self.message_senders.take_all());
         woken
     }
 
@@ -351,6 +397,31 @@ impl<S: Handshake> ConnCell<S> {
     #[cfg(test)]
     pub(crate) fn stream_waker_entries(&self) -> (usize, usize) {
         (self.blocked_readers.len(), self.blocked_writers.len())
+    }
+
+    /// How many futures are parked in §9.8's and §11's three slots, in
+    /// `(message readers, datagram readers, message senders)` order.
+    ///
+    /// **Additive, and deliberately not folded into
+    /// [`stream_waker_entries`]**: that accessor's arity is already named by
+    /// tests this slice does not own, and widening it would red them for a
+    /// reason unrelated to what they assert.
+    ///
+    /// The pin it exists for is the one `LocalSet` hides (`PLAN-6.md` §9):
+    /// `run_until` re-polls its body on any local-task wake, so a build that
+    /// never wired `MessageReadable` to [`message_readers`] can still pass a
+    /// `.await`-based wakeup test, woken incidentally by the driver.
+    /// Occupancy is assertable where the wake is not.
+    ///
+    /// [`stream_waker_entries`]: Self::stream_waker_entries
+    /// [`message_readers`]: Self::message_readers
+    #[cfg(test)]
+    pub(crate) fn sugar_waker_entries(&self) -> (usize, usize, usize) {
+        (
+            self.message_readers.len(),
+            self.datagram_readers.len(),
+            self.message_senders.len(),
+        )
     }
 }
 

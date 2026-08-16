@@ -84,6 +84,8 @@ pub(crate) enum Frame {
     MaxStreamsUni(u64),
     /// `0x1c` — §15's teardown signal.
     Close(Close),
+    /// `0x30`/`0x31` — §11's unreliable payload. §8.4.
+    Datagram(Datagram),
 }
 
 impl Frame {
@@ -100,6 +102,7 @@ impl Frame {
             Frame::MaxStreamsBidi(_) => constants::FRAME_MAX_STREAMS_BIDI,
             Frame::MaxStreamsUni(_) => constants::FRAME_MAX_STREAMS_UNI,
             Frame::Close(_) => constants::FRAME_CLOSE,
+            Frame::Datagram(datagram) => datagram.type_code(),
         }
     }
 
@@ -120,13 +123,24 @@ impl Frame {
             }
             Frame::MaxStreamData(grant) => 1 + grant.body_len(),
             Frame::Close(close) => 1 + close.body_len(),
+            Frame::Datagram(datagram) => 1 + datagram.body_len(),
         }
     }
 
     /// Whether this frame extends to the end of the plaintext — §8.5's
     /// *"at most one … per packet, in final position"*.
+    ///
+    /// Two frame types can wear the form and [`Packing`] enforces the rule
+    /// for both from here, which is why the check is a property of the
+    /// **frame** and never of a fill loop: slice 6 adds DATAGRAM as a second
+    /// contributor to stage 3, and a duplicated check is the one that
+    /// drifts.
     pub(crate) fn extends_to_end(&self) -> bool {
-        matches!(self, Frame::Stream(s) if !s.len_present)
+        match self {
+            Frame::Stream(s) => !s.len_present,
+            Frame::Datagram(d) => !d.len_present,
+            _ => false,
+        }
     }
 
     /// Append this frame's wire encoding to `out`. §8.4.
@@ -148,7 +162,78 @@ impl Frame {
             }
             Frame::MaxStreamData(grant) => grant.encode_body(out),
             Frame::Close(close) => close.encode_body(out),
+            Frame::Datagram(datagram) => datagram.encode_body(out),
         }
+    }
+}
+
+/// §8.4's DATAGRAM — §11's unreliable payload, in its two forms.
+///
+/// `type(0x30) ‖ data(to the end of the plaintext)` or
+/// `type(0x31) ‖ length ‖ data`.
+///
+/// **The `0x30` form is not an optimisation.** `MAX_DATAGRAM_PAYLOAD` is
+/// 1169 = `MAX_PLAINTEXT` − 1 and is *defined by* that form (§11.2): the
+/// same payload as `0x31` needs `1 + 2 + 1169 = 1172` bytes and does not
+/// fit a packet at all, so a build emitting only `0x31` can never send the
+/// ratified maximum — and the failure is silent, the datagram simply never
+/// fitting and eventually being evicted (ruling 155).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Datagram {
+    /// The payload.
+    pub(crate) data: Vec<u8>,
+    /// `false` ⇒ type `0x30`, no length field, **extends to the end of the
+    /// plaintext and must be the packet's final frame**.
+    /// `true` ⇒ type `0x31`, explicit varint length.
+    pub(crate) len_present: bool,
+}
+
+impl Datagram {
+    /// The type code, with §8.4's one flag bit applied.
+    pub(crate) fn type_code(&self) -> u64 {
+        if self.len_present {
+            constants::FRAME_DATAGRAM_LEN
+        } else {
+            constants::FRAME_DATAGRAM
+        }
+    }
+
+    fn body_len(&self) -> usize {
+        if self.len_present {
+            varint_len(self.data.len() as u64) + self.data.len()
+        } else {
+            self.data.len()
+        }
+    }
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        if self.len_present {
+            put_varint(self.data.len() as u64, out);
+        }
+        out.extend_from_slice(&self.data);
+    }
+
+    /// Parse a DATAGRAM body. `ty` carries the LEN bit.
+    ///
+    /// §8.4's second structural error — *"a `0x30` frame that is not the
+    /// packet's final frame"* — is **not decidable here** and is not
+    /// attempted here: a `0x30` body consumes the remainder by definition,
+    /// so after this returns the cursor is at the end and the loop
+    /// terminates. See [`parse`] for where the check would have to live and
+    /// why it is unreachable there too.
+    fn parse_body(ty: u64, buf: &[u8]) -> Result<(Datagram, usize), Structural> {
+        let len_present = ty == constants::FRAME_DATAGRAM_LEN;
+        let mut cursor = Cursor::new(buf);
+        let data = if len_present {
+            let len = cursor.varint()?;
+            let len = usize::try_from(len).map_err(|_| Structural::LengthOverrun)?;
+            cursor.bytes(len)?.to_vec()
+        } else {
+            let rest = cursor.rest().to_vec();
+            cursor.advance(rest.len());
+            rest
+        };
+        Ok((Datagram { data, len_present }, cursor.consumed()))
     }
 }
 
@@ -577,6 +662,19 @@ pub(crate) enum Structural {
     /// §8.4. The boundary is `>`, not `≥`.
     #[error("MAX_STREAMS max {0} exceeds 2⁶⁰")]
     MaxStreamsTooLarge(u64),
+    /// §8.4's *"a `0x30` frame that is not the packet's final frame"* — a
+    /// frame followed something that extends to the end of the plaintext.
+    ///
+    /// **Unreachable against this parser, and minted anyway.** An
+    /// extends-to-end body consumes the remainder *by definition*, so a
+    /// following frame is absorbed into its data and is unobservable: the
+    /// error §8.4 states on the receiver is really a **sender**
+    /// prohibition wearing a receiver's clothes (`PLAN-6.md` §6 U-3, §7
+    /// C-6). It exists so the rule is nameable in the trace §18.2 makes
+    /// operator contract, and so the day a body parser gains a bound the
+    /// guard is already the thing that fires.
+    #[error("a frame follows one that extends to the end of the plaintext")]
+    TrailingFrame,
 }
 
 /// §8.2's parse phase: the **whole** plaintext, applying nothing.
@@ -595,6 +693,18 @@ pub(crate) fn parse(plaintext: &[u8]) -> Result<Vec<Frame>, Structural> {
     let mut cursor = Cursor::new(plaintext);
 
     while !cursor.is_empty() {
+        // §8.5: *"at most one extends-to-end frame … in final position"*.
+        // Reaching here with one already parsed means a frame followed it.
+        //
+        // **This is dead by construction and deliberately written.** Both
+        // extends-to-end bodies (¬LEN STREAM and `0x30` DATAGRAM) consume
+        // `cursor.rest()`, so the loop condition above is already false —
+        // see [`Structural::TrailingFrame`] for why the rule is minted
+        // rather than dropped. It is not a second opinion on a check that
+        // exists elsewhere: nothing else states it on the receive side.
+        if frames.last().is_some_and(Frame::extends_to_end) {
+            return Err(Structural::TrailingFrame);
+        }
         // The type code is itself a varint (§8.1, §8.3's note on the gaps).
         let ty = cursor.varint()?;
         let frame = match ty {
@@ -641,10 +751,13 @@ pub(crate) fn parse(plaintext: &[u8]) -> Result<Vec<Frame>, Structural> {
                 cursor.advance(used);
                 Frame::Close(close)
             }
-            // Everything else — §8.3's `0x05` reserved row, the types
-            // slice 6 adds, and any code outside the table — is §8.2's
-            // unknown type. Slice 6 adds arms above; it does not widen
-            // this one.
+            constants::FRAME_DATAGRAM | constants::FRAME_DATAGRAM_LEN => {
+                let (datagram, used) = Datagram::parse_body(ty, cursor.rest())?;
+                cursor.advance(used);
+                Frame::Datagram(datagram)
+            }
+            // Everything else — §8.3's `0x05` reserved row and any code
+            // outside the table — is §8.2's unknown type.
             other => return Err(Structural::UnknownType(other)),
         };
         frames.push(frame);
@@ -787,6 +900,44 @@ impl Packing {
     /// Stage 3 — the STREAM and DATAGRAM fill (§8.5).
     pub(crate) fn fill(&mut self, frame: Frame) -> bool {
         self.push(Stage::Fill, frame)
+    }
+
+    /// Stage 3 — one DATAGRAM, in whichever of §8.4's two forms fits.
+    ///
+    /// `false` leaves `data` unpacked and this packet untouched; the caller
+    /// keeps it queued for the next one.
+    ///
+    /// **The form is chosen, not fixed** (ruling 155, `PLAN-6.md` §4.2):
+    ///
+    /// 1. `0x31` when the length varint also fits — it leaves the packet
+    ///    open, so the STREAM fill can still use the remaining room;
+    /// 2. otherwise `0x30`, which extends to the end and therefore closes
+    ///    the packet. This branch is what makes the ratified maximum
+    ///    reachable at all: 1169 bytes need `1 + 2 + 1169 = 1172 >
+    ///    MAX_PLAINTEXT` in the `0x31` form (§11.2), so a build without it
+    ///    silently never sends a maximum-size datagram;
+    /// 3. otherwise nothing fits and the datagram waits.
+    ///
+    /// Trying `0x31` **first** is what bounds the cost to the streams: the
+    /// extends-to-end form is used only when the length-prefixed one cannot
+    /// be, never as a default.
+    pub(crate) fn datagram(&mut self, data: &[u8]) -> bool {
+        let room = self.room();
+        let n = data.len();
+        let len_present = if 1 + varint_len(n as u64) + n <= room {
+            true
+        } else if 1 + n <= room {
+            false
+        } else {
+            return false;
+        };
+        self.push(
+            Stage::Fill,
+            Frame::Datagram(Datagram {
+                data: data.to_vec(),
+                len_present,
+            }),
+        )
     }
 
     /// Stage 4 — PING last, if a probe still owes ack-eliciting content.
