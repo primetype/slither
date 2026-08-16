@@ -150,3 +150,11 @@ Not yours, either of you:
   is what makes it reachable.
 - **`src/core/connection/testfix.rs`** — the shared in-crate fixture. If
   5b needs a capability it lacks, **report it, do not add it**.
+
+
+> **[CORRECTED 2026/08/16 — ruling 147]** §2.5's waker list for
+> `SendStream::acked()` omits the **death latch**. Read exhaustively it is
+> short by one, and a verb parked there when the connection dies is woken
+> by nothing — ruling 128's "parking is never permitted on a dead
+> connection", violated in the one direction an application cannot poll
+> its way out of.

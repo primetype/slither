@@ -2564,23 +2564,45 @@ mod packing {
     /// arrives. Deleting it would lose the obligation; leaving it running
     /// would fail a correct build.
     #[test]
-    #[ignore = "needs §14's congestion bound to create pending stream data (slice 5, ruling 130)"]
     fn credit_frames_precede_the_stream_fill_in_a_packet() {
         let t = t0();
         let mut s = Solo::installed_at(t);
 
-        // Owe the peer a MAX_STREAM_DATA: half a stream window consumed.
+        // 1. Fill §14.5's window. Ruling 134: `write()` accepts everything
+        //    flow control admits, so all 32 KiB enter send state and the
+        //    congestion window — not the caller — decides what leaves. The
+        //    remainder stays **pending in the core**, which is the state
+        //    slice 4 could not produce and which this test needs.
+        let mine = s.conn.open(Dir::Uni).expect("open");
+        assert_eq!(write_all(&mut s.conn, t, mine, &ramp(0, 32 * 1024)), 0);
+        let burst = drain(&mut s.conn);
+        let highest = s.conn.next_counter().expect("established") - 1;
+        assert!(
+            !burst.transmits().is_empty(),
+            "the first flight must leave, or the window was never filled"
+        );
+
+        // 2. Now owe a MAX_STREAM_DATA *while the window is full*. Credit
+        //    frames are ack-eliciting, so §14.5 refuses this one too and it
+        //    stays owed rather than going out alone — which is exactly what
+        //    slice 4 could not arrange, and why this test was ignored twice.
         let id = Solo::peer_uni(0);
         let half = (INITIAL_MAX_STREAM_DATA / 2) as usize;
         let _ = s.deliver_stream_bytes(t, id, 0, half, false);
         let r = s.conn.accept(Dir::Uni).expect("open");
         let _ = read_exactly(&mut s.conn, t, r, half);
 
-        // …and, at the same time, have plenty of our own data pending.
-        let mine = s.conn.open(Dir::Uni).expect("open");
-        assert_eq!(write_all(&mut s.conn, t, mine, &ramp(0, 32 * 1024)), 0);
-
-        let d = drain(&mut s.conn);
+        // 3. An ACK re-opens the window. The pump it triggers owes a credit
+        //    frame **and** has stream data pending — the coincidence §8.5's
+        //    ordering rule is about, and the only state in which it is
+        //    observable at all.
+        let mut ack = Vec::new();
+        put(&mut ack, crate::constants::FRAME_ACK);
+        put(&mut ack, highest); // largest
+        put(&mut ack, 0); // ack_delay
+        put(&mut ack, 0); // range_count
+        put(&mut ack, highest); // first_range: counters 0..=highest
+        let d = s.deliver_packed(t, &[ack]);
         let packets = s.packets(&d);
 
         let mut found = false;

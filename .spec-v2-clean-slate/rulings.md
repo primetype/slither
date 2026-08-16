@@ -3691,3 +3691,105 @@ under them, and in every case the right action was to narrow or invert
 the assertion rather than delete the test — because the mutation each was
 built to catch is usually still live, just newly reachable by a different
 route.
+
+---
+
+## Round 25 — slice 5b integration, and slice 5 closed (2026/08/16)
+
+**All fifteen blind story tests passed on first contact.** The suite is
+**801 passing, 0 failing, 0 ignored** — the first time since slice 4 that
+it carries no deferred obligation at all.
+
+**Ruling 146 — ruling 133's local-close half is reversed. Both death paths
+retain stream state until the linger expires.**
+
+Ruling 133 said a *closing* endpoint frees `streams`/`flow` at once
+(§15.2's letter) while a *draining* one keeps them for `CLOSE_LINGER`
+(ruling 128), and justified the asymmetry by arguing that **at the closer
+the application signalled that it is done**. The argument is sound and the
+rule it produced is not, for a reason neither I nor the 5a planner saw:
+
+`Streams::send_settled` returns **`true` for an absent half**, because an
+absent half is normally one that completed and was collected. Freeing the
+closer's state therefore makes `Connection::acked()` answer **`Ok(())`
+over bytes that were never acknowledged** — the exact misreport ruling 47
+exists to prevent, arriving through the door ruling 133 opened. The 5b
+implementer found it by refusing to implement 133 blind: it reported that
+the work *"is implemented nowhere and assigned to nobody"* and that doing
+it would break `acked()`, rather than patching around either.
+
+Reversing costs **nothing**, because 133's local-close half was never
+built: 5a declined it, and 5b's contract did not assign it. What it buys
+is uniformity — `read` and `accept_*` now behave identically whoever
+closed — and an `acked()` that is honest by construction rather than by a
+guard. §15.2's *"may drop immediately"* is permissive, so retaining is
+conformant; §10.6 already bounds the buffers, and the draining path
+already spends exactly this memory under ruling 128.
+
+**The general lesson is about the shape of 133, not its content.** It
+invented an asymmetry to satisfy a rationale, and the asymmetry created a
+correctness hazard in a *different* subsystem two rounds later. A rule
+whose only justification is that it feels right about intent should be
+suspected of exactly this.
+
+**Ruling 147 — `CONTRACT-5b` §2.5's waker list for `SendStream::acked()`
+omits the death latch, and the omission is a permanent hang.** The
+contract parks the verb in `blocked_ackers`, *"woken by `StreamFinished`
+and by `StreamReset`"* — while the sibling paragraph for
+`Connection::acked()` ends *"and on the latch"*. Read exhaustively, a
+`SendStream::acked()` already parked when the connection dies is woken by
+**nothing**, violating ruling 128's *"parking is never permitted on a dead
+connection"* in the one direction an application cannot poll its way out
+of. Found by the blind test author reading the list as exhaustive —
+**working rule 8 applied to a list in the binding contract**, which is
+where that defect class has now appeared twice in three slices. The
+implementer had already swept the latch, so the test passed; the contract
+is corrected so the next reader does not build what it says.
+
+**Ruling 148 — `FlakyPolicy::lossy(rate)` is invisible to every counter
+the public API has, so a test that injects a loss rate cannot prove a
+datagram died.** The tap is written **above** the loss draw, so
+`sends() − tap.len()` sees blackholes and injected send failures only. A
+story test that sets a loss rate and asserts "the bytes arrived" therefore
+passes a build with **no loss at all** — working rule 9's exact failure,
+sitting in the fixture rather than in any test. The blind author found it,
+and every lossy test it wrote uses `block_path` (counter-proved) or
+`drop_at` (index-based, no RNG) **plus an assertion that the drop window
+was actually reached**. §16.10 makes the three fixture names contract;
+this is a gap in what they can attest, and slice 9's documentation
+obligations should record it rather than leave it for the next author to
+rediscover.
+
+**Ruling 149 — `credit_frames_precede_the_stream_fill_in_a_packet` is
+discharged, after being deferred twice.** Ruling 114 sent it to slice 7;
+ruling 130 moved it to slice 5; slice 5b reported it still unreachable.
+The mechanism was in the implementer's own report: *"stream data pending"
+implies "window full", and credit frames are ack-eliciting, so the
+coincidence needs an ACK to re-open the window.* That is a recipe, and it
+works. The fixture now: fills §14.5's window (ruling 134 — `write()`
+accepts what the window cannot send, so the remainder is **pending in the
+core**, the state slice 4 could not produce); then owes a MAX_STREAM_DATA
+*while the window is full*, so §14.5 refuses the credit frame too and it
+stays owed instead of going out alone; then delivers an ACK, whose pump
+owes credit **and** has stream data pending.
+
+**Verified by mutation twice, because the first attempt did not prove what
+it looked like.** Swapping `Stage::Control` and `Stage::Fill` reds the
+test — but through `frame.rs`'s own forward-only assertion, not through
+the test's. Only mutating at the **emission site** (`pack_control` after
+`fill`, both pushed as `Fill`) makes the test's own *"§8.5: control
+frames, then the fill"* fire. A mutation caught by the implementation's
+internal guard proves the guard, not the test.
+
+### Slice 5 closed
+
+**801 tests, nine gates, no ignored obligations.** Twenty rulings across
+Rounds 23–25 (130–149), of which **six corrected ratified text of mine**:
+131 (§13.2's parenthetical), 132 (128's mechanism), 137 (§14.6's single
+marker), 141 (139(f)'s comparison), 146 (133's asymmetry), 147 (the
+contract's waker list).
+
+**Four consecutive slices with zero implementation defects from the blind
+split.** The 5b implementer's own summary is the pattern in one line: it
+shipped a red on purpose, because the red was a finding about a ruling
+rather than a bug in its code, and it declined to patch around it.

@@ -4011,14 +4011,20 @@ reserved cleartext close packet type (`0x04`) stays dead.
 - **Receiving an authenticated CLOSE**: surface
   `ConnectionLost::PeerClosed { code, reason }`, emit **nothing**, hold a
   brief drain for the same `CLOSE_LINGER` (discarding late packets, no
-  replies), then drop all state. **[AMENDED 2026/08/15 — ruling 133]**
-  *Received stream state is retained for that drain, and this is the
-  asymmetry ruling 128 needs.* The bullet above lets a **closing**
-  endpoint free stream and flow-control state at once, and it should:
-  calling `close()` while a receive half holds unread bytes **is** a
-  decision to discard them. A peer's CLOSE is not that decision, so here
-  the bytes stay claimable for the linger (§16.2, ruling 128) and are
-  freed at expiry. The no-linger deaths — liveness (§7.4), nonce
+  replies), then drop all state. **[AMENDED 2026/08/15 — ruling 133, CORRECTED
+  2026/08/16 — ruling 146]** *Received stream state is retained for the
+  drain — **on both paths**, not only this one.* Ruling 133 read the
+  bullet above as licensing a **closing** endpoint to free stream and
+  flow-control state at once, on the argument that calling `close()` while
+  a receive half holds unread bytes *is* a decision to discard them. That
+  argument is sound and the rule it produced was not: `send_settled`
+  reports an **absent** half as settled, so freeing the closer's state
+  makes `Connection::acked()` answer `Ok(())` over bytes that were never
+  acknowledged — precisely the misreport ruling 47 exists to prevent. The
+  "may" above stays permissive and slither declines it: both paths retain
+  until the linger expires, `read` and `accept_*` behave identically
+  whoever closed (§16.2, ruling 128), and `acked()` is honest by
+  construction. The no-linger deaths — liveness (§7.4), nonce
   exhaustion (§7.9), `Replaced` (§5.4), endpoint dropped — retain
   nothing, and the consequence is stated rather than left to be found: a
   receiver killed by `DEAD_TIMEOUT` mid-transfer cannot drain, which is

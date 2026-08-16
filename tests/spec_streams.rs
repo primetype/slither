@@ -683,11 +683,11 @@ async fn a_live_send_stream_stops_the_last_connection_drop_from_closing_undernea
 ///
 /// # BROKEN BUILD
 ///
-/// The build shipped in slice 4b. Deleting this test loses the obligation;
-/// running it fails a correct slice-4 build, which is why it is ignored
-/// rather than removed (ruling 114's precedent).
+/// The build shipped in slice 4b, where this was `#[ignore]`d naming this
+/// ruling. **Slice 5b implemented it and the `#[ignore]` is gone.** A build
+/// that regressed to the 4b behaviour answers `Err(PeerClosed)` to the
+/// `accept_uni` below, over a stream that arrived in full.
 #[tokio::test(start_paused = true)]
-#[ignore = "ruling 128: the post-death drain lands in slice 5"]
 async fn a_receiver_can_drain_a_stream_the_sender_closed_behind() {
     local(async {
         let pair = Pair::seeded(0x4B00_0014);
@@ -1144,22 +1144,41 @@ async fn every_stream_verb_answers_connection_lost_after_the_connection_dies() {
             "CONTRACT-4b §8: `id` keeps answering after the connection dies"
         );
 
-        // Ruling 118, the row that matters: an unclaimed stream is sitting
-        // there and `accept_uni` must still refuse, on the first poll.
+        // **Expired premise, twice over — rulings 128 and 146.** This
+        // asserted ruling 118's original rule: `accept_*` refuses
+        // immediately, "with nothing drained first". Ruling 128 overturned
+        // that for the *draining* endpoint, and ruling 133 briefly kept it
+        // for the *closing* one — which ruling 146 then reversed, because
+        // freeing the closer's stream state made `Connection::acked()`
+        // report `Ok(())` over bytes that were never acknowledged.
+        //
+        // So both death paths behave alike: a stream that arrived before
+        // the death is still claimable, and only an **empty** queue answers
+        // `ConnectionLost`. Both halves are asserted, because "it hands
+        // something over" alone would pass a build that hands over the same
+        // stream for ever.
         let mut acc = pin!(ca.accept_uni());
         match poll_once(acc.as_mut()).await {
-            Poll::Ready(Err(_)) => {}
+            Poll::Ready(Ok(_)) => {}
             other => panic!(
-                "ruling 118: `accept_*` answers `Err(ConnectionLost)` immediately, \
-                 with nothing drained first — a drained handle is one on which \
-                 every `read` fails. Got {}",
+                "ruling 128: a stream that arrived before the death survives \
+                 it, whoever closed. Got {}",
                 match other {
-                    Poll::Pending => "Pending".to_string(),
-                    Poll::Ready(Ok(_)) => "Ok(handle)".to_string(),
-                    Poll::Ready(Err(_)) => unreachable!(),
+                    Poll::Pending => "Pending",
+                    Poll::Ready(Err(_)) => "Err(ConnectionLost)",
+                    Poll::Ready(Ok(_)) => unreachable!(),
                 }
             ),
         }
+        // `acc` is left to fall out of scope: dropping a `Pin<&mut _>`
+        // releases nothing (the `pin!` temporary outlives it) and trips
+        // `clippy::drop_non_drop`.
+        let mut drained = pin!(ca.accept_uni());
+        assert!(
+            matches!(poll_once(drained.as_mut()).await, Poll::Ready(Err(_))),
+            "ruling 128: once nothing is left, `accept_*` reports the death — \
+             and never `Pending`, which would hang a claimer for ever"
+        );
 
         let mut opn = pin!(ca.open_uni());
         assert!(
@@ -1167,12 +1186,26 @@ async fn every_stream_verb_answers_connection_lost_after_the_connection_dies() {
             "ruling 118: `open_*` answers immediately too"
         );
 
-        // The peer observes the close and its own verbs answer the same way.
+        // The peer observes the close — and, under ruling 128, still drains
+        // what arrived before it. The 1 000 bytes written above are readable
+        // *after* the death; only once they are gone does the death surface.
+        // The stream carries no FIN, so there is no `Ok(None)` to reach.
         let _ = within(cb.closed(), "peer closed").await;
-        assert!(matches!(
-            within(r.read(&mut [0u8; 64]), "read after close").await,
-            Err(ReadError::ConnectionLost(_))
-        ));
+        let mut got = 0usize;
+        loop {
+            let mut buf = [0u8; 256];
+            match within(r.read(&mut buf), "read after close").await {
+                Ok(Some(n)) => got += n,
+                Err(ReadError::ConnectionLost(_)) => break,
+                other => panic!("ruling 128: expected a drain then the death, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got, 1000,
+            "ruling 128: every byte that arrived before the CLOSE is readable \
+             after it — a build that drops them reports 0 here and still \
+             ends with `ConnectionLost`, which is why the count is asserted"
+        );
     })
     .await;
 }
