@@ -316,7 +316,13 @@
 > supply of **Intros** that provoke refusals, so the claim was false and
 > is replaced by the bound ruling 41's collapse actually delivers: **at
 > most one probe per `KEEPALIVE_TIMEOUT` per connection**, however many
-> Intros arrive. The probe stays exempt from §14.5's congestion
+> Intros arrive. *(Superseded in round 30 — **ruling 175**: that
+> replacement was false too. The collapse suppresses only refusals landing
+> while a mark is **outstanding**, and a live peer clears the mark in
+> ~1 RTT, so the true rate is `min(refusal rate, 1/RTT)`. The bound is
+> restated honestly in §7.5, §6.9 and §6.3, and **no cooldown is added** —
+> every re-mark records a fresh floor, so the security half is untouched.)*
+> The probe stays exempt from §14.5's congestion
 > *admission* gate — a cwnd-blocked probe would convert congestion into a
 > liveness verdict — but is now explicitly **counted** in the sent map
 > and `bytes_in_flight`, which keeps §17.5's cwnd bound true; §6.3's
@@ -834,10 +840,25 @@ alone (§5.2).
 consulted **post-`ss`**, at the point each path proves the static: the
 tie-break's routing (§6.6) or the staged chain's admission (§6.4) — is
 exactly one of **three** values:
-**LIVE** — an established connection exists; **PENDING** — an in-flight
-outbound initiation exists and no established connection (the
+**LIVE** — an established connection exists; **PENDING** — **a pending
+exists for that static** and no established connection (the
 simultaneous-open state; §16.1 forbids both at once); or **NONE** —
 neither.
+**[AMENDED 2026/08/16 — ruling 178]** *PENDING means a pending exists,
+not that a datagram is in flight.* This value read "an in-flight
+outbound initiation exists", which ruling 90's
+`mint_pending`/`start_attempt` split left ambiguous — a **minted**
+pending has nothing in flight yet — and the predicate is now stated
+positively: **membership in the pending tables** (§17.3, §17.4), from
+the instant `connect()` mints the pending until it completes, gives up
+or is cancelled (§16.3, ruling 50). Everywhere this document says an
+"in-flight outbound pending" it means an entry in those tables; there is
+no separate per-static flag, and all three readers of "is this static
+PENDING?" — §6.4's branch, §6.5's hint set, and this rule — consult the
+same tables. The alternative reading routes an initiation arriving in
+the mint-to-send window down the **NONE** row, which installs a second
+session and leaves both sides mutually dark for `DEAD_TIMEOUT` —
+precisely the divergence ruling 35 exists to prevent.
 
 - **LIVE** — the initiation is a **candidate replacement**: it parks as
   an ordinary
@@ -921,8 +942,13 @@ The responder anchors an accepted session at the initiation's msg1 source
 address — the one place a peer-supplied address becomes a send target
 before any authenticated data has arrived from it. That anchor arms
 §7.3's anti-amplification budget: until the address validates by traffic,
-output to it is capped at `AMPLIFICATION_FACTOR` × the authenticated
-bytes received from it (§7.3).
+output to it is capped at `AMPLIFICATION_FACTOR` × the authenticated,
+window-fresh bytes received from it (§7.3). **[AMENDED 2026/08/16 —
+rulings 168, 169]** *"Validates by traffic"* is a predicate, not a mood:
+the anchor records `validation_floor` (the counter the next seal will
+use), and the address validates — and the budget disarms — at the first
+authenticated, window-fresh packet from it carrying an ACK covering any
+counter at or above that floor (§7.3).
 
 ### 5.7 Timer values and their derivations
 
@@ -1279,15 +1305,24 @@ connections themselves keep running regardless — they hold no queue
 slot. That last clause needs one qualification, and it is stated here
 rather than left to §7.5: an established connection **we dialled**
 (`replacement_basis` = `None`) does feel a parked `Intro` for its own
-static, because refusing that `accept()` marks it **contested** and puts
-it on a `KEEPALIVE_TIMEOUT` watch (§6.4, §7.5). A live connection
-answers the probe and survives; what it costs is one ack-eliciting PING,
-and — by ruling 41's collapse — one such probe per `KEEPALIVE_TIMEOUT`
-however many Intros the attacker supplies, with no re-armed deadline and
-no second mark. So the claim as amended: established connections hold no
+static, because an `accept()` that **admits** that `Intro` and then
+refuses it on the basis rule marks the connection **contested** and puts
+it on a `KEEPALIVE_TIMEOUT` watch (§6.4, §7.5, ruling 177 — an
+un-admitted candidate, including a walk that exhausts, marks nothing). A
+live connection
+answers the probe and survives; what it costs is one ack-eliciting PING
+per mark, with no second PING and no re-armed deadline for any refusal
+landing **while that mark is outstanding** (ruling 41's collapse).
+**[AMENDED 2026/08/16 — ruling 175]** *This passage previously claimed
+"one such probe per `KEEPALIVE_TIMEOUT` however many Intros the attacker
+supplies" and "at most once per 10 s"; both are false.* The collapse
+covers only the outstanding-mark window, and a live peer clears the mark
+in about one RTT, so the honest rate is `min(refusal rate, 1/RTT)`. So
+the claim as amended: established connections hold no
 queue slot and are not denied by occupancy, and the only thing a flood
-can do to a dialled one is ask it, at most once per 10 s, to prove it is
-still there. One occupancy surface is
+can do to a dialled one is ask it — once per mark, over an
+application-paced `accept()` rate — to prove it is
+still there, which a live connection does by answering. One occupancy surface is
 sharper than the rest and is stated precisely: freeze-on-carry parks
 **endpoint-frozen, non-evictable** consumed slots that no application
 ever held, so an attacker that spoofs a hint-set source (the dialled
@@ -1329,7 +1364,14 @@ human-in-the-loop accept decision. The rule:
   strictly-greater timestamp. msg2 is written for the
   admitted candidate. A failing candidate is discarded and the next-newest
   tried, until admission or exhaustion. The per-source cap bounds the walk
-  at four `es` + `ss` pairs.
+  at four `es` + `ss` pairs. **[AMENDED 2026/08/16 — ruling 177]**
+  **Exhaustion — every candidate tried and none admitted — returns
+  `AcceptError::Stale`**, and it is a distinct case from "nothing
+  parked": it is reachable precisely *because* initiations are parked.
+  It is named in the `Stale` list below rather than left to this
+  sentence's "or exhaustion", and it marks **nothing**: the contested
+  mark below requires an **admitted** candidate, so a walk that reaches
+  no admission buys an attacker no probe (§6.9, §7.5).
 - **The §16.1 guard — a proven-LIVE admission replaces only against a
   newer basis.** At admission, fast path or re-home: if a LIVE connection
   exists for the proven static, the `accept()` **is** the replacement
@@ -1344,7 +1386,8 @@ human-in-the-loop accept decision. The rule:
   measure a replacement against) or a candidate not strictly newer than
   `t` — `accept()` returns `AcceptError::Stale` and the live connection
   is untouched. **One exception to "untouched", and it is the point of
-  ruling 36:** a refusal against a **`None`** basis marks that connection
+  ruling 36:** a refusal of an **admitted candidate** against a
+  **`None`** basis marks that connection
   **contested**, which records a **probe floor** (the counter the next
   seal will use), sends an ack-eliciting PING on it, and requires an ACK
   covering **any counter at or above that floor** within
@@ -1353,11 +1396,35 @@ human-in-the-loop accept decision. The rule:
   rather than a receive is what the question needs, and why the predicate
   is a high-water mark rather than that one packet (ruling 41) are
   specified in §7.5.
+  **[RATIFIED 2026/08/16 — ruling 177]** *"Admitted" is load-bearing and
+  is stated here because this is the narrower of two texts that
+  disagreed.* The mark requires a candidate that reached admission —
+  the **same** proven static, a **verifying tail tag**, and the
+  timestamp guard passed — so it is a **key-holder** primitive, priced
+  in §7.5's security argument as *"an attacker's replay supply buys
+  refusals"*. The refusals that reach **no** admission — nothing parked,
+  and a re-home walk that exhausts — return `Stale` and mark nothing;
+  an attacker able to park only mac1-valid rubbish therefore cannot
+  provoke a probe with no key material at all, which is what §6.9's DoS
+  table already prices those rows at (*0 DH … one bounded queue slot*,
+  never a probe).
+  **[RATIFIED 2026/08/16 — ruling 179]** *And one carve-out, stated here
+  because this is where the mark is taken.* A mark against a connection
+  already **closing or draining** (§15.2) is a **no-op** — no floor, no
+  PING, no deadline. A closing connection stays in §17.4's map for its
+  linger, which is what makes the `Retired` event and the guard pin
+  necessary, so this rule as written would otherwise take the mark and
+  leave §7.5 to undo it. §7.5 states the same carve-out from the state's
+  side; a rule enforced only in the section that *describes* the state
+  and not in the section that *enters* it is a rule that gets missed.
   The connection's protocol state is otherwise unchanged and the refusal
   itself stands either way: a live peer answers — the probe, a PTO retry,
   or any later packet will do — and keeps its connection. Refusing again
   while the connection is already contested adds nothing: no second mark,
-  no second PING, and no re-armed deadline (§7.5). A refusal against a `Some(t)` basis marks nothing — there
+  no second PING, and no re-armed deadline (§7.5) — that collapse covers
+  refusals landing while the mark is **outstanding**, and once the mark
+  clears the next admitted refusal is a full second mark with a fresh
+  floor (ruling 175). A refusal against a `Some(t)` basis marks nothing — there
   the basis can decide, and a genuine reconnect carries a strictly greater
   timestamp. There is no `AcceptError::AlreadyConnected`: a
   basis-passing proven-LIVE accept is a replacement, so the variant is
@@ -1404,9 +1471,24 @@ human-in-the-loop accept decision. The rule:
   (§6.7's winner-side record), the write that denies a later replay of
   that same initiation the vacuous guard pass it would otherwise enjoy.
   No other `Stale` leaves a record behind.
-- **PENDING at admission.** If an in-flight outbound initiation exists
-  for the proven static, `accept()` applies **§6.7's comparison** over the
-  same ordered pair of statics:
+- **PENDING at admission.** If **a pending exists for the proven
+  static**, `accept()` applies **§6.7's comparison** over the
+  same ordered pair of statics. **[AMENDED 2026/08/16 — ruling 178]**
+  *The predicate is **membership in the pending tables** (§17.3), not
+  whether a datagram has left the host.* This clause read "an in-flight
+  outbound initiation exists", which ruling 90's
+  `mint_pending`/`start_attempt` split made ambiguous — a **minted**
+  pending has no initiation in flight — and ruling 91 recorded the
+  ambiguity as open. It closes here on the table-membership reading,
+  because a minted pending is a declared intent to dial: if a peer's
+  initiation arriving in that window took §5.4's **NONE** row instead,
+  we would install as responder and `start_attempt` would *then* fire,
+  giving two sessions, two key sets, both msg2s dropped and both sides
+  mutually dark for `DEAD_TIMEOUT` — exactly the divergence ruling 35
+  exists to prevent. The mechanism was already verified in round 8: all
+  three readers of "is this static PENDING?" consult the same pending
+  tables that ruling 50's cancellation empties, and there is no separate
+  per-static flag anywhere.
   - **The peer's static is smaller** — we would be the tie-break *loser*:
     the `accept()` **cancels** the pending — the pending and its index are
     dropped and its `Connecting` resolves
@@ -1446,14 +1528,29 @@ human-in-the-loop accept decision. The rule:
   connection** at all, keeping only the one its own outbound completes.
   Either way that ordering against one static yields exactly one
   connection.
-- **Stale.** If no initiation for that static is currently parked, if the
-  admitted candidate fails the basis rule above, or if the static is
-  PENDING and we are the tie-break winner, `accept()` returns
-  `AcceptError::Stale`; the application SHOULD
+- **Stale.** **[AMENDED 2026/08/16 — ruling 177 adds the fourth case.]**
+  `accept()` returns `AcceptError::Stale` in exactly four situations, and
+  this list is the complete enumeration:
+  1. no initiation for that static is currently parked;
+  2. the **re-home walk exhausts** — candidates *were* parked and every
+     one of them failed the three-part admission test above. This is a
+     distinct case from (1), reachable precisely when initiations are
+     parked, and it was previously missing from this list while §6.9
+     supplied it only in passing (*"before it returns `Stale`"*), leaving
+     the path with no stated return value;
+  3. an **admitted** candidate fails the basis rule above — the only one
+     of the four that can mark the connection contested;
+  4. the static is PENDING and we are the tie-break winner.
+
+  The application SHOULD
   re-accept when the peer's next initiation surfaces as a new `Intro`. On
   the tie-break-winner case there is nothing to re-accept: our own
   outbound is completing that connection, and its `Connecting` resolves
-  in the ordinary way.
+  in the ordinary way. Only case (3) can touch a live connection
+  (§7.5's contested mark, and only where the basis is `None`); (1) and
+  (2) leave it untouched, and (4) has no live connection to touch —
+  it keeps its pending and writes the winner-side guard record described
+  above.
 
 ### 6.5 The routing rule
 
@@ -1462,9 +1559,16 @@ Inbound `HandshakeInit` processing in the endpoint core:
 1. **Stage 0 (always):** length gate, classify, mac1 verify. Failure is a
    silent drop. Cost: one keyed hash.
 2. **Hint check (no DH):** the *hint set* is the dialled addresses of all
-   in-flight outbound initiations — **nothing else** (established
+   **pendings** — **nothing else** (established
    connections' addresses are not hints; a LIVE static's initiation takes
-   the ordinary staged path below). If `src` ∉ hint set → park at stage 0
+   the ordinary staged path below). **[AMENDED 2026/08/16 — ruling 178]**
+   *"All pendings" is membership in the pending tables (§17.3), not "all
+   pendings whose msg1 has left":* a pending minted by `connect()`
+   contributes its dialled address from the instant it is minted, so the
+   eager path is reachable for a peer whose initiation crosses ours
+   inside the `mint_pending`/`start_attempt` window (ruling 90). The
+   clause previously read "in-flight outbound initiations". If `src` ∉
+   hint set → park at stage 0
    (§6.3) and surface an `Intro`.
 3. **Eager path (`src` ∈ hint set):** the endpoint immediately runs the
    split intro read (1 DH, `es` — Appendix A.1) and inspects the claimed
@@ -1710,6 +1814,24 @@ the restart resolves after all. The delay is then bounded by the
 application's next `accept()` rather than by `DEAD_TIMEOUT`, and the
 `Intro` is still parked when it comes (§6.3's `INTRO_TTL`).
 
+**[AMENDED 2026/08/16 — ruling 171]** *That bound rests on a premise this
+paragraph establishes and never joined to it, which is the failure this
+section's own method exists to prevent.* The attacker described above
+**roams the session to itself** as it drips, so the probe is aimed at an
+address §7.3 has just marked unvalidated and re-armed the budget for —
+and if the budget admitted the owed ACK ahead of the probe, the probe
+would never leave, `Contested` would never fire, and the zombie would be
+immortal after all. Two rules close it, and neither is optional here:
+§7.3's priority order puts a **pending contested probe ahead of every
+other class of output except CLOSE** at an unvalidated address (rulings
+171 and 186 — and a connection sending CLOSE is not a zombie anyone needs
+to reap, so the carve-out cannot weaken this argument), and §7.3's
+`validation_floor` means an off-path injector cannot keep the address
+unvalidated in the first place, since it can never produce an ACK
+covering a counter we sealed after the roam (ruling 168). *"Dies within
+`KEEPALIVE_TIMEOUT` of the probe"* is therefore true, and true for a
+named reason.
+
 ### 6.9 DoS accounting
 
 Per attacker packet; the mac1 verification (one keyed hash) is already
@@ -1789,21 +1911,41 @@ app-driven, post-authentication, bounded by the
 per-source cap; not attacker amplification.
 
 **The contested-connection probe's cost, accounted here rather than only
-at §7.5.** A refused `accept()` against a live connection whose
-`replacement_basis` is `None` marks that connection contested and sends
-one ack-eliciting PING on it (§7.5, rulings 36/41/43). The refusals are
+at §7.5.** An `accept()` that **admits** a candidate against a live
+connection whose `replacement_basis` is `None`, and refuses it on the
+basis rule, marks that connection contested and sends one ack-eliciting
+PING on it (§7.5, rulings 36/41/43). **[AMENDED 2026/08/16 — ruling
+177]** *This sentence previously read "a refused `accept()`", which
+scoped the mark to **any** refusal and put it a whole authentication
+tier below §6.4's rule.* §6.4's narrower rule governs: the mark requires
+an **admitted** candidate — same proven static, verifying tail tag,
+timestamp guard passed — so a walk that exhausts without admitting
+anything, or a chain with nothing parked, returns `Stale` and marks
+**nothing**. An attacker who can park only mac1-valid rubbish therefore
+buys no probe at all: this table already prices those rows at *0 DH …
+one bounded queue slot*, and that price is correct as written.
+The refusals are
 `accept()` calls, but the *Intros* that provoke them are
 attacker-suppliable — that is exactly what §6.3's queue exists for — so
 this is an attacker-adjacent cost and belongs in this table's reasoning.
-Its bound is ruling 41's collapse rather than the accept rate: a
-connection already contested absorbs every further refusal without a
-mark, a PING, or a re-armed deadline, so the cost is **at most one
-`MAX_DATAGRAM`-bounded packet per `KEEPALIVE_TIMEOUT` per live
-connection** — roughly one packet per 10 s per connection — no matter
-how many Intros arrive. The packet is exempt from the congestion
+**[AMENDED 2026/08/16 — ruling 175]** *The bound previously stated here
+— "at most one `MAX_DATAGRAM`-bounded packet per `KEEPALIVE_TIMEOUT` per
+live connection … no matter how many Intros arrive" — was false, and
+§7.5 stated the same false thing.* Ruling 41's collapse suppresses only
+refusals landing **while a mark is outstanding**; a live peer ACKs in
+about one RTT and clears the mark, after which the next refusal is a
+full second mark. The honest cost is **one `MAX_DATAGRAM`-bounded packet
+per mark, one mark per uncontested refusal, marks never overlapping**,
+so the per-connection rate is `min(refusal rate, 1/RTT)` — the refusal
+rate being the application's own `accept()` rate over an attacker-fed
+Intro supply. No cooldown is imposed (§7.5): the security half is
+unaffected, because every re-mark records a fresh floor. The packet is
+exempt from the congestion
 admission gate but counted in the sent map (§13.5, §14.5), and it is
-capped by §7.3's budget at an unvalidated address like everything else.
-The state is likewise one slot: a single optional
+capped by §7.3's budget at an unvalidated address like everything else —
+where, being a **pending contested probe**, it outranks every other
+class of output but CLOSE (§7.3, rulings 171 and 186).
+The state is likewise one slot regardless of the rate: a single optional
 `(probe_floor, deadline)` per connection, never a list (§17.5).
 
 **No amplification.** The accept path replies 107 B (msg2) to a 196 B
@@ -1813,7 +1955,10 @@ packets, the `0x04` packet type is never emitted, CLOSE exists only
 inside the seal and its linger replies only to authenticated,
 window-fresh inbound (§15.2), every staged rejection is local and silent,
 and a peer-supplied anchor or roam target is send-capped by the
-anti-amplification budget until it validates by traffic (§7.3).
+anti-amplification budget until it validates by traffic — §7.3's
+`validation_floor` predicate, an ACK covering a counter we sealed after
+the anchor or the roam, which a spoofed source can never produce
+(§7.3, ruling 168).
 
 **One qualification, since ruling 40 made the beacon reachable.** The
 `ratio < 1` above is a property of the *accept path itself*, and it
@@ -1826,12 +1971,26 @@ initiation never turns us into a keepalive source aimed at a spoofed
 address" states without that qualification and which is corrected there.
 The **operative bound in that case is §7.3's budget, not the msg2
 ratio**: total output to the unvalidated address may not exceed
-`AMPLIFICATION_FACTOR` (3) × the authenticated bytes received from it,
+`AMPLIFICATION_FACTOR` (3) × the authenticated, window-fresh bytes
+received from it,
 so the worst case is 3 × 196 B = 588 B for one replayed msg1 — a ratio
 of 3, the maximum the budget permits anywhere in this document, and
-reached only where the application opted the beacon on. The honest
-statement is therefore: **no path exceeds the 3× budget, and the accept
-path with no beacon configured stays far under it at 0.55×.** The
+reached only where the application opted the beacon on. **[AMENDED
+2026/08/16 — ruling 168]** That 588 B bound survives the budget's new
+disarm condition, and the premise is named rather than assumed: the
+spoofed source is not the peer, so nothing at it can produce an ACK
+covering `validation_floor`, the address never validates, and the cap
+therefore binds this case for the session's whole life — exactly as the
+superseded permanent-cap text claimed for every case. The honest
+statement is therefore: **no path to an address that has not proved
+return routability exceeds the 3× budget, and the accept
+path with no beacon configured stays far under it at 0.55×.** The scope
+qualifier is ruling 168's and matters: once an address *has* validated —
+an ACK covering `validation_floor`, which only the genuine peer at that
+address can produce — the budget disarms and the ratio stops being an
+amplification figure at all, because there is no longer a third party to
+reflect toward. Every attacker-relevant case in this table is a case
+that never validates. The
 alternative of suppressing the beacon entirely while an address is
 unvalidated — the beacon's NAT-holding job being arguably meaningless
 before return routability is proved — would restore the ratio outright
@@ -1869,9 +2028,15 @@ Every seal — payload, control, keepalive — burns the next counter.
   delivery**. The window's greatest advances only on authenticated
   counters; hiss's `MAX_EPOCH_JUMP` and commit-and-cap bound forged-counter
   cost upstream of it (§2.1).
-- **Liveness and roaming are driven only by packets that are both
+- **Liveness, roaming, and §7.3's amplification budget are driven only by
+  packets that are both
   authenticated and window-marked** (fresh). No replayed packet ever moves
-  the endpoint or refreshes liveness.
+  the endpoint, refreshes liveness, or funds the budget.
+  **[AMENDED 2026/08/16 — ruling 169]** The budget is named here because
+  §7.3 previously funded itself on the broader *authenticated* class and
+  excluded only the unauthenticated, which on the literal text let a
+  replayed packet replenish a security counter. Three readers, one class,
+  and this is the complete list of what reads it.
 - Sizing: 2048 sits above boringtun's 1024 and below the kernel's 8192;
   it is ~20 ms of reordering memory at 1 Gbps line rate and ~200 ms at
   100 Mbps, comfortably inside one ratchet epoch (65 536), with margin for
@@ -1905,7 +2070,7 @@ controller with the pre-roam flight fenced off (§14.6) — new wiring
 relative to all prior slither: a new path
 carries no continuity evidence for the old window.
 
-**The anti-amplification budget.** **[RATIFIED 2026/08/14, amended 2026/08/14]** Roaming moves the
+**The anti-amplification budget.** **[RATIFIED 2026/08/14, amended 2026/08/14; amended 2026/08/16 — rulings 168, 169, 170, 171]** Roaming moves the
 endpoint on one authenticated packet, and an accepted initiation anchors
 at its msg1 source (§5.6) — in both cases a peer-supplied address becomes
 a send target with no return-routability proof, while §13.4 and §14.5
@@ -1915,34 +2080,169 @@ from the congestion window. Unchecked, that is a reflector. The rule:
 whenever a session's endpoint address changes (a roam) or is first
 anchored from a msg1 source, the address is **unvalidated** and a
 send-side budget arms — total bytes sent to the address MUST NOT exceed
-`AMPLIFICATION_FACTOR` (= 3) × total bytes **received from it and
-authenticated** on this session, both counters resetting at each such
-address change. Authenticated means the packet's AEAD tag verified
-(§7.2's authenticated class; the anchoring initiation qualifies, its
-handshake tail tags having verified at admission) — merely-received
-bytes, unauthenticated or undecryptable datagrams claiming the
-address, MUST NOT replenish the budget. The budget
-binds **all** output to the address, **explicitly including the §14.5 and
-§13.4 congestion-window exemptions** — those exemptions are scoped to
-cwnd, never to this budget. The 3× ratio is **never lifted**: it is the
-amplification factor QUIC accepts (RFC 9000 §8.2/§9.3), it forces an
-attacker to pay a third of any flood it reflects — removing the
-reflection incentive at zero protocol machinery — and a genuine peer
+`AMPLIFICATION_FACTOR` (= 3) × total bytes **received from it,
+authenticated, and window-fresh** on this session, both counters resetting
+at each such
+address change. **[RATIFIED 2026/08/16 — ruling 169]** Authenticated and
+window-fresh means the packet's AEAD tag verified **and** §7.2's replay
+window marked it as not-yet-seen — §7.2's *authenticated and
+window-marked* class, the same class that is the only thing permitted to
+move the endpoint or refresh liveness, and the class this section's own
+opening sentence already names (the anchoring initiation qualifies, its
+handshake tail tags having verified at admission). Three kinds of bytes
+MUST NOT replenish the budget, and the list is exhaustive in both
+directions — nothing outside the authenticated, window-fresh class ever
+funds it: merely-received bytes; unauthenticated or undecryptable
+datagrams claiming the address; and **replayed duplicates of packets
+already counted**. The third is the one the earlier text admitted by
+accident, by citing the broader *authenticated* class and then excluding
+only the unauthenticated: a keyless on-path attacker who could refund the
+budget by re-injecting bytes we have already counted would inflate our
+send allowance toward an address of its choosing, which is the reflector
+this rule exists to prevent. No argument has ever been offered for
+letting duplicates fund a security counter.
+
+**The scope is one session.** **[RATIFIED 2026/08/16 — ruling 170]** Both
+byte counters, and the `validation_floor` below, are **per unvalidated
+address, per session**. They live in `core::Connection` beside the roam
+seam (§13.6, §14.6) — the only place they are implementable, and the only
+place §17.5's per-connection state census budgets them; there is no
+endpoint-side per-address table. The residual is stated here rather than
+left to inference: `N` sessions anchored or roamed to the **same** address
+carry `N` independent budgets, so a peer holding `N` sessions against one
+victim address multiplies the reflector by `N`. That is routine under
+NAT, and routine in §6.9's threat model. It is bounded by the number of
+sessions the application accepts — the endpoint's governing scale in §6.9
+and §17.5 — and it is the price of putting the counters where the roam
+seam is.
+
+**Disarming: `validation_floor`, a return-routability proof.**
+**[RATIFIED 2026/08/16 — ruling 168; this reverses a declination recorded
+in the superseded text]** The unvalidated state **ends**, and the text
+now says how. At each address change — a roam, or the first anchor from a
+msg1 source — the connection records, in the same act that arms the
+budget:
+
+> `validation_floor` = **the counter the next seal will use** —
+> `DatagramSend::next_counter()` (Appendix A.2), the identical
+> construction ruling 41 records as the contested probe's `probe_floor`.
+
+The address becomes **validated**, and the budget **disarms**, at the
+first **authenticated, window-fresh packet from that address** carrying
+an ACK that covers **any counter ≥ `validation_floor`**. Until that
+moment the 3× cap binds all output exactly as stated above. At validation
+the two byte counters and `validation_floor` are freed and the cap no
+longer applies to that address; they are **re-armed, with a fresh floor
+recorded, at the next address change** — §13.6 lists this among the roam
+seam's per-connection resets, and §7.7's counter space is never reset, so
+a fresh floor is always strictly above every counter already sealed.
+
+An ACK at or above the floor can only have been minted by a peer that
+**received a packet we sent to that address after the change** — which is
+return routability, proved, with no new frame type, no new packet type,
+and no state beyond one `u64` and one `bool` per connection. The argument
+is §7.5's probe-floor argument verbatim: an ACK's coverage derives from
+the peer's replay window (§12.2), which cannot contain a counter the peer
+never received, and an attacker holds only packets we sealed *before* the
+floor. If nothing at the new address ever answers, nothing is validated
+and the session dies by liveness inside 25 s — unconditionally, since any
+ack-eliciting output we aim at the address arms the death clock by
+itself, even where nothing marking is sent (§7.4). There is no deadlock in
+either direction: the budget always admits *something* (the anchoring or
+roaming packet funds 3× its own size), and what it admits is enough to
+elicit the ACK that ends it.
+
+**Why the literal permanent cap could not stand, recorded so the
+reversal is not re-litigated.** The budget arms on *every* first anchor
+from a msg1 source, so **every responder-side connection begins
+unvalidated**. Under a cap that never ends, an accepting endpoint could
+never send more than 3× what it receives for the connection's entire
+life — and a peer downloading a file replies with ACKs only, ~40 B per
+~2400 B sent (§12.4's delayed ACK), funding ~120 B of budget against
+2400 B of demand. **An endpoint that accepts connections could never
+serve one.** The superseded text's reassurance — that *"a genuine peer
 clears it within about one round trip, because its own authenticated
-traffic funds the budget continuously, while a path that sends nothing
-dies by liveness inside 25 s (no deadlock — and unconditionally so: any
-ack-eliciting output we aim at the address arms the death clock by itself,
-even where nothing marking is sent, §7.4). The judgment calls needing
-the ruling: the never-lifted ratio versus an
-N-authenticated-packets-over-1-RTT validation unlock (more state, the
-same reflection property), and this wire-free budget versus explicit
-PATH_CHALLENGE/PATH_RESPONSE validation — two new frame types and a
-second reset seam, the one reviewed alternative that would move the wire;
-recorded in §19 as the QUIC-faithful-migration lever.
+traffic funds the budget continuously"* — is true only of a **symmetric**
+request/response exchange and false of every asymmetric transfer, which
+is what made the permanence look harmless; and "clears it" is transition
+language for a transition the old rule did not define.
+
+**What is still never lifted.** The **3× ratio itself** is never raised,
+never lowered, never configurable, and never waived. For as long as an
+address is unvalidated it binds **all** output to it, **explicitly
+including the §14.5 and §13.4 congestion-window exemptions** — those
+exemptions are scoped to cwnd, never to this budget — and it caps every
+byte any accrued window could discharge there (§14.5). It is the
+amplification factor QUIC accepts (RFC 9000 §8.2/§9.3), and it forces an
+attacker to pay a third of any flood it reflects, removing the reflection
+incentive at zero protocol machinery. What ends is the **unvalidated
+state**, not the ratio — and RFC 9000 is now cited for what it says: QUIC
+binds that limit *until the address is validated*, and validates it by a
+return-routability proof, which is exactly the shape adopted here.
+
+**Why this is not the declined alternative.** Two alternatives remain
+declined, and `validation_floor` is neither of them. (1) *An
+N-authenticated-packets-over-1-RTT validation unlock* — more state than
+this, and, decisively, **the same reflection property**: N authenticated
+packets can be replayed at us by an off-path attacker, whereas an ACK
+covering a counter *we* chose after the address change cannot be
+manufactured without the key. `validation_floor` is a **single**
+round-trip proof carrying **less** state (one `u64`, one `bool`) and a
+strictly stronger predicate; the declined option was the weaker one,
+which is likely why it was declined. (2) *Explicit
+PATH_CHALLENGE/PATH_RESPONSE validation* — two new frame types, a second
+reset seam alongside the roam seam, and the one reviewed alternative that
+would move the wire; still declined, still recorded in §19 as the
+QUIC-faithful-migration lever. `validation_floor` is wire-free: it adds
+no frame, no packet type, and no byte to any packet.
+
+**Priority within a scarce budget.** **[RATIFIED 2026/08/16 — ruling
+171]** The budget binds all output and cannot be waived, so when it
+admits less than is owed, *something* must yield, and the order is
+normative rather than left to queue order:
+
+1. **CLOSE** (§15.2) — **[RATIFIED 2026/08/16 — ruling 186]**.
+2. **A pending contested probe** (§7.5) — ahead of all other output to an
+   unvalidated address.
+3. Pure ACKs.
+4. PTO probes (§13.4).
+5. Keepalives — passive and persistent (§7.5).
+6. Retransmissions (§13.5).
+7. New application data — STREAM and DATAGRAM fill (§8.5).
+
+The probe's place is the load-bearing one, and §7.5 already makes the
+argument exactly once, for the congestion gate: *"a probe the gate could
+delay past its own deadline would silently convert congestion into a
+liveness verdict."* The argument transfers verbatim to the budget. The
+attack it forecloses: an adversary holding harvested peer→us Data injects
+one small packet just under `DEAD_TIMEOUT` **from a fresh source each
+time**, which refreshes liveness, roams the session (re-arming the
+counters at that one packet's bytes), and leaves too little budget for
+the probe to win against the ACK also owed — making the zombie the probe
+exists to reap immortal, and `Contested` never fire. Ruling 168
+independently defuses that attack's engine, since an off-path injector
+cannot produce an ACK covering `validation_floor` and so cannot keep the
+address unvalidated for free; the priority rule stands anyway, because an
+attacker who *can* keep an address unvalidated must still not be able to
+starve the verdict.
+
+**Why CLOSE outranks even the probe. [RATIFIED 2026/08/16 — ruling
+186]** §16.5 states the governing principle for exactly this tie: *"a
+terminal outcome precedes a routine one."* A connection that is closing
+has no use for the probe's verdict — the probe exists to decide whether to
+reap a connection, and one that is leaving has answered that question
+already. §7.5 points the same way from the other side: a contested mark
+taken on an already-closing connection is a **no-op**, so the two states
+barely co-exist, and where a mark taken while live survives into closing
+its verdict is moot. A CLOSE the budget will not admit, by contrast, costs
+the peer a full `DEAD_TIMEOUT` to learn what one small packet would have
+told it at once. Both are small and both are cwnd-exempt, so the ordering
+is free in the common case and decides only the scarce-budget case, which
+is what this rule is for.
 
 | Constant | Value |
 |---|---|
-| `AMPLIFICATION_FACTOR` | 3 (× authenticated bytes received, per unvalidated address) |
+| `AMPLIFICATION_FACTOR` | 3 (× authenticated, window-fresh bytes received, per unvalidated address, per session) |
 
 ### 7.4 The liveness model — `seal` versus `seal_quiet`
 
@@ -1991,17 +2291,22 @@ implementation choice (§6.7, §17.1, and §15.4's endpoint-dropped row all
 rest on it), and without the pin an implementation that started the clock
 unarmed would hold such a session **forever**, since §7.6 is deleted and
 liveness is the only reaper. And with `last_send` equal to
-`last_authenticated_recv`, §7.5's passive rule — *received since it last
-sent* — is false until the first authenticated receive, so a half-open
+`last_authenticated_recv`, §7.5's passive rule — *received since its last
+marking send* (§7.5, ruling 182) — is false until the first authenticated
+receive, so a half-open
 session emits nothing at all: it is reaped in silence, and a replayed
 initiation never turns us into a keepalive source aimed at a spoofed
 address — **unless the application has configured a persistent keepalive
 on that connection**, whose beacon is unconditional by design (§7.5) and
 therefore does fire into the unvalidated anchor. That case is not a hole
 but a smaller guarantee: the beacon's output to an unvalidated address
-stays capped by §7.3's anti-amplification budget at 3× the authenticated
-bytes received, so the session emits at most 588 B for the replayed
-196 B and then goes quiet until the address validates. §6.9 states the
+stays capped by §7.3's anti-amplification budget at 3× the authenticated,
+window-fresh bytes received, so the session emits at most 588 B for the
+replayed
+196 B and then goes quiet until the address validates — §7.3's
+`validation_floor` predicate (ruling 168), which a spoofed source cannot
+satisfy, so here "until" means "never" and the 588 B is the whole
+budget the case ever gets. §6.9 states the
 resulting ratio in full. The claim above is exact for the default
 configuration — the beacon is off unless asked for — and this sentence
 is what makes it exact rather than merely usually true.
@@ -2053,8 +2358,24 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
 - **The keepalive is the empty plaintext** (§3.4) — the cheapest possible
   liveness beacon, bypassing the frame layer, sealed via `seal`. Its
   classification, explicit: the keepalive is a **marking** send. Passive
-  rule: a side that has received since it last sent, and has not sent for
+  rule: a side that has received since its last **marking** send, and has
+  not made a **marking** send for
   `KEEPALIVE_TIMEOUT`, sends a keepalive.
+  **[AMENDED 2026/08/16 — ruling 182]** *Both conjuncts read `S` =
+  `last_send`, **marking sends only** (§7.4) — this rule previously said
+  "has not sent", and wire traces diverge from the first non-marking send
+  onward.* The formal definition at ruling 40's derivation below governs,
+  and here — unusually for this document — the **formal rule carried the
+  intent and the prose carried the bug**. The reason is decisive rather
+  than reflexive: the beacon's soundness proof below rests on *"every
+  send that can establish `S > R` is a marking send, so the death clock
+  is armed there (§7.4)"*. Under the prose reading a **non-marking** send
+  blocks the dance — "has not sent" becomes false — **without arming the
+  death clock**, and the proof collapses into exactly the immortal
+  half-open session SECV5-2 was applied to prevent. When two statements
+  conflict, follow the one some other proof depends on. *(Which
+  individual sends are marking is **§7.4's** classification, quoted, not
+  re-derived here — a PTO probe's class in particular is §7.4's answer.)*
 - **Persistent keepalive** is a per-connection opt-in beacon, for NAT
   holding and for mutually idle links. Its trigger is WireGuard's: it
   fires when no marking send has occurred for the configured interval,
@@ -2206,7 +2527,8 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   not hidden — and it is **narrower than "two consecutive losses"**. At
   25 s = 2 × `KEEPALIVE_TIMEOUT` + 5 s grace the tolerance is one lost
   keepalive **in one direction**: if A's keepalive at t = 10 is lost but
-  B's arrives, A has received since it last sent, keepalives again at
+  B's arrives, A has received since its last marking send, keepalives
+  again at
   t = 20, and lands inside B's deadline with 5 s to spare. A
   **simultaneous bidirectional** loss — one loss *event*, two packets, the
   same interval — is not tolerated at all: both sides then hold
@@ -2408,19 +2730,42 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   after-the-mark-arrival coincidence. The floor is what makes the proof
   a statement about counters rather than about arrival order.
 
-  **Cost, and the honest bound (ruling 43).** An earlier draft bounded
-  the probe by "the application's own accept rate and nothing an attacker
-  controls". That was false and is corrected here: refusals are provoked
-  by **Intros**, and an attacker supplies Intros — the queue in §6.3
-  exists precisely because it can. What actually bounds the probe is the
-  collapse rule above. A connection that is already contested absorbs
-  every further refusal without a mark, a PING, or a re-armed deadline,
-  so the probe rate is **at most one packet per `KEEPALIVE_TIMEOUT` per
-  connection** — about one packet per 10 s — no matter how many Intros
-  arrive, and the endpoint-wide total is that times the number of live
-  connections the application is holding. That is a bound the attacker
-  cannot move, which is what the earlier sentence was reaching for and
-  did not have.
+  **Cost, and the honest bound (rulings 43 and 175).** Two drafts have
+  bounded this probe and both were wrong. The first bounded it by "the
+  application's own accept rate and nothing an attacker controls";
+  ruling 43 corrected the false half — refusals are provoked by
+  **Intros**, and an attacker supplies Intros, which is what the queue in
+  §6.3 exists for — and replaced it with *"at most one packet per
+  `KEEPALIVE_TIMEOUT` per connection … a bound the attacker cannot
+  move."* **[AMENDED 2026/08/16 — ruling 175]** *That replacement is also
+  false, and by a factor of about a thousand.* The collapse rule
+  suppresses only refusals landing **while the mark is outstanding**, and
+  on a **live** connection the peer ACKs in about one RTT, which clears
+  the mark; the next refusal then lands uncontested and is a full second
+  mark, with its own PING and its own fresh floor. The real rate is
+  `min(refusal rate, 1/RTT)` — on a 10 ms LAN path up to ~100 probes/s,
+  not 0.1/s. Both texts said the same thing and both were wrong the same
+  way, which is why review passed it: not a conflict between two
+  statements, but one unstated scope agreed upon in two places.
+
+  The bound, stated honestly: **at most one probe per mark, at most one
+  mark per uncontested refusal, and marks cannot overlap** — one floor
+  and one deadline per connection, never a list (§17.5). The refusal rate
+  is the application's own `accept()` rate; the **Intro** supply that
+  provokes those refusals is the attacker's, and no sentence here should
+  be read as claiming otherwise. The endpoint-wide total is the
+  per-connection rate times the number of live connections the
+  application holds.
+
+  **No cooldown is added**, and the omission is deliberate rather than an
+  oversight: a cooldown would leave a genuine second doubt unprobed for
+  its duration, trading a cost bound for a security hole. The security
+  half is untouched either way, and this is what makes the honest bound
+  affordable — **every re-mark records a fresh floor**, so each probe
+  still demands acknowledged progress *after* the doubt that raised it.
+  A connection answering 100 probes a second is a connection answering,
+  which is precisely the verdict the probe asks for. This is a **cost**
+  defect, not a security one.
 
   **Congestion: exempt from the gate, counted in the map.** The probe is
   admitted regardless of the congestion window (§14.5) — a probe the gate
@@ -2438,14 +2783,47 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   **When the probe cannot be sent, and when it must not be.** The
   deadline is armed at the probe's **transmission**, not at the mark, so
   a probe that §7.3's budget will not yet admit leaves the mark
-  **pending** rather than failed — the endpoint sends it, and arms, at
+  **pending** rather than failed — the endpoint sends it, **unless the
+  mark has already cleared**, and arms, at
   the first instant the budget allows. A connection may not be killed by
   a question that was never asked. That same instant is when the
   application-visible `Contested` signal fires (§16.4, §16.2, ruling 46):
   the mark-pending gap emits nothing, so the signal never announces a
   countdown that is not yet running. A contested mark taken on a connection
   already closing or draining (§15.2) is a **no-op**: that connection is
-  already leaving, and the parked `Intro` will meet no live static.
+  already leaving, and the parked `Intro` will meet no live static —
+  §6.4 carries the same carve-out at the point the mark is *taken*
+  (ruling 179).
+
+  **The pending mark's other two exits.** **[RATIFIED 2026/08/16 —
+  ruling 176]** The mark-pending state had one stated entry and one
+  stated exit; two more are reachable and are stated now.
+
+  - **An ACK covering the floor arrives while the mark is still
+    pending.** This is ordinary, not exotic: the floor is *the counter
+    the next seal will use*, so **any** post-mark seal — a keepalive, a
+    retransmission, a pure ACK, an application Data packet — lands at or
+    above it, and the peer's ACK of that seal clears the mark before the
+    probe was ever admitted. **Clearing a pending mark cancels the
+    pending probe and emits nothing.** The *"mark-pending gap emits
+    nothing"* principle §16.4 already states for the gap governs its
+    exit too. Both halves matter: on the literal earlier text
+    `ContestCleared` fired *"when the mark clears"* unconditionally, so
+    it could fire with **no preceding `Contested`** — the unmatched
+    notification that ruling 46 deleted `under_probe: bool` to prevent
+    (§16.4 now states the matching rule) — and the send rule *"the
+    endpoint sends it, and arms, at the first instant the budget
+    allows"* carried no condition, so a **stray probe** would go out and
+    arm a `KEEPALIVE_TIMEOUT` verdict deadline for a mark that no longer
+    exists. That deadline would then be uncancellable by §16.5's disarm
+    rule, which disarms on an ACK covering a floor that has *already*
+    been satisfied.
+  - **The connection roams again while the mark is still pending.** The
+    pending mark is left **intact with its floor unchanged**: the
+    counter space is never reset (§7.7), so the floor stays meaningful
+    across the seam, and the roam changes only the probe's budget
+    prospects, not the question it asks. §13.6 lists it among the roam
+    seam's per-connection outcomes for exactly this reason (ruling 173).
 
   The probe's `KEEPALIVE_TIMEOUT` deadline is deliberately shorter than
   `INTRO_TTL` (§6.3), and the peer's retransmit train re-mints an
@@ -2827,9 +3205,28 @@ unrepresentable (§11.4).
 Frames-to-packets is many-to-many: one packet carries many frames, and
 one stream's bytes span many packets. Within a packet the sender packs in
 this order: the ACK first (if owed), then control frames (credit grants,
-RESET_STREAM, CLOSE), then STREAM and DATAGRAM fill, then PING last if a
+RESET_STREAM, CLOSE), then STREAM and DATAGRAM fill, then PING last
+among **length-prefixed** frames if a
 probe still owes ack-eliciting content. At most one extends-to-end frame
-(¬LEN STREAM, or `0x30` DATAGRAM) per packet, in final position. Within
+(¬LEN STREAM, or `0x30` DATAGRAM) per packet, in final position.
+
+**[RATIFIED 2026/08/16 — ruling 181]** *Two frames were told to be last;
+the two senses are different and the parser forces the separation.* An
+extends-to-end frame carries **no length prefix** — it is defined as
+running to the end of the packet — so its final position is
+**structural**: nothing *can* follow it, because anything that did would
+be parsed as part of it. That claim is not negotiable. PING's "last" is
+**ordinal**, a placement preference among length-prefixed frames, and a
+one-byte frame's position carries no semantics. Therefore: **PING is
+packed immediately before the extends-to-end frame**, and "PING last"
+reads as *last among length-prefixed frames*. A sender may equally emit
+the datagram in its `0x31` LEN form and keep PING physically last — both
+parse identically and the choice is the sender's — but the ¬LEN form
+**must never be followed by anything**. Slice 7 makes the collision
+routine, since the contested probe and the PTO probe both emit PING into
+packets that may already carry an extends-to-end frame.
+
+Within
 the STREAM fill, streams with pending data are served **round-robin** —
 one quantum per stream per fill pass, the quantum size
 implementation-defined — which is what makes the no-head-of-line-blocking
@@ -3811,13 +4208,47 @@ walk, no RTT sample, and no `app_limited` window growth — the
 roam-triggering path break must not be read as fresh-path congestion (the
 break *is* §14.4's predicate: two far-apart losses with nothing acked
 between; unfenced, every roam would start at `MINIMUM_WINDOW` instead of
-`INITIAL_WINDOW`). The RTT estimator is treated as suspect-but-kept, with
+`INITIAL_WINDOW`). **[AMENDED 2026/08/16 — ruling 172]** Those four
+fences are **not** all read from one stamp: `recovery_start` (set to the
+roam instant, never cleared) fences the congestion event and the
+`app_limited` growth, and `path_gen` fences the RTT sample and the
+persistent-congestion walk. §14.6 states the assignment in full and why
+the two mechanisms are behaviourally indistinguishable here. The RTT
+estimator is treated as suspect-but-kept, with
 `min_rtt` re-seeded from the first post-roam sample (§13.1).
 (Consequence: immediately after a roam,
 `bytes_in_flight` may exceed the fresh initial window; the admission gate
 then blocks new sends until old-path packets are acknowledged or declared
 lost — a bounded stall of at most one loss-detection/PTO cycle, kept
 probeable by the PTO exemption within §7.3's budget.)
+
+**Every per-connection reset on this seam, in one list.**
+**[RATIFIED 2026/08/16 — ruling 173]** This section's title claims a
+scope, and a list read as exhaustive had better be one — the previous
+text covered recovery and congestion state only, while §7.3 mandates a
+reset on the *same* seam that it never mentioned. An implementer
+building `on_roam()` from the old list would touch the controller and the
+sent map and let the amplification budget carry the **old** address's
+credit to the new one, funding sends to a fresh attacker-supplied address
+with credit earned from the genuine peer — the reflector §7.3 exists to
+prevent, reconstructed out of a missing line. Narrowing the title instead
+was considered and declined: the omission is invisible until someone
+builds against it, so the list is the thing that has to exist.
+
+| On a roam | What happens | Where it is ruled |
+|---|---|---|
+| congestion controller | **reset** to `INITIAL_WINDOW` / `ssthresh = u64::MAX` | §14.6 |
+| `recovery_start` | **set to the roam instant** — never cleared | §14.6, ruling 139(b) |
+| path generation (`path_gen`) | **incremented** — the pre-roam stamp is what fences the RTT sample and the persistent-congestion walk | §14.6, ruling 172 |
+| amplification byte counters (sent, received) | **reset to zero**, and the address becomes unvalidated | §7.3 |
+| `validation_floor` | **re-recorded** at the roam — the counter the next seal will use; any earlier floor is discarded | §7.3, ruling 168 |
+| sent-packet map | **kept** — in-flight ACKs still resolve, `bytes_in_flight` stays consistent | §13.5, above |
+| PTO / loss detection | **undisturbed** — timers continue, no re-arm, no cancel | §13.3, §13.4 |
+| RTT estimator | **kept as a prior** (suspect-but-kept); `min_rtt` re-seeded from the first post-roam sample | §13.1 |
+| pending contested mark and its `probe_floor` | **kept intact, floor unchanged** — a roam changes the pending probe's budget prospects, not the question it asks | §7.5, ruling 176 |
+| `Contested` deadline, once armed | **undisturbed** — it is armed at the probe's transmission and disarmed only by an ACK covering `probe_floor` | §16.5, §7.5 |
+| §7.2's anti-replay window | **not reset** — stated out loud rather than left clean-by-construction: one session has one never-reset counter space (§7.7), so a roam cannot rewind it and a replayed packet stays a replay across the seam | §7.2, §7.7 |
+| the session keys, the counter space, stream and credit state | **untouched** — roaming is a path change, not a session change (§7.8) | §7.7, §7.8 |
 
 ## 14. Congestion control *(DRAFT 2026/08/13)*
 
@@ -3924,7 +4355,16 @@ retransmits them (§11.1).
 fresh roam target or msg1-source anchor — §7.3's anti-amplification
 budget binds **all** output, the exempt classes above included: probes,
 pure ACKs, CLOSE, and keepalives are free of the congestion window, never
-of the budget.
+of the budget. **[AMENDED 2026/08/16 — rulings 168, 171]** Two
+consequences follow and are stated here so this list is not read as the
+whole story. First, "unvalidated" is a **state with an exit**: §7.3's
+`validation_floor` disarms the budget on a return-routability proof, and
+these exemptions then face no cap at all. Second, while the budget *is*
+armed and admits less than is owed, §7.3's priority order decides which
+exempt class goes first — a **pending contested probe** ahead of
+everything, because a probe the budget could delay past its own deadline
+would convert a scarce budget into a liveness verdict, which is the same
+argument that earns it the cwnd exemption above.
 
 **`app_limited`** (quinn's mechanism, pinned): the send path maintains an
 application-limited flag — set when the sender runs out of queued data
@@ -3963,8 +4403,35 @@ one seam; the RTT estimator survives it as a prior (§13.1):
   after every normal loss episode — silently, and permanently on a lossy
   path. The mechanism that works is the one this bullet already names:
   **path-generation stamping**. `SentPacket` therefore carries a `u32`
-  path generation from slice 5 onward, held at 0 until roaming exists,
-  and §13.6's fences read that stamp rather than the recovery marker. This is conservative per RFC 9002/quinn
+  path generation from slice 5 onward, held at 0 until roaming exists.
+  **[AMENDED 2026/08/16 — ruling 172]** *The split is 2/2, and the four
+  fences are assigned individually here because three texts previously
+  gave three answers.* This clause read *"§13.6's fences read that stamp
+  rather than the recovery marker"* — plural and unqualified, i.e. all
+  four on the stamp — which reversed its own opening two sentences.
+  Ruling 137's enumeration, for its part, assigned three of the four and
+  silently dropped the persistent-congestion walk. The assignment, in
+  full, is the one the code shipped:
+
+  | Fence on a pre-roam packet | Read by |
+  |---|---|
+  | no congestion event | `recovery_start`, set to the roam instant (§14.3 already gates it) |
+  | no `app_limited` window growth | `recovery_start`, same reason |
+  | no RTT sample | `path_gen` — `recovery_start` cannot serve it |
+  | no persistent-congestion walk | `path_gen` — ruling 137's missing fourth assignment |
+
+  The two readings are **behaviourally identical**, and the reason is
+  worth recording so the 2/2 split is not re-litigated as a hybrid that
+  reintroduces ruling 137's silent failure: escaping the
+  `recovery_start` fence would require `recovery_start` to be
+  *clearable*, and ruling 139(b) forbids exactly that — *"`recovery_start`
+  is **not** cleared"*; it is only ever assigned `Some(now)` and moves
+  **monotonically forward**. Every pre-roam packet therefore satisfies
+  `sent_time ≤ roam_instant ≤ every later recovery_start`, so its
+  in-recovery test stays true permanently. The defect was
+  **documentation, not behaviour** — but all three texts have to say the
+  one thing the code does, because §14.6 is where a blind test author
+  reads the fences and asserts against them. This is conservative per RFC 9002/quinn
   precedent (a fresh
   controller per path); a reviewer could argue for keeping cwnd across a
   same-NAT port rebind — declined here for want of evidence the path is
@@ -4090,7 +4557,7 @@ what each side observes:
 | Cause | Transmitted | Local surface | Peer's view |
 |---|---|---|---|
 | liveness — 25 s without an authenticated fresh receive (§7.5) | nothing | `ConnectionLost::TimedOut` | its own liveness fires ≈ symmetrically |
-| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's one PING, at the mark — or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4); **nothing** at the verdict | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
+| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's one PING, at the mark — or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output** to that address (§7.3, ruling 171); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
 | nonce exhaustion (§7.9) | nothing | `ConnectionLost::NonceExhausted` | liveness |
 | local `close(code, reason)` / last-handle drop (§16.2) | CLOSE, then ≤ 1 reply/s for 5 s | `ConnectionLost::LocallyClosed` | `PeerClosed { code, reason }` |
 | peer's CLOSE received | nothing (drain only) | `ConnectionLost::PeerClosed { code, reason }` | (it closed) |
@@ -4741,11 +5208,17 @@ applications that never read this paragraph.
 *The PENDING interaction, verified.* A cancelled attempt leaves **no**
 PENDING entry anywhere the tie-break can consult. All three readers of
 "is this static PENDING?" read the same pending tables the cancellation
-empties: ruling 35's §6.4 branch fires on *an in-flight outbound
-initiation exists for the proven static*, §6.5's hint set is defined as
+empties: ruling 35's §6.4 branch fires on *a pending exists for the
+proven static*, §6.5's hint set is defined as
 *the pending tables' dialled addresses* (§17.4), and §5.4's responder
 rule defines PENDING the same way. There is no separate per-static flag
-that could outlive the pending. So an initiation from that peer arriving
+that could outlive the pending. **[AMENDED 2026/08/16 — ruling 178]**
+*This verification is what ruling 178 rests on, and it is stated in the
+same words the three readers now use.* The §6.4 branch's clause read "an
+in-flight outbound initiation exists" until that ruling; the
+verification above was already about **table membership**, which is why
+ruling 90's `mint_pending`/`start_attempt` split — a pending minted with
+nothing yet in flight — resolves to PENDING rather than NONE. So an initiation from that peer arriving
 after a cancelled dial takes §5.4's **NONE** row — the ordinary staged
 accept — and never §6.7's comparison: there is no stale pending to lose a
 tie-break to, and no `Connecting` left for §6.4's loser branch to resolve
@@ -4980,7 +5453,18 @@ enum ToEndpoint {
     the transmission, the verdict (§18.2) — because an operator wants
     the gap and an application does not.
   - **`ContestCleared` is emitted when the mark clears** because an ACK
-    covering the probe floor arrived. It is a separate variant rather
+    covering the probe floor arrived. **[AMENDED 2026/08/16 — ruling
+    176]** *And it is emitted **only where `Contested` was**.* The
+    clause above read unconditionally, which made an unmatched
+    notification reachable by an entirely ordinary route: the floor is
+    the counter the *next* seal will use, so any post-mark seal lands at
+    or above it, and the peer's ACK can clear a mark whose probe §7.3's
+    budget never admitted — firing `ContestCleared` with no preceding
+    `Contested`. That is precisely the mis-read ruling 46 deleted
+    `under_probe: bool` to prevent, arriving by a different door.
+    Clearing a **pending** mark therefore cancels the pending probe and
+    emits nothing at all (§7.5): the mark-pending gap emits nothing, and
+    so does its exit. It is a separate variant rather
     than ruling 45's `Contested { under_probe: bool }`, because that
     field read backwards: `under_probe: false` names the *pending* state
     to any reader skimming the enum, while it meant *cleared*, and the
@@ -5070,7 +5554,16 @@ enum ToEndpoint {
   not one per refusal**: ruling 41 collapses concurrent marks into a
   single contested state, so a refusal arriving while `Contested` is
   armed neither re-arms it nor adds a second, and the named-timer model
-  holds with no queue behind the name. `Pto` is armed only while an
+  holds with no queue behind the name. **[AMENDED 2026/08/16 — rulings
+  175, 176]** Two clarifications the timer model depends on. The collapse
+  covers refusals arriving while the mark is **outstanding**; once it
+  clears, the next admitted refusal is a fresh mark with a fresh floor
+  and arms this timer again — the timer is one-at-a-time, not
+  once-per-`KEEPALIVE_TIMEOUT` (ruling 175). And a mark that clears
+  **while still pending** cancels its pending probe, so this timer is
+  never armed for it (ruling 176) — which matters here because the
+  disarm rule above keys on an ACK covering the floor, and a floor
+  already satisfied cannot disarm a deadline armed after it. `Pto` is armed only while an
   ack-eliciting packet is in the sent map (§13.3) — the probe is
   ack-eliciting and is in that map (§13.5), so `Pto` and `Contested` can
   be armed together and are independent; `Liveness` is armed by the first
@@ -5104,6 +5597,31 @@ enum ToEndpoint {
   probe or retransmission that evaluation produced, §8.5); and
   `PersistentKeepalive` is evaluated last — any marking send the instant
   produced re-arms it (§7.5).
+  **[AMENDED 2026/08/16 — ruling 174]** *Two relations were missing, and
+  "exhaustive" is the same self-certifying scope claim as §13.6's title
+  one section apart.* The relations above leave
+  `{Liveness, CloseLinger, Contested}` unordered against
+  `{Loss, Pto, AckDelay}`, and `{Loss, Pto, AckDelay}` unordered against
+  `Keepalive`. Both are stated now, and the enum's declaration order in
+  `timers.rs` — which froze this answer so slices 5 and 7 would not
+  re-derive it from prose — is authoritative:
+  - **Teardown collection precedes loss/PTO evaluation.** A connection
+    collected this instant evaluates no loss and sends no probe; this one
+    *is* an instance of the governing principle (a terminal outcome
+    before a routine one, state removal before emission).
+  - **`Loss`, `Pto` and `AckDelay` precede `Keepalive` evaluation.** This
+    one does **not** follow from the principle and must be stated rather
+    than derived: `AckDelay` before `Keepalive` is
+    emission-before-emission, which the principle does not reach. The
+    practical reason it is the right order is §7.5's — a keepalive
+    evaluated after the instant's other output sees an accurate
+    `last_send`.
+
+  Only five of the eight timers are ever armed before slice 7; slice 7
+  arms `Contested`, `Keepalive` and `PersistentKeepalive` for the first
+  time, which is what makes **every** collision in those two groups newly
+  reachable, and is why the gap had to close before a blind test author
+  derived the opposite from this list and asserted it.
 
 **The lateness bound.**
 
@@ -5367,6 +5885,18 @@ accepted (§6.4).
 
 - An entry is **pinned** — never evicted — while a live `Connection`, an
   in-flight outbound pending, or a staged mid-state exists for its static.
+  **[RATIFIED 2026/08/16 — ruling 187]** "In-flight outbound pending"
+  here carries §5.4's definition without qualification: **membership in
+  the pending tables**, so a **minted** pending pins from the instant
+  `connect()` mints it, before `start_attempt` has sent anything. The pin
+  exists so that the entry the attempt is *about to need* — to validate
+  its msg2 or its replacement — survives until it arrives, and the
+  narrower reading opens a window in which exactly that entry can be
+  evicted, invisibly, until an eviction and a dial coincide. The
+  extension is **self-bounding**: the pin lasts as long as the pending,
+  and dropping a `Connecting` empties the pending tables synchronously
+  (ruling 50), so no minted-and-abandoned pending holds an entry. Ruling
+  37's `HANDSHAKE_GIVEUP` exemption and the 1024 cap are untouched.
   For a staged mid-state (whose static is merely claimed until
   `authenticate()`) the pin never *creates* an entry — a bounded
   exception to §6.1's nothing-durable rule, flipping a bit on an entry a
@@ -5517,6 +6047,20 @@ their initiations take the ordinary staged path (§5.4), so the endpoint
 tracks no per-connection address (the connection core owns its own
 endpoint address, §7.3).
 
+**[RATIFIED 2026/08/16 — ruling 178]** **Membership in the pending
+tables *is* the PENDING predicate**, and this section is where the
+tables live, so it is stated here as well as at §5.4 and §6.4. An entry
+counts from the instant `connect()` **mints** it — not from the instant
+its msg1 leaves the host — and stops counting when the pending
+completes, gives up, or is cancelled (§16.3, ruling 50). Ruling 90's
+`mint_pending`/`start_attempt` split is what made *"an in-flight
+outbound initiation exists"* ambiguous, and ruling 91 recorded the
+ambiguity as open across §6.4, §6.5 and this section; it is closed on
+the table-membership reading. There is no separate per-static flag: the
+three readers of the predicate all read these tables, so an
+implementation cannot diverge from this rule without inventing state
+this document does not have.
+
 **The replacement basis.** Each entry of the `static → connection` map
 carries one further field, `replacement_basis: Option<Timestamp>`,
 alongside the connection it names — connection-scoped state, endpoint-held
@@ -5574,7 +6118,7 @@ policy:
 | stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 220 B raw bytes each, ≈ 225 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
-| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ `INITIAL_MAX_DATA` (1 MiB) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
+| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ `INITIAL_MAX_DATA` (1 MiB) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one `validation_floor` (`u64`) and one validated flag, per connection and never per address (ruling 170)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
 
 **The caveat on the sent map, stated because ruling 43 changed what it
 covers.** "Bounded by cwnd" is exact for congestion-controlled output
@@ -5782,7 +6326,7 @@ its future home.
 | packet-number truncation | the per-packet-overhead lever; safe against hiss's commit-and-cap, couples to the replay-window width (§3.4, §7.2) |
 | PMTUD | `MAX_DATAGRAM` is fixed at 1200 (§3.5) |
 | cookies / mac2 | packet type `0x05`; WireGuard's under-load model is the template; answers §6.3's occupancy exposure, §6.5's hint-set spoof, and §6.9's ungated eager-`es` rate (§4.3) |
-| PATH_CHALLENGE / PATH_RESPONSE | the QUIC-faithful upgrade of §7.3's anti-amplification budget: explicit address validation before roam commit; two frame types from the reserved space plus a second reset seam alongside the roam seam (§7.3, §14.6) |
+| PATH_CHALLENGE / PATH_RESPONSE | the QUIC-faithful upgrade of §7.3's anti-amplification budget: **explicit** address validation **before** roam commit, where §7.3's `validation_floor` validates implicitly and *after* (ruling 168) — two frame types from the reserved space plus a second reset seam alongside the roam seam (§7.3, §14.6) |
 | the range-tracker ACK | decouples ACK fidelity from the replay window; wire-compatible (§7.2, §12.2) |
 | per-peer `ss` precomputation | needs a hiss seam or a bounded memoising provider; re-opens the DH-cost table (§6.1) |
 | persistence | nothing in this specification survives a process restart by design (§5.4: restart is a replacement or a fresh accept, never a merge) |
@@ -6219,7 +6763,23 @@ clock (§16.10); no test sleeps.
     §7.3's anti-amplification budget leaves the mark **pending** with no
     deadline armed, that the deadline arms at the eventual transmission,
     and that a contested mark taken on a closing or draining connection
-    is a no-op.
+    is a no-op (§6.4 carries that carve-out too — ruling 179).
+  - **The pending mark's other two exits (ruling 176).** Hold the probe
+    with the budget, then let an ACK covering the floor arrive — any
+    post-mark seal's ACK will do, since the floor is the counter the next
+    seal uses. Assert **no probe is ever sent**, **no deadline is ever
+    armed**, and **no notification of any kind is emitted** — in
+    particular no `ContestCleared`, which without this rule fires with no
+    preceding `Contested`, and no stray probe arming a verdict deadline
+    for a mark that no longer exists. Separately, **roam again while the
+    mark is still pending** and assert the mark survives with its floor
+    **unchanged**.
+  - **Re-marking after a clear (ruling 175).** Clear a mark with an ACK,
+    then deliver a fresh `Intro` and refuse again: assert a **second**
+    PING goes out with a **fresh, strictly greater** floor and a newly
+    armed deadline. An implementation that read the old
+    "one probe per `KEEPALIVE_TIMEOUT`" bound as a rate limit fails this,
+    and a genuine second doubt would go unprobed.
   - **The notification arrives at the probe's transmission** (§16.2,
     §16.4, rulings 45/46, FAB-6). Drive the mark-pending case above —
     roam to an unvalidated address so §7.3's budget holds the probe —
@@ -6234,10 +6794,37 @@ clock (§16.10); no test sleeps.
 - **The anti-amplification budget** (§7.3): a roam or msg1-source anchor
   caps all output — PTO probes, the contested-connection probe, pure
   ACKs, CLOSE, and keepalives
-  included — at 3× authenticated bytes received until traffic validates
-  the address; a
-  genuine roam clears the budget within ~1 RTT; a silent address dies by
+  included — at 3× **authenticated, window-fresh** bytes received until
+  the address validates; a silent address dies by
   liveness having received at most 3× what it sent.
+  - **The disarm, and the re-arm** (rulings 168, 170). Assert the
+    positive: a genuine roam validates the address and **disarms** the
+    budget within ~1 RTT, at the first authenticated, window-fresh packet
+    from the new address whose ACK covers `validation_floor` — after
+    which output to it is no longer capped at all. Assert the negative
+    from the side that separates it (working rule 9): with the ACK
+    **withheld** — the peer answering only with packets that acknowledge
+    nothing at or above the floor — the cap must still bind. And assert
+    the re-arm: roam again, and a **fresh** floor is recorded and the cap
+    binds again, with no credit carried across from the old address
+    (§13.6). The load-bearing regression is the asymmetric transfer: an
+    **accepting** endpoint serving a download, whose peer replies with
+    ACKs only, must reach full send rate — under the superseded permanent
+    cap it could never exceed 3× ~40 B per ~2400 B and could not serve at
+    all.
+  - **Replay does not fund it** (ruling 169). Re-inject a peer packet the
+    replay window has already marked and assert the budget's received
+    counter does **not** move; an implementation funding on the broader
+    *authenticated* class passes every other assertion here and fails
+    only this one.
+  - **Per session** (ruling 170). Two connections anchored to the same
+    peer address hold two independent budgets: exhausting one must not
+    throttle the other, and funding one must not credit the other.
+  - **Priority under scarcity** (ruling 171). With the budget admitting
+    less than is owed, assert a **pending contested probe** goes out
+    ahead of an ACK, a keepalive, a PTO probe, a retransmission and new
+    application data — the starvation path in which the verdict is
+    never reached is what this ordering exists to foreclose.
 
 **CLOSE.**
 - Linger semantics: one CLOSE emitted, ≤ 1 reply/s under inbound flood —
@@ -6372,7 +6959,7 @@ rulings).**
 | `HANDSHAKE_GIVEUP` | 90 s | §5.5 |
 | `KEEPALIVE_TIMEOUT` / `DEAD_TIMEOUT` | 10 s / 25 s | §7.5 |
 | `PERSISTENT_KEEPALIVE` (default, per-connection) | 10 s; admissible range **[1 s, `DEAD_TIMEOUT`)** — handle-rejected **below 1 s** (floor, ruling 42) and **at or above** `DEAD_TIMEOUT` (ceiling, ruling 40) | §7.5 |
-| `AMPLIFICATION_FACTOR` | 3 (× authenticated bytes received, per unvalidated address) | §7.3 |
+| `AMPLIFICATION_FACTOR` | 3 (× authenticated, window-fresh bytes received, per unvalidated address, per session; disarmed by an ACK covering `validation_floor` — rulings 168–170) | §7.3 |
 | `INTRO_QUEUE_CAP` / `INTRO_MAX_PER_SOURCE` / `INTRO_TTL` | 1024 / 4 / 15 s | §6.3 |
 | `TS_GUARD_ORPHAN_CAP` | 1024 | §17.1 |
 | `TS_GUARD_ORPHAN_TTL` | `= INTRO_TTL` (15 s) | §17.1 |

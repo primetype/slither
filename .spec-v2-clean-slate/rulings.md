@@ -4905,3 +4905,100 @@ contested mark is a *state* and only its latest value is meaningful.
 `CONTRACT-7.md` §5.4's *"at most one of each can ever be pending"* is
 corrected to say what is true: **at most one mark exists at any instant,
 and a slot may be rewritten any number of times.**
+
+### 186 — CLOSE's rank in the budget priority order, and ruling 171 amended
+
+The applying agent found that **ruling 171's enumeration omits CLOSE**
+— *"ahead of ACKs, keepalives, PTO probes, retransmissions and new
+Data"* — and refused to either drop it or silently rank it. It placed
+CLOSE provisionally and **marked the placement unratified in the spec text
+itself**, so that moving it later is a ruling rather than an excavation.
+That is working rule 5 and working rule 3 both applied correctly, and it
+was the right call.
+
+**The defect is mine, and it is defect class 1 in a ruling of mine for the
+fourth time.** I wrote a list of output classes to establish a priority
+and did not state what bounded it; §14.5 and §13.4's exemption lists both
+name CLOSE, so a reader assembling the contenders from the spec gets six
+classes where my ruling gives five. *"A stated construction with an
+unstated or contradicted scope"* — written into the ruling that exists to
+fix an unstated scope.
+
+**Ruling: CLOSE ranks FIRST, above the pending contested probe**, and
+ruling 171(a)'s *"priority over all other output"* is amended to *"over
+all other output except CLOSE"*. Full order to an unvalidated address:
+
+> **1.** CLOSE · **2.** a pending contested probe · **3.** pure ACKs ·
+> **4.** PTO probes · **5.** keepalives · **6.** retransmissions ·
+> **7.** new application data.
+
+**Why CLOSE outranks even the probe.** §16.5 already states the governing
+principle for exactly this kind of tie: *"a terminal outcome precedes a
+routine one."* A connection that is closing has **no use for the probe's
+verdict** — the probe exists to decide whether to reap a connection, and
+one that is leaving has already answered that question. Ruling 179 points
+the same way from the other side: a contested mark taken on an
+already-closing connection is a **no-op**, so the two states barely
+co-exist, and where a mark taken while live survives into closing, its
+verdict is moot. Meanwhile a CLOSE that the budget will not admit costs
+the peer a full `DEAD_TIMEOUT` (25 s) to learn what one small packet would
+have told it immediately.
+
+Both are small and both are cwnd-exempt, so this ordering costs nothing in
+the common case; it decides only the scarce-budget case, which is the one
+ruling 171 exists for.
+
+### 187 — §17.1's guard pin follows ruling 178's predicate
+
+The applying agent found three further sites reading *"in-flight outbound
+pending"* — §17.1's pin rule (twice), §6.5 and §6.6 — and **declined to
+edit them**, on the ground that they describe the pending *object* rather
+than the PENDING *predicate*, and that extending a predicate into an
+eviction rule is a semantic change ruling 178 did not make. It fixed
+§5.4's definition, which those sites inherit, and flagged the rest.
+
+Correct on both counts, and the flag deserves an answer rather than
+inheritance.
+
+**Ruling: the pin follows the predicate.** A pending in the tables pins
+the static's guard entry against §17.1's orphan aging and LRU eviction,
+whether or not `start_attempt` has run.
+
+**Why.** The pin exists so that the guard entry we are **about to need**
+— to validate the msg2 or the replacement that our dial will produce — is
+still there when it arrives. `mint_pending` is a declared intent to dial;
+the entry is needed for the same reason a moment later. Leaving the
+interval unpinned opens a window in which precisely the entry the attempt
+depends on can be evicted, and the window is invisible because nothing
+observes it until an eviction and a dial coincide.
+
+**And the extension is self-bounding**, which is what makes it cheap: the
+pin lasts exactly as long as the pending, and ruling 50 makes dropping a
+`Connecting` empty the pending tables synchronously. There is no path by
+which a minted-and-abandoned pending holds a guard entry indefinitely —
+the same tables that answer "is this static PENDING?" answer "is this
+entry pinned?", which is ruling 178's point restated.
+
+**One thing this ruling does not do:** it does not widen §17.1's eviction
+*scope* in any other respect. Ruling 37's `HANDSHAKE_GIVEUP` exemption
+for tie-break and winner-side records is untouched, and the 1024 cap
+still bounds the tier.
+
+### Round 30, second closing note
+
+The round now stands at **twenty rulings (168–187)** and its last three
+came from agents declining to do what they were told, or finding what they
+were not asked for:
+
+- The applier found **six** sites of contrary prose beyond its brief's
+  list, one of which (§6.3) stated ruling 175's false bound
+  **independently** of the two sections I had identified. Working rule 4
+  paid for itself in a single pass.
+- It **declined twice** rather than resolving, and both declines became
+  rulings (186, 187). Every agent that has reported rather than resolved
+  has been right — now eight for eight.
+- Its own flagged residual is the sharpest thing to hand the adversarial
+  review: ruling 168 frees the budget counters **at validation**, so a
+  connection that validates and then roams to an attacker's address
+  re-arms from zero and carries no credit across. That is correct, and it
+  is the property most worth attacking.
