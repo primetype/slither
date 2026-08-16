@@ -136,6 +136,21 @@ the spec rounds.
 4. **Grep for the rationale, not only the token.** A verification that
    greps for a changed value will miss prose still arguing the position
    you reversed. This happened, and shipped a self-contradicting section.
+   **Two companions, both bought at full price:**
+   *(a) When you correct one clause of a sentence, read the other clauses
+   of that sentence.* Ruling 182 rewrote §7.5's passive keepalive rule
+   from "has not sent" to "has not made a marking send" — and left the
+   other half of the same sentence stating `R > S` where the prose said
+   *"has received since it last sent"*. The two differ exactly when the
+   instants coincide, which the driver's once-per-turn `now()` makes
+   ordinary, and the result was a connection that neither talked nor died
+   (ruling 195). The defect was inside the sentence being edited.
+   *(b) Apply this rule to `rulings.md` too, not only to the spec.* A
+   ruling that reverses another's conclusion inherits the duty to address
+   its **reasoning**. Ruling 175 corrected ruling 43's number and silently
+   reinstated the characterisation 43 had explicitly denied; a blind test
+   author caught it by grepping the record rather than the spec — the
+   first time anyone had (ruling 188).
 5. **If your brief tells you to do something that looks wrong, say so
    rather than doing it.** An agent that declined a blanket instruction
    in round 8 was right, and its refusal became ruling 51's guard.
