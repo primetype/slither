@@ -6983,3 +6983,36 @@ framing that was available when it was deferred.** What changed between
 240 and 241 was reading ruling 165's own rationale and asking what it was
 reasoned about — working rule 4, applied to the ruling record rather than
 the spec.
+
+### 242 (maintainer) — the spec called itself an unratified draft for two days after it was ratified
+
+Every one of `SPEC.md`'s twenty section headers carried
+*(DRAFT 2026/08/13)*, Appendix B carried *(DRAFT 2026/08/13;
+non-normative)*, and the header block read *"DRAFT v6 … unratified"* —
+while `CLAUDE.md`'s first line called the same file *"the ratified
+protocol for slither's wire — version 1 … Ratified 2026/08/14"*.
+
+**This matters at ship rather than being cosmetic.** `SPEC.md` is
+deliberately *not* in `Cargo.toml`'s `exclude` list — it ships to
+consumers on purpose, and the rustdoc points at it. A consumer would have
+been handed a document that calls itself a draft and a repository that
+calls it ratified, with no way to tell which was stale.
+
+**Ruling: the markers are swept and the document is stamped
+`RATIFIED 2026/08/14`, wire version 1**, with an **amendment table** in
+the header naming everything that moved after the freeze: 208 (the wire —
+two new frame types, no existing byte moved), 221, 227, 229, 232, 238,
+241. The table is the point: *"ratified"* alone would now be its own small
+lie, because the wire did move, and a reader deserves one place that says
+what and when.
+
+**The shape, one more time.** A status was decided, recorded in one
+artefact, and never swept into the artefact it was *about* — the same
+defect as ruling 234 (an amendment that left the superseded banner
+standing) and ruling 236 (an amendment that contradicted its own file's
+§6.2), a week's worth of instances of working rule 4 in documents rather
+than code. `CLAUDE.md` itself records that it is *"the one document no
+slice ever puts on an agent's path"*; this round shows `SPEC.md`'s
+**header** has the same problem for the opposite reason — every agent is
+told never to read the file whole (working rule 1), so nobody ever sees
+the top of it.

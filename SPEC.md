@@ -1,8 +1,27 @@
 # slither — protocol specification, wire version 1 (first release)
 
-> **DRAFT v6, 2026/08/14 (unratified; walkthrough revisions, all four
-> security-fix passes, and the Appendix A reconciliation against shipped
-> hiss 0.3.2 applied).**
+> **Status: RATIFIED 2026/08/14. Wire version 1 (`VERSION` `0x01`).**
+>
+> **[Stamped 2026/08/16 — ruling 242.]** Every section header of this
+> document carried a `DRAFT 2026/08/13` marker and this block read
+> *"DRAFT v6 … unratified"* for two days after the protocol was ratified,
+> while `CLAUDE.md` described the same file as *"the ratified protocol for
+> slither's wire — version 1 … Ratified 2026/08/14"*. The markers were
+> simply never swept.
+>
+> **Amended after ratification. None of it has been released** — v0.2 is
+> unpublished and `bubble-engine` is the only consumer — which is the
+> standing reason each amendment was affordable:
+>
+> | Ruling | Where | What moved |
+> |---|---|---|
+> | **208** | §8.3, §8.4, §7.3 | **the wire**: `PATH_CHALLENGE` `0x1a` and `PATH_RESPONSE` `0x1b`, nine bytes each. **No existing byte moved** — every golden vector is byte-identical. |
+> | 221 | §13.4, §8.3 | a PTO probe to an unvalidated address carries the challenge, not a bare PING |
+> | 227 | §16.11.1 (new) | the nine-variant `io::ErrorKind` table, replacing a slash with no rule for choosing |
+> | 229 | §16.11, Appendix B | the adapter face list gains `incoming`; `Endpoint` gains `poll_accept` |
+> | 232 | Appendix B | the composability obligations, which two documents had claimed were already there |
+> | 238 | §16.11.1 | the `WriteError` match is exhaustive; the fallback arm hid the future rather than guarding it |
+> | 241 | §9.8, §9.9 | the peer-reset latch is scoped to unidirectional streams |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -361,7 +380,7 @@ NewReno congestion control). All session cryptography flows through `hiss`
 (Noise **IK** via the `noise!` macro and its datagram transport); the one
 raw primitive is mac1's keyed BLAKE2b from `cryptoxide`.
 
-## 1. Status, scope, and the first wire *(DRAFT 2026/08/13)*
+## 1. Status, scope, and the first wire
 
 ### 1.1 The first wire
 
@@ -493,7 +512,7 @@ a delayed challenge only prolongs a cap.
 **Zero** is the expected count again. A bracketed marker appearing without
 a ruling is the same signal a red wire vector is.
 
-## 2. Crypto suites and `channel!` *(DRAFT 2026/08/13)*
+## 2. Crypto suites and `channel!`
 
 ### 2.1 The hiss contract
 
@@ -585,7 +604,7 @@ consequence: P-256 mac1 keying moves from the pre-release drafts' 33-byte
 compressed form to the 65-byte uncompressed form — fixed at the first
 golden freeze (§4.4), with no shipped bytes to move.
 
-## 3. Packet grammar *(DRAFT 2026/08/13)*
+## 3. Packet grammar
 
 ### 3.1 Packet types and version
 
@@ -741,7 +760,7 @@ sending surface enforces its own cap at the handle — `DatagramError::TooLarge`
 above `MAX_DATAGRAM_PAYLOAD` (§11.4), `MessageError::TooLarge` above
 `MESSAGE_RECV_MAX` (§9.8).
 
-## 4. mac1 — the DoS gate *(DRAFT 2026/08/13)*
+## 4. mac1 — the DoS gate
 
 ### 4.1 Construction
 
@@ -814,7 +833,7 @@ alternative — pinning the compressed form per curve — would preserve the
 pre-release drafts' mac1 bytes at the price of a second, per-curve encoding
 rule alongside the canonical one.
 
-## 5. Handshake *(DRAFT 2026/08/13)*
+## 5. Handshake
 
 ### 5.1 Prologue
 
@@ -1091,7 +1110,7 @@ There is no DH-rekey trigger at all — neither by message count
 ratchet is the only rekey, refreshing keys by count with no handshake
 (§5.4, §7.7).
 
-## 6. Staged accept and initiation routing *(DRAFT 2026/08/13)*
+## 6. Staged accept and initiation routing
 
 The responder's staged DH costs become an application-driven typestate,
 and inbound initiations route between that typestate and the endpoint's
@@ -2081,7 +2100,7 @@ and is **left open** rather than adopted here, because it is a
 behavioural change to the beacon and the budget already bounds the
 exposure.
 
-## 7. Session layer *(DRAFT 2026/08/13)*
+## 7. Session layer
 
 ### 7.1 The counter is the packet number
 
@@ -3193,7 +3212,7 @@ The wire's varints additionally cap ACK-referenced counters at 2⁶² − 1
 both bounds are stated for completeness, neither is reachable at any
 physical send rate.
 
-## 8. The frame layer *(DRAFT 2026/08/13)*
+## 8. The frame layer
 
 ### 8.1 Varint encoding
 
@@ -3616,7 +3635,7 @@ classes:
   frame is ever re-queued by loss detection, so neither appears in §13.5's
   retransmission path.
 
-## 9. Streams *(DRAFT 2026/08/13)*
+## 9. Streams
 
 ### 9.1 Stream identifiers
 
@@ -3975,7 +3994,7 @@ for "stop transmitting this stream to me"; an uninterested receiver drops
 its handle and discards arrivals (§16.2), and the sender runs to FIN or
 resets.
 
-## 10. Flow control *(DRAFT 2026/08/13)*
+## 10. Flow control
 
 ### 10.1 The model
 
@@ -4257,7 +4276,7 @@ both properties implementable.
   credit accounts the stream's offset high-water mark, not bytes on the
   wire.
 
-## 11. Datagrams *(DRAFT 2026/08/13)*
+## 11. Datagrams
 
 ### 11.1 Contract
 
@@ -4320,7 +4339,7 @@ is core behaviour, not a shell detail. A silent drop is a known
 operability weakness of the
 precedent and is deliberately not copied.
 
-## 12. ACK *(DRAFT 2026/08/13)*
+## 12. ACK
 
 ### 12.1 Range semantics
 
@@ -4409,7 +4428,7 @@ the conservative fallback if the Appendix B timing obligations disappoint.
   feed recovery (§13.2) and the congestion controller (§14.2). Duplicate
   acknowledgment of a counter is a no-op.
 
-## 13. Loss recovery *(DRAFT 2026/08/13)*
+## 13. Loss recovery
 
 Per connection (a connection has exactly one session — §7.8), over the
 ack-eliciting sent-packet map. RFC 9002's shape throughout.
@@ -4618,7 +4637,7 @@ builds against it, so the list is the thing that has to exist.
 | §7.2's anti-replay window | **not reset** — stated out loud rather than left clean-by-construction: one session has one never-reset counter space (§7.7), so a roam cannot rewind it and a replayed packet stays a replay across the seam | §7.2, §7.7 |
 | the session keys, the counter space, stream and credit state | **untouched** — roaming is a path change, not a session change (§7.8) | §7.7, §7.8 |
 
-## 14. Congestion control *(DRAFT 2026/08/13)*
+## 14. Congestion control
 
 ### 14.1 The controller seam
 
@@ -4822,7 +4841,7 @@ No pacing (no sub-RTT wakeups in the v1 shell; a 12 KB initial window
 bounds bursts adequately), no ECN (wire and socket work), no CUBIC/BBR
 (trait-additive later). All deferred with pointers in §19.
 
-## 15. CLOSE and the connection lifecycle *(DRAFT 2026/08/13)*
+## 15. CLOSE and the connection lifecycle
 
 ### 15.1 The CLOSE frame
 
@@ -4960,7 +4979,7 @@ hint is the `AcceptError::Stale` that provoked the mark: it does not say
 that a live connection is now on a 10 s watch, and the spec states that
 rather than implying otherwise.
 
-## 16. Object model and the sans-io core *(DRAFT 2026/08/13)*
+## 16. Object model and the sans-io core
 
 ### 16.1 The object model
 
@@ -6339,7 +6358,7 @@ here**: it re-crosses the core→shell seam with channels, and the handle
 shapes above are already compatible with adding one later without a
 breaking change.
 
-## 17. Endpoint-global state *(DRAFT 2026/08/13)*
+## 17. Endpoint-global state
 
 Four pieces of state are endpoint-core-global; none may be pushed into a
 connection.
@@ -6633,7 +6652,7 @@ an attacker chose to supply; ruling 41 collapses concurrent marks into a
 single floor-and-deadline pair, so a connection under a refusal flood
 holds exactly the same state as a connection refused once (§7.5, §16.5).
 
-## 18. Errors and observability *(DRAFT 2026/08/13)*
+## 18. Errors and observability
 
 ### 18.1 The error taxonomy
 
@@ -6802,7 +6821,7 @@ at exactly 256 KiB, who reads the **receiver's** log to find out. **No
 API change, no notification, no new error variant** — §18.1 stays closed
 — **and no wire change**: the RESET_STREAM was already being sent.
 
-## 19. Out of scope and deferred *(DRAFT 2026/08/13)*
+## 19. Out of scope and deferred
 
 **[RATIFIED 2026/08/14]** The deferrals below are ratified as a block; each names
 its future home.
@@ -6945,7 +6964,7 @@ re-litigated. (A 12-byte timestamp in msg2 was separately **considered
 and declined as wire-affecting** when fixing ruling 36 — that is a wire
 decision, not a hiss dependency.)
 
-## Appendix B — test obligations *(DRAFT 2026/08/13; non-normative)*
+## Appendix B — test obligations *(non-normative)*
 
 The obligations this specification's normative clauses demand. All flow
 tests run two endpoints over `testutil::FlakyWire` on tokio's paused
