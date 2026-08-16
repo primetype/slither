@@ -582,7 +582,36 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 // latch, the writer this wake unparks would then be told
                 // `Finished` and `acked()` would answer `Ok(())` — success
                 // reported over data the peer discarded.
-                cell.borrow_mut().peer_resets.insert(r, error_code);
+                //
+                // **[RATIFIED 2026/08/16 — ruling 241]** …but only on a
+                // **unidirectional** stream. `peer_resets` is read by the
+                // *send* half alone (`SendStream::poll_write`,
+                // `poll_finish`, `poll_acked`), and ruling 165's premise —
+                // *"the bytes were discarded"* — is §9.8's
+                // **receiver-emitted** overflow reset, which exists only on
+                // the uni message path.
+                //
+                // On a **bidirectional** stream the same frame means the
+                // peer abandoned **its own** send direction, which says
+                // nothing about our bytes. §9.9 is explicit while
+                // STOP_SENDING is deferred: *"an uninterested receiver drops
+                // its handle and discards arrivals, and the sender runs to
+                // FIN or resets."* Latching there made the canonical client
+                // shape — read a `BiStream` to EOF, drop it — fail the
+                // peer's `shutdown()` with `Reset(0)` **after the payload
+                // had arrived whole**. Measured; it is how S31 first failed.
+                //
+                // The recv half is untouched: it learns of the reset through
+                // the core, exactly as before.
+                let gates_our_send_half = cell
+                    .borrow()
+                    .core
+                    .as_ref()
+                    .and_then(|core| core.stream_id(r))
+                    .is_some_and(|id| id.dir() == Dir::Uni);
+                if gates_our_send_half {
+                    cell.borrow_mut().peer_resets.insert(r, error_code);
+                }
                 Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
                 Self::wake_stream(cell, |cell| cell.blocked_writers.get_mut(&r));
                 Self::wake_stream(cell, |cell| cell.blocked_ackers.get_mut(&r));

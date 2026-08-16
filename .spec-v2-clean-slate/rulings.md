@@ -6929,3 +6929,57 @@ never-written send half should finish rather than reset it, or `poll_shutdown`
 should distinguish "reset after my data was acknowledged" from a reset that
 lost data, or the hazard is documented and accepted. All three are outside
 slice 8's mandate.
+
+## Round 38 — slice 9 (ship) (2026/08/16)
+
+### 241 (maintainer) — **ruling 165's peer-reset latch is scoped to unidirectional streams.** Ruling 240 is superseded
+
+Ruling 240 recorded that dropping a read-only `BiStream` fails the peer's
+`shutdown()` with `Reset(0)`, offered three vague remedies and deferred.
+Looking again — at the *rationale* rather than the symptom — produced a
+precise defect instead.
+
+**Ruling 165 latches a peer `RESET_STREAM` into `peer_resets`, which only
+the send half reads** (`SendStream::poll_write`, `poll_finish`,
+`poll_acked` — `stream.rs:278, 365, 471`). Its stated premise is *"§9.8's
+overflow reset means the bytes were discarded, and `Finished` would report
+that as an orderly close"*. §9.8's overflow reset is **receiver-emitted,
+on the uni message path**, and there the premise is exactly true.
+
+The driver latched **every** `ConnEvent::StreamReset`. On a
+**bidirectional** stream the identical frame means the peer abandoned
+**its own** send direction and says nothing about our bytes — and §9.9
+settles it while STOP_SENDING is deferred: *"an uninterested receiver
+drops its handle and discards arrivals, and the sender runs to FIN or
+resets."* Nothing there stops **our** sender.
+
+**Defect class 1, the project's most productive: a stated construction
+with an unstated scope.** Ruling 165 was reasoned about one stream shape
+and applied to all of them.
+
+**Ruling: the latch fires only when the reset concerns a stream we send on
+unidirectionally.** The recv half is untouched — it learns of the reset
+through the core as before. Shell-layer only; **no wire byte moves** and
+`WriteError::Reset` keeps its meaning. It simply stops firing where its
+premise does not hold.
+
+**Verified in both directions, which is the part worth recording.** With
+the latch disabled outright, `s30_the_overflow_reset_trues_up_connection_credit`
+goes red — so ruling 165's guarantee **is** pinned, and the scoped latch
+keeps exactly the test the unscoped one existed for. With the scoping in
+place, S31's canonical shape (read a `BiStream` to EOF, drop it) passes
+**with ruling 240's fixture workaround removed**. Neither check alone
+would have been enough: the first shows I did not disable §9.8, the second
+shows the fix is at the source rather than in the test.
+
+**On ruling 240.** Its three candidate remedies were *"finish rather than
+reset a never-written send half"*, *"have `poll_shutdown` distinguish"*,
+and *"document and accept"* — and the correct answer was **none of them**,
+because all three accepted the symptom's framing. The first would have
+made an abandoned empty stream indistinguishable from a legitimately empty
+one, a real semantic loss, while leaving the over-broad latch in place for
+every other reset. **Deferring an item is not neutral: it freezes the
+framing that was available when it was deferred.** What changed between
+240 and 241 was reading ruling 165's own rationale and asking what it was
+reasoned about — working rule 4, applied to the ruling record rather than
+the spec.

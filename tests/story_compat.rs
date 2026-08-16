@@ -405,28 +405,24 @@ async fn s31_shutdown_then_close_does_not_lose_the_tail() {
             within(bi.read_to_end(&mut got), "read_to_end")
                 .await
                 .expect("the tail survived the close");
-            // **[Integrator, ruling 240]** The handle is returned, not
-            // dropped here, and that is load-bearing rather than tidy.
+            // **[Integrator, ruling 241]** The handle is dropped here, on
+            // purpose: read-to-EOF-then-drop is the canonical client shape,
+            // and it is what found the defect.
             //
             // `SendStream::drop` on a live local end emits
-            // `RESET_STREAM(NO_ERROR)` (`src/shell/stream.rs:574`). This
-            // reader never writes, so dropping its `BiStream` the instant
-            // `read_to_end` returns resets the **unused** send direction —
-            // and that reset reaches the writer while it is still inside
-            // `shutdown()` awaiting acknowledgement, which then fails
-            // `Reset(0)`. Measured: that is exactly how this test first
-            // failed at integration, *after* the payload had arrived whole.
-            //
-            // The race is nothing to do with S31's subject. Holding the
-            // handle across the join asserts the tail survives, which is
-            // the story; dropping it asserts a teardown ordering no ruling
-            // has settled. **The hazard underneath is real and is recorded
-            // as ruling 240 — it is not fixed here**, because the drop rule
-            // is ratified and slice 8 may not move it.
-            (got, bi)
+            // `RESET_STREAM(NO_ERROR)`, so this reader resets the send
+            // direction it never used. Ruling 165 latched **every** peer
+            // reset into `peer_resets`, which only the *send* half reads, so
+            // that reset reached the writer inside `shutdown()` and failed
+            // it `Reset(0)` **after the payload had arrived whole**. Ruling
+            // 241 scopes the latch to uni streams, where §9.8's
+            // receiver-emitted reset actually means "the bytes were
+            // discarded". If this test starts failing `Reset(0)` again, that
+            // scoping has regressed — not this fixture.
+            got
         };
 
-        let ((), (got, _reader_handle)) = tokio::join!(write_side, read_side);
+        let ((), got) = tokio::join!(write_side, read_side);
         assert_same_bytes(&got, &want, "S31 tail after shutdown-then-close");
     })
     .await;
