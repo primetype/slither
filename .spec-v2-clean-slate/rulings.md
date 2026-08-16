@@ -5264,3 +5264,203 @@ into slice 4.
 Neither claimed a gate it had not run. T-K reported clippy blocked by the
 environment; T-M reported it clean on its own target with the shim in
 place.
+
+### 195 — §7.5's passive rule is a **flag**, not a timestamp comparison. **Ninth time the prose held the intent.**
+
+Found by integrating T-K's blind story tests: `s5_one_exchange_..._self_sustains`
+failed with *"the initiator put 0 datagrams on the wire in 75 s"* — and the
+connection was **alive**. Instrumented at the core, both sides read:
+
+```
+role=Responder S=T R=T R>S=false armed_deadline=false
+role=Initiator S=T R=T R>S=false armed_deadline=false
+```
+
+**S and R exactly equal, and `armed` false.** No keepalive (the passive rule
+needs `R > S`) and no death (`armed` gates the deadline). That is precisely
+SECV5-2's **immortal half-open session** — the failure ruling 39's install
+pin was applied to prevent — reconstructed through a different door.
+
+**Why they are equal, and why this is not a paused-clock artifact.** §7.5
+gives the rule two ways in one sentence:
+
+> *"a side that **has received since it last sent**, and has not made a
+> marking send for `KEEPALIVE_TIMEOUT`, sends a keepalive"* (prose)
+> — against `S` = `last_send`, `R` = `last_authenticated_recv`, predicate
+> **`R > S`** (formal).
+
+*Has received since it last sent* is a **flag**. `R > S` is a **comparison**.
+They agree everywhere except when the two instants are **equal**, and equal
+is reachable: the shell driver caches `let now = now()` **once per turn**, so
+a receive and a send handled in the same turn share an `Instant` in
+production, not only under `start_paused`. On the paused clock nothing
+advances between install and the exchange, so it happens **every** time —
+which is why a blind story test found in one run what the core's own unit
+tests, each advancing the clock between steps, could not.
+
+Ruling 39's derivation is unaffected and is the reason the naive repair is
+wrong: at install `R == S` deliberately, so `R >= S` would make an
+idle-from-install connection keepalive immediately and destroy the 25 s reap
+that ruling 39 exists to produce. The comparison cannot distinguish *"nothing
+received since install"* from *"received at the same instant as install"*,
+because it is the wrong instrument.
+
+**Ruling:** the passive rule is carried as **state, not arithmetic** — a
+`received_since_last_marking_send` flag, cleared at install and by every
+marking send, set by every authenticated window-fresh receive. The keepalive
+deadline stays `S + KEEPALIVE_TIMEOUT`. This is exactly the prose, is
+equivalent to `R > S` whenever the instants differ, and is correct when they
+coincide. §7.5's formal statement is rewritten to the flag; ruling 40's proof
+carries over verbatim with *"whenever `R > S`"* reading *"whenever the flag
+is set"*, and its *"the only state that blocks the dance is `S > R`"* reading
+*"the flag being clear"*.
+
+**This is the ninth time the prose held the correct intent and the formal
+rule held the bug** — and the sharpest instance yet, because I edited *this
+very sentence* two rounds ago (ruling 182, `"has not sent"` →
+`"has not made a marking send"`) and corrected one half while the other half
+carried this. Working rule 4 says to grep for the rationale, not the token; it
+needs a companion: **when you correct one clause of a sentence, read the
+other clauses of that sentence.** Added to `CLAUDE.md` as part of rule 4.
+
+**Working rule 9, from the other end.** The paused clock *is* the degenerate
+case here, and it violated the bound — which is why the story test caught
+what six core unit tests around the same code did not. A fixture that
+collapses distinctions is not only a limit on coverage (working rule 13); it
+is occasionally the **only** instrument that exposes a bound the real clock
+hides.
+
+### 196 (integration) — a "peer restart" needs the endpoint handle dropped **first**, and the test said so before it did it
+
+Three of T-K's twelve tests failed at integration with
+`ConnectionLost::PeerClosed { code: 0, reason: [] }` where they expected a
+contested mark. The zombie was being killed by a **graceful CLOSE** before
+the probe could run.
+
+`Drop for Connection` (`src/shell/connection.rs:1185`):
+
+```rust
+if last_for_connection && !last_in_process {
+    self.close_now(constants::NO_ERROR, b"");
+}
+```
+
+**Ruling 88's design, and the implementation is right**: dropping the last
+handle *for a connection* closes it politely; dropping the last handle *in
+the process* does not, because the driver is stopping anyway. The test wrote
+
+```rust
+drop(cb);
+b.ep = None;
+```
+
+with the comment *"every handle it had goes at once, which **by ruling 88
+seals no CLOSE**"* — which names the correct rule and then defeats it by
+ordering. With `b.ep` still held, `cb`'s drop is *"last for the connection,
+not last in the process"*, so it seals exactly the CLOSE the comment says it
+does not. Reversed, the test passes.
+
+**Ruling: the test is corrected, not the code**, and the correction is
+recorded here rather than made quietly, because a red test at integration is
+where working rule 6 is most easily broken — the tempting move is to adjust
+whichever side is cheaper. The author's *intent* was right and is preserved
+verbatim; only the two lines' order changed. Rust cannot drop two bindings
+simultaneously, so "every handle at once" always has an order, and **which
+order is not a detail — it selects between two ratified behaviours.**
+
+**What this says about the seam.** A crash and a graceful shutdown differ
+only by drop order, with no API that says which you meant. That is a sharp
+edge for a consumer modelling failure, and it is worth a note in §16.3's
+drop table before slice 9 — the rule is stated there, but not the fact that
+**sequencing two drops chooses between them.**
+
+### Slice 7's integration result
+
+With rulings 195 and 196 applied: **872 tests under `--all-features`, 775
+bare, 0 failing, 0 ignored.** Both blind test files compiled against an
+implementation neither author saw, and **T-M's 16 mobility tests passed
+without a single change on either side**.
+
+One implementation defect (ruling 195), one test defect (ruling 196), and
+the implementation defect was found **only** by a blind story test — six
+core unit tests around the same code missed it, because each advanced the
+clock between steps and the bug lives exactly where two instants coincide.
+
+### 197 (implementer's item 2) — `EndpointOutput` gains two shell-only variants. **Ratifying a mechanism the implementer had to invent.**
+
+§6.4 requires the replacing `accept()` to fire `Replaced` **on the old
+connection**, and a `None`-basis refusal to mark **that connection**
+contested. The implementer found there is no channel:
+
+- `EndpointOutput` (§16.4) offers only `ToConnection(ConnectionId, Install)`,
+  and the text says *"Install only"* **twice**;
+- `core::Connection`'s verb list has nothing either.
+
+**Both lists read as exhaustive** (working rule 8), and between them the
+endpoint core cannot reach a connection core at all — so the ratified §6.4
+behaviour was **unimplementable as specified**. It built
+`EndpointOutput::{Replaced, Contested}` on `HandshakeFailed`'s precedent
+(which is already an endpoint output naming a connection), plus
+`pub(crate) Connection::{replaced, mark_contested}`, and flagged it: *"the
+mechanism is invented, not ratified."*
+
+**Ruling: ratified as built.** It is the minimal shape — no new endpoint
+verb, no public API, no wire change — and `HandshakeFailed` establishes the
+precedent that an endpoint output may name a connection and carry a verdict
+to it. §16.4's two lists are amended to include the variants **and to state
+what bounds them**: `EndpointOutput` carries to a connection exactly those
+verdicts the *endpoint* owns and the connection cannot reach — install,
+handshake failure, replacement, contested marking — because each is decided
+by the static map, which is endpoint state.
+
+**This is the fourth time a §16.4 list has been found short by someone
+building against it** (ruling 71's stage-0 accessors was the first). The
+pattern is stable enough to act on: **before slice 9, every enumerated API
+surface in §16.4 gets an explicit scope sentence**, because the section's
+lists are the ones agents build from and its omissions are invisible until
+they do.
+
+### 198 (implementer's item 1) — the budget priority scheduler is **partially built**, and the reason it stopped is correct
+
+Ruling 171 and 186 give a seven-position priority order for output to an
+unvalidated address. The implementer built the two positions that carry a
+verdict — **CLOSE is unconditioned** (it does not go through the pump, and
+entering the post-mortem abandons the mark) and **a pending contested probe
+stops the pump dead** — and did **not** schedule positions 3–7.
+
+It says why, and it is right: `CONTRACT-7.md` §3.2 listed the probe first
+and CLOSE last, while `SPEC.md` **at its own base commit** listed CLOSE
+first — because ruling 186 landed after the contract was written and I
+updated the spec and the brief without updating the contract's §3.2 or its
+§0 table. The sub-order differed too. It refused to redesign `pump_packets`
+against an order two authoritative documents disagreed about.
+
+**That is working rule 5 exactly**, and the failure is mine: the contract
+declares itself governing — *"if you find yourself reasoning from a default,
+you are reading a stale copy"* — **and was itself the stale copy.** A
+document that asserts its own primacy has to be updated first, not last;
+mine was updated third, behind the spec and the brief.
+
+**Ruling:** the order stands as ruled (186); the **residual is recorded as
+debt, not quietly closed.** Under a scarce budget an owed retransmission can
+still spend budget a keepalive should have had. This is bounded — it needs
+an unvalidated address *and* a budget too small for what is owed, and ruling
+168 now ends the unvalidated state on one round trip — but it is real, it is
+unpinned by any test, and **slice 8 or 9 owes the budget-aware scheduler
+across positions 3–7.**
+
+### 199 — the §16.3 drop table should say that sequencing two drops chooses between its two rules
+
+From ruling 196's diagnosis, and separable from it. §16.3 states both drop
+rules correctly and `Connection`'s own rustdoc even calls the interaction
+"drop-order sensitive". What neither says is the operational consequence:
+**a crash and a graceful shutdown differ only by the order two bindings fall
+out of scope, and no API distinguishes them.** A consumer modelling peer
+failure — which is precisely what a reconnect scheduler does — has no way to
+express "this peer died" other than by getting an ordering right.
+
+**Ruling:** §16.3's drop table gains the sentence, and it is a
+**documentation obligation for slice 9**, not new behaviour. Declined:
+adding an explicit `abandon()`/`kill()` verb — it is API surface for a
+testing concern, and slice 8's API review is the place to raise it if the
+review wants it.

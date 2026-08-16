@@ -254,6 +254,27 @@ pub(crate) struct Liveness {
     last_authenticated_recv: Instant,
     last_send: Instant,
     armed: bool,
+    /// **[RATIFIED 2026/08/16 — ruling 195]** §7.5's passive predicate, as
+    /// **state rather than arithmetic**.
+    ///
+    /// §7.5 states the rule two ways in one sentence: the prose is *"a side
+    /// that **has received since it last sent**"* — a flag — and the formal
+    /// rule is `R > S` — a comparison. They agree everywhere except when
+    /// the two instants are **equal**, and equal is reachable: the shell
+    /// driver caches `now()` **once per turn**, so a receive and a send
+    /// handled in one turn share an `Instant`. Under `start_paused` nothing
+    /// advances between install and a first exchange, so it happens every
+    /// time — leaving `R == S`, no keepalive (the comparison is false) and
+    /// no death (`armed` is false): SECV5-2's **immortal half-open
+    /// session**, which ruling 39's install pin exists to prevent.
+    ///
+    /// `R >= S` is **not** the repair: at install `R == S` deliberately, so
+    /// it would make an idle-from-install connection keepalive at once and
+    /// destroy the 25 s reap. The comparison cannot separate *"nothing
+    /// received since install"* from *"received at the same instant as
+    /// install"* — it is the wrong instrument, and the prose named the
+    /// right one.
+    received_since_marking_send: bool,
 }
 
 impl Liveness {
@@ -271,6 +292,10 @@ impl Liveness {
             last_authenticated_recv: now,
             last_send: now,
             armed: true,
+            // Ruling 39: the dance must **not** bootstrap from the install
+            // alone — a connection that carries nothing emits nothing and
+            // is reaped at 25 s.
+            received_since_marking_send: false,
         }
     }
 
@@ -296,6 +321,10 @@ impl Liveness {
     fn on_send(&mut self, now: Instant, marking: bool, ack_eliciting: bool) {
         if marking {
             self.last_send = now;
+            // Ruling 195: a marking send is what the passive keepalive
+            // would have been sent to do, so it clears the debt — whether
+            // or not the clock has advanced since the receive that set it.
+            self.received_since_marking_send = false;
         }
         if marking || ack_eliciting {
             self.armed = true;
@@ -307,6 +336,9 @@ impl Liveness {
     fn on_authenticated_fresh_recv(&mut self, now: Instant) {
         self.last_authenticated_recv = now;
         self.armed = false;
+        // Ruling 195: §7.5's *"has received since it last sent"*, recorded
+        // as the fact it is. This is the whole of the passive predicate.
+        self.received_since_marking_send = true;
     }
 
     /// §7.5's `last_send` — the marking clock. Read by slice 7's keepalive;
@@ -320,6 +352,18 @@ impl Liveness {
     /// The receive anchor the death deadline hangs from.
     pub(crate) fn last_authenticated_recv(&self) -> Instant {
         self.last_authenticated_recv
+    }
+
+    /// **[RATIFIED 2026/08/16 — ruling 195]** §7.5's passive predicate:
+    /// *"a side that has received since it last sent"*.
+    ///
+    /// **Use this, never `last_authenticated_recv() > last_send()`.** The
+    /// comparison is the same predicate everywhere the two instants differ
+    /// and is **wrong when they are equal**, which the driver's once-per-turn
+    /// `now()` makes reachable — see the field's own note. A keepalive owed
+    /// here fires at `last_send() + KEEPALIVE_TIMEOUT`.
+    pub(crate) fn owes_passive_keepalive(&self) -> bool {
+        self.received_since_marking_send
     }
 
     /// Whether the death deadline is armed.

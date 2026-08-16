@@ -1,11 +1,11 @@
 //! §16.2's `Connection` handle — the subset slice 3 builds.
 //!
 //! `close()`, ruling 46's `closed()`, the four accessors, slice 4's stream
-//! verbs, slice 5's `acked()` and slice 6's four sugar verbs. The §16.2
-//! verbs still absent — `notified`, `set_persistent_keepalive` — belong to
-//! slice 7 and are **absent rather than stubbed**: in this module tree an
-//! unimplemented verb is a claim about the protocol, and an
-//! `unimplemented!()` on a public surface is a worse claim than an absence.
+//! verbs, slice 5's `acked()`, slice 6's four sugar verbs, and slice 7's
+//! `notified()`, `set_persistent_keepalive()` and `persistent_keepalive()`.
+//! §16.2's surface is now complete; what remains for slice 8 is the
+//! composability layer (`AsyncRead`/`AsyncWrite`, the `Sink`/`Stream`
+//! adapters), which wraps these verbs rather than adding to them.
 //!
 //! # Where the work happens
 //!
@@ -342,6 +342,35 @@ impl<S: Handshake> Connection<S> {
             self.shell.mark_dirty(self.id);
         }
         Ok(())
+    }
+
+    /// The configured persistent-keepalive interval, or `None` when the
+    /// beacon is off (§7.5).
+    ///
+    /// **[RATIFIED 2026/08/16 — ruling 189]** This exists because ruling 44
+    /// makes *"a rejected call leaves the interval **unchanged**"* an
+    /// acceptance criterion that nothing in §16.2's surface could observe.
+    /// Without it the obligation is testable only by inferring the interval
+    /// from beacon cadence across a 3 × `DEAD_TIMEOUT` window, bracketed
+    /// from both sides so that neither an upward nor a downward clamp
+    /// survives — which a blind test author did, and should not have had to.
+    /// A configuration setter whose effect cannot be read back is the
+    /// defect; this is the fix.
+    ///
+    /// A shared-cell read like the other accessors (§16.8), never a command
+    /// round trip.
+    ///
+    /// On a connection whose core is gone this reports `None`, and that is
+    /// consistent rather than lossy: `set_persistent_keepalive` on a dead
+    /// connection validates the band and then stores nothing, so there is
+    /// no configured beacon to report. The shell keeps **no mirror** of the
+    /// interval — a second copy would be a second source of truth for a
+    /// value the core already owns.
+    pub fn persistent_keepalive(&self) -> Option<Duration> {
+        let cell = self.cell.borrow();
+        cell.core
+            .as_ref()
+            .and_then(|core| core.persistent_keepalive())
     }
 
     /// Resolve once everything handed to this connection **so far** has

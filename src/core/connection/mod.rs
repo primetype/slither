@@ -2120,7 +2120,11 @@ impl<C: Handshake> Connection<C> {
         let deadline = clocks.and_then(|liveness| liveness.deadline());
         self.timers.set(TimerKind::Liveness, deadline);
 
-        let passive = clocks.filter(|l| l.last_authenticated_recv() > l.last_send());
+        // Ruling 195: the flag, not `R > S`. The comparison is false when
+        // the two instants coincide — which the driver's once-per-turn
+        // `now()` makes ordinary — and a receive that cannot bootstrap the
+        // dance leaves a connection that neither talks nor dies.
+        let passive = clocks.filter(|l| l.owes_passive_keepalive());
         self.timers.set(
             TimerKind::Keepalive,
             passive.map(|l| l.last_send() + constants::KEEPALIVE_TIMEOUT),
@@ -2161,7 +2165,7 @@ impl<C: Handshake> Connection<C> {
         // The beacon fires **unconditionally** — it does not consult `R` —
         // so reaching here at all is enough for it. The passive rule
         // re-checks its own predicate.
-        if !passive || liveness.last_authenticated_recv() > liveness.last_send() {
+        if !passive || liveness.owes_passive_keepalive() {
             self.transmit_keepalive(now);
         }
         // Whether or not one went out, the two deadlines are derived state

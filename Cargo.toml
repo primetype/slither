@@ -215,3 +215,21 @@ required-features = ["test-util"]
 [[test]]
 name = "story_message"
 required-features = ["test-util"]
+
+# Slice 7. These are the integrator's to add (working rule 15): each names
+# a file written by a blind agent that did not exist when the other agent's
+# worktree was cut, and cargo *refuses to parse* a manifest naming a missing
+# test file — so an implementer landing them early leaves a tree on which no
+# gate can run at all.
+#
+# **[ruling 194]** They are also not cosmetic. There is no `autotests =
+# false` here, so cargo auto-discovers both targets *without* their
+# `required-features`, and the feature-less `cargo test` gate fails on
+# `unresolved import slither::testutil` until these stanzas exist.
+[[test]]
+name = "story_keepalive"
+required-features = ["test-util"]
+
+[[test]]
+name = "story_mobility"
+required-features = ["test-util"]
