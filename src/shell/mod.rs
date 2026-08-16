@@ -87,7 +87,7 @@ mod tests {
 
             assert!(a.is_established());
             assert!(b.is_established());
-            assert_eq!(a.remote_address(), pair.b.addr);
+            assert_eq!(a.remote_address(), pair.b.addr());
             assert_eq!(a.remote_static().as_ref(), pair.b.public_static.as_ref());
             assert_eq!(b.remote_static().as_ref(), pair.a.public_static.as_ref());
             // Ruling 89: both peers of one session produce the same value.
@@ -163,14 +163,14 @@ mod tests {
             let dialling = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("the static is NONE");
 
             // A second dial while the first is in flight is refused.
             assert_eq!(
                 pair.a
                     .endpoint
-                    .connect(pair.b.addr, pair.b.public_static)
+                    .connect(pair.b.addr(), pair.b.public_static)
                     .err(),
                 Some(ConnectError::AlreadyConnected),
             );
@@ -180,7 +180,7 @@ mod tests {
             let redial = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("the cancellation is ordered ahead of this verb");
             drop(redial);
         })
@@ -239,10 +239,15 @@ mod tests {
                 b: peer_b,
             } = pair;
             let tap = net.tap();
+            // Read the address out before the closure: `Peer::addr()` is a
+            // method (ruling 180), so capturing it inline would borrow the
+            // whole `peer_a` and block the `drop(peer_a.endpoint)` below.
+            // As a field it was captured disjointly and this compiled.
+            let a_addr = peer_a.addr();
             let from_a = |tap: &crate::testutil::Tap| {
                 tap.snapshot()
                     .iter()
-                    .filter(|spied| spied.src == peer_a.addr)
+                    .filter(|spied| spied.src == a_addr)
                     .count()
             };
 
@@ -276,7 +281,7 @@ mod tests {
             let pair = Pair::seeded(9);
             let (a, b) = pair.establish().await;
             let tap = pair.net.tap();
-            let addr_a = pair.a.addr;
+            let addr_a = pair.a.addr();
             let from_a = || {
                 tap.snapshot()
                     .iter()
@@ -307,11 +312,11 @@ mod tests {
             let dialling = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("connect");
 
             let intro = pair.b.endpoint.accept().await.expect("an introduction");
-            assert_eq!(intro.source(), pair.a.addr);
+            assert_eq!(intro.source(), pair.a.addr());
             assert_ne!(intro.sender_index(), 0, "§17.2 mints nonzero indices");
             let before = pair.b.dhs.get();
             drop(intro);
@@ -338,13 +343,13 @@ mod tests {
     async fn a_dial_nobody_answers_gives_up_at_the_giveup_and_not_before() {
         local(async {
             let pair = Pair::seeded(7);
-            pair.net.partition(pair.b.addr);
+            pair.net.partition(pair.b.addr());
 
             let started = tokio::time::Instant::now();
             let outcome = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("connect")
                 .await;
             let elapsed = tokio::time::Instant::now() - started;
@@ -363,7 +368,7 @@ mod tests {
             drop(
                 pair.a
                     .endpoint
-                    .connect(pair.b.addr, pair.b.public_static)
+                    .connect(pair.b.addr(), pair.b.public_static)
                     .expect("a redial after the give-up"),
             );
         })
@@ -451,7 +456,7 @@ mod tests {
             assert_eq!(
                 pair.a
                     .endpoint
-                    .connect(pair.b.addr, pair.b.public_static)
+                    .connect(pair.b.addr(), pair.b.public_static)
                     .err(),
                 Some(ConnectError::AlreadyConnected),
                 "the static was freed before the linger expired",
@@ -474,7 +479,7 @@ mod tests {
             let from_a = || {
                 tap.snapshot()
                     .iter()
-                    .filter(|spied| spied.src == pair.a.addr)
+                    .filter(|spied| spied.src == pair.a.addr())
                     .count()
             };
             let before = from_a();
@@ -482,7 +487,7 @@ mod tests {
             let redial = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect(
                     "`mint_pending` still found the static occupied after the linger: \
                      `Retired` never reached the endpoint core (ruling 90)",
@@ -535,7 +540,7 @@ mod tests {
             let dialling = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("connect");
             settle().await;
 
@@ -549,7 +554,7 @@ mod tests {
             let dialling = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("the static is NONE again");
             let intro = pair.b.endpoint.accept().await.expect("an introduction");
             let claimed = intro
@@ -654,7 +659,7 @@ mod tests {
             assert_eq!(
                 pair.a
                     .endpoint
-                    .connect(pair.b.addr, pair.b.public_static)
+                    .connect(pair.b.addr(), pair.b.public_static)
                     .err(),
                 Some(ConnectError::AlreadyConnected),
                 "the driver stopped: `Driver::drop` ran `stop()` on an unwind",
@@ -690,12 +695,12 @@ mod tests {
         local(async {
             let pair = Pair::seeded(13);
             // Nobody answers, so the attempt runs to §5.5's give-up.
-            pair.net.partition(pair.b.addr);
+            pair.net.partition(pair.b.addr());
 
             let dialling = pair
                 .a
                 .endpoint
-                .connect(pair.b.addr, pair.b.public_static)
+                .connect(pair.b.addr(), pair.b.public_static)
                 .expect("the static is NONE");
             // The driver must *start* the attempt before the clock jumps,
             // or §5.5's 90 s give-up is measured from the far side of the

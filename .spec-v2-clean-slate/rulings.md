@@ -4808,3 +4808,100 @@ ADV-S-4, §6.9/§17.5's cost accounting for the probe. The auditor
 separately did not read §6.3's stage-0 queue or §12's ACK derivation, on
 which rulings 175 and 176 both lean. Recorded so the adversarial review
 after this slice knows where the floor is thin.
+
+### 184 — ruling 181 amended: the arithmetic dissolves the Q5 collision
+
+The planner's recorded default for Q5 was *"the extends-to-end frame wins;
+**the PING takes its own packet**"*, with the instruction *"do not write a
+test that asserts a probe rides a data packet."* Ruling 181 said PING is
+packed immediately before the extends-to-end frame and offered the `0x31`
+LEN form as an equivalent escape. **Both were reasoning without ruling
+155's arithmetic, and the arithmetic answers it.**
+
+Ruling 155: `MAX_DATAGRAM_PAYLOAD` = 1169, `MAX_PLAINTEXT` = 1170, and a
+maximum-size datagram in the `0x31` form needs 1 + 2 + 1169 = **1172
+bytes and cannot be sent at all** — which is why the `0x30` form is
+mandatory rather than an optimisation.
+
+Carry that one step further, which neither of us did:
+
+> A maximum-size datagram in `0x30` form occupies 1 + 1169 = **1170
+> bytes — exactly `MAX_PLAINTEXT`.** It shares its packet with **nothing**:
+> no PING, no ACK, no control frame, no stream fill.
+
+**So for a maximum-size datagram the collision is vacuous** — it is alone
+in its packet under every packing rule, and ruling 155's documented bias
+(*"preferentially delayed by any packet carrying control frames"*) is
+precisely this fact, already ratified. The collision arises **only** for a
+*sub-maximum* extends-to-end frame, where room remains.
+
+**Ruling 181 stands, sharpened:**
+
+- A **maximum-size** `0x30` datagram is alone in its packet. Nothing is
+  packed with it, so no rule is needed and none is violated.
+- A **sub-maximum** extends-to-end frame leaves room, and **PING is packed
+  immediately before it**. A probe *does* ride such a packet.
+- The `0x31` escape is **withdrawn for datagrams**: ruling 155 makes
+  `0x30` mandatory, and the sizes where `0x31` would fit are exactly the
+  sizes where nothing was blocking. It remains available to STREAM frames,
+  which have a LEN form ruling 155 does not constrain.
+
+**The planner's default is therefore superseded**, and its test
+instruction inverted: a test **may** assert that a probe rides a data
+packet, provided the datagram aboard is sub-maximum. `CONTRACT-7.md`'s
+§7.2 and its ⚠ table are corrected.
+
+**What this says about the process.** Two agents and the integrator each
+reasoned about Q5 from §8.5's *words* and reached three different answers;
+the question was settled by two constants in a ruling all three had read.
+Working rule 8 says to ask what bounds a construction — here the bound was
+**numeric**, sitting in a ratified ruling one section away, and each of us
+treated a packing question as a question about precedence. **When a
+spec-text conflict is about capacity, do the arithmetic before taking a
+position.**
+
+### 185 (planner Q10) — a second write to an occupied notification slot takes the **new** generation
+
+The planner recorded this as a default awaiting a ruling, on the
+assumption — from §5.4's own table — that *"ruling 41's collapse means at
+most one of each can ever be pending."* **Ruling 175 falsifies that
+assumption's scope.** Ruling 41 collapses concurrent *marks*: at any
+instant at most one mark exists. It does **not** bound how many marks
+occur over a connection's life, and ruling 175 established that a **live**
+peer ACKs in ~1 RTT, clears the mark, and the next refusal is a full
+second mark. So `Contested`, `ContestCleared`, `Contested`, … is ordinary
+traffic on a healthy contested connection, and an application that does
+not drain between them **will** find an occupied slot rewritten.
+
+This is defect class 1 once more, and this time inside a contract rather
+than the spec: *"at most one of each can ever be pending"* is a true
+statement about marks read as a statement about **slots**.
+
+**Ruling: the latest write takes the slot and the new generation.**
+
+The generation is what §16.4 orders handover by, so taking the new one is
+what makes the pair read as **current state**. Worked through, with the
+application never draining:
+
+- `Contested`(g1) → `ContestCleared`(g2) → `Contested`(g3). The
+  `Contested` slot now holds g3, the `ContestCleared` slot g2. Handover in
+  generation order gives **cleared, then contested** — "contested now".
+  Correct.
+- Had the slot **kept** g1, handover would give **contested, then
+  cleared** — "cleared now", the exact inverse of the truth, and
+  unfalsifiable from the application's side.
+
+So the alternative is not merely lossier, it is **wrong in a specific
+direction**: it reports a contested connection as healthy, which is the
+one error S11 exists to prevent (*"refused but healthy, keep using it"*
+versus *"refused and about to die, prepare to redial"*). A re-dial
+scheduler reading it would stand down exactly when it should dial.
+
+Retention stays **one slot per kind** (§17.5 — nothing to bound), and the
+merge rule for `AddressMoved` is untouched: oldest unclaimed `from`,
+newest `to`, because that pair describes the *net* move, whereas a
+contested mark is a *state* and only its latest value is meaningful.
+
+`CONTRACT-7.md` §5.4's *"at most one of each can ever be pending"* is
+corrected to say what is true: **at most one mark exists at any instant,
+and a slot may be rewritten any number of times.**

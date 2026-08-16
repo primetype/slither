@@ -334,7 +334,7 @@ async fn sd1_send_datagram_never_waits_under_pressure() {
         settle().await;
 
         // Nothing can leave A. The send queue is the only sink.
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         const BURST: usize = 200;
         const {
@@ -466,7 +466,7 @@ async fn sd3_a_maximum_size_datagram_crosses_intact() {
         assert_same_bytes(&got, &want, "the maximum-size datagram");
 
         assert!(
-            full_sized_sends(&pair.net.tap(), pair.a.addr) >= 1,
+            full_sized_sends(&pair.net.tap(), pair.a.addr()) >= 1,
             "§11.2: 14 + 1 + {MAX_DATAGRAM_PAYLOAD} + 16 = {MAX_DATAGRAM}, so the \
              packet carrying it is exactly MAX_DATAGRAM bytes; no such send was \
              observed"
@@ -695,7 +695,7 @@ async fn sd6_a_lost_datagram_is_never_retransmitted_and_never_blocks() {
 
         // Arm an index window on A's wire, anchored at its current index.
         const WINDOW: usize = 4;
-        let base = sent_from(&tap, pair.a.addr);
+        let base = sent_from(&tap, pair.a.addr());
         pair.a
             .wire
             .set_policy(FlakyPolicy::drop_at(base..base + WINDOW));
@@ -703,7 +703,7 @@ async fn sd6_a_lost_datagram_is_never_retransmitted_and_never_blocks() {
         assert_eq!(ca.send_datagram(&tagged(2, MAX_DATAGRAM_PAYLOAD)), Ok(()));
         settle().await;
 
-        let after = sent_from(&tap, pair.a.addr);
+        let after = sent_from(&tap, pair.a.addr());
         assert!(
             after > base,
             "the drop window was never reached: A made no send at index {base}, so \
@@ -715,7 +715,7 @@ async fn sd6_a_lost_datagram_is_never_retransmitted_and_never_blocks() {
              escaped it and tag 2's absence below would be unproven",
             after - base
         );
-        let dropped = send_sizes(&tap, pair.a.addr, base..after);
+        let dropped = send_sizes(&tap, pair.a.addr(), base..after);
         assert!(
             dropped.contains(&MAX_DATAGRAM),
             "no MAX_DATAGRAM-sized send fell inside the drop window ({dropped:?}); \
@@ -1001,7 +1001,7 @@ async fn sd10_datagrams_are_flow_control_exempt() {
         let mut tag = 0u16;
         let mut rounds = 0usize;
         let sealed_bytes =
-            |tap: &Tap| full_sized_sends(tap, pair.a.addr) as u64 * MAX_DATAGRAM_PAYLOAD as u64;
+            |tap: &Tap| full_sized_sends(tap, pair.a.addr()) as u64 * MAX_DATAGRAM_PAYLOAD as u64;
 
         while sealed_bytes(&tap) <= INITIAL_MAX_DATA {
             assert!(

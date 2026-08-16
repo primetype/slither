@@ -331,7 +331,7 @@ async fn s12_a_bulk_stream_survives_loss_reordering_and_duplication() {
         let last_dropped = arm_drops(
             &tap,
             &pair.a.wire,
-            pair.a.addr,
+            pair.a.addr(),
             flaky.clone(),
             /* skip */ 4,
             /* count */ 6,
@@ -367,7 +367,7 @@ async fn s12_a_bulk_stream_survives_loss_reordering_and_duplication() {
         );
 
         // ── working rule 9: the loss is *shown*, not assumed ────────────
-        let a_sends = sent_from(&tap, pair.a.addr);
+        let a_sends = sent_from(&tap, pair.a.addr());
         assert!(
             a_sends > last_dropped,
             "the drop window ends at send index {last_dropped} and A's wire only \
@@ -444,7 +444,7 @@ async fn s12_a_stream_lost_before_anything_was_acked_is_rescued_by_the_pto() {
 
         // ── everything this stream sends is destroyed ───────────────────
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         let mut send = within(ca.open_uni(), "open_uni").await.expect("open_uni");
         write_all(&mut send, &want, "pre-blackhole write").await;
@@ -465,7 +465,7 @@ async fn s12_a_stream_lost_before_anything_was_acked_is_rescued_by_the_pto() {
              intact and there is no loss for §13 to recover from"
         );
 
-        pair.net.heal_path(pair.a.addr, pair.b.addr);
+        pair.net.heal_path(pair.a.addr(), pair.b.addr());
 
         // Nothing is retried by the test: no further write, no `settle` loop
         // that could smuggle in fresh traffic. From here only §13.3's probe
@@ -548,7 +548,7 @@ async fn s12_a_stream_completes_when_the_acknowledgements_are_lost() {
 
         // ── the return path dies; the forward path does not ─────────────
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.b.addr, pair.a.addr);
+        pair.net.block_path(pair.b.addr(), pair.a.addr());
 
         write_all(&mut send, &chunk2, "chunk 2 (acknowledgement blackholed)").await;
         settle().await;
@@ -584,7 +584,7 @@ async fn s12_a_stream_completes_when_the_acknowledgements_are_lost() {
         }
 
         // ── heal, finish, and require every byte exactly once ───────────
-        pair.net.heal_path(pair.b.addr, pair.a.addr);
+        pair.net.heal_path(pair.b.addr(), pair.a.addr());
         write_all(&mut send, &chunk3, "chunk 3 (after the heal)").await;
         recovering(send.finish(), "finish").await.expect("finish");
         settle().await;
@@ -656,7 +656,7 @@ async fn s12_the_probe_train_backs_off_and_the_transfer_completes_on_heal() {
             .expect("accept_uni");
 
         // ── blackhole the forward path, mid-transfer ────────────────────
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
         write_all(&mut send, &chunk2, "chunk 2 (blackholed)").await;
         settle().await;
 
@@ -720,7 +720,7 @@ async fn s12_the_probe_train_backs_off_and_the_transfer_completes_on_heal() {
         );
 
         // ── heal, and require the whole transfer ────────────────────────
-        pair.net.heal_path(pair.a.addr, pair.b.addr);
+        pair.net.heal_path(pair.a.addr(), pair.b.addr());
         recovering(send.finish(), "finish").await.expect("finish");
         settle().await;
 
@@ -778,7 +778,7 @@ async fn s12_a_retransmitting_stream_does_not_starve_its_sibling() {
         let last_dropped = arm_drops(
             &tap,
             &pair.a.wire,
-            pair.a.addr,
+            pair.a.addr(),
             base,
             /* skip */ 2,
             /* count */ 12,
@@ -843,7 +843,7 @@ async fn s12_a_retransmitting_stream_does_not_starve_its_sibling() {
             a_done.1
         );
 
-        let a_sends = sent_from(&tap, pair.a.addr);
+        let a_sends = sent_from(&tap, pair.a.addr());
         assert!(
             a_sends > last_dropped,
             "A's wire reached only index {a_sends}; the twelve-packet hole at \
@@ -899,7 +899,7 @@ async fn s28_a_stream_acked_before_the_close_does_not_lose_its_tail() {
         let last_dropped = arm_drops(
             &tap,
             &pair.a.wire,
-            pair.a.addr,
+            pair.a.addr(),
             flaky.clone(),
             /* skip */ 1,
             /* count */ 2,
@@ -939,7 +939,7 @@ async fn s28_a_stream_acked_before_the_close_does_not_lose_its_tail() {
              and the FIN with it",
         );
 
-        let a_sends = sent_from(&tap, pair.a.addr);
+        let a_sends = sent_from(&tap, pair.a.addr());
         assert!(
             a_sends > last_dropped,
             "A's wire reached index {a_sends}, short of the drop window ending at \
@@ -978,7 +978,7 @@ async fn s28_connection_acked_covers_every_stream_before_the_close() {
         let last_dropped = arm_drops(
             &tap,
             &pair.a.wire,
-            pair.a.addr,
+            pair.a.addr(),
             flaky.clone(),
             /* skip */ 1,
             /* count */ 2,
@@ -1025,7 +1025,7 @@ async fn s28_connection_acked_covers_every_stream_before_the_close() {
             "S28: stream 2 as well",
         );
 
-        let a_sends = sent_from(&tap, pair.a.addr);
+        let a_sends = sent_from(&tap, pair.a.addr());
         assert!(
             a_sends > last_dropped,
             "A's wire reached index {a_sends}, short of the drop window ending at \
@@ -1206,7 +1206,7 @@ async fn s28_an_unacknowledged_transfer_on_a_dead_connection_reports_the_loss() 
         let (ca, cb) = pair.establish().await;
 
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         let mut send = within(ca.open_uni(), "open_uni").await.expect("open_uni");
         write_all(&mut send, &payload(4096), "write into the blackhole").await;
@@ -1288,7 +1288,7 @@ async fn s28_a_parked_acked_wakes_when_the_connection_dies() {
         let (ca, cb) = pair.establish().await;
 
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         let mut send = within(ca.open_uni(), "open_uni").await.expect("open_uni");
         write_all(&mut send, &payload(4096), "write into the blackhole").await;
@@ -1443,7 +1443,7 @@ async fn s28_stream_acked_reports_the_reset_that_abandoned_its_bytes() {
         const CODE: u64 = 0x2a;
 
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         let mut send = within(ca.open_uni(), "open_uni").await.expect("open_uni");
         write_all(&mut send, &payload(4096), "write into the blackhole").await;
@@ -1512,7 +1512,7 @@ async fn s28_connection_acked_resolves_when_a_stream_in_the_snapshot_is_reset() 
         let (ca, _cb) = pair.establish().await;
 
         let lost_before = blackholed(&pair);
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
 
         let mut s1 = within(ca.open_uni(), "open s1").await.expect("open s1");
         write_all(&mut s1, &payload(4096), "s1 write").await;

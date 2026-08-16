@@ -656,7 +656,9 @@ impl FlakyWire {
             // test wants to hold across the move it re-applies to the new
             // address.
             inner.partitioned.remove(&old);
-            inner.blocked.retain(|(from, to)| *from != old && *to != old);
+            inner
+                .blocked
+                .retain(|(from, to)| *from != old && *to != old);
         }
         self.addr.set(new_addr);
         // Anything parked on the old inbox must re-examine the new one.
@@ -1067,6 +1069,16 @@ impl SharedWire {
         self.0.local_addr()
     }
 
+    /// **[ruling 180]** Move this wire to `to`. See [`FlakyWire::rebind`].
+    ///
+    /// Every clone of this `SharedWire` observes the move — the address
+    /// lives in one `Cell` behind the shared `Rc`, not in the handle — so
+    /// the driver holding its own clone sends from the new address on its
+    /// very next send, with no re-plumbing.
+    pub fn rebind(&self, to: SocketAddr) {
+        self.0.rebind(to);
+    }
+
     /// Replace the policy. Takes effect from the next send; the send index
     /// is not reset.
     pub fn set_policy(&self, policy: FlakyPolicy) {
@@ -1099,14 +1111,42 @@ pub struct Peer {
     /// **only if** no `Connecting` or `Connection` of its own is still
     /// alive (§16.3).
     pub endpoint: TestEndpoint,
-    /// Where this endpoint lives on the [`Network`].
-    pub addr: SocketAddr,
     /// A shared handle on its wire, for mid-run [`FlakyPolicy`] changes.
     pub wire: SharedWire,
     /// Its cumulative DH count (§6.1 prices the ladder cumulatively).
     pub dhs: DhCounter,
     /// Its static public key — what the *other* peer dials.
     pub public_static: TestPublicKey,
+}
+
+impl Peer {
+    /// Where this endpoint lives on the [`Network`] **right now**.
+    ///
+    /// **[ruling 180]** This was a `pub addr` field until slice 7. A field
+    /// could not follow [`rebind`](Peer::rebind), so after a move it would
+    /// hold the address this peer *used to* have — and every mobility test
+    /// is precisely a test about which address is current. Reading a stale
+    /// one would not fail loudly; it would assert the pre-move address and
+    /// pass. The field is gone rather than kept-and-deprecated so that no
+    /// call site can read the wrong thing.
+    pub fn addr(&self) -> SocketAddr {
+        self.wire.local_addr()
+    }
+
+    /// Move this endpoint to `to` — an interface change, or a NAT rebind.
+    ///
+    /// The peer at the other end re-homes on our next authenticated,
+    /// window-fresh packet (§7.3). Roaming is **receive-driven**, so
+    /// nothing happens until we send: that is S18's positive obligation on
+    /// the mover, and [`FlakyWire::rebind`] documents why in-flight
+    /// datagrams to the old address are abandoned rather than carried.
+    ///
+    /// # Panics
+    ///
+    /// If `to` is already registered on the network.
+    pub fn rebind(&self, to: SocketAddr) {
+        self.wire.rebind(to);
+    }
 }
 
 /// Two endpoints on one in-memory [`Network`] — §16.10's kernel-free
@@ -1189,7 +1229,7 @@ impl Pair {
         let dial = async {
             self.a
                 .endpoint
-                .connect(self.b.addr, self.b.public_static)
+                .connect(self.b.addr(), self.b.public_static)
                 .expect("connect")
                 .await
                 .expect("the dial completed")
@@ -1224,7 +1264,6 @@ impl Peer {
             .build();
         Peer {
             endpoint,
-            addr,
             wire,
             dhs,
             public_static,

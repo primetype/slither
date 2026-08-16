@@ -380,7 +380,7 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
 
         // The hole. One direction only: b → a keeps working, so nothing
         // here is a connection-wide outage.
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
         write_all(&mut a1, &chunk2, "A chunk 2 (blackholed)").await;
         // **The driver must run before the path is healed.** Ruling 114 says
         // a mutating call *seals* everything the ledger admits — it does not
@@ -391,7 +391,7 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         // lost, and this test reads a contiguous 10 530 bytes while claiming
         // to have made a permanent hole.
         settle().await;
-        pair.net.heal_path(pair.a.addr, pair.b.addr);
+        pair.net.heal_path(pair.a.addr(), pair.b.addr());
 
         // **Slice 5 changed what "a permanent gap" costs to build.** §13's
         // loss detection is *connection*-level: once B acknowledges anything
@@ -407,7 +407,7 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         // persists for exactly the window under test, deterministically,
         // and A→B data keeps flowing. Healed at the end, where recovery is
         // then allowed to finish the job.
-        pair.net.block_path(pair.b.addr, pair.a.addr);
+        pair.net.block_path(pair.b.addr(), pair.a.addr());
 
         // Lands beyond the hole: buffered by the reassembler, undeliverable
         // for ever, because slice 4 never retransmits chunk 2.
@@ -492,7 +492,7 @@ async fn s13_a_stalled_stream_does_not_block_a_concurrent_one() {
         // loss. Asserting it here also stops the test passing against a
         // build that never recovers: under slice 4 this read would hang,
         // and `within` fails rather than hangs.
-        pair.net.heal_path(pair.b.addr, pair.a.addr);
+        pair.net.heal_path(pair.b.addr(), pair.a.addr());
         settle().await;
 
         // Exactly the two remaining chunks — **not** `read_to_end`: stream A

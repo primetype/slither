@@ -418,7 +418,7 @@ async fn s16_one_byte_over_the_bound_is_rejected_at_the_handle() {
         quiesce(NOT_BEFORE).await;
 
         let tap = pair.net.tap();
-        let before = sent_from(&tap, pair.a.addr);
+        let before = sent_from(&tap, pair.a.addr());
 
         let too_big = payload(BOUND + 1);
         let err = within(ca.send_message(&too_big), "send_message over the bound")
@@ -431,7 +431,7 @@ async fn s16_one_byte_over_the_bound_is_rejected_at_the_handle() {
 
         settle().await;
         assert_eq!(
-            sent_from(&tap, pair.a.addr),
+            sent_from(&tap, pair.a.addr()),
             before,
             "§9.8:3088 — the bound is checked **at the handle**: an oversize \
              send opens no stream, admits no byte, and puts nothing on the wire"
@@ -660,12 +660,12 @@ async fn s16_message_then_acked_then_close_delivers_after_the_death() {
         let killed_before = blackholed(&pair);
 
         // The whole first transmission dies.
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
         within(ca.send_message(&m), "send_message")
             .await
             .expect("accepted");
         quiesce(NOT_BEFORE).await;
-        pair.net.heal_path(pair.a.addr, pair.b.addr);
+        pair.net.heal_path(pair.a.addr(), pair.b.addr());
 
         assert!(
             blackholed(&pair) >= killed_before + min_first_flight_packets(),
@@ -753,14 +753,14 @@ async fn s16_without_acked_the_same_drop_set_loses_the_message() {
         let m = payload(16 * 1024);
         let killed_before = blackholed(&pair);
 
-        pair.net.block_path(pair.a.addr, pair.b.addr);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
         within(ca.send_message(&m), "send_message")
             .await
             .expect("accepted");
         quiesce(NOT_BEFORE).await;
 
         // Heal and close with nothing in between: the pre-ruling-47 ordering.
-        pair.net.heal_path(pair.a.addr, pair.b.addr);
+        pair.net.heal_path(pair.a.addr(), pair.b.addr());
         ca.close(NO_ERROR, b"").await;
         drop(ca);
 
@@ -1298,12 +1298,12 @@ async fn s30_a_lost_overflow_reset_is_regenerated_until_acknowledged() {
 
         // The receiver's next sends die — the reset among them.
         let killed_before = blackholed(&pair);
-        pair.net.block_path(pair.b.addr, pair.a.addr);
+        pair.net.block_path(pair.b.addr(), pair.a.addr());
 
         arm_claim!(_claim, cb, "the claim that triggers the reset");
         quiesce(NOT_BEFORE).await;
 
-        pair.net.heal_path(pair.b.addr, pair.a.addr);
+        pair.net.heal_path(pair.b.addr(), pair.a.addr());
         assert!(
             blackholed(&pair) > killed_before,
             "the window in which B emitted its reset must actually have been \

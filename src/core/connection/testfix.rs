@@ -559,10 +559,29 @@ impl Pair {
 
     /// Hand every queued A→B datagram to B, in order, and drain B.
     pub(crate) fn flush_a_to_b(&mut self, now: Instant) -> Drained {
+        self.flush_a_to_b_from(now, a_addr())
+    }
+
+    /// [`flush_a_to_b`](Pair::flush_a_to_b) with an explicit source
+    /// address — **the core-level way to drive §7.3's roaming**.
+    ///
+    /// **[ruling 180]** A roam is *"an authenticated, fresh, window-marked
+    /// Data packet whose source differs from the session's current
+    /// endpoint"*. At the core there is no socket, so the source is simply
+    /// the address handed to `handle_datagram`: passing a different one
+    /// **is** the peer having moved. `FlakyWire::rebind` is the shell-level
+    /// counterpart; this is the sans-io one, and it is the cheaper of the
+    /// two for pinning what the core does.
+    ///
+    /// The packets are genuine — sealed by A, so authenticated and
+    /// window-fresh. That matters: §7.2 refuses to roam on anything
+    /// replayed, so a roam test built by replaying captured bytes from a
+    /// new address pins the *rejection*, not the roam.
+    pub(crate) fn flush_a_to_b_from(&mut self, now: Instant, src: SocketAddr) -> Drained {
         let queued = std::mem::take(&mut self.a_to_b);
         let mut all = Drained::default();
         for dgram in queued {
-            self.b.handle_datagram(now, a_addr(), &dgram);
+            self.b.handle_datagram(now, src, &dgram);
             let d = self.drain_b();
             all.outs.extend(d.outs);
             all.deadline = d.deadline;
@@ -571,10 +590,16 @@ impl Pair {
     }
 
     pub(crate) fn flush_b_to_a(&mut self, now: Instant) -> Drained {
+        self.flush_b_to_a_from(now, b_addr())
+    }
+
+    /// [`flush_b_to_a`](Pair::flush_b_to_a) with an explicit source.
+    /// See [`flush_a_to_b_from`](Pair::flush_a_to_b_from).
+    pub(crate) fn flush_b_to_a_from(&mut self, now: Instant, src: SocketAddr) -> Drained {
         let queued = std::mem::take(&mut self.b_to_a);
         let mut all = Drained::default();
         for dgram in queued {
-            self.a.handle_datagram(now, b_addr(), &dgram);
+            self.a.handle_datagram(now, src, &dgram);
             let d = self.drain_a();
             all.outs.extend(d.outs);
             all.deadline = d.deadline;
@@ -918,8 +943,24 @@ impl Solo {
 
     /// Seal `frames` as the peer, feed it, drain.
     pub(crate) fn deliver(&mut self, now: Instant, frames: &[u8]) -> Drained {
+        self.deliver_from(now, a_addr(), frames)
+    }
+
+    /// [`deliver`](Solo::deliver) from an explicit source address — the
+    /// one-sided way to roam the connection under test (§7.3).
+    ///
+    /// **[ruling 180]** The packet is sealed by the real peer session, so
+    /// it is authenticated and window-fresh; only its *source* differs.
+    /// That is exactly §7.3's predicate, and it is the whole of a roam at
+    /// core level.
+    ///
+    /// Note what this does **not** do: it does not re-home anything by
+    /// itself if the frames fail to authenticate, and §7.2 rejects a
+    /// replay outright. A test that roams by re-sending bytes the tap
+    /// already saw pins the replay window, not the roam.
+    pub(crate) fn deliver_from(&mut self, now: Instant, src: SocketAddr, frames: &[u8]) -> Drained {
         let dgram = self.peer.seal(frames);
-        self.conn.handle_datagram(now, a_addr(), &dgram);
+        self.conn.handle_datagram(now, src, &dgram);
         drain(&mut self.conn)
     }
 

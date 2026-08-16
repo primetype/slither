@@ -1,9 +1,12 @@
 # CONTRACT-7 — the binding API contract for slice 7 (mobility and contest)
 
-**Status: DRAFT until Round 30 rules the items marked ⚠ below. BINDING
-once committed.** Every slice-7 agent compiles against this and none may
-change it. If you believe something here is wrong, **say so in your report
-and implement it as written anyway** (working rule 5).
+**Status: BINDING.** Round 30 (rulings 168–184) has ruled every item this
+file previously marked ⚠-unruled, including the planner's two open
+questions — **and it changed both of their stated defaults**, so a reader
+working from a remembered default will build the wrong thing. Every
+slice-7 agent compiles against this file and none may change it. If you
+believe something here is wrong, **say so in your report and implement it
+as written anyway** (working rule 5).
 
 Base commit for the worktree cut: **named in your brief**. This file and
 the `testutil`/`testfix` extension of PLAN-7 §3 are both in it (working
@@ -46,7 +49,7 @@ round of rulings.
 | **152 / 128** | The post-death drain covers `recv_message` and `recv_datagram` as well as `read`/`accept_*`. **Parking is never permitted on a dead connection.** A `Notification` *"is a fact about the connection, complete in itself, and it survives the event it describes."* |
 | **155** | One datagram per packet, packed **before** the stream fill; the `0x30` extends-to-end form is **mandatory**, not an optimisation. ⚠ Its interaction with "PING last" is §7.2. |
 
-### Round 30 (2026/08/16) — rulings 168–180, **the governing set for this slice**
+### Round 30 (2026/08/16) — rulings 168–184, **the governing set for this slice**
 
 Taken after an adversarial spec audit run blind to the planner. **Eleven
 of twelve findings upheld.** These override every §-section quoted below.
@@ -67,17 +70,23 @@ of twelve findings upheld.** These override every §-section quoted below.
 | **179** | §6.4's admission rule carries the closing/draining carve-out **explicitly**, where the mark is taken — *"a rule enforced only in the section that describes the state rather than the section that enters it is a rule that gets missed."* |
 | **180** | **`FlakyWire::rebind(new_addr)`.** `addr` becomes a `Cell`; `Network` moves the `EndpointState` between keys **carrying the existing `Rc<Notify>`** (the driver's recv loop is parked on that exact `Rc`; a fresh one hangs it); rebinding onto a registered address panics. **In-flight datagrams are abandoned, not carried** — that is what a real rebind does, and the carry-across alternative would let S18 pass *for the wrong reason*. `src/testutil/mod.rs` lands **committed before dispatch**. |
 
-### ⚠ The two items Round 30 did not reach
+### The planner's two open items are now ruled — **both defaults changed**
 
-| Q | Subject | Default until ruled |
-|---|---|---|
-| **Q5** | §8.5 gives **two** frames "final position" — *"then PING last"* vs *"at most one extends-to-end frame … in final position"*. Slice 7 makes the collision routine | **(b) the extends-to-end frame wins; the PING takes its own packet.** Ruling 155 made the `0x30` form mandatory, so demoting it to `0x31` to fit a PING would make a maximum-size datagram unsendable on any probe-owing packet. **Do not write a test that asserts a probe rides a data packet.** |
-| **Q7** | Is the passive keepalive's `S` marking-sends-only? | **Yes** — `Liveness::last_send()`. §7.4 makes `seal_quiet` output liveness-neutral and ruling 40's derivation computes `S + I` from marking sends. |
+| # | Decision |
+|---|---|
+| **181 + 184** | **Q5 is settled by arithmetic, not precedence.** A maximum-size datagram in `0x30` form is 1 + 1169 = **exactly `MAX_PLAINTEXT` (1170)**, so it shares its packet with **nothing** under any rule — that *is* ruling 155's documented bias, already ratified. The collision arises only for a **sub-maximum** extends-to-end frame, and there **PING is packed immediately before it**. An extends-to-end frame's final position is *structural* (nothing can follow a frame with no length prefix); PING's "last" is merely *ordinal*. **The planner's default is superseded and its test instruction inverted: you MAY assert that a probe rides a data packet, provided the datagram aboard is sub-maximum.** The `0x31` escape is **withdrawn for datagrams** (ruling 155 makes `0x30` mandatory) and remains open to STREAM frames. |
+| **182** | **Q7: yes, and for a stated reason.** The passive keepalive reads `S` = last **marking** send. §7.5's prose *"has not sent"* is corrected. This is the **first time in this project the formal rule held the intent rather than the prose** — because the beacon's soundness proof rests on *"every send that can establish `S > R` is a marking send, so the death clock is armed there"*, which the prose reading collapses into an immortal half-open session. **Which sends are marking is §7.4's answer — quote it, do not re-derive it.** |
+| **183** | **A paused-clock test-authoring instruction, and it will bite you.** `Congestion::reset(now)` sets `recovery_start = now`, and `in_recovery` tests `sent_time <= start`. A **post-roam** packet sent in the *same virtual instant* as the roam therefore **is** fenced. On tokio's paused clock that is the norm, not an edge case. **A test asserting "a post-roam loss cuts cwnd" must advance the clock after the roam, or it asserts the opposite of what its name says.** The `≤` stands — it is §14.3's ordinary rule and the roam case errs conservatively (a fenced packet suppresses a cwnd *cut*, never inflates a window). |
+| **184** | Amends 181; see above. Also records the process finding: three parties reasoned about Q5 from §8.5's words and got three answers, when two constants in a ruling all three had read settled it. **When a spec conflict is about capacity, do the arithmetic before taking a position.** |
 
 **Everything else the planner flagged, Round 30 ruled.** Q1 → 176 (and
 the three-state shape below stands); Q2 → 168/169/170; Q3 → 172;
-Q6 → 174; Q9 → 168/173; Q10 → 176; Q12 → 180; Q14 → 178; Q16 → 178;
-Q13, Q15, Q17, Q18 stand as recorded in `QUESTIONS-7.md`.
+Q5 → 181/184; Q6 → 174; Q7 → 182; Q9 → 168/173; Q10 → 176; Q12 → 180;
+Q14 → 178; Q16 → 178; Q13, Q15, Q17, Q18 stand as recorded in
+`QUESTIONS-7.md`.
+
+**Nothing in this contract is now marked ⚠-unruled.** If you find
+yourself reasoning from a default, you are reading a stale copy.
 
 ---
 
@@ -202,7 +211,7 @@ roam.**
 | 2 | `path_generation += 1` |
 | 3 | `Recovery::on_roam(now)` — sent map **kept**, `min_rtt` re-seeded |
 | 4 | `NewReno::reset(now)` — cwnd = `INITIAL_WINDOW`, ssthresh = `u64::MAX`, `recovery_start = Some(now)` |
-| 5 | The budget arms: both counters reset, then the **triggering packet's datagram length** credits the received counter ⚠ Q9 |
+| 5 | The budget arms: both counters reset, then the **triggering packet's datagram length** credits the received counter. **RULED (168/169):** correct as written — the roam trigger is authenticated *and* window-fresh by §7.3, which is exactly what ruling 169 requires of anything that funds the budget. The same step records `validation_floor`. |
 | 6 | `tracing::debug!(target: "slither::roam", …)` with `from` and `to` |
 | 7 | `ConnEvent::AddressMoved { from, to }` is queued |
 
@@ -685,9 +694,9 @@ The shape above is illustrative; **the behaviour below is binding.**
 |---|---|
 | **O(1)** | Retention is **one slot per kind**, never a queue. There is no bound to configure because there is nothing to bound (§17.5). |
 | **`AddressMoved` merge** | An unclaimed `AddressMoved` superseded by a further roam keeps the **oldest unclaimed `from`** and the **newest `to`**, *"so the pair always describes the net move since the application last looked."* |
-| **`Contested` / `ContestCleared`** | Distinct kinds. Ruling 41's collapse means **at most one of each can ever be pending**. |
+| **`Contested` / `ContestCleared`** | Distinct kinds. **At most one *mark* exists at any instant** (ruling 41's collapse) — but that is a statement about marks, **not** about slots, and an earlier draft of this table read it as the latter. Ruling 175: a live peer clears in ~1 RTT and the next refusal is a full second mark, so `Contested` → `ContestCleared` → `Contested` is ordinary traffic and **a slot may be rewritten any number of times**. |
 | **Ordering** | Pending notifications of different kinds are handed over in **generation order** (§16.4's ordering rule). |
-| **Second write to an occupied slot** | ⚠ Q10. Default until ruled: **the latest write takes the generation**, so a re-mark after a clear reads as "contested now". |
+| **Second write to an occupied slot** | **RULED (185): the latest write takes the slot and the new generation.** With no drain, `Contested`(g1) → `ContestCleared`(g2) → `Contested`(g3) hands over as *cleared, then contested* = "contested now". Keeping the old generation would hand over *contested, then cleared* = **"cleared now", the exact inverse of the truth** — reporting a contested connection as healthy, which is the one error S11 exists to prevent. |
 | **Survives death** | A notification generated before the death is **still claimable after it**. `notified()` returns `Err(ConnectionLost)` **only once every slot is drained.** |
 
 ### 5.5 `slither::policy` — the three traced moments
@@ -794,19 +803,38 @@ The keepalive is §3.4's **empty plaintext** — a 16-byte tag-only
 ciphertext, a **30-byte datagram** — and bypasses the frame layer at
 `mod.rs:321–326` and `frame.rs:686–690`.
 
-### 7.2 ⚠ Q5 — the packing collision
+### 7.2 The packing collision — **RULED (181 + 184)**
 
 §8.5 gives two frames "final position": *"then PING last"* and *"at most
 one extends-to-end frame (¬LEN STREAM, or `0x30` DATAGRAM) per packet, in
 final position."*
 
-**Default until ruled: (b) — the extends-to-end frame wins, and the PING
-takes its own packet.** Rationale: ruling 155 made the `0x30` form
-mandatory rather than optional, so demoting it to `0x31` to fit a PING
-would make a maximum-size datagram unsendable on any probe-owing packet.
+**The two claims are not the same kind of claim.** An extends-to-end frame
+carries **no length prefix**, so it runs to the end of the packet by
+definition: its final position is **structural**, and anything following it
+would be parsed as part of it. PING's "last" is **ordinal** — a placement
+preference among length-prefixed frames, and a 1-byte frame's position
+carries no semantics.
 
-**A test that asserts a probe rides a data packet is asserting the
-opposite ruling. Do not write one until Q5 lands.**
+**And for the case everyone worried about, the collision does not exist.**
+Ruling 155 fixes `MAX_DATAGRAM_PAYLOAD` = 1169 and `MAX_PLAINTEXT` = 1170.
+A maximum-size datagram in `0x30` form is `1 + 1169 = 1170` bytes —
+**exactly the whole plaintext**. It shares its packet with *nothing*: no
+PING, no ACK, no control frame, no stream fill. That is not a new
+constraint; it **is** ruling 155's documented bias.
+
+So:
+
+| case | rule |
+|---|---|
+| maximum-size `0x30` datagram | alone in its packet. No packing rule applies because nothing else fits. |
+| **sub-maximum** extends-to-end frame | **PING is packed immediately before it.** |
+| STREAM frames | the LEN form remains available; ruling 155 does not constrain it. |
+| datagrams | the `0x31` escape is **withdrawn** — ruling 155 makes `0x30` mandatory, and the sizes where `0x31` fits are exactly the sizes where nothing was blocking. |
+
+**This inverts the earlier instruction.** A test **may** assert that a
+probe rides a data packet, provided the datagram aboard is sub-maximum.
+The previous draft told you not to write one; that default is superseded.
 
 ### 7.3 PING's retransmission class is unchanged
 
@@ -909,6 +937,12 @@ impl FlakyWire {
     /// This wire's **current** local address. Changes under `rebind`.
     pub fn local_addr(&self) -> SocketAddr;
 }
+impl SharedWire {
+    /// Every clone observes the move — the address lives in one `Cell`
+    /// behind the shared `Rc`, so the driver's own clone sends from the
+    /// new address on its next send, with no re-plumbing.
+    pub fn rebind(&self, to: SocketAddr);
+}
 impl Peer {
     pub fn rebind(&self, to: SocketAddr);
     pub fn addr(&self) -> SocketAddr;   // was a pub field; now current
@@ -930,6 +964,36 @@ impl Pair {
 silent, and still receive** — so S18's central claim, *"the mover must
 send, and the keepalive is what does it"*, would pass **for the wrong
 reason**. Abandonment is what makes the positive obligation bite.
+
+It is pinned by
+`testutil::tests::a_datagram_in_flight_to_the_old_address_is_lost_on_rebind`,
+and **verified by mutation**: built against the carry-across alternative
+the ruling declined, that test fails on its own assertion — not on an
+internal guard, and not on a later one.
+
+### 9.0 Two details settled in the landing, beyond the sketch above
+
+1. **`Peer::addr` is a method, and the field is gone** — not deprecated,
+   removed. A field cannot follow a `rebind`, so after a move it would
+   hold the address the peer *used to* have, and every mobility test is
+   exactly a test about which address is current. It would not fail
+   loudly; it would assert the pre-move address and **pass**. 99 call
+   sites moved to `addr()`.
+   *A consequence worth knowing before you hit it:* Rust 2021 closures
+   capture disjoint **fields**, so `|| ... peer.addr ...` used to leave
+   `peer.endpoint` movable. A **method** borrows the whole struct, so a
+   closure that reads the address now conflicts with a later
+   `drop(peer.endpoint)`. Read the address into a local before the
+   closure — `src/shell/mod.rs` has the worked case.
+2. **Rebinding to the address you already hold is a no-op, not a panic** —
+   and specifically it does **not** drop the inbox, which the naive
+   remove-then-insert would. Pinned by
+   `rebinding_to_the_same_address_keeps_the_inbox`.
+
+A rebind also clears any `partition`/`block_path` involving the old
+address: those are properties of an **address**, not of a wire, and a
+fresh address is by definition neither partitioned nor blocked. Re-apply
+them to the new address if your test needs them held across the move.
 
 `Network::inject(from, to, bytes)` already exists and is the **forgery**
 fixture — it bypasses `Tap`, `Network::sends()` and every `FlakyPolicy`
