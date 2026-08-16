@@ -34,13 +34,22 @@ recommendation any more.**
    `Result<_, ConnectionLost>` returns `Some(Err(..))` for ever after death and
    **never** `None`. No adapter carries a "finished" flag. The rustdoc on each
    must warn that a bare `while let Some(_) = s.next().await` **spins**.
-3. **`tower` (225, 230).** `impl Service<()> for Connection<H>` with
-   `Response = BiStream<H>`: `call()` opens one bi stream and the stream *is*
+3. **`tower` (225, 230).** `call()` opens one bi stream and the stream *is*
    the correlation. Plus `serve`. **No `Rpc`, no `Codec` bound, no `codec`
    feature interaction.** `story_tower`'s features are
    `["test-util", "tower"]`. A dev-dependency `tower = { version = "0.5",
    default-features = false, features = ["util"] }` exists for
    `UnsyncBoxService`.
+
+   **[CORRECTED — ruling 236.]** This item said `impl Service<()> for
+   Connection<H>`, **contradicting §6.2 of this very file**, whose heading
+   reads *"The stream-opener — `&Connection<S>`, not `Connection<S>`"*. The
+   receiver is `&Connection<S>`: `open_bi(&self)` borrows, `Service::call`
+   takes `&mut self` with an anonymous lifetime `type Future` cannot name,
+   and `Service` has no GAT. **§6.2 was right and §0.0 was a paraphrase of
+   `PLAN.md` §3.4's sketch that inherited the sketch's defect.** Ruling 225
+   settled *one bi stream per call, not the message verb* and is silent on
+   the receiver, so nothing overrode §6.2.
 4. **Lifetimes (231).** `Messages<'a, H>`, `Datagrams<'a, H>`,
    `IncomingBi<'a, H>`, `IncomingUni<'a, H>`, `Notifications<'a, H>`,
    `Incoming<'a, I>` — every adapter borrows its handle. Each type's rustdoc

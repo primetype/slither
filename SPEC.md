@@ -6242,10 +6242,22 @@ would make every death look alike to a consumer whose only view is
 
 Two binding details, both directly testable:
 
-- **`WriteError` is `#[non_exhaustive]`** (ruling 61 reserves `Stopped`),
-  so the conversion needs a `_ =>` arm. It maps to `ErrorKind::Other` and
-  **must not** be `unreachable!()` — that is a panic on a variant a future
-  minor version adds.
+- **The `WriteError` match is exhaustive, and deliberately so.**
+  **[CORRECTED 2026/08/16 — ruling 238.]** This bullet read: *"`WriteError`
+  is `#[non_exhaustive]` (ruling 61 reserves `Stopped`), **so** the
+  conversion needs a `_ =>` arm … and must not be `unreachable!()`."* The
+  conclusion was aimed at the right hazard and the *"so"* was false.
+  `#[non_exhaustive]` is **inert inside the defining crate**, and the
+  conversion can only live there (the orphan rule puts
+  `impl From<WriteError> for io::Error` in slither or nowhere), so it never
+  bites. `src/error.rs`'s `write_error_is_exhaustive_in_crate` already
+  proves this.
+  A `_ =>` arm therefore does not future-proof the conversion — it
+  **hides** the future. An exhaustive match turns the day `Stopped` lands
+  into a **compile error at the exact site that must be updated**, which is
+  strictly stronger than silently mapping a new variant to `Other`, and it
+  is what the original *"must not be `unreachable!()`"* clause was reaching
+  for: a variant that cannot compile cannot panic.
 - **The inner error is preserved.** Every arm constructs
   `io::Error::new(kind, err)`, so `e.into_inner().downcast::<ReadError>()`
   recovers the original including a reset's `u64` code. The `ErrorKind` is

@@ -6758,3 +6758,86 @@ and neither is in the manifest at `704a4ae`.
 `autotests = false`, cargo auto-discovers each new test file *without* its
 `required-features`, so the feature-less `cargo test` gate breaks until
 every stanza lands. The gate does not degrade — it fails outright.
+
+### 236 (Agent A) — §0.0 contradicted §6.2 of its own file on the `tower` receiver
+
+`CONTRACT-8.md` §0.0 item 3 wrote `impl Service<()> for Connection<H>`.
+**§6.2 of the same file is headed *"The stream-opener — `&Connection<S>`,
+not `Connection<S>`"*** and gives the reason: `open_bi(&self)` borrows,
+`Service::call` takes `&mut self` with an anonymous lifetime that
+`type Future` cannot name, and `Service` has no GAT.
+
+The agent read ruling 225 **in full** before deciding, found it silent on
+the receiver (it settles *one bi stream per call, not the message verb*),
+noted that §16.11 leaves `tower` shapes *"otherwise unconstrained"*,
+concluded that §0.0 was an inherited paraphrase of `PLAN.md` §3.4's sketch
+carrying that sketch's defect, implemented the only form that compiles —
+`impl<'a, S: Handshake + 'static> Service<()> for &'a Connection<S>` — and
+documented the argument at the impl. **Every step of that is what the
+working rules ask for**, and the reason it landed as working code rather
+than a blocked agent is that it checked the ruling instead of the
+paraphrase.
+
+**§6.2 stands; §0.0 is corrected.** This is the **second** defect of this
+shape in `CONTRACT-8.md` this slice — ruling 234 was the stale §8 banner —
+and both are mine, from the same act: **I wrote an amendment section
+without reading the sections it amends.** Working rule 4 names it, ruling
+234 recorded it, and I then did it again in the same file within the hour.
+The lesson that generalises: *an amendment is an edit to the document, not
+an addition to it, and it inherits the duty to read what it lands on.*
+
+### 237 (Agent A) — the dispatch table had a **hole**, not an overlap
+
+Ruling 228 mandated seven `pub(crate)` accessors returning
+`WakerSlot<Box<dyn FnMut(u64)>>`. `src/shell/mod.rs:55` declares
+`mod shared;` — **private to `shell`** — so `WakerSlot` cannot be *named*
+from `crate::compat`, and all seven accessors were uncallable as adapter
+field types. The one-line fix lives in `src/shell/mod.rs`, **which is in no
+agent's ownership row**.
+
+Working rule 6 says *"if a path is not in exactly one row, the dispatch has
+a race in it"*, and every prior instance has been a path in **two** rows —
+slice 2a's destroyed 68 tests, slice 1's near miss. This is the mirror: a
+path in **zero** rows, needed by a ruling the same brief mandated. It does
+not corrupt anything; it silently blocks. The agent added the line, scoped
+it `#[cfg(any(feature = "sink", feature = "tower"))]`, wrote the reason at
+the site, and **flagged the hole rather than quietly widening its
+mandate** — which is the behaviour rule 5 asks for and the reason this is
+a ruling rather than an undiscovered divergence.
+
+**The rule is amended in substance: an ownership table must be checked for
+absence as well as overlap.** Ruling 228 named a mechanism (working rule
+11) and the mechanism was *reachable* only through a file nobody could
+touch — which is rule 11's shape one level out: not *does the mechanism
+exist*, but *can the agent I am briefing get to it*.
+
+### 238 (Agent A) — ruling 227's *"so"* was false, and the fix is to **delete** the arm, not allow it
+
+Ruling 227 and §16.11.1 read: *"`WriteError` is `#[non_exhaustive]`
+(ruling 61 reserves `Stopped`), **so** the conversion needs a `_ =>` arm …
+and must not be `unreachable!()`."*
+
+**`#[non_exhaustive]` is inert inside the defining crate**, and the
+conversion can only live there — the orphan rule puts
+`impl From<WriteError> for io::Error` in slither or nowhere. `src/error.rs`
+already contains `write_error_is_exhaustive_in_crate` proving it. So the
+attribute never bites, rustc reports the arm as unreachable, and `-D
+warnings` rejects it. The agent kept the arm with
+`#[allow(unreachable_patterns)]` and reported the defect.
+
+**Ruling: the arm is deleted and the match is exhaustive.** Reviewing the
+agent's finding changes the conclusion as well as the reasoning. A `_ =>`
+arm does not future-proof this conversion — it **hides** the future,
+silently mapping `Stopped` to `Other` on the day it lands. An exhaustive
+match makes that day a **compile error at the exact site that must be
+updated**, which is strictly stronger and is what the original *"must not
+be `unreachable!()`"* clause was reaching for: **a variant that cannot
+compile cannot panic.** §16.11.1 is corrected.
+
+Third instance this session of a rationale of mine naming a mechanism that
+does not hold where the code lives (working rule 11, after 205 and 206) —
+and the first where the *conclusion* moved too. Ruling 206 recorded the
+inverse case, a right conclusion on a wrong argument, and noted it is
+invisible to any review that checks conclusions. This one says the other
+half out loud: **checking the argument is how the conclusion gets a second
+look.**
