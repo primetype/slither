@@ -168,6 +168,25 @@ impl<I: Identity> Endpoint<I> {
     ///
     /// works **with no advance of the clock between them** — which is the
     /// `timeout()` idiom every consumer writes.
+    ///
+    /// # A connection you are not using dies — S5
+    ///
+    /// **Do not connect ahead of need.** slither has no idle state: a
+    /// session over which neither side sends dies at `DEAD_TIMEOUT` (25 s),
+    /// and this is deliberate rather than a gap. Dialling at start-up so the
+    /// path is "warm" for a request several minutes later gets you a dead
+    /// connection and a surprising error at the moment you first try to use
+    /// it.
+    ///
+    /// Two shapes work. **Dial when you need it** — the handshake is one
+    /// round trip. Or **keep it alive by using it**: §7.5's keepalive
+    /// machinery holds a session open only while there is traffic to hold
+    /// open, so an application-level heartbeat is what makes a long-lived
+    /// idle connection a real thing.
+    ///
+    /// This is the single most surprising behaviour for a new consumer, and
+    /// it is the one with no code fix — the alternative is sessions that
+    /// outlive their usefulness and a `!Send` driver that never quiesces.
     pub fn connect(
         &self,
         remote: SocketAddr,

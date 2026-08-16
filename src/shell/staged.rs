@@ -142,6 +142,24 @@ impl<I: Identity> Intro<I> {
     /// same-source entry **without re-surfacing it**, so the peer's next
     /// retransmit would find the slot occupied by a chain no application
     /// can reach, and would go unanswered until `INTRO_TTL`.
+    /// # The key this returns is **claimed**, not authenticated — S7
+    ///
+    /// **Do not denylist on it.** This is stage 0: the peer has asserted a
+    /// static public key and *nothing has verified that it holds the
+    /// matching private key*. Only [`Claimed::authenticate`] does that.
+    ///
+    /// An attacker can therefore claim **any** public key it likes. If a
+    /// host bans the key this returns, an attacker bans a third party by
+    /// naming them: one unauthenticated packet per victim, no key material,
+    /// no session. A denylist keyed here is a denial-of-service primitive
+    /// pointed at your own users.
+    ///
+    /// Rate-limiting, logging and routing on a claimed key are fine — they
+    /// cost the claimant something or cost the victim nothing. Anything
+    /// that **persists a penalty against the named identity** belongs after
+    /// [`authenticate`](Claimed::authenticate), which is the first point at
+    /// which the key is the peer's.
+    ///
     /// # Cancel-safety
     ///
     /// The `Intro` stays alive across the round-trip and is only marked

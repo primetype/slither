@@ -547,6 +547,19 @@ impl<S: Handshake> Connection<S> {
     /// satisfiable in this slice: the peer's uni streams close as soon as
     /// their receive half is retired.
     ///
+    /// # Do not mix with [`send_message`](Self::send_message) — S30
+    ///
+    /// §9.8's messages are **sugar over auto-managed unidirectional
+    /// streams**: they open, fill and finish uni streams of their own. An
+    /// application that uses both the message verb and the raw uni verbs on
+    /// **one connection** cannot tell which uni streams are its own, and
+    /// slither will not guess — this is a **programming error with a
+    /// defined loud failure**, not a silent interleaving.
+    ///
+    /// Pick one per connection. The two shapes look identical at the call
+    /// site, which is exactly why this warning is on all three of
+    /// `send_message`, `open_uni` and `accept_uni` rather than in one place.
+    ///
     /// Cancel-safe, for [`open_bi`](Self::open_bi)'s reason.
     pub async fn open_uni(&self) -> Result<SendStream<S>, ConnectionLost> {
         let slot = self.opener_slot(Dir::Uni);
@@ -598,6 +611,20 @@ impl<S: Handshake> Connection<S> {
 
     /// Claim the next peer-opened unidirectional stream (§9.1). FIFO, and
     /// cancel-safe, exactly as [`accept_bi`](Self::accept_bi).
+    ///
+    /// # Do not mix with [`send_message`](Self::send_message) — S30
+    ///
+    /// §9.8's messages are **sugar over auto-managed unidirectional
+    /// streams**: they open, fill and finish uni streams of their own. An
+    /// application that uses both the message verb and the raw uni verbs on
+    /// **one connection** cannot tell which uni streams are its own, and
+    /// slither will not guess — this is a **programming error with a
+    /// defined loud failure**, not a silent interleaving.
+    ///
+    /// Pick one per connection. The two shapes look identical at the call
+    /// site, which is exactly why this warning is on all three of
+    /// `send_message`, `open_uni` and `accept_uni` rather than in one place.
+    ///
     pub async fn accept_uni(&self) -> Result<RecvStream<S>, ConnectionLost> {
         let slot = self.acceptor_slot(Dir::Uni);
         poll_fn(|cx| self.poll_accept_uni(cx, slot.key())).await
