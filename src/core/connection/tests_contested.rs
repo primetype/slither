@@ -48,11 +48,24 @@
 //! is **30 bytes**, worth 90 bytes of cap.
 //!
 //! A responder anchored from a msg1 source starts **unvalidated** with
-//! `budget_recv = INIT_PACKET_LEN` = 196 and `budget_sent = 0`, so its cap
-//! is `AMPLIFICATION_FACTOR * 196` = **588**. One datagram sized to exactly
-//! that cap is admitted (the check is `<=`) and leaves nothing queued
-//! behind it. After it `room == 0`, and the 31-byte probe cannot leave.
-//! That is the pending state, in three calls.
+//! `budget_recv = INIT_PACKET_LEN` = 196, so its cap is
+//! `AMPLIFICATION_FACTOR * 196` = **588**. One datagram sized to exactly
+//! the *remaining* room is admitted (the check is `<=`) and leaves nothing
+//! queued behind it. After it `room == 0`, and the 31-byte probe cannot
+//! leave. That is the pending state, in three calls.
+//!
+//! **[corrected by I1 — finding A2]** `budget_sent` does **not** start at
+//! 0: the endpoint emitted `RESP_PACKET_LEN` = 107 bytes of msg2 to this
+//! unvalidated anchor before the connection existed, and §7.3 caps *total
+//! bytes sent*, so the connection charges them at its arming. The room the
+//! shaping datagram fills is therefore 588 − 107 = **481**, and every
+//! number below is read from `room()` rather than written down — which is
+//! why this correction moves one assertion and no arithmetic.
+//!
+//! **[corrected by I1 — ruling 208]** …and the shaping packet carries nine
+//! bytes of `PATH_CHALLENGE` ahead of the datagram, because §8.7 makes the
+//! challenge a standing obligation on every packet built while the address
+//! is unvalidated. `spend_to_the_cap` subtracts it.
 //!
 //! **[corrected at integration — ruling 201]** This paragraph originally
 //! computed the shaping packet from ruling 155's *"mandatory"* `0x30`
@@ -66,17 +79,29 @@
 //! frame overhead here is 1 + the length varint (1 byte below 64, 2 up to
 //! 16383, §8.1), and both sizes occur in this file.
 //!
-//! # The two floors
+//! # The two floors — **[migrated by I1 for ruling 208]**
 //!
-//! `validation_floor` (ruling 168) is recorded when the budget **arms** —
-//! at install, before anything is sealed — so it is **0**.
-//! `probe_floor` (ruling 41) is recorded at the **mark**, after the
-//! spend-down packet has used counter 0, so it is **1**. §3.2 says in
-//! terms: *"two independent floors recorded at different moments; do not
-//! conflate them, and do not share one field."* An ACK covering counter 0
-//! alone therefore **validates the address** (releasing the probe) while
-//! **not** covering the probe floor (so the mark survives) — which is a
-//! test a build sharing one field fails in one direction or the other.
+//! This file was written when §7.3 and §7.5 each recorded a *counter
+//! floor*: `validation_floor` at the budget's arming (so **0**), and
+//! `probe_floor` (ruling 41) at the **mark**, after the spend-down packet
+//! has used counter 0 (so **1**). §3.2 said in terms: *"two independent
+//! floors recorded at different moments; do not conflate them, and do not
+//! share one field."*
+//!
+//! **[ruling 208]** supersedes the first of the two. An ACK is an assertion
+//! by whoever holds the key and §7.3's roaming threat model *is* the key
+//! holder, so an ACK covering anything validates **no** address; what
+//! disarms the budget is a `PATH_RESPONSE` echoing the arming's eight-byte
+//! challenge. The `probe_floor` half is **untouched** — ruling 208 reaches
+//! only §7.3's floor, and ruling 210 records deleting the whole mechanism
+//! as the most likely way to break that change.
+//!
+//! So the "do not share one field" test does not disappear; it gets
+//! sharper, because the two exits are now different *frames* rather than
+//! two readings of one integer. It is
+//! `a_response_that_validates_the_address_releases_the_probe_without_clearing_the_mark`
+//! below, and it now also pins the inverse: the ACK that used to validate
+//! must **not**.
 //!
 //! # No clock, so no runtime
 //!
@@ -96,8 +121,8 @@ use super::testfix::*;
 use super::timers::TimerKind;
 
 use crate::constants::{
-    AEAD_TAG_LEN, AMPLIFICATION_FACTOR, DATA_HEADER_LEN, FRAME_ACK, INIT_PACKET_LEN,
-    KEEPALIVE_TIMEOUT,
+    AEAD_TAG_LEN, AMPLIFICATION_FACTOR, DATA_HEADER_LEN, FRAME_ACK, FRAME_PATH_CHALLENGE,
+    FRAME_PATH_RESPONSE, FRAME_PING, INIT_PACKET_LEN, KEEPALIVE_TIMEOUT, RESP_PACKET_LEN,
 };
 use crate::error::ConnectionLost;
 
@@ -249,12 +274,26 @@ fn spend_to_the_cap(s: &mut Solo, now: Instant) {
     // The length varint is 1 byte below 64 and 2 up to 16383 (§8.1), and
     // both sizes occur here: a responder at its 588-byte cap needs a
     // 555-byte payload, a post-roam core at 90 needs 57.
+    // **[I1, ruling 208]** …and the nine bytes of `PATH_CHALLENGE` that
+    // ride ahead of it. §8.5 as amended packs the path frames **first among
+    // the control frames**, and §8.7 makes the challenge a **standing**
+    // obligation: it is re-offered on every packet the pump builds while
+    // the address is unvalidated, which is precisely the state this whole
+    // fixture is in. A payload calibrated against a datagram-only packet
+    // therefore overshoots by nine, the datagram does not fit, and what
+    // leaves is a 39-byte challenge packet with the datagram still queued —
+    // the same shape as the ACK correction above, one ruling later.
+    let path = if s.conn.outstanding_challenge().is_some() {
+        (1 + 8) as u64
+    } else {
+        0
+    };
     let payload = {
-        let one = space - PKT_OVERHEAD - 1 - 1;
+        let one = space - path - PKT_OVERHEAD - 1 - 1;
         if one < 64 {
             one as usize
         } else {
-            (space - PKT_OVERHEAD - 1 - 2) as usize
+            (space - path - PKT_OVERHEAD - 1 - 2) as usize
         }
     };
     assert!(
@@ -298,10 +337,13 @@ fn spend_to_the_cap(s: &mut Solo, now: Instant) {
 /// A responder sitting at its cap: the pending gap is one `mark()` away.
 fn responder_at_the_cap(now: Instant) -> Solo {
     let mut s = responder_at(now);
+    // **[I1, A2]** `sent` is the msg2 the endpoint already put on this
+    // unvalidated anchor, not 0: §7.3 caps *total bytes sent*, and leaving
+    // those 107 uncounted measured 3.55× against a normative MUST of 3.
     assert_eq!(
         budget(&s),
-        (0, INIT_PACKET_LEN as u64),
-        "§3.2's second arming event"
+        (RESP_PACKET_LEN as u64, INIT_PACKET_LEN as u64),
+        "§3.2's second arming event, with the msg2 it provoked charged to it"
     );
     spend_to_the_cap(&mut s, now);
     s
@@ -332,6 +374,15 @@ fn ack_frame(largest: u64, ack_delay: u64, first_range: u64, pairs: &[(u64, u64)
         put(&mut f, *gap);
         put(&mut f, *range);
     }
+    f
+}
+
+/// §8.4's `PATH_RESPONSE`, encoded by hand like [`ack_frame`] — the type
+/// byte and eight opaque bytes, no length prefix. **[ruling 208]**
+fn path_response_frame(value: [u8; 8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    put(&mut f, FRAME_PATH_RESPONSE);
+    f.extend_from_slice(&value);
     f
 }
 
@@ -398,14 +449,16 @@ fn a_responder_anchored_from_msg1_starts_unvalidated_with_the_msg1_credited() {
 
     assert_eq!(
         s.conn.amplification_budget(),
-        Some((0, INIT_PACKET_LEN as u64)),
-        "§3.2: armed at the msg1 anchor — nothing sent, the msg1 credited, \
-         *\"its handshake tail tags having verified at admission\"*"
+        Some((RESP_PACKET_LEN as u64, INIT_PACKET_LEN as u64)),
+        "§3.2: armed at the msg1 anchor, the msg1 credited — *\"its \
+         handshake tail tags having verified at admission\"* — and **[A2]** \
+         the msg2 the endpoint already sent to it charged against it"
     );
     assert_eq!(
         room(&s),
-        RESPONDER_CAP,
-        "the cap is AMPLIFICATION_FACTOR * INIT_PACKET_LEN = 588"
+        RESPONDER_CAP - RESP_PACKET_LEN as u64,
+        "the cap is AMPLIFICATION_FACTOR * INIT_PACKET_LEN = 588, of which \
+         the msg2's 107 bytes are already spent"
     );
 }
 
@@ -629,18 +682,42 @@ fn the_probe_the_notification_and_the_deadline_all_land_at_the_transmission_inst
 
     let d2 = release_the_budget(&mut s, t2);
 
-    let frames = s.drain_frames(&d2);
-    assert!(
-        has_ping(&frames),
-        "§5.1 transmission step 1: an ack-eliciting PING, *\"at the first \
-         instant the budget allows\"*"
-    );
+    // **[I1, ruling 212(c)]** Two packets, and their **order** is the
+    // ruling: *"`PATH_CHALLENGE` and `PATH_RESPONSE` rank immediately after
+    // CLOSE, above the contested probe … everything else in the order
+    // competes for the budget; the challenge dissolves it."* The address is
+    // unvalidated, so the released room buys the challenge first (39 B) and
+    // the probe second (31 B) — inside the 90 B a single keepalive credits.
+    // This test previously read *"nothing else is owed, so the probe rides
+    // alone"*, which was true before the challenge existed.
     assert_eq!(
         d2.transmits().len(),
-        1,
-        "nothing else is owed, so the probe rides alone"
+        2,
+        "the challenge and the probe, in that order"
     );
-    assert_eq!(d2.transmits()[0].to, a_addr(), "§5.6: aimed at the anchor");
+    // Read as **raw plaintext** rather than through `testfix`'s decoder:
+    // nine fixed self-delimiting bytes need no decoder, and this assertion
+    // then holds whatever that decoder does or does not yet know about
+    // §8.3's two new rows.
+    let first = s.peer.open_dgram(&d2.transmits()[0].data);
+    assert_eq!(
+        first.first().copied(),
+        Some(FRAME_PATH_CHALLENGE as u8),
+        "§7.3's rank above the probe: the challenge goes first — it is the \
+         only output that **ends** the scarcity every other rank is \
+         competing inside"
+    );
+    assert_eq!(first.len(), 9, "and it rides alone: 1 type byte + 8 opaque");
+    let second = s.peer.open_dgram(&d2.transmits()[1].data);
+    assert_eq!(
+        second.as_slice(),
+        [FRAME_PING as u8],
+        "§5.1 transmission step 1: an ack-eliciting PING, *\"at the first \
+         instant the budget allows\"*, and it follows the challenge"
+    );
+    for t in d2.transmits() {
+        assert_eq!(t.to, a_addr(), "§5.6: aimed at the anchor");
+    }
     assert_eq!(
         contested_events(&d2),
         1,
@@ -675,22 +752,29 @@ fn the_probe_the_notification_and_the_deadline_all_land_at_the_transmission_inst
 }
 
 /// §3.2's *"do not conflate them, and do not share one field"*, made
-/// observable: an ACK covering **counter 0 only** validates the address
-/// (`validation_floor` = 0, recorded when the budget armed at install) and
-/// therefore releases the probe — while **not** covering `probe_floor` = 1
-/// (recorded at the mark, after the shaping packet used counter 0), so the
-/// mark survives and the probe still goes out.
+/// observable — **migrated for ruling 208, and stronger for it**.
 ///
-/// Mutation caught: a build that keeps **one** floor. If it records that
-/// single floor at the mark, the ACK covers nothing, the address never
-/// validates and the probe never leaves — `has_ping` fails. If it records
-/// it at the arming, the ACK covers it and the mark **clears**, so
-/// `ContestCleared` fires with no preceding `Contested` and no probe is
-/// sent — both of the remaining assertions fail. There is no single-field
-/// build that passes this test, which is what makes it a pin rather than a
-/// bound.
+/// The address is validated by a `PATH_RESPONSE` echoing the arming's
+/// challenge, which releases the probe; the **same delivery** carries no
+/// ACK at all, so `probe_floor` = 1 is not covered, the mark survives, and
+/// the probe goes out.
+///
+/// Before it, the assertion this test used to make is **inverted**: the ACK
+/// covering counter 0 — at or above the old `validation_floor` of 0, which
+/// is exactly what used to validate — must now leave the budget armed.
+/// **[ruling 208]** *"`largest` is not a proof of receipt; it is an
+/// assertion by whoever holds the key"*, and a build that kept the old
+/// predicate beside the new one has left the bypass unlocked, which is the
+/// thing that ruling names as the reason for removing it rather than
+/// leaving it inert.
+///
+/// Mutation caught: a build that keeps **one** floor, or one exit. If the
+/// response also cleared the mark, `cleared_events` fires and no probe is
+/// sent. If the ACK still validated, the budget is gone before the response
+/// arrives and the first assertion fails. If neither exit exists the probe
+/// never leaves and `has_ping` fails. No single-mechanism build passes.
 #[test]
-fn an_ack_that_validates_the_address_releases_the_probe_without_clearing_the_mark() {
+fn a_response_that_validates_the_address_releases_the_probe_without_clearing_the_mark() {
     let t = t0();
     let mut s = responder_at_the_cap(t);
     let t1 = t + Duration::from_secs(1);
@@ -701,20 +785,23 @@ fn an_ack_that_validates_the_address_releases_the_probe_without_clearing_the_mar
         highest_sealed, 0,
         "premise: the shaping datagram is the only packet sealed so far"
     );
+    let challenge = s
+        .conn
+        .outstanding_challenge()
+        .expect("an armed budget owes a challenge");
 
     let d1 = mark(&mut s, t1);
     assert_nothing_happened(&mut s, &d1, "the mark");
 
-    // Covers counter 0 and nothing else: at or above `validation_floor`
-    // (0), strictly below `probe_floor` (1).
+    // The superseded proof: an ACK covering counter 0 — at or above the old
+    // `validation_floor`, which is precisely what used to validate.
     let d2 = s.deliver(t2, &ack_frame(0, 0, 0, &[]));
-
-    assert_eq!(
-        s.conn.amplification_budget(),
-        None,
-        "ruling 168: an authenticated, window-fresh packet carrying an ACK \
-         covering `validation_floor` is a return-routability proof — the \
-         address is validated and the budget disarms"
+    assert!(
+        s.conn.amplification_budget().is_some(),
+        "**[ruling 208]** an ACK validates no address: `largest` is an \
+         assertion by whoever holds the key, and §7.3's roaming threat \
+         model *is* the key holder. A build that kept the old predicate \
+         beside the new one leaves the bypass unlocked"
     );
     assert_eq!(
         cleared_events(&d2),
@@ -722,17 +809,49 @@ fn an_ack_that_validates_the_address_releases_the_probe_without_clearing_the_mar
         "ruling 41: `probe_floor` is 1; an ACK covering only 0 clears \
          nothing"
     );
+
+    // The probe leaves on **this** delivery, and the reason is worth being
+    // explicit about because it is not the ACK: any peer packet is at least
+    // 30 bytes and credits 3× that, so the budget now admits the 31-byte
+    // probe. The pre-208 form of this test read the release as the ACK's
+    // *validation*, which the credit would have produced anyway — an
+    // assertion that did not separate what it named (working rule 9).
     let frames = s.drain_frames(&d2);
     assert!(
         has_ping(&frames),
-        "the mark survived and the budget no longer binds, so §7.5's probe \
-         leaves at this instant"
+        "the mark survived and the credited budget admits the probe, so \
+         §7.5's PING leaves at this instant"
     );
     assert_eq!(contested_events(&d2), 1, "and `Contested` fires with it");
     assert_eq!(
         s.conn.timer(TimerKind::Contested),
         Some(t2 + KEEPALIVE_TIMEOUT),
         "armed at the transmission, as always"
+    );
+
+    // The real proof, on a later delivery: the address validates and the
+    // **armed** mark is still untouched — the second half of *"do not share
+    // one field"*, now that the two exits are two different frames.
+    let t3 = t2 + Duration::from_secs(1);
+    let d3 = s.deliver(t3, &path_response_frame(challenge));
+    assert_eq!(
+        s.conn.amplification_budget(),
+        None,
+        "**[ruling 208]** an authenticated, window-fresh packet from the \
+         anchor carrying a `PATH_RESPONSE` that echoes the arming's \
+         challenge is the return-routability proof — the address is \
+         validated and the budget disarms"
+    );
+    assert_eq!(
+        cleared_events(&d3),
+        0,
+        "a `PATH_RESPONSE` covers no counter at all, so §7.5's probe floor \
+         is untouched and the verdict is still outstanding"
+    );
+    assert_eq!(
+        s.conn.timer(TimerKind::Contested),
+        Some(t2 + KEEPALIVE_TIMEOUT),
+        "…and the deadline still stands at the transmission instant"
     );
 }
 
@@ -970,14 +1089,20 @@ fn an_ack_covering_the_floor_while_armed_clears_the_mark_and_disarms_the_deadlin
     );
     assert_eq!(contested_events(&d2), 1, "premise: armed");
 
-    // The probe took the floor counter, so this ACK is now legitimate:
-    // §12.5 processes it, and it covers `probe_floor`.
-    assert_eq!(
-        s.conn.next_counter().expect("installed") - 1,
-        floor,
-        "premise: the probe is the packet sealed at the floor"
+    // **[I1, ruling 212(c)]** The probe is no longer the *first* packet
+    // sealed after the mark: §7.3 ranks `PATH_CHALLENGE` above it, so the
+    // challenge takes the floor counter and the probe takes the next one.
+    // The ACK is therefore built from the highest sealed counter rather
+    // than from `floor` — it still covers `probe_floor`, which is what
+    // §7.5 asks of it, and covering *more* than the floor is exactly what
+    // ruling 41 makes a high-water mark for.
+    let highest = s.conn.next_counter().expect("installed") - 1;
+    assert!(
+        highest >= floor,
+        "premise: the probe was sealed at or above the mark's floor \
+         ({highest} against {floor})"
     );
-    let d3 = s.deliver(t3, &ack_frame(floor, 0, floor, &[]));
+    let d3 = s.deliver(t3, &ack_frame(highest, 0, highest, &[]));
 
     assert_eq!(
         cleared_events(&d3),

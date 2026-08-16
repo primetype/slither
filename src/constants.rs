@@ -198,6 +198,21 @@ pub const FRAME_MAX_STREAMS_BIDI: u64 = 0x12;
 /// MAX_STREAMS (unidirectional) frame type. §8.3.
 pub const FRAME_MAX_STREAMS_UNI: u64 = 0x13;
 
+/// PATH_CHALLENGE frame type. §8.3, §7.3.
+///
+/// **[RATIFIED 2026/08/16 — ruling 208]** §7.3's return-routability
+/// challenge: eight opaque bytes, drawn per arming from the connection's
+/// §16.6 sub-seed. `0x1a`/`0x1b` are QUIC's own code points for these two
+/// frames.
+pub const FRAME_PATH_CHALLENGE: u64 = 0x1a;
+
+/// PATH_RESPONSE frame type. §8.3, §7.3.
+///
+/// **[RATIFIED 2026/08/16 — ruling 208]** [`FRAME_PATH_CHALLENGE`]'s eight
+/// bytes, echoed verbatim. A response matching the outstanding challenge is
+/// what disarms §7.3's budget.
+pub const FRAME_PATH_RESPONSE: u64 = 0x1b;
+
 /// CLOSE frame type. §8.3.
 pub const FRAME_CLOSE: u64 = 0x1c;
 
@@ -620,6 +635,18 @@ const _: () = assert!(INTRO_MAX_PER_SOURCE <= INTRO_QUEUE_CAP);
 // §7.3's budget must admit at least one response to one initiation, or a
 // responder could never answer an unvalidated address at all.
 const _: () = assert!(AMPLIFICATION_FACTOR as usize * INIT_PACKET_LEN >= RESP_PACKET_LEN);
+// **[ruling 208]** The challenge must fit inside the budget its own arming
+// creates, or an address roamed to by a bare keepalive could never be
+// validated at all. The smallest arming credit is §3.4's empty-plaintext
+// keepalive — a 30-byte datagram — so `AMPLIFICATION_FACTOR ×` it must
+// cover one datagram carrying a `PATH_CHALLENGE`: 14 B of header, 1 B of
+// type code, 8 B of challenge and a 16 B tag. This is what fails if anyone
+// later grows `DATA_HEADER_LEN`, shrinks `AMPLIFICATION_FACTOR`, or widens
+// the challenge past eight bytes.
+const _: () = assert!(
+    AMPLIFICATION_FACTOR as usize * (DATA_HEADER_LEN + AEAD_TAG_LEN)
+        >= DATA_HEADER_LEN + 1 + 8 + AEAD_TAG_LEN
+);
 const _: () = assert!(RETRANSMIT_BASE_MS + RETRANSMIT_JITTER_MAX_MS < HANDSHAKE_GIVEUP_MS);
 const _: () = assert!(INTRO_TTL_MS < HANDSHAKE_GIVEUP_MS);
 const _: () = assert!(PERSISTENT_KEEPALIVE_MIN_MS <= PERSISTENT_KEEPALIVE_DEFAULT_MS);
@@ -678,11 +705,16 @@ mod tests {
             ("FRAME_MAX_STREAM_DATA", FRAME_MAX_STREAM_DATA),
             ("FRAME_MAX_STREAMS_BIDI", FRAME_MAX_STREAMS_BIDI),
             ("FRAME_MAX_STREAMS_UNI", FRAME_MAX_STREAMS_UNI),
+            // **[ruling 208]** §8.3's two new rows. Nothing fails if this
+            // table misses a type — which is exactly what makes an omission
+            // here a defect rather than a red test.
+            ("FRAME_PATH_CHALLENGE", FRAME_PATH_CHALLENGE),
+            ("FRAME_PATH_RESPONSE", FRAME_PATH_RESPONSE),
             ("FRAME_CLOSE", FRAME_CLOSE),
             ("FRAME_DATAGRAM", FRAME_DATAGRAM),
             ("FRAME_DATAGRAM_LEN", FRAME_DATAGRAM_LEN),
         ];
-        assert_eq!(frames.len(), 14, "the frame table has 14 named types");
+        assert_eq!(frames.len(), 16, "the frame table has 16 named types");
 
         for (i, (name_a, a)) in frames.iter().enumerate() {
             for (name_b, b) in &frames[i + 1..] {

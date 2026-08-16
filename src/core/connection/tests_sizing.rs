@@ -16,8 +16,21 @@
 //!
 //! The two observable consequences, and they are what is asserted here:
 //! application data **moves promptly** after a roam, and what moves is
-//! **ack-eliciting**, so the peer's ACK can cover `validation_floor` and
-//! disarm the budget (ruling 168).
+//! **ack-eliciting**.
+//!
+//! # Migrated for ruling 208
+//!
+//! This file was written against ruling 168's predicate — *the peer's ACK
+//! covers `validation_floor` and the budget disarms*. **[ruling 208]**
+//! supersedes it: an ACK is an assertion by whoever holds the key, and the
+//! roaming threat model *is* the key holder, so what disarms the budget is
+//! a `PATH_RESPONSE` echoing the arming's eight-byte challenge. The premises
+//! that expired were **narrowed or inverted, never deleted** — the ACK
+//! delivery in `the_shrunken_packet_carries_the_challenge_whose_echo_
+//! validates` now asserts the budget stays armed, which is a **stronger**
+//! test than the one it replaces. Ruling 203's sizing subject is untouched:
+//! the packet that must fit the budget is now the one carrying the
+//! challenge, and it is 39 bytes against a 90-byte floor.
 //!
 //! # Working rule 9, applied deliberately
 //!
@@ -142,6 +155,37 @@ fn counter_of(dgram: &[u8]) -> u64 {
     )
 }
 
+/// §8.4's `PATH_RESPONSE`: the type byte and eight opaque bytes, no length
+/// prefix. **[ruling 208]**
+///
+/// Hand-built here rather than taken from the fixture for the same reason
+/// [`is_ack_eliciting`] re-decodes by hand: a builder that shares the
+/// implementation's encoder cannot separate a build that mis-encodes from
+/// one that mis-parses.
+fn path_response_frame(value: [u8; 8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    put(&mut f, constants::FRAME_PATH_RESPONSE);
+    f.extend_from_slice(&value);
+    f
+}
+
+/// Whether any datagram in `d` carries a `PATH_CHALLENGE` with exactly
+/// `value` — searched in the **decrypted plaintext bytes**, not through a
+/// frame decoder.
+///
+/// The nine bytes are fixed-width and self-delimiting (§8.4), so a byte
+/// scan cannot be fooled here by a length field; and staying off the
+/// fixture's decoder means this assertion holds whatever that decoder does
+/// or does not yet know.
+fn carries_challenge(solo: &mut Solo, d: &Drained, value: [u8; 8]) -> bool {
+    let mut needle = vec![constants::FRAME_PATH_CHALLENGE as u8];
+    needle.extend_from_slice(&value);
+    d.transmits().iter().any(|t| {
+        let pt = solo.peer.open_dgram(&t.data);
+        pt.windows(needle.len()).any(|w| w == needle)
+    })
+}
+
 /// §8.4's ACK covering exactly one counter.
 fn ack_frame(largest: u64) -> Vec<u8> {
     let mut f = Vec::new();
@@ -252,8 +296,10 @@ fn a_tight_budget_after_a_roam_still_moves_application_data_at_once() {
     );
     assert!(
         is_ack_eliciting(&packets[0]),
-        "ruling 168 validates only on an ACK covering `validation_floor`, so \
-         non-ack-eliciting output can never end the unvalidated state"
+        "**[ruling 208]** an ACK no longer validates anything; what ends the \
+         unvalidated state is a PATH_RESPONSE, and the challenge that asks \
+         for one is itself ack-eliciting — so a non-ack-eliciting first \
+         packet means neither mechanism is running"
     );
 }
 
@@ -261,25 +307,38 @@ fn a_tight_budget_after_a_roam_still_moves_application_data_at_once() {
 // 2 — the round trip the shrunken packet exists to buy
 // ═══════════════════════════════════════════════════════════════════════
 
-/// The purpose, end to end on one core: the shrunken packet's **own
-/// counter** is at or above `validation_floor`, so the peer's ACK of that
-/// packet disarms the budget — *"validates the address at once"*.
+/// The purpose, end to end on one core: the shrunken packet **carries the
+/// challenge** whose echo disarms the budget — *"validates the address at
+/// once"*.
 ///
-/// **What the broken build does:** with no transmit there is no counter to
-/// ACK, and the connection cannot leave the unvalidated state at all. A
-/// build that shrinks to a bare ACK (ruling 207(b)) fails
-/// `is_ack_eliciting`: a peer does not ACK an ACK (§12.4, *"no ACK-of-ACK
-/// loops"*), so the counter is never covered.
+/// **Migrated, not rewritten (ruling 208).** This test asserted that the
+/// shrunken packet's own counter was at or above `validation_floor`, so the
+/// peer's ACK of it disarmed the budget. An ACK is four plaintext integers
+/// under AEAD and the peer holds the key, so `largest` was never a proof;
+/// the premise expired and the assertion **inverts**: the ACK arrives here
+/// and the budget must **still be armed**. What disarms it is a
+/// `PATH_RESPONSE` echoing the eight bytes the shrunken packet carried.
 ///
-/// The closing assertion is the other half of ruling 168 — once validated,
-/// the cap is genuinely **gone**, not merely enlarged. A build that shrank
-/// correctly but kept sizing to a stale room would still be crawling.
+/// **What the broken builds do:** with no transmit there is nothing to
+/// carry the challenge and the connection cannot leave the unvalidated
+/// state at all (ruling 203). A build that shrinks to a bare ACK fails
+/// `is_ack_eliciting` (ruling 207(b)). A build that packs a PING where the
+/// challenge belongs passes both of those and then stalls forever on an ACK
+/// that proves nothing — which is why the challenge is asserted for by
+/// **value**, against the arming's own bytes.
+///
+/// The closing assertion is the other half: once validated, the cap is
+/// genuinely **gone**, not merely enlarged. A build that shrank correctly
+/// but kept sizing to a stale room would still be crawling.
 #[test]
-fn the_shrunken_packet_carries_a_counter_the_peers_ack_can_validate() {
+fn the_shrunken_packet_carries_the_challenge_whose_echo_validates() {
     let now = t0();
     let mut solo = roamed_with(now, 0);
     let before = room(&solo.conn);
-    let floor = solo.conn.validation_floor();
+    let challenge = solo
+        .conn
+        .outstanding_challenge()
+        .expect("the roam armed the budget and drew a challenge");
 
     let r = solo.conn.open(Dir::Uni).expect("a uni stream opens");
     let _ = write_all(&mut solo.conn, now, r, &[0x5Au8; 2048]);
@@ -287,33 +346,40 @@ fn the_shrunken_packet_carries_a_counter_the_peers_ack_can_validate() {
     let ts = d.transmits();
     assert!(
         !ts.is_empty(),
-        "nothing left the sender, so there is no counter for the peer to \
-         ACK and ruling 168's proof can never be produced (ruling 203)"
+        "nothing left the sender, so nothing carried the challenge and \
+         ruling 208's proof can never be asked for (ruling 203)"
     );
 
     let counter = counter_of(&ts[0].data);
-    assert!(
-        counter >= floor,
-        "ruling 168: the floor is *the counter the next seal will use* at \
-         the arming, so every packet sealed after the roam is at or above \
-         it — {counter} against a floor of {floor}"
-    );
-
     let packets = solo.packets(&d);
     assert!(
         is_ack_eliciting(&packets[0]),
         "ruling 207(b): a packet sized to fit the budget is useless if what \
          fits is a bare ACK"
     );
+    assert!(
+        carries_challenge(&mut solo, &d, challenge),
+        "**[ruling 208]** the shrunken packet must carry the arming's own \
+         challenge; a PING here elicits an ACK that validates nothing and \
+         reproduces ruling 203's stall one indirection later"
+    );
 
     // The peer ACKs it — **from the address the session roamed to**, which
-    // is what ruling 168 requires (*"an authenticated, window-fresh packet
-    // from that address"*).
+    // is everything ruling 168 asked for, and it is no longer enough.
     let d_ack = solo.deliver_from(now, c_addr(), &ack_frame(counter));
     assert!(
+        solo.conn.amplification_budget().is_some(),
+        "**[ruling 208]** an ACK is an assertion by whoever holds the key, \
+         and §7.3's roaming threat model *is* the key holder: the budget \
+         stays armed"
+    );
+
+    // …and the echo is.
+    let _ = solo.deliver_from(now, c_addr(), &path_response_frame(challenge));
+    assert!(
         solo.conn.amplification_budget().is_none(),
-        "ruling 168: one ACK covering the floor is return routability \
-         proven, and the budget disarms"
+        "**[ruling 208]** a PATH_RESPONSE echoing the arming's challenge, \
+         from the address in question, is return routability proven"
     );
 
     // The cap is gone, not merely wider.
@@ -666,11 +732,11 @@ fn each_credited_round_moves_application_data_instead_of_banking_it() {
 /// roaming packet here *is* ack-eliciting, so `b` owes an ACK — and today's
 /// build can still emit that ACK on its standalone path. So "a packet went
 /// out" proves nothing on this fixture, and the assertion has to be the end
-/// state: an ACK is not ack-eliciting (§12.4), `a` therefore never ACKs it,
-/// `b`'s counter at or above `validation_floor` is never covered, and
-/// `b.amplification_budget()` never becomes `None`. That is ruling 207(b)'s
-/// *"the connection stalls exactly as it does today, one indirection later"*,
-/// made observable.
+/// state: `b.amplification_budget()` becoming `None`. **[ruling 208]** That
+/// end state now has one route and only one — `b`'s output carries a
+/// `PATH_CHALLENGE` and `a` echoes it — so a build that emits a bare ACK, or
+/// a PING, or nothing at all fails here, and the three failures are ruling
+/// 207(b)'s, ruling 208's and ruling 203's respectively.
 #[test]
 fn two_cores_validate_the_roamed_address_within_one_round_trip() {
     let now = t0();
@@ -717,12 +783,18 @@ fn two_cores_validate_the_roamed_address_within_one_round_trip() {
     let later = now + constants::MAX_ACK_DELAY + Duration::from_millis(1);
     let _ = p.flush_b_to_a(later);
     let settled = later + constants::MAX_ACK_DELAY + Duration::from_millis(1);
-    // **[integrator, ruling 208]** `a`'s ACK has to reach `b` **from `b`'s
-    // anchor**. `on_ack_coverage` gates `on_ack_covering` on `from_anchor`
-    // (`mod.rs:1276`, ruling 168), so an ACK carrying `a`'s *original*
-    // source can never validate however correct its coverage — and `a`
-    // never rebound, because at core level the roam was expressed by
-    // handing `b` a different source address, not by moving `a`.
+    // **[integrator, ruling 208]** `a`'s reply has to reach `b` **from
+    // `b`'s anchor**. `apply_live` gates `on_path_response` on
+    // `from_anchor`, so a response carrying `a`'s *original* source
+    // validates nothing however correct its bytes — a peer that echoes from
+    // its old address has proved nothing about the new one. `a` never
+    // rebound, because at core level the roam was expressed by handing `b`
+    // a different source address, not by moving `a`.
+    //
+    // **[ruling 208]** What crosses here is no longer the ACK. `b`'s
+    // post-roam packet carries its `PATH_CHALLENGE`; `a` answers with a
+    // `PATH_RESPONSE` on the receive, which `drain_a` queues; this delivery
+    // is what carries it back.
     //
     // `pump()` drives both legs with the **default** addresses and
     // therefore cannot express this exchange at all; only the `_from`
@@ -741,10 +813,11 @@ fn two_cores_validate_the_roamed_address_within_one_round_trip() {
 
     assert!(
         p.b.amplification_budget().is_none(),
-        "ruling 168: `b`'s post-roam output must be ack-eliciting, so that \
-         `a`'s ACK covers `validation_floor` and the budget disarms within \
-         one round trip. Still armed means the output was a bare ACK, or \
-         nothing at all — ruling 203's stall, or ruling 207(b)'s"
+        "**[ruling 208]** `b`'s post-roam output must carry its \
+         `PATH_CHALLENGE`, so that `a`'s echo disarms the budget within one \
+         round trip. Still armed means the output was a bare ACK, a PING \
+         where the challenge belongs, or nothing at all — ruling 207(b)'s \
+         stall, ruling 208's, or ruling 203's"
     );
 
     // And the escape is real, not merely recorded: once the budget is gone
