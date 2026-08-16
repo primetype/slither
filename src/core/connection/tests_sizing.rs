@@ -717,7 +717,27 @@ fn two_cores_validate_the_roamed_address_within_one_round_trip() {
     let later = now + constants::MAX_ACK_DELAY + Duration::from_millis(1);
     let _ = p.flush_b_to_a(later);
     let settled = later + constants::MAX_ACK_DELAY + Duration::from_millis(1);
-    let (_da, db) = p.pump(settled);
+    // **[integrator, ruling 208]** `a`'s ACK has to reach `b` **from `b`'s
+    // anchor**. `on_ack_coverage` gates `on_ack_covering` on `from_anchor`
+    // (`mod.rs:1276`, ruling 168), so an ACK carrying `a`'s *original*
+    // source can never validate however correct its coverage — and `a`
+    // never rebound, because at core level the roam was expressed by
+    // handing `b` a different source address, not by moving `a`.
+    //
+    // `pump()` drives both legs with the **default** addresses and
+    // therefore cannot express this exchange at all; only the `_from`
+    // helper can. As written this test asserted the right end state over a
+    // delivery that could not produce it. The author flagged exactly this
+    // class — *"read such a red as fixture-level, not behaviour-level"* —
+    // and this is the instance.
+    // `a` owes its ACK on §12.4's **delayed-ACK timer**: `b` sent one
+    // ack-eliciting packet and `ACK_ELICITING_PER_ACK` is 2, so nothing is
+    // owed immediately. `flush_b_to_a` calls `handle_datagram` and
+    // `drain_a` but never `handle_timeout`, so the timer never fires and
+    // `a` emits nothing at all.
+    p.a.handle_timeout(settled);
+    let _ = p.drain_a();
+    let db = p.flush_a_to_b_from(settled, c_addr());
 
     assert!(
         p.b.amplification_budget().is_none(),
