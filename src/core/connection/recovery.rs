@@ -126,6 +126,15 @@ pub(crate) struct Recovery {
     pto_count: u32,
     /// Maintained incrementally; `debug_assert`ed equal to the map sum.
     bytes_in_flight: u64,
+    /// **[ruling 137, live since slice 7]** §14.6's path generation, held
+    /// **here** and nowhere else.
+    ///
+    /// The connection stamps it onto every [`SentPacket`] at seal time and
+    /// [`on_roam`](Self::on_roam) is the only thing that moves it, so the
+    /// stamp and the two fences that read it cannot drift apart — which is
+    /// the whole failure mode a second copy on the connection would
+    /// reintroduce.
+    path_gen: u32,
 }
 
 /// What one ACK's processing produced, handed to the caller so the caller —
@@ -186,7 +195,13 @@ impl Recovery {
             last_ack_eliciting: None,
             pto_count: 0,
             bytes_in_flight: 0,
+            path_gen: 0,
         }
+    }
+
+    /// §14.6's current path generation — what a fresh seal is stamped with.
+    pub(crate) fn path_gen(&self) -> u32 {
+        self.path_gen
     }
 
     /// Record one **ack-eliciting** packet (§13.5).
@@ -194,10 +209,12 @@ impl Recovery {
     /// Arms nothing: the caller re-reads [`loss_deadline`](Self::loss_deadline)
     /// and [`pto_deadline`](Self::pto_deadline) after every mutating call.
     pub(crate) fn on_sent(&mut self, packet: SentPacket) {
-        debug_assert_eq!(
-            packet.path_gen, 0,
-            "ruling 137: the path generation is held at 0 until slice 7"
-        );
+        // **[ruling 137, discharged by slice 7]** The `debug_assert_eq!` that
+        // pinned `path_gen` at 0 stood here, as the tripwire that would fire
+        // the moment the field went live. It has: §7.3's roaming stamps the
+        // connection's current generation at seal time, and its removal is
+        // the marker that this fence is now load-bearing rather than
+        // reserved.
         self.last_ack_eliciting = Some(packet.time_sent);
         self.bytes_in_flight += packet.size;
         let counter = packet.counter;
@@ -272,12 +289,18 @@ impl Recovery {
             .copied();
 
         let mut outcome = AckOutcome::default();
+        // §13.6's RTT fence needs the *sampled packet's* generation, and the
+        // packet is consumed by the loop below, so it is carried out of it.
+        let mut sample_path_gen = None;
         for counter in &newly {
             let packet = self
                 .sent
                 .remove(counter)
                 .expect("the counter came from this map and nothing removed it since");
             self.bytes_in_flight -= packet.size;
+            if sample_from == Some(*counter) {
+                sample_path_gen = Some(packet.path_gen);
+            }
             outcome
                 .ack_events
                 .push((packet.time_sent, packet.size, packet.app_limited));
@@ -290,10 +313,20 @@ impl Recovery {
                 .last()
                 .expect("newly is non-empty, so at least one event was pushed");
             debug_assert_eq!(counter, ack.largest);
-            self.rtt.sample(
-                now.saturating_duration_since(sent_at),
-                Duration::from_micros(ack.ack_delay),
-            );
+            // **[ruling 172]** §13.6's first `path_gen` fence: *"no RTT
+            // sample"* from a packet sent on the old path. Its round trip
+            // measures a path this connection is no longer on, and §13.1
+            // keeps the estimator across a roam only *"as a prior, not a
+            // fact"* — feeding it an old-path sample would make it a fact
+            // again. `min_rtt` has just been re-seeded to `None`, so a
+            // pre-roam sample would additionally *define* the new floor from
+            // the old path.
+            if sample_path_gen == Some(self.path_gen) {
+                self.rtt.sample(
+                    now.saturating_duration_since(sent_at),
+                    Duration::from_micros(ack.ack_delay),
+                );
+            }
         }
 
         // §13.3: "`pto_count` resets to 0 whenever **any** packet is newly
@@ -393,9 +426,31 @@ impl Recovery {
     /// next sample, because §13.1 requires it to be **allowed to rise** or
     /// an old short path pins the PTO floor under a new long one.
     ///
-    /// **Uncalled until slice 7**: §7.3's roaming does not exist yet.
+    /// It also advances §14.6's path generation, which is **ruling 172's
+    /// half of the 2/2 fence split**: from here on, a `SentPacket` stamped
+    /// with an older generation feeds **no RTT sample** and takes **no part
+    /// in §14.4's persistent-congestion walk**. The other half —
+    /// §14.3's congestion event and §14.5's `app_limited` growth — is fenced
+    /// by `recovery_start`, which [`NewReno::reset`] sets to the same
+    /// instant.
+    ///
+    /// `recovery_start` cannot serve these two: it is *also* set by every
+    /// ordinary congestion event, so reusing it would suppress RTT sampling
+    /// after every normal loss episode — silently, and permanently on a
+    /// lossy path.
+    ///
+    /// **What still happens to a pre-roam packet**: it resolves for loss and
+    /// retransmission normally, its frames re-queue by §8.7's class, and it
+    /// leaves `bytes_in_flight` when acked or declared lost. The fences
+    /// suppress *feedback*, never *recovery*.
+    ///
+    /// [`NewReno::reset`]: super::congestion::NewReno::reset
     pub(crate) fn on_roam(&mut self, now: Instant) {
         let _ = now;
+        // Saturating for the reason the connection's roam commit states: a
+        // wrap to 0 would alias the initial generation and un-fence the
+        // oldest packets in the map.
+        self.path_gen = self.path_gen.saturating_add(1);
         self.rtt.reseed_min_rtt();
     }
 
@@ -552,7 +607,19 @@ impl Recovery {
         let mut run_start: Option<Instant> = None;
         let mut previous: Option<u64> = None;
         for counter in lost {
-            let sent_at = self.sent[counter].time_sent;
+            let packet = &self.sent[counter];
+            // **[ruling 172]** §13.6's second `path_gen` fence, and §14.4
+            // states the obligation without naming a mechanism: *"packets
+            // sent before a roam are excluded from the walk."* Excluded, not
+            // "not-lost" — the packet still resolves for retransmission
+            // above; it simply takes no part in the verdict. A run that
+            // straddles a roam would otherwise collapse the window on
+            // evidence gathered from a path the connection has left, which
+            // is the one direction §14.6's reset exists to prevent.
+            if packet.path_gen != self.path_gen {
+                continue;
+            }
+            let sent_at = packet.time_sent;
             // A run is broken by any counter between two lost packets that
             // was **acknowledged** rather than lost. A counter still in
             // flight breaks nothing: it is not acknowledged.

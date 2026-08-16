@@ -1132,6 +1132,9 @@ mod replay {
 
 mod liveness {
     use super::*;
+    // Slice 7's passive keepalive arms inside this module's subject (§7.5),
+    // and one test now names its deadline.
+    use crate::constants::KEEPALIVE_TIMEOUT;
 
     /// §7.4: *"At install the clock is pinned, and it is pinned **armed**.
     /// A newly installed session sets both `last_authenticated_recv` and
@@ -1272,7 +1275,7 @@ mod liveness {
     /// re-arms at `receive + DEAD_TIMEOUT`. That build kills this
     /// connection; the spec's does not.
     #[test]
-    fn a_fresh_receive_re_anchors_the_clock_and_no_arming_send_follows() {
+    fn a_fresh_receive_re_anchors_the_clock_and_the_keepalive_then_arms_it() {
         let t = t0();
         let mut f = established_at(t);
 
@@ -1288,14 +1291,26 @@ mod liveness {
             d.outs
         );
 
-        // And past the *new* anchor's deadline too, because no arming send
-        // has happened since (§7.4's second conjunct).
+        // **[amended by slice 7 — §7.5, ruling 40]** The original second
+        // half asserted the connection was *still* alive past the new
+        // anchor's deadline, because no arming send had happened since
+        // (§7.4's second conjunct). Slice 7 makes that premise
+        // unconstructible on a live connection: the receive above puts
+        // `R > S`, which arms §7.5's passive keepalive at
+        // `S + KEEPALIVE_TIMEOUT`, and the keepalive is a **marking** send —
+        // *"arming enables death, never defers it"*. So an arming send does
+        // follow, at `S + KEEPALIVE_TIMEOUT`, and the connection dies at the
+        // new anchor's deadline.
+        //
+        // The rule under test is untouched and is now pinned harder: the
+        // death instant **is** the re-anchor, observed. A build that failed
+        // to re-anchor would have died at `t + DEAD_TIMEOUT` above.
         let d = f.timeout(r + DEAD_TIMEOUT + NS);
-        assert!(
-            d.closed().is_empty(),
-            "§7.4: no arming send since the receive, so the deadline is not armed"
+        assert_eq!(
+            d.closed(),
+            vec![ConnectionLost::TimedOut],
+            "§7.4 + §7.5: the keepalive is the arming send, and death lands at the new anchor"
         );
-        assert!(f.conn.is_established());
     }
 
     /// §16.5: *"`Liveness` … is **disarmed** and re-anchored by every
@@ -1324,9 +1339,16 @@ mod liveness {
             Some(r + DEAD_TIMEOUT),
             "§16.5: a receive disarms Liveness; it does not re-arm it"
         );
+        // **[amended by slice 7 — the author's own note above]** *"Slice 7
+        // arms `Keepalive` at this moment (§7.5), so the expected value here
+        // becomes the keepalive deadline rather than `None`. That is a
+        // change of arming, not of this rule."* `S` is still the install —
+        // the receive moved `R`, not `S` — so the beacon is due at
+        // `t + KEEPALIVE_TIMEOUT`, which is this receive's own instant.
         assert_eq!(
-            d.deadline, None,
-            "slice 3a arms nothing else at this moment"
+            d.deadline,
+            Some(t + KEEPALIVE_TIMEOUT),
+            "slice 7 arms exactly one thing here: §7.5's passive keepalive"
         );
     }
 }

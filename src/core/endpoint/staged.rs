@@ -609,17 +609,62 @@ impl<I: Identity> Endpoint<I> {
         // install because §17.1's `HANDSHAKE_GIVEUP` extension attaches to
         // the row this call is about to write, not to the one it removed.
         let mut lost_tiebreak = false;
+        // §6.4's LIVE branch: the connection this accept replaces, if any.
+        // Read here and acted on **after** msg2 is written, so an accept
+        // that fails on the ladder destroys nothing.
+        let mut replacing = None;
         match self
             .statics
             .get(&peer_key)
-            .map(|entry| (entry.state, entry.conn))
+            .map(|entry| (entry.state, entry.conn, entry.replacement_basis))
         {
             None => {}
-            Some((StaticState::Live, _)) => {
-                self.discard_chain(now, id);
-                return Err(AcceptError::Stale);
-            }
-            Some((StaticState::Pending, dial)) => {
+            // §6.4's §16.1 guard, and the whole of §5.4's LIVE row.
+            //
+            // The candidate is **admitted** — it reached here only through
+            // `authenticate()`, so it proved the same static with a
+            // verifying tail tag and passed §17.1's guard. Ruling 177 makes
+            // that load-bearing: the refusals that reach *no* admission —
+            // nothing parked, and a re-home walk that exhausts — mark
+            // nothing, so an attacker able to park only mac1-valid rubbish
+            // cannot provoke a probe with no key material at all.
+            Some((StaticState::Live, live, basis)) => match basis {
+                // *"only if that connection's replacement basis is `Some(t)`
+                // and the candidate's timestamp is **strictly greater** than
+                // `t`"*. `Some(t)` means **we responded** to the initiation
+                // that established it, so we hold a timestamp of this peer's
+                // to measure a replacement against.
+                Some(t) if timestamp > t => replacing = Some(live),
+                // A candidate not strictly newer than the basis: refused,
+                // and it marks **nothing** — *"there the basis can decide,
+                // and a genuine reconnect carries a strictly greater
+                // timestamp."*
+                Some(_) => {
+                    self.discard_chain(now, id);
+                    return Err(AcceptError::Stale);
+                }
+                // **[ruling 36]** `None` — we **dialled** this connection,
+                // so we hold no initiation timestamp of the peer's at all
+                // and the basis refuses every candidate, however old. That
+                // is what keeps a passively captured msg1 from destroying a
+                // connection we dialled — and it is also the case where a
+                // *genuine* reconnect is indistinguishable from a replay, so
+                // the refusal marks the connection **contested** and §7.5's
+                // probe asks the live peer whether it is still there.
+                //
+                // The mark is delivered to the connection core rather than
+                // taken here, because ruling 179's closing/draining
+                // carve-out is a fact about the connection's lifecycle and
+                // §17.4 keeps a closing connection in this map for its
+                // linger. The endpoint cannot tell the two apart; the
+                // connection can, and it no-ops.
+                None => {
+                    self.emit(EndpointOutput::Contested(live));
+                    self.discard_chain(now, id);
+                    return Err(AcceptError::Stale);
+                }
+            },
+            Some((StaticState::Pending, dial, _)) => {
                 if self.wins_tiebreak(&peer_key) {
                     self.keep_winner_side_record(now, id, dial, &peer_key, timestamp);
                     return Err(AcceptError::Stale);
@@ -663,6 +708,22 @@ impl<I: Identity> Endpoint<I> {
 
         let conn = self.next_connection_id();
         self.indices.insert_session(our_index, conn);
+
+        // §5.4: *"`accept()` of that `Intro` performs the
+        // `ConnectionLost::Replaced` teardown **as the act that installs the
+        // replacement**"* — so it fires here, after the ladder has
+        // succeeded and never before. A withheld or replayed replacement
+        // initiation left unaccepted costs one parked `Intro` and nothing
+        // else.
+        if let Some(old) = replacing {
+            self.retire_replaced(now, old, &peer_key);
+            // Emitted **before** the accept's msg2, which is generation
+            // order and normative (§16.4) — the same ordering
+            // `cancel_pending_losing_tiebreak` takes for the tie-break
+            // loser's `HandshakeFailed`.
+            self.emit(EndpointOutput::Replaced(old));
+        }
+
         self.statics.insert(
             peer_key,
             StaticEntry {
@@ -728,6 +789,43 @@ impl<I: Identity> Endpoint<I> {
         if let Some(entry) = self.intros.remove(id) {
             self.release_chain_guard_state(now, entry.guard_undo, entry.guard_pin);
         }
+    }
+
+    /// §6.4's LIVE branch: release the replaced connection's §17.4 row.
+    ///
+    /// This is the static half of [`handle_connection_event`]'s `Retired`
+    /// handling, run **here** rather than waiting for the old connection's
+    /// own `Retired`, because the replacement writes a new row at the same
+    /// key in the very next statement. By then `remove_by_connection(old)`
+    /// finds nothing — the row belongs to the new connection — so the §17.1
+    /// pin and the `HANDSHAKE_GIVEUP` extension would both be lost, and the
+    /// guard entry would be pinned for the endpoint's life.
+    ///
+    /// The **index** half is not duplicated: `Retired { our_index }` names a
+    /// value only the connection core holds, and dropping that route is
+    /// still its event's job. When it arrives, `drop_pending` finds nothing
+    /// and `remove_by_connection` finds nothing, so this release is not
+    /// performed twice.
+    ///
+    /// [`handle_connection_event`]: Endpoint::handle_connection_event
+    fn retire_replaced(&mut self, now: Instant, old: ConnectionId, peer_key: &[u8]) {
+        let Some(entry) = self.statics.remove(peer_key) else {
+            debug_assert!(false, "the LIVE row was read at the top of this verb");
+            return;
+        };
+        debug_assert_eq!(
+            entry.conn, old,
+            "§16.1: one connection per static, and this is the one being replaced"
+        );
+        // §17.1's extension, dated from this connection's death — the
+        // instant the bullet names. Armed before the release, for the reason
+        // `drop_pending` states.
+        if entry.guard_exempt {
+            self.extend_guard_exemption(now, peer_key);
+        }
+        // A live connection is a key-holder pin (ruling 77): reaching it took
+        // the peer's key.
+        self.guard.unpin(peer_key, PinKind::KeyHolder, now);
     }
 
     /// §6.4's PENDING branch, **winner side**: refuse, keep the pending,

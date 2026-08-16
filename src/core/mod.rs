@@ -264,6 +264,33 @@ pub enum EndpointOutput<C: Handshake> {
     /// A dial gave up at `HANDSHAKE_GIVEUP` (§5.5). Shell-only: it never
     /// reaches a connection core, which is simply dropped.
     HandshakeFailed(ConnectionId, ConnectError),
+    /// §6.4's LIVE branch replaced this connection (§5.4): tear it down with
+    /// [`ConnectionLost::Replaced`](crate::error::ConnectionLost::Replaced).
+    ///
+    /// # Why the endpoint core cannot do this itself
+    ///
+    /// §6.4 requires the replacing `accept()` to fire the teardown *"as the
+    /// act that installs the replacement"*, and §7.5 requires the refusal
+    /// against a `None` basis to mark that connection contested — both on a
+    /// **connection** the endpoint core cannot reach. §16.4's core API has
+    /// no such channel: `ToConnection` carries `Install` *"only"*, and the
+    /// connection's verb list has nothing a replacement or a mark could
+    /// arrive through. So these two travel as shell-only outputs, on
+    /// [`HandshakeFailed`](EndpointOutput::HandshakeFailed)'s terms exactly,
+    /// and the shell hands each to the named connection core.
+    ///
+    /// **This is a crate-internal seam, not a wire or an API change**, and
+    /// the gap is reported rather than resolved by it: see
+    /// `.slices/07-mobility/`'s implementation report.
+    Replaced(ConnectionId),
+    /// §6.4 refused an admitted candidate against a `None` basis: mark this
+    /// connection **contested** (ruling 36, §7.5).
+    ///
+    /// Shell-only, for [`Replaced`](EndpointOutput::Replaced)'s reason. The
+    /// core it names decides whether the mark is taken at all: ruling 179
+    /// makes it a no-op on a closing or draining connection, and only the
+    /// connection knows its lifecycle.
+    Contested(ConnectionId),
     /// **Terminal.** The drain is empty; the next armed deadline follows,
     /// or `None` if nothing is armed.
     Timeout(Option<Instant>),
@@ -293,6 +320,8 @@ impl<C: Handshake> std::fmt::Debug for EndpointOutput<C> {
             EndpointOutput::HandshakeFailed(id, e) => {
                 f.debug_tuple("HandshakeFailed").field(id).field(e).finish()
             }
+            EndpointOutput::Replaced(id) => f.debug_tuple("Replaced").field(id).finish(),
+            EndpointOutput::Contested(id) => f.debug_tuple("Contested").field(id).finish(),
             EndpointOutput::Timeout(d) => f.debug_tuple("Timeout").field(d).finish(),
         }
     }

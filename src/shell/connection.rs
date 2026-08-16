@@ -22,14 +22,15 @@ use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::constants;
-use crate::core::connection::{AckSnapshot, SendMessage};
+use crate::core::connection::{AckSnapshot, SendMessage, validate_persistent_keepalive};
 use crate::core::{Connection as CoreConnection, ConnectionId, Dir, StreamRef};
-use crate::error::{ConnectionLost, DatagramError, MessageError};
+use crate::error::{ConfigError, ConnectionLost, DatagramError, MessageError};
 use crate::packet::{Channel, Handshake};
 
-use super::shared::{ConnCell, ShellLink, WakerSlot, close_now, now};
+use super::shared::{ConnCell, Notification, ShellLink, WakerSlot, close_now, now};
 use super::stream::{BiStream, RecvStream, SendStream};
 
 /// The static public key type of a suite — §2.4's canonical octets.
@@ -188,6 +189,159 @@ impl<S: Handshake> Connection<S> {
                 Poll::Pending
             }
         }
+    }
+
+    /// Claim **one** [`Notification`] — §16.2's narrow per-connection event
+    /// stream (ruling 46).
+    ///
+    /// The same pull model as [`accept_bi`](Self::accept_bi),
+    /// [`recv_message`](Self::recv_message) and
+    /// [`recv_datagram`](Self::recv_datagram): the connection **retains**
+    /// what has not been claimed, and this hands over exactly one, so a
+    /// notification is never dropped on the floor between an application's
+    /// two visits. Retention is **one slot per kind**, never a queue — two
+    /// unclaimed roams merge into the net move rather than accumulating.
+    ///
+    /// Resolves `Err(ConnectionLost)` once the connection has ended **and**
+    /// its unclaimed notifications have been drained: a notification
+    /// generated before the death is not lost to the death (ruling 152).
+    ///
+    /// **Cancel-safe**: a dropped future has claimed nothing, and the next
+    /// call yields the same notification.
+    ///
+    /// ```no_run
+    /// # async fn example<S: slither::Handshake>(conn: &slither::Connection<S>) {
+    /// use slither::Notification;
+    ///
+    /// while let Ok(notification) = conn.notified().await {
+    ///     match notification {
+    ///         Notification::AddressMoved { from, to } => {
+    ///             tracing::info!(%from, %to, "the peer moved");
+    ///         }
+    ///         Notification::Contested => {
+    ///             tracing::warn!("someone else claims this peer's identity");
+    ///         }
+    ///         Notification::ContestCleared => {
+    ///             tracing::info!("the peer answered; the connection stands");
+    ///         }
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub async fn notified(&self) -> Result<Notification, ConnectionLost> {
+        let slot = self.notification_slot();
+        poll_fn(|cx| self.poll_notified(cx, slot.key())).await
+    }
+
+    /// The one implementation of [`notified`](Self::notified).
+    ///
+    /// Precedence is ruling 128's inversion, on
+    /// [`poll_recv_datagram`](Self::poll_recv_datagram)'s terms exactly:
+    ///
+    /// 1. a slot has something → `Ready(Ok(notification))`;
+    /// 2. the death latch → `Ready(Err(lost))`, **only** once every slot is
+    ///    drained;
+    /// 3. no core and no latch → `debug_assert!` and `EndpointDropped`;
+    /// 4. otherwise park in `notification_wakers`.
+    ///
+    /// **Parking is never permitted on a dead connection** (ruling 128):
+    /// nothing further can arrive, so step 4 is unreachable past the latch.
+    ///
+    /// **[ruling 58]** At most one item, and only inside the poll. An
+    /// adapter that claimed ahead of its consumer would rebuild the
+    /// unbounded shell queue §10.6 forbids while looking like a
+    /// convenience.
+    pub(crate) fn poll_notified(
+        &self,
+        cx: &mut Context<'_>,
+        key: u64,
+    ) -> Poll<Result<Notification, ConnectionLost>> {
+        let mut cell = self.cell.borrow_mut();
+        if let Some(notification) = cell.notifications.take_oldest() {
+            return Poll::Ready(Ok(notification));
+        }
+        if let Some(lost) = cell.closed.clone() {
+            return Poll::Ready(Err(lost));
+        }
+        if cell.core.is_none() {
+            debug_assert!(
+                false,
+                "a connection cell held neither a core nor a close reason (§16.3)"
+            );
+            return Poll::Ready(Err(ConnectionLost::EndpointDropped));
+        }
+        cell.notification_wakers.park(key, cx);
+        Poll::Pending
+    }
+
+    /// Mint this future's slot in §16.2's notification-waiter set.
+    fn notification_slot(&self) -> WakerSlot<impl FnMut(u64)> {
+        let key = self.cell.borrow_mut().notification_wakers.key();
+        WakerSlot::new(key, {
+            let cell = Rc::clone(&self.cell);
+            move |key| cell.borrow_mut().notification_wakers.unpark(key)
+        })
+    }
+
+    /// §7.5's persistent keepalive — the beacon. `None` disables it, which
+    /// is the default.
+    ///
+    /// **This is not what keeps an ordinary connection alive.** §7.5's
+    /// passive dance is automatic for any connection that has carried
+    /// traffic and needs no opt-in: one message in one direction is enough
+    /// to make a pair self-sustaining indefinitely. The beacon is for a link
+    /// that is **mutually idle** — one that must stay open through a NAT
+    /// whose binding would otherwise lapse, or through a firewall that reaps
+    /// idle flows.
+    ///
+    /// # The admissible band
+    ///
+    /// `[1 s, DEAD_TIMEOUT)` — **1 s inclusive, 25 s exclusive**. Outside it
+    /// the call returns [`ConfigError`] and **leaves the current interval
+    /// unchanged**: it never panics (which would be undefined behaviour
+    /// across an FFI boundary) and it never silently clamps (which would
+    /// report success while giving a beacon that does not do what was
+    /// asked).
+    ///
+    /// Below 1 s the beacon is a flood; at or above 25 s it cannot keep a
+    /// connection alive at all, because the peer declares death at
+    /// `DEAD_TIMEOUT` of silence and a beacon at exactly that interval
+    /// arrives, at best, simultaneously with the verdict.
+    ///
+    /// # A beacon does not defer death
+    ///
+    /// Both keepalives are **marking** sends, so they *arm* §7.4's death
+    /// clock rather than postponing it. A connection whose entire output is
+    /// beacons and which never hears back still ends at `DEAD_TIMEOUT` after
+    /// the last authenticated packet it received. That is the point: the
+    /// beacon keeps a *path* open, and the peer's answers are what keep the
+    /// *connection* alive.
+    ///
+    /// Synchronous — a shared-cell write like the accessors, not a command
+    /// round trip. On a connection that has already ended, `None` still
+    /// succeeds and a `Some(_)` is still validated.
+    pub fn set_persistent_keepalive(&self, interval: Option<Duration>) -> Result<(), ConfigError> {
+        // Validated before the cell is touched, so a dead connection gives
+        // the same verdict a live one would: the band is a property of the
+        // value, not of the connection's state.
+        validate_persistent_keepalive(interval)?;
+        let applied = {
+            let mut cell = self.cell.borrow_mut();
+            match cell.core.as_mut() {
+                Some(core) => {
+                    let result = core.set_persistent_keepalive(now(), interval);
+                    debug_assert!(result.is_ok(), "the band was checked immediately above");
+                    cell.dirty = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if applied {
+            self.shell.mark_dirty(self.id);
+        }
+        Ok(())
     }
 
     /// Resolve once everything handed to this connection **so far** has
@@ -923,8 +1077,14 @@ impl<S: Handshake> Connection<S> {
 
     /// The address this connection's datagrams go to — §5.6's anchor.
     ///
-    /// Slice 7's roaming (§7.3) is what makes this change; in this slice it
-    /// is fixed for the connection's life.
+    /// **Total**: it never panics and is never `Option`. Before the install
+    /// it is the address `connect()` was given; §7.3's roaming is what makes
+    /// it change afterwards, and it keeps answering after the connection has
+    /// died.
+    ///
+    /// It moves only where **the peer** moved. Our own interface change or
+    /// NAT rebind does not alter where we send, so it is invisible here —
+    /// the peer observes that one, on its side, as its own roam.
     pub fn remote_address(&self) -> SocketAddr {
         self.cell.borrow().remote_address
     }

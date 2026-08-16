@@ -184,14 +184,17 @@ pub(crate) struct ConnCell<S: Handshake> {
     pub(crate) closed: Option<ConnectionLost>,
     /// Everyone awaiting the latch.
     pub(crate) closed_wakers: Wakers,
-    /// §16.2's notification slots — declared now, filled in slice 7.
-    ///
-    /// Empty and unread in this slice, and deliberately present: `closed()`
-    /// must not be built as the shell's only event path, or slice 7's
-    /// `notified()` is a rewrite rather than an addition (§16.2's
-    /// "retention is one slot per kind").
-    #[allow(dead_code, reason = "slice 7 fills it; the place is the point")]
+    /// §16.2's notification slots — one per kind, filled by slice 7.
     pub(crate) notifications: NotificationSlots,
+    /// Everyone parked in [`notified()`](super::Connection::notified).
+    ///
+    /// **Not** swept by [`take_all_stream_wakers`](Self::take_all_stream_wakers),
+    /// on `closed_wakers`' terms exactly: a notification **survives the
+    /// death**, so this set is woken by the drain that fills a slot and by
+    /// [`Driver::latch`](super::driver::Driver) taking it under the same
+    /// borrow that sets the latch — never as part of a teardown sweep that
+    /// would hide which of the two released the waiter.
+    pub(crate) notification_wakers: Wakers,
     /// Set by any handle-side mutating borrow; cleared by the driver when
     /// it drains.
     pub(crate) dirty: bool,
@@ -320,7 +323,8 @@ impl<S: Handshake> ConnCell<S> {
             remote_address,
             closed: None,
             closed_wakers: Wakers::default(),
-            notifications: NotificationSlots,
+            notifications: NotificationSlots::default(),
+            notification_wakers: Wakers::default(),
             dirty: true,
             handles: 0,
             blocked_readers: BTreeMap::new(),
@@ -581,12 +585,161 @@ impl<I: Identity> ShellLink for Shell<I> {
     }
 }
 
-/// §16.2's per-kind notification retention. Slice 7 fills it.
+/// The application-facing notification set (§16.2, ruling 46).
 ///
-/// A unit struct rather than an empty enum: it is a **place**, not a claim
-/// about which kinds exist.
+/// Deliberately **not** a mirror of `core::ConnEvent`, which is
+/// `pub(crate)` and reaches no application: `StreamReadable`,
+/// `MessageReadable` and the rest are already served by the blocking verbs,
+/// *"and duplicating them would give two ways to learn the same thing."*
+///
+/// # What bounds this list
+///
+/// Three kinds, and the bound is a rule rather than an accident: a kind
+/// belongs here iff it is **a fact about the connection that no verb can
+/// deliver**. `AddressMoved` is the peer having moved — no verb of the
+/// application's is waiting on it, and `remote_address()` answers *where*
+/// without ever saying *when*. `Contested` and `ContestCleared` are §7.5's
+/// probe going out and being answered — a policy decision the transport
+/// took on the application's behalf, with a `KEEPALIVE_TIMEOUT` verdict
+/// hanging off it. Everything else §16.4 emits either wakes a parked verb
+/// or is the death, which is `closed()`'s.
+///
+/// `#[non_exhaustive]`, so a later wire line may add a kind without a
+/// breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notification {
+    /// §7.3's roam committed: the peer's address moved.
+    ///
+    /// Fires only where **the peer** moved. Our own rebind changes nothing
+    /// about where we send, so it is invisible here — S19's acceptance is
+    /// entirely peer-side.
+    ///
+    /// When two roams are unclaimed the pair is **merged**: `from` is the
+    /// oldest unclaimed anchor and `to` the newest, so it always describes
+    /// the net move since the application last looked.
+    AddressMoved {
+        /// The anchor the session left.
+        from: SocketAddr,
+        /// The anchor it moved to.
+        to: SocketAddr,
+    },
+    /// §7.5's contested-connection probe went out.
+    ///
+    /// **Never at the mark** (ruling 46's FAB-6): §7.3's budget can hold
+    /// the probe, and the mark emits nothing while it does. An ACK covering
+    /// the probe floor must arrive within `KEEPALIVE_TIMEOUT` of *this*
+    /// instant or the connection ends with `ConnectionLost::TimedOut` —
+    /// which arrives on [`closed()`](super::Connection::closed), not here.
+    Contested,
+    /// That mark cleared — an ACK covered the probe floor.
+    ///
+    /// Emitted **only where `Contested` was** (ruling 176). A mark that
+    /// clears while still pending cancels its probe and emits neither, so
+    /// this never arrives unmatched.
+    ContestCleared,
+}
+
+/// §16.2's per-kind notification retention: **one slot per kind, never a
+/// queue**.
+///
+/// > *"There is no bound to configure because there is nothing to bound"*
+/// > (§17.5).
+///
+/// O(1) in space and time. An implementer who reaches for a `VecDeque` has
+/// rebuilt the unbounded intermediate queue §10.6 forbids — and ruling 58's
+/// *"an adapter never claims ahead of its consumer"* is the same rule from
+/// the other end: [`take_oldest`](Self::take_oldest) hands over **one**
+/// item, and only from inside a `poll`.
+///
+/// # Generations, and why the newest write takes one
+///
+/// Pending notifications of different kinds are handed over in **generation
+/// order** (§16.4's ordering rule), so each slot carries the generation of
+/// the write that filled it.
+///
+/// **[ruling 185]** A second write to an occupied slot takes the slot **and
+/// the new generation**. With no drain in between,
+/// `Contested`(g1) → `ContestCleared`(g2) → `Contested`(g3) then hands over
+/// as *cleared, then contested* = "contested now". Keeping the old
+/// generation would hand over *contested, then cleared* = **"cleared now",
+/// the exact inverse of the truth** — reporting a contested connection as
+/// healthy, which is the one error S11 exists to prevent.
+///
+/// A slot may be rewritten any number of times. Ruling 41's collapse bounds
+/// *marks* to one at a time; that is a statement about marks and not about
+/// slots, and ruling 175 makes `Contested` → `ContestCleared` → `Contested`
+/// ordinary traffic.
 #[derive(Debug, Default)]
-pub(crate) struct NotificationSlots;
+pub(crate) struct NotificationSlots {
+    /// Merged: **oldest unclaimed `from`, newest `to`**.
+    address_moved: Option<(SocketAddr, SocketAddr)>,
+    address_moved_gen: u64,
+    contested: Option<u64>,
+    contest_cleared: Option<u64>,
+    next_gen: u64,
+}
+
+impl NotificationSlots {
+    fn bump(&mut self) -> u64 {
+        let generation = self.next_gen;
+        self.next_gen = self.next_gen.saturating_add(1);
+        generation
+    }
+
+    /// Record §7.3's roam, merging with an unclaimed one.
+    pub(crate) fn address_moved(&mut self, from: SocketAddr, to: SocketAddr) {
+        let generation = self.bump();
+        match &mut self.address_moved {
+            // *"so the pair always describes the net move since the
+            // application last looked"* — the oldest `from` is kept and only
+            // the destination advances.
+            Some((_, unclaimed_to)) => *unclaimed_to = to,
+            None => self.address_moved = Some((from, to)),
+        }
+        self.address_moved_gen = generation;
+    }
+
+    /// Record §7.5's probe transmission.
+    pub(crate) fn contested(&mut self) {
+        self.contested = Some(self.bump());
+    }
+
+    /// Record §7.5's mark clearing.
+    pub(crate) fn contest_cleared(&mut self) {
+        self.contest_cleared = Some(self.bump());
+    }
+
+    /// Claim the oldest unclaimed notification, or `None`.
+    ///
+    /// **One item per call**, which is the whole of ruling 58 at this seam.
+    pub(crate) fn take_oldest(&mut self) -> Option<Notification> {
+        let candidates = [
+            self.address_moved.map(|_| self.address_moved_gen),
+            self.contested,
+            self.contest_cleared,
+        ];
+        let (slot, _) = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, generation)| generation.map(|g| (slot, g)))
+            .min_by_key(|(_, generation)| *generation)?;
+        match slot {
+            0 => self
+                .address_moved
+                .take()
+                .map(|(from, to)| Notification::AddressMoved { from, to }),
+            1 => {
+                self.contested = None;
+                Some(Notification::Contested)
+            }
+            _ => {
+                self.contest_cleared = None;
+                Some(Notification::ContestCleared)
+            }
+        }
+    }
+}
 
 /// A `Connecting`'s resolution slot (§16.2).
 pub(crate) enum PendingOutcome<I: Identity> {
@@ -729,6 +882,8 @@ impl<I: Identity> ShellState<I> {
                             crate::core::EndpointOutput::IntroReady(..) => "IntroReady",
                             crate::core::EndpointOutput::ToConnection(..) => "ToConnection",
                             crate::core::EndpointOutput::HandshakeFailed(..) => "HandshakeFailed",
+                            crate::core::EndpointOutput::Replaced(_) => "Replaced",
+                            crate::core::EndpointOutput::Contested(_) => "Contested",
                             crate::core::EndpointOutput::Timeout(_) => unreachable!(),
                         }
                     );
@@ -887,4 +1042,83 @@ pub(crate) enum Command<I: Identity> {
     Dirty(ConnectionId),
     /// The last handle went away (§16.3, §15.4's endpoint-dropped row).
     HandlesGone,
+}
+
+#[cfg(test)]
+mod notification_slots_tests {
+    use super::*;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, last], 41_000))
+    }
+
+    /// Two unclaimed roams merge into the **net** move: the oldest `from`,
+    /// the newest `to`. A build that keeps the newest pair whole reports a
+    /// move that never happened as one leg of a move that did.
+    #[test]
+    fn two_unclaimed_roams_merge_into_the_net_move() {
+        let mut slots = NotificationSlots::default();
+        slots.address_moved(addr(1), addr(2));
+        slots.address_moved(addr(2), addr(3));
+
+        assert_eq!(
+            slots.take_oldest(),
+            Some(Notification::AddressMoved {
+                from: addr(1),
+                to: addr(3),
+            })
+        );
+        assert_eq!(slots.take_oldest(), None, "one slot, not a queue");
+    }
+
+    /// **[ruling 185]** With no drain in between,
+    /// `Contested` → `ContestCleared` → `Contested` hands over as *cleared,
+    /// then contested* — "contested now". Keeping the first generation on
+    /// the rewritten slot inverts that into "cleared now", which is the one
+    /// error S11 exists to prevent.
+    #[test]
+    fn a_rewritten_slot_takes_the_new_generation() {
+        let mut slots = NotificationSlots::default();
+        slots.contested();
+        slots.contest_cleared();
+        slots.contested();
+
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(slots.take_oldest(), None);
+    }
+
+    /// Different kinds come out in generation order, not in slot order.
+    #[test]
+    fn kinds_are_handed_over_oldest_first() {
+        let mut slots = NotificationSlots::default();
+        slots.contested();
+        slots.address_moved(addr(1), addr(2));
+        slots.contest_cleared();
+
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(
+            slots.take_oldest(),
+            Some(Notification::AddressMoved {
+                from: addr(1),
+                to: addr(2),
+            })
+        );
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), None);
+    }
+
+    /// Retention is O(1): a storm of marks occupies exactly the same space
+    /// as one, which is what makes §17.5's *"nothing to bound"* true.
+    #[test]
+    fn a_storm_of_marks_occupies_one_slot() {
+        let mut slots = NotificationSlots::default();
+        for _ in 0..10_000 {
+            slots.contested();
+            slots.contest_cleared();
+        }
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), None);
+    }
 }

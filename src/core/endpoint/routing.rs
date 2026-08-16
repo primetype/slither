@@ -757,6 +757,11 @@ mod tests {
         intros: Vec<(IntroId, SocketAddr)>,
         installs: Vec<ConnectionId>,
         failed: Vec<(ConnectionId, ConnectError)>,
+        /// §6.4's LIVE branch, added by slice 7. Collected rather than
+        /// ignored: a `Replaced` or a `Contested` a §6.5/§6.6 routing test
+        /// did not expect is a fact worth being able to see.
+        replaced: Vec<ConnectionId>,
+        contested: Vec<ConnectionId>,
         deadline: Option<Instant>,
     }
 
@@ -799,6 +804,12 @@ mod tests {
                     EndpointOutput::IntroReady(id, src) => d.intros.push((id, src)),
                     EndpointOutput::ToConnection(id, _) => d.installs.push(id),
                     EndpointOutput::HandshakeFailed(id, why) => d.failed.push((id, why)),
+                    // §6.4's LIVE branch. This fixture predates it and
+                    // asserts nothing about either, so they are collected
+                    // rather than ignored: a `Replaced` a routing test did
+                    // not expect is a fact worth being able to see.
+                    EndpointOutput::Replaced(id) => d.replaced.push(id),
+                    EndpointOutput::Contested(id) => d.contested.push(id),
                 }
             }
             panic!("poll_output() never reached Timeout (§16.4)");
@@ -1338,41 +1349,86 @@ mod tests {
     /// The other half of the pair above: §17.1 mitigation (i) still holds
     /// for every `Stale` that is not the tie-break winner's.
     ///
-    /// The LIVE row is the reachable one — §6.4's re-home admission is a
-    /// later slice, so a proven-LIVE `accept()` still refuses — and its
-    /// refusal must leave the guard exactly as it was.
+    /// **[amended by slice 7 — §6.4, ruling 36]** This used to drive the
+    /// refusal through a proven-LIVE `accept()` against a connection
+    /// `large` had **accepted**, on the note that *"§6.4's re-home
+    /// admission is a later slice"*. It is not a later slice any more: that
+    /// row's basis is `Some(t)`, every candidate that survives §17.1's
+    /// guard is strictly newer than it, and §6.4 therefore **replaces**
+    /// rather than refusing.
+    ///
+    /// The refusal the test needs is the **other** LIVE row: one this
+    /// endpoint **dialled**, whose basis is `None` and which refuses every
+    /// candidate however new. Its `Stale` is the one this rule is about, and
+    /// it comes with ruling 36's contested mark, asserted here as the second
+    /// half of what the refusal does.
+    ///
+    /// Reaching it needs the initiation to be captured **before** the dial
+    /// completes: once `third` has accepted us, §16.1 forbids it a dial of
+    /// its own, so there is no later moment at which it could mint one.
     #[test]
-    fn a_live_row_stale_still_reverts_its_record() {
+    fn a_dialled_live_rows_stale_reverts_its_record_and_marks_contested() {
         let t = t0();
         let (small, mut large) = ordered_pair(t);
         let mut third = Node::new(t, 21, 0x44, addr(4, 4004));
 
-        // `large` accepts `third`, so `third`'s static is LIVE on it.
-        let first = lone_msg1(&mut third, t, &large);
-        let drained = large.feed(t, addr(8, 4008), &first);
-        let (id, _) = drained.intros[0];
-        large.ep.authenticate(t, id).expect("authenticates");
-        large.ep.accept(t, id).expect("NONE");
-        let _ = large.drain();
-        let established = large
-            .ep
-            .greatest(third.canonical())
-            .expect("the accept made the record permanent");
+        // A genuine initiation from `third`, captured while its own row for
+        // `large` is still NONE.
+        let captured = lone_msg1(&mut third, t, &large);
 
-        // A second, strictly newer initiation from the same static.
-        let second = lone_msg1(&mut third, t, &large);
-        let drained = large.feed(t, addr(8, 4010), &second);
+        // `large` now **dials** `third` and completes, so `third`'s static
+        // is LIVE on `large` with a `None` basis (§17.4: a msg2 completion
+        // teaches us no timestamp of the peer's).
+        let (dialled, out) = large.dial(t, third.addr, &third.pk);
+        let msg1 = out.transmits[0].data.clone();
+        let resp = {
+            let drained = third.feed(t, large.addr, &msg1);
+            let (id, _src) = drained.intros[0];
+            third
+                .ep
+                .authenticate(t, id)
+                .expect("a real msg1 authenticates");
+            let (_conn, _c) = third.ep.accept(t, id).expect("third has no row for large");
+            third.drain().transmits[0].data.clone()
+        };
+        let _ = large.feed(t, third.addr, &resp);
+        assert!(
+            large.ep.greatest(third.canonical()).is_none(),
+            "§17.1: a dial writes no record at all — the guard bars nothing here"
+        );
+
+        // The captured initiation surfaces, authenticates, and is refused.
+        let drained = large.feed(t, addr(8, 4010), &captured);
         let (id2, _) = drained.intros[0];
-        let (_p, newer) = large.ep.authenticate(t, id2).expect("authenticates");
-        assert!(newer > established, "§5.5: every retransmit is newer");
+        large.ep.authenticate(t, id2).expect("authenticates");
+        assert!(
+            large.ep.greatest(third.canonical()).is_some(),
+            "`authenticate()` writes provisionally, and that is what must be reverted"
+        );
         assert!(
             matches!(large.ep.accept(t, id2), Err(AcceptError::Stale)),
-            "§6.4's proven-LIVE admission is a later slice"
+            "§6.4: a `None` basis refuses every candidate, however new"
         );
+
         assert_eq!(
             large.ep.greatest(third.canonical()),
-            Some(established),
+            None,
             "§17.1 mitigation (i): a non-winner `Stale` REVERTS its provisional record"
+        );
+        // **[ruling 36]** …and, being a refusal of an *admitted* candidate
+        // against a `None` basis, it marks that connection contested. The
+        // mark itself is the connection core's — ruling 179's carve-out is a
+        // fact about its lifecycle — so what the endpoint owes is the signal.
+        let after = large.drain();
+        assert_eq!(
+            after.contested,
+            vec![dialled],
+            "§7.5's probe is asked of the connection the refusal was about"
+        );
+        assert!(
+            after.replaced.is_empty(),
+            "a refusal replaces nothing: {:?}",
+            after.replaced
         );
         let _ = small;
     }
