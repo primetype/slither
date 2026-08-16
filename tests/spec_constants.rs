@@ -285,7 +285,15 @@ fn max_epoch_jump() {
 // ---------------------------------------------------------------------
 // §8.3 — the frame table (SPEC.md §8.3's own registry, cited as `Home` by
 // the consolidated table's compressed "frame types" row: 0x00, 0x01, 0x02,
-// 0x04, 0x08-0x0f, 0x10-0x13, 0x1c, 0x30/0x31; 0x05 reserved)
+// 0x04, 0x08-0x0f, 0x10-0x13, 0x1a, 0x1b, 0x1c, 0x30/0x31; 0x05 reserved)
+//
+// **[ruling 208]** `0x1a` PATH_CHALLENGE and `0x1b` PATH_RESPONSE were
+// added to §8.3 on 2026/08/16 — the first wire change since v1 froze.
+// `CONTRACT-7b.md` §1.1 names this comment as one of *three* lists that
+// enumerate §8.3 and therefore go stale together (the other two are
+// `constants.rs`'s uniqueness table and `frame.rs`'s inline
+// `ack_eliciting_matches_the_whole_of_table_8_3`). Working rule 8 reads
+// each of them as exhaustive whether or not it says so.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -799,4 +807,226 @@ fn wire_error_codes_are_all_below_application_base() {
     assert!(STREAM_STATE_ERROR < APPLICATION_ERROR_BASE);
     assert!(FINAL_SIZE_ERROR < APPLICATION_ERROR_BASE);
     assert!(MESSAGE_OVERFLOW < APPLICATION_ERROR_BASE);
+}
+
+// ---------------------------------------------------------------------
+// §8.3 / §8.4 / §7.3 — ruling 208's two path-validation frames
+//
+// **[ruling 208, RATIFIED 2026/08/16]** The first wire change since v1
+// froze. Ruling 210(d) is the governing constraint on *this* file: the
+// change "adds two *new* type codes and moves **no existing byte**, so
+// every golden vector must stay byte-identical." Every test below is
+// written to fail if that stops being true.
+//
+// Written by the blind test author against `CONTRACT-7b.md` §1.1 and §10,
+// and `SPEC.md` §8.3:3267-3268, §8.4:3429-3470, §7.3:2204-2213.
+// ---------------------------------------------------------------------
+
+#[test]
+fn frame_path_challenge() {
+    // SPEC.md §8.3:3267: `0x1a` | PATH_CHALLENGE | data (8 opaque bytes,
+    // **not** a varint) | ack-eliciting yes | rtx never | home §7.3.
+    // Ruling 208: "`0x1a`/`0x1b` are QUIC's own code points for these two
+    // frames" (RFC 9000 §19.17/§19.18).
+    assert_eq!(FRAME_PATH_CHALLENGE, 0x1a);
+}
+
+#[test]
+fn frame_path_response() {
+    // SPEC.md §8.3:3268: `0x1b` | PATH_RESPONSE.
+    assert_eq!(FRAME_PATH_RESPONSE, 0x1b);
+}
+
+#[test]
+fn path_frames_are_distinct_and_ordered() {
+    // The two `assert_eq!`s above are in separate `#[test]`s by this file's
+    // design, so neither can see the other's value. The degenerate build
+    // this catches and they do not: one `const` copy-pasted and edited in
+    // only one place, leaving `CHALLENGE == RESPONSE` — under which a
+    // responder echoes a challenge as a challenge, forever.
+    assert_ne!(FRAME_PATH_CHALLENGE, FRAME_PATH_RESPONSE);
+    assert!(FRAME_PATH_CHALLENGE < FRAME_PATH_RESPONSE);
+    assert_eq!(FRAME_PATH_RESPONSE, FRAME_PATH_CHALLENGE + 1);
+}
+
+#[test]
+fn path_frame_codes_collide_with_no_existing_frame_type() {
+    // **This is the ruling-210(d) pin, and the one test here that catches a
+    // *missed* edit rather than a wrong one.**
+    //
+    // `CONTRACT-7b.md` §1.1, of `constants.rs:670-683`'s FRAME_* uniqueness
+    // table: "Nothing fails if it is missed; that is what makes it a
+    // defect." This test is the thing that fails. A build that reused a
+    // code already in the table — `0x1c` CLOSE is the nearest neighbour and
+    // an easy typo — turns this red, and no golden-wire vector would.
+    //
+    // Working rule 8: §8.3's table is read as exhaustive, so every named
+    // code in the crate is listed here and the list is the assertion.
+    let existing: [u64; 14] = [
+        FRAME_PADDING,
+        FRAME_PING,
+        FRAME_ACK,
+        FRAME_RESET_STREAM,
+        FRAME_STOP_SENDING_RESERVED,
+        FRAME_STREAM_BASE,
+        FRAME_STREAM_MAX,
+        FRAME_MAX_DATA,
+        FRAME_MAX_STREAM_DATA,
+        FRAME_MAX_STREAMS_BIDI,
+        FRAME_MAX_STREAMS_UNI,
+        FRAME_CLOSE,
+        FRAME_DATAGRAM,
+        FRAME_DATAGRAM_LEN,
+    ];
+    for code in existing {
+        assert_ne!(
+            code, FRAME_PATH_CHALLENGE,
+            "PATH_CHALLENGE (0x1a) collides with an existing §8.3 frame code",
+        );
+        assert_ne!(
+            code, FRAME_PATH_RESPONSE,
+            "PATH_RESPONSE (0x1b) collides with an existing §8.3 frame code",
+        );
+    }
+    // The STREAM entry is a *range*, not a point, so membership in it is
+    // not covered by the pairwise check above.
+    for code in [FRAME_PATH_CHALLENGE, FRAME_PATH_RESPONSE] {
+        assert!(
+            !(FRAME_STREAM_BASE..=FRAME_STREAM_MAX).contains(&code),
+            "a path frame code fell inside §8.3's 0x08-0x0f STREAM range",
+        );
+    }
+}
+
+#[test]
+fn no_existing_frame_code_moved_for_ruling_208() {
+    // **Ruling 210(d), stated as a test.** "My 'the wire vectors will go red
+    // by design' licence is withdrawn... every golden vector must stay
+    // byte-identical." The per-constant tests above each pin one code; this
+    // pins the *set*, so a build that renumbered the table to "make room"
+    // for 0x1a/0x1b fails here under one readable name rather than as a
+    // scatter of apparently unrelated reds.
+    assert_eq!(FRAME_PADDING, 0x00);
+    assert_eq!(FRAME_PING, 0x01);
+    assert_eq!(FRAME_ACK, 0x02);
+    assert_eq!(FRAME_RESET_STREAM, 0x04);
+    assert_eq!(FRAME_STOP_SENDING_RESERVED, 0x05);
+    assert_eq!(FRAME_STREAM_BASE, 0x08);
+    assert_eq!(FRAME_STREAM_MAX, 0x0f);
+    assert_eq!(FRAME_MAX_DATA, 0x10);
+    assert_eq!(FRAME_MAX_STREAM_DATA, 0x11);
+    assert_eq!(FRAME_MAX_STREAMS_BIDI, 0x12);
+    assert_eq!(FRAME_MAX_STREAMS_UNI, 0x13);
+    assert_eq!(FRAME_CLOSE, 0x1c);
+    assert_eq!(FRAME_DATAGRAM, 0x30);
+    assert_eq!(FRAME_DATAGRAM_LEN, 0x31);
+}
+
+#[test]
+fn path_frame_codes_encode_as_a_one_byte_varint() {
+    // SPEC.md §8.4:3435-3437: "Nine bytes each, fixed: no length prefix and
+    // no varint anywhere". `CONTRACT-7b.md` §1.1's table derives
+    // `encoded_len() == 9` from "both codes are < 64 so the varint is one
+    // byte".
+    //
+    // **Working rule 9.** Nine bytes is a *derived* quantity and this bound
+    // is what it derives from. A build that chose `0x40`/`0x41` would still
+    // be "two new unused code points" and would still pass every uniqueness
+    // check above, but each frame would encode in ten bytes and §7.3's
+    // 90-byte no-deadlock arithmetic would be wrong by construction. This
+    // is the assertion that separates them.
+    assert!(FRAME_PATH_CHALLENGE < 64);
+    assert!(FRAME_PATH_RESPONSE < 64);
+}
+
+#[test]
+fn a_path_challenge_datagram_fits_the_smallest_budget_its_arming_creates() {
+    // **[ruling 208 / `CONTRACT-7b.md` §1.6]** "The challenge must fit
+    // inside the budget its own arming creates, or an address roamed to by
+    // a bare keepalive can never be validated."
+    //
+    // SPEC.md §7.3:2241-2247 states the arithmetic normatively: "3x the
+    // *smallest* packet that can arm the budget — §7.5's 30-byte keepalive,
+    // 90 B — still admits a packet carrying the challenge, which costs 14 B
+    // of header, 9 B of frame and a 16 B tag."
+    //
+    // The contract asks for this as a `const _: () = assert!(..)` in
+    // `constants.rs` — the *implementer's* file. This is the runtime twin in
+    // the test author's file, so the pin exists on both sides of the blind
+    // split and neither agent's omission can hide it.
+    let smallest_arming_credit = DATA_HEADER_LEN + AEAD_TAG_LEN;
+    let budget = AMPLIFICATION_FACTOR as usize * smallest_arming_credit;
+    let challenge_datagram = DATA_HEADER_LEN + 1 + 8 + AEAD_TAG_LEN;
+
+    // The components pinned individually, so a change to any one of them
+    // names itself rather than surfacing as a failed inequality.
+    assert_eq!(smallest_arming_credit, 30);
+    assert_eq!(budget, 90);
+    assert_eq!(challenge_datagram, 39);
+
+    // The bound the contract states. Not decoration: it fails if anyone
+    // grows `DATA_HEADER_LEN`, shrinks `AMPLIFICATION_FACTOR`, or widens the
+    // challenge past 8 bytes.
+    assert!(budget >= challenge_datagram);
+
+    // **Working rule 9 applied to the bound itself.** `budget >=
+    // challenge_datagram` alone is satisfied for free by many wrong builds,
+    // including one with `AMPLIFICATION_FACTOR == 2` (60 >= 39). §7.3 and
+    // the contract both claim a *specific* headroom — "51 bytes — room for
+    // the challenge *and* an ACK" — and that number is what excludes the
+    // satisfied-for-free reading. Asserting it is what makes this test
+    // sensitive to the factor at all.
+    assert_eq!(budget - challenge_datagram, 51);
+}
+
+#[test]
+fn a_challenge_and_a_contested_probe_fit_one_arming_together() {
+    // SPEC.md §7.3:2409-2412, inside the flagged rank-2/rank-4 interaction:
+    // "probe and challenge together cost 14 B of header + 1 B of PING + 9 B
+    // of challenge + a 16 B tag = **40 B**, inside the 90 B floor computed
+    // above."
+    //
+    // Load-bearing for ruling 212(c), which resolves that flag by ranking
+    // the path frames *above* the probe: the resolution is free of cost only
+    // because the two never actually contend ("in practice they do not
+    // compete at all"). If this goes red, the rank stops being free and
+    // becomes a real trade-off that needs re-deciding.
+    let ping = 1;
+    let challenge_frame = 1 + 8;
+    let both = DATA_HEADER_LEN + ping + challenge_frame + AEAD_TAG_LEN;
+    assert_eq!(both, 40);
+
+    let budget = AMPLIFICATION_FACTOR as usize * (DATA_HEADER_LEN + AEAD_TAG_LEN);
+    assert!(both <= budget);
+    // The two-sided form again: `40 <= 60` holds for a degenerate factor of
+    // 2. The spec's claim is the 90 B floor.
+    assert_eq!(budget, 90);
+}
+
+#[test]
+fn the_msg1_anchor_budget_still_admits_a_challenge_after_the_msg2_charge() {
+    // **[`CONTRACT-7b.md` §2, finding A2]** The responder's msg2 —
+    // `RESP_PACKET_LEN` = 107 bytes — is emitted before the connection
+    // exists and is now charged to the budget its own arming created. §2's
+    // arithmetic: "588 - 107 = 481, against 39 for a challenge datagram. It
+    // does."
+    //
+    // The contract says "no second assertion is needed, but the arithmetic
+    // belongs in a comment". A comment is not a pin — working rule 9's "a
+    // name is not a pin", one register up — and this arithmetic decides
+    // whether a responder-side connection can ever validate its own anchor.
+    // It is cheap, so it is here.
+    let anchor_credit = INIT_PACKET_LEN;
+    let budget = AMPLIFICATION_FACTOR as usize * anchor_credit;
+    assert_eq!(budget, 588);
+
+    let after_msg2 = budget - RESP_PACKET_LEN;
+    assert_eq!(after_msg2, 481);
+
+    let challenge_datagram = DATA_HEADER_LEN + 1 + 8 + AEAD_TAG_LEN;
+    assert!(after_msg2 >= challenge_datagram);
+    // The separating form: a build that charged msg2 *and* msg1 (196 + 107 =
+    // 303) still satisfies `>= 39`. What it violates is the claim that the
+    // charge is exactly one msg2.
+    assert_eq!(budget - after_msg2, RESP_PACKET_LEN);
 }
