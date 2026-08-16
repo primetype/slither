@@ -778,11 +778,41 @@ impl Streams {
             debug_assert!(false, "frames are applied only after the install");
             return Ok(());
         };
-        self.check_peer_may_send(f.id, role)?;
+        self.check_peer_may_reset(f.id, role)?;
 
         let Some(r) = self.locate(f.id, role, events, flow)? else {
             return Ok(());
         };
+
+        // §9.8's one receiver-emitted reset, seen from the **sender's** end:
+        // a uni stream we opened has no receive half at all, so there is
+        // nothing below for this frame to be applied to and it would fall
+        // through as inert — leaving the sender stalled at the window for
+        // ever, which is the exact failure §9.8 exists to replace.
+        //
+        // `final_size` is not checked against anything: it describes what
+        // *we* sent, we already know it, and §9.6 marks it informational
+        // for the receiver. The credit true-up below is likewise the
+        // receiving direction's and has no counterpart here — §10.1's send
+        // ledger is charged at `write`, and §9.6 does not refund it.
+        if self
+            .entries
+            .get(&r)
+            .is_some_and(|s| s.dir == Dir::Uni && s.local)
+        {
+            let newly = self
+                .entries
+                .get_mut(&r)
+                .and_then(|s| s.send.as_mut())
+                .is_some_and(|send| send.stopped_by_peer(f.error_code));
+            if newly {
+                events.push(ConnEvent::StreamReset {
+                    r,
+                    error_code: f.error_code,
+                });
+            }
+            return Ok(());
+        }
 
         let stream = self
             .entries
@@ -1369,11 +1399,40 @@ impl Streams {
 
     /// Ruling 97's step 1: could the peer have sent this frame at all?
     fn check_peer_may_send(&self, id: StreamId, role: Role) -> Result<(), Violation> {
-        // The peer may send STREAM/RESET_STREAM on any bidi stream, and on a
-        // uni stream only if the peer opened it.
+        // The peer may send STREAM on any bidi stream, and on a uni stream
+        // only if the peer opened it.
         if id.dir() == Dir::Uni && self.is_local(id, role) {
             return Err(Violation::StreamState);
         }
+        Ok(())
+    }
+
+    /// §8.4's admission rule for **RESET_STREAM**, which is
+    /// [`check_peer_may_send`](Self::check_peer_may_send)'s **with one
+    /// exception**.
+    ///
+    /// SPEC.md:2686-2689, in terms:
+    ///
+    /// > a `stream_id` naming a stream the sender of the frame could not
+    /// > send on (their receive-only half) ⇒ `STREAM_STATE_ERROR` — **with
+    /// > exactly one exception, the message-mode overflow reset of §9.8, in
+    /// > which the *receiver* of a uni stream emits RESET_STREAM as its
+    /// > abandonment signal (§9.6)**
+    ///
+    /// So a peer RESET_STREAM naming a uni stream **we** opened is legal:
+    /// it is the one receiver-emitted reset, and refusing it kills the
+    /// connection with `STREAM_STATE_ERROR` in exactly the case §9.8 exists
+    /// to make survivable and diagnosable.
+    ///
+    /// **The exception is structural, not code-conditional, and it has to
+    /// be.** Nothing on the wire distinguishes *"the §9.8 reset"* from any
+    /// other RESET_STREAM — the frame carries an `error_code` a peer
+    /// chooses, and §9.8's conflict is invisible to the wire by design
+    /// (ruling 51). Filtering on `error_code == MESSAGE_OVERFLOW` would
+    /// therefore turn a peer's non-conforming code into a connection kill,
+    /// which §8.4's sentence does not ask for. See `IMPLEMENTATION-6.md`
+    /// §4-F3.
+    fn check_peer_may_reset(&self, _id: StreamId, _role: Role) -> Result<(), Violation> {
         Ok(())
     }
 

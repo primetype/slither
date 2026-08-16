@@ -922,11 +922,15 @@ impl Packing {
     /// extends-to-end form is used only when the length-prefixed one cannot
     /// be, never as a default.
     pub(crate) fn datagram(&mut self, data: &[u8]) -> bool {
-        let room = self.room();
         let n = data.len();
-        let len_present = if 1 + varint_len(n as u64) + n <= room {
+        // The type byte comes off the top for both forms; what is left is
+        // what the body has to fit in.
+        let Some(body) = self.room().checked_sub(1) else {
+            return false;
+        };
+        let len_present = if varint_len(n as u64) + n <= body {
             true
-        } else if 1 + n <= room {
+        } else if n <= body {
             false
         } else {
             return false;

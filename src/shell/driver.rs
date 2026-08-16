@@ -516,15 +516,22 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             // `acked()`'s two maps are woken as well, because
             // `CONTRACT-5b.md` §2.5 names this event beside
             // `StreamFinished` for both. It is a **wake and not a
-            // verdict**: this event is §9.6's peer-emitted RESET_STREAM,
-            // which `Streams::on_reset_stream` applies to the *receive*
-            // half alone, so on a bidi stream our send half is untouched
-            // by it and `poll_acked` must go on waiting. The one reset of
-            // ours a peer can cause — §9.8's receiver-emitted overflow
-            // reset — is not representable in this build; see
-            // `IMPLEMENTATION-5b.md` §4-C1.
+            // verdict**: on a bidi stream this is §9.6's peer-emitted reset
+            // of our *receive* half, our send half is untouched, and
+            // `poll_acked` must go on waiting.
+            //
+            // **The blocked writer is woken too, and slice 6 is why.**
+            // Slice 5b recorded that the one reset of ours a peer can cause
+            // — §9.8's receiver-emitted overflow reset — was *"not
+            // representable in this build"* (`IMPLEMENTATION-5b.md` §4-C1).
+            // §9.8 makes it representable, and its whole point is that the
+            // sender is **stalled at the stream window** when it arrives:
+            // that writer is parked in `blocked_writers`, and without this
+            // line it is woken by nothing and stalls for ever anyway —
+            // §9.8's loud failure delivered as the silent one it replaces.
             ConnEvent::StreamReset { r, .. } => {
                 Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
+                Self::wake_stream(cell, |cell| cell.blocked_writers.get_mut(&r));
                 Self::wake_stream(cell, |cell| cell.blocked_ackers.get_mut(&r));
                 wake_settled(cell);
             }

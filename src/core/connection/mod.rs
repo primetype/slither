@@ -619,7 +619,7 @@ impl<C: Handshake> Connection<C> {
     /// §16.4's `send_message`: allocate the next outbound uni stream, write
     /// the whole payload, set FIN (§9.8).
     ///
-    /// # Whole payload or nothing — **ruling 150**
+    /// # Whole payload or nothing — **rulings 150 and 163**
     ///
     /// [`SendMessage::Blocked`] means **nothing happened**: no stream was
     /// opened, no byte was buffered, no index was spent. §10.6 makes credit
@@ -1355,6 +1355,12 @@ impl<C: Handshake> Connection<C> {
         self.recovery = Recovery::new();
         self.congestion = NewReno::new();
         self.ack = AckState::new();
+
+        // §11's send queue joins them: nothing can be sealed from here, so
+        // a queued datagram is state with no future. The **receive** queue
+        // is deliberately kept — ruling 152 puts `recv_datagram` in ruling
+        // 128's post-death drain, on the same terms as `streams` above.
+        self.datagrams.discard_send();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1458,6 +1464,20 @@ impl<C: Handshake> Connection<C> {
             // starvation is bounded in both directions and statable: a
             // stream waits at most one packet per queued datagram, a
             // datagram at most one packet per predecessor.
+            //
+            // **[ruling 161]** This decision **never evicts**. `peek_send`
+            // does not remove, so a head the packet cannot fit stays
+            // queued: §11.3's drop-oldest is `send_datagram`'s discipline,
+            // on enqueue, and a packing pass is not queue pressure.
+            //
+            // The residual, documented rather than engineered away: a
+            // **maximum-size datagram is preferentially delayed** by any
+            // packet already carrying control frames, because 1169 bytes
+            // plus its type byte need the whole plaintext and §8.5 packs
+            // the ACK first. It is bounded — §12.4 does not put an ACK on
+            // every packet — and the alternative, reordering the queue to
+            // fit a smaller datagram first, trades a bounded delay for a
+            // silent reordering nobody has ruled on.
             let mut sent_datagram = None;
             if let Some(data) = self.datagrams.peek_send()
                 && packing.datagram(data)
@@ -1827,31 +1847,46 @@ pub(crate) enum ConnEvent {
     Closed(ConnectionLost),
 }
 
-/// What [`Connection::send_message`] did with the payload. §9.8.
+/// Whether the core took the whole payload. §9.8.
 ///
-/// **[ruling 150]** §16.4 types the core verb `Result<(), MessageError>`,
-/// and `MessageError` is exhaustive, already shipped and pinned by
-/// `tests/spec_errors.rs` — `TooLarge` and `ConnectionLost`, nothing else.
-/// So *"not now"* cannot be a `MessageError`, and it is not an error in any
-/// case: it is a **park**, on the shell's side of the seam. This enum is
-/// the third answer the ruling requires and the return type reports it, in
-/// exactly the shape [`StreamsExhausted`] takes for `open` — a `pub(crate)`
-/// condition the shell converts into a wait and no application ever sees.
+/// **[RATIFIED 2026/08/16 — ruling 163]** *"Not now"* is **not an error**,
+/// so §18.1 stays closed: `MessageError` is exhaustive, already shipped and
+/// pinned by `tests/spec_errors.rs` — `TooLarge` and `ConnectionLost`,
+/// nothing else — and adding a variant would be a breaking change to a
+/// taxonomy that is closed by process. It is reported in the **success**
+/// type instead, which is what this core already does twice over:
+/// [`write`](Connection::write)'s `Ok(0)` and [`accept`](Connection::accept)'s
+/// `None` both mean *the state is not ready*, and neither is an error
+/// either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendMessage {
-    /// The whole payload was admitted: a uni stream was opened, every byte
-    /// buffered and the FIN pinned.
+    /// Admitted in full: a uni stream was opened, every byte entered send
+    /// state, and the FIN rides the final data frame (ruling 153).
     Sent,
-    /// **Nothing happened.** No index was spent, no half exists, no byte was
-    /// buffered — so a shell future dropped on this answer has sent nothing
-    /// and the verb is trivially cancel-safe.
+    /// **Nothing happened — a total no-op.** No stream opened, no index
+    /// spent, no byte buffered, no event queued, and the caller's payload
+    /// untouched. The shell parks and retries.
     ///
-    /// The wake comes from `ConnEvent::StreamsAvailable { dir: Dir::Uni }`
-    /// (refused for §10.4's stream allowance) or
-    /// `ConnEvent::SendCreditAvailable` (refused for §10.3's connection
-    /// credit). Which of the two refused is deliberately **not** reported:
-    /// the shell parks both on one waker set, and a distinction no consumer
-    /// acts on is a second thing to keep in step.
+    /// # The invariant, and why it is load-bearing
+    ///
+    /// Ruling 150 chose atomic admission precisely so a dropped
+    /// `send_message` future cannot leave a **FIN-less half-written uni
+    /// stream** behind, which against a message-mode receiver would
+    /// *manufacture* the failure S30 exists to diagnose. A `Blocked` that
+    /// had already opened a stream reintroduces that by the back door — so
+    /// it is delivered by **ordering** and not by cleanup:
+    /// [`send_message`](Connection::send_message) tests connection credit
+    /// **before** `Streams::open`, and `Streams::open` itself returns
+    /// `Err(StreamsExhausted)` above its first mutation. There is no
+    /// rollback path to get wrong because there is nothing to roll back.
+    ///
+    /// # It carries no reason, deliberately
+    ///
+    /// The shell parks in one `message_senders` set fed by three wake
+    /// sources — `ConnEvent::StreamsAvailable { dir: Dir::Uni }`, ruling
+    /// 150's `ConnEvent::SendCreditAvailable`, and the death latch — so
+    /// naming the cause would buy the caller nothing and cost a second slot
+    /// to release.
     Blocked,
 }
 

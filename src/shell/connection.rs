@@ -549,7 +549,9 @@ impl<S: Handshake> Connection<S> {
                     false,
                     "a connection cell held neither a core nor a close reason (§16.3)"
                 );
-                return Err(DatagramError::ConnectionLost(ConnectionLost::EndpointDropped));
+                return Err(DatagramError::ConnectionLost(
+                    ConnectionLost::EndpointDropped,
+                ));
             };
             let sent = core.send_datagram(now(), data);
             if sent.is_ok() {
@@ -658,17 +660,19 @@ impl<S: Handshake> Connection<S> {
         cx: &mut Context<'_>,
         key: u64,
     ) -> Poll<Result<Vec<u8>, ConnectionLost>> {
-        let outcome = {
+        let (outcome, called) = {
             let mut cell = self.cell.borrow_mut();
             // Every call — `Some` or `None` — can have run §9.8's overflow
             // scan and emitted a RESET_STREAM, and a claim retires a half
             // that owes MAX_DATA and MAX_STREAMS. So the cell is dirtied on
-            // the strength of the *call*, not of the answer.
+            // the strength of the *call*, not of the answer — and left
+            // alone when there was no core to call.
             let claimed = cell.core.as_mut().map(|core| core.recv_message(now()));
-            if claimed.is_some() {
+            let called = claimed.is_some();
+            if called {
                 cell.dirty = true;
             }
-            match claimed {
+            let outcome = match claimed {
                 Some(Some(payload)) => Some(Ok(payload)),
                 _ => match cell.closed.clone() {
                     Some(lost) => Some(Err(lost)),
@@ -684,11 +688,13 @@ impl<S: Handshake> Connection<S> {
                         None
                     }
                 },
-            }
+            };
+            (outcome, called)
         };
-        // Outside the borrow (finding F10): waking and driving both re-enter
-        // the cell.
-        self.shell.mark_dirty(self.id);
+        // Outside the borrow (finding F10): driving re-enters the cell.
+        if called {
+            self.shell.mark_dirty(self.id);
+        }
         match outcome {
             Some(result) => Poll::Ready(result),
             None => Poll::Pending,

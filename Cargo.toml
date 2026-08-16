@@ -207,3 +207,21 @@ required-features = ["test-util"]
 [[test]]
 name = "story_reliability"
 required-features = ["test-util"]
+
+# ── slice 6, at integration ──────────────────────────────────────────────
+#
+# `tests/story_datagram.rs` (S15) and `tests/story_message.rs` (S16, S30)
+# are written by two authors who never saw the implementation (working rule
+# 6) and land with them. **Left commented out on purpose (ruling 126):**
+# cargo refuses to *parse* a manifest whose `[[test]]` names a missing file,
+# which reds every gate at once — build, fmt, clippy, doc and test alike —
+# and the failure names the manifest rather than the missing file. The
+# integrator uncomments both stanzas once the files exist.
+#
+# [[test]]
+# name = "story_datagram"
+# required-features = ["test-util"]
+#
+# [[test]]
+# name = "story_message"
+# required-features = ["test-util"]
