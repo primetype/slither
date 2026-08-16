@@ -1170,6 +1170,141 @@ impl<S: Handshake> Connection<S> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// The type-erased mirror of the seven minters above — **ruling 228**
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Ruling 122(a) kept the `poll_*` verbs `pub(crate)` on the ground that
+// *"slice 8's `compat/` is in-crate and reaches them"*. That is true of the
+// verbs and **not true of what they require**: every one takes a `key: u64`
+// minted by one of the seven `fn`s above, all of them private to this
+// module, so `crate::compat` cannot obtain one — and without a slot an
+// adapter has no key that is stable for its life and released on drop,
+// which is the whole of the verbs' cancel-safety.
+//
+// Worse, `WakerSlot<impl FnMut(u64)>` is **unnameable**, so it cannot be an
+// adapter struct's field at all, and a §16.11 `Stream` adapter must hold its
+// slot for the adapter's whole life rather than for one poll. Boxing the
+// release closure is what makes the type nameable.
+//
+// Additive, in-crate, and no public signature moves, so ruling 204 is
+// untouched. The private minters above are left exactly as they were:
+// §16.2's `async fn` forms pay no allocation for this.
+//
+// **Why `S: 'static`, and why it restricts nothing.** The bound is the
+// `Box<dyn FnMut(u64)>`'s: the release closure owns an
+// `Rc<RefCell<ConnCell<S>>>`, so erasing it behind a `'static` trait object
+// needs `S: 'static`. The only way to obtain a `Connection<S>` is through an
+// `Endpoint<I>`, and `EndpointBuilder::build` already requires `I: 'static`
+// — which gives `I::Suite: 'static`. It is that same bound, and for the same
+// kind of reason: the spawned task's, **not** a `Send` requirement (S21).
+//
+// **Why the `allow` and not a `cfg` matrix.** Ruling 228 fixes the set at
+// **seven** — the complete mirror — while which members are live depends on
+// the enabled features: `sink` reaches five, `tower` reaches
+// `opener_slot_boxed`, and `settled_slot_boxed` has no adapter in slice 8 at
+// all (§16.2's `acked()` has no `Stream` or `Sink` face). A `cfg` matrix
+// would have to be revised every time an adapter moved between features, and
+// would make the set something other than the seven the ruling names.
+impl<S: Handshake + 'static> Connection<S> {
+    /// [`notification_slot`](Self::notification_slot), type-erased for
+    /// `compat::Notifications` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn notification_slot_boxed(&self) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().notification_wakers.key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().notification_wakers.unpark(key)
+            }),
+        )
+    }
+
+    /// [`settled_slot`](Self::settled_slot), type-erased (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn settled_slot_boxed(&self) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().settled_wakers.key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().settled_wakers.unpark(key)
+            }),
+        )
+    }
+
+    /// [`message_reader_slot`](Self::message_reader_slot), type-erased for
+    /// `compat::Messages` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn message_reader_slot_boxed(&self) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().message_readers.key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().message_readers.unpark(key)
+            }),
+        )
+    }
+
+    /// [`datagram_reader_slot`](Self::datagram_reader_slot), type-erased for
+    /// `compat::Datagrams` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn datagram_reader_slot_boxed(&self) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().datagram_readers.key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().datagram_readers.unpark(key)
+            }),
+        )
+    }
+
+    /// [`message_sender_slot`](Self::message_sender_slot), type-erased for
+    /// `compat::MessageSink` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn message_sender_slot_boxed(&self) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().message_senders.key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().message_senders.unpark(key)
+            }),
+        )
+    }
+
+    /// [`opener_slot`](Self::opener_slot), type-erased for `compat::tower`'s
+    /// `OpenBi` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn opener_slot_boxed(&self, dir: Dir) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().stream_openers[dir.slot()].key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().stream_openers[dir.slot()].unpark(key)
+            }),
+        )
+    }
+
+    /// [`acceptor_slot`](Self::acceptor_slot), type-erased for
+    /// `compat::IncomingBi` and `compat::IncomingUni` (ruling 228).
+    #[allow(dead_code)]
+    pub(crate) fn acceptor_slot_boxed(&self, dir: Dir) -> WakerSlot<Box<dyn FnMut(u64)>> {
+        let key = self.cell.borrow_mut().stream_acceptors[dir.slot()].key();
+        WakerSlot::new(
+            key,
+            Box::new({
+                let cell = Rc::clone(&self.cell);
+                move |key| cell.borrow_mut().stream_acceptors[dir.slot()].unpark(key)
+            }),
+        )
+    }
+}
+
 /// Build both halves of one bidirectional stream under a **single** cell
 /// borrow — the `build` argument [`Connection::poll_open_with`] and
 /// [`Connection::poll_accept_with`] take for `Dir::Bi`.

@@ -6,7 +6,7 @@
 //! second copy of the cores' state.
 
 use std::cell::RefCell;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -73,12 +73,70 @@ impl<I: Identity> Endpoint<I> {
     /// it — which is §6.2's silent reject, the documented meaning of
     /// dropping a staged object, not a loss.
     pub async fn accept(&self) -> Option<Intro<I>> {
-        if self.shell.driver_stopped() {
-            return None;
+        let mut pending = None;
+        poll_fn(|cx| self.poll_accept(cx, &mut pending)).await
+    }
+
+    /// The one implementation of [`accept`](Self::accept) — **ruling 229**.
+    ///
+    /// §16.11 lists the `Stream`/`Sink` faces and ruling 229 added
+    /// `incoming` to that list, which had named seven faces and none of them
+    /// the endpoint's. The reason it was missed is this function's absence:
+    /// `accept()` is on ruling 53's **channel** side — §6.2 requires the DH
+    /// to land on the driver task — so it was the one verb with no `poll_*`
+    /// behind it, and an adapter built on the `async fn` would have had to
+    /// **box and store an in-flight future**, which is precisely the cost
+    /// §16.3 names as what ruling 53 exists to avoid. A face that could not
+    /// be built the way the section builds every other face is a face that
+    /// quietly falls off the section's list.
+    ///
+    /// So this is ruling 53's *"written once"* rule applied to the verb that
+    /// escaped it: `accept()` above is `poll_fn` over this, and
+    /// `compat::Incoming` holds the same `Option<Receiver>` this takes —
+    /// a `oneshot::Receiver` is `Unpin`, so the adapter stays `Unpin` too.
+    ///
+    /// # `pending` is the caller's, and dropping it is §6.2's silent reject
+    ///
+    /// The slot holds the outstanding request between polls. Dropping it
+    /// with a request in flight — dropping the `accept()` future, or the
+    /// `Incoming` adapter — may drop one `Intro` that the driver handed over
+    /// in that same instant, which is *"the documented meaning of dropping a
+    /// staged object, not a loss"*.
+    ///
+    /// # The slot is cleared before `Ready`
+    ///
+    /// Not tidiness: `tokio::sync::oneshot::Receiver` **panics** when polled
+    /// after it has completed. Clearing it is also what lets a caller poll
+    /// again for the *next* introduction, which is what the `Stream` face
+    /// does.
+    ///
+    /// `None` means the endpoint is closed, exactly as [`accept`](Self::accept)
+    /// documents, and it stays `None`: a stopped driver is answered on the
+    /// first branch, and a driver that stops with a request outstanding
+    /// drops the sender, which resolves the receiver in error.
+    pub(crate) fn poll_accept(
+        &self,
+        cx: &mut Context<'_>,
+        pending: &mut Option<tokio::sync::oneshot::Receiver<Intro<I>>>,
+    ) -> Poll<Option<Intro<I>>> {
+        let rx = match pending {
+            Some(rx) => rx,
+            None => {
+                if self.shell.driver_stopped() {
+                    return Poll::Ready(None);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.shell.send(Command::Accept(tx));
+                pending.insert(rx)
+            }
+        };
+        match Pin::new(rx).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(outcome) => {
+                *pending = None;
+                Poll::Ready(outcome.ok())
+            }
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.shell.send(Command::Accept(tx));
-        rx.await.ok()
     }
 
     /// Dial `remote_static` at `remote` (§5.5).
