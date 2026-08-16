@@ -2635,12 +2635,39 @@ mod smoke {
     /// Two established `Connection`s over one real IK handshake: `a` is
     /// §6.7's initiator, `b` the acceptor, so §9.1's parity is directly
     /// assertable.
+    /// Two **dialled** cores, installed through §16.4's `Install`.
+    ///
+    /// Built this way rather than through `Connection::established` — which
+    /// is what it used to be, and is one line shorter — because that
+    /// constructor **is** §6.4's accept path, and since slice 7 it arms
+    /// §7.3's anti-amplification budget from the accepted msg1's anchor.
+    /// A budgeted core sends at most 3 × 196 bytes before the peer answers,
+    /// which is correct for an accepted connection and wrong for a fixture
+    /// whose subject is §9/§10's machinery: every multi-packet write below
+    /// would be measuring the budget rather than the fill.
+    ///
+    /// A `connect()`-created connection starts validated, so this is the
+    /// pair with no §7.3 state at all — and it is also what
+    /// `testfix::Pair::installed_at` builds, for the same reason.
     fn pair(now: Instant) -> (Connection<Suite>, Connection<Suite>) {
         let (a_session, b_session) = sessions();
-        (
-            Connection::established(now, [1u8; 32], a_session, Role::Initiator),
-            Connection::established(now, [2u8; 32], b_session, Role::Responder),
-        )
+        let mut a = Connection::connecting([1u8; 32]);
+        let mut b = Connection::connecting([2u8; 32]);
+        a.handle_endpoint_event(
+            now,
+            Install {
+                session: a_session,
+                role: Role::Initiator,
+            },
+        );
+        b.handle_endpoint_event(
+            now,
+            Install {
+                session: b_session,
+                role: Role::Responder,
+            },
+        );
+        (a, b)
     }
 
     /// Drain one core to `Timeout`, returning what it produced.

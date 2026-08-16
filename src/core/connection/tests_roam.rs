@@ -9,7 +9,8 @@
 //! states with their two unstated exits.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::constants;
 use crate::core::connection::mobility::Contested;
@@ -17,6 +18,18 @@ use crate::core::connection::testfix::{Pair, Solo, a_addr, b_addr, drain, put, t
 use crate::core::connection::timers::TimerKind;
 use crate::core::connection::{ConnEvent, ConnOutput};
 use crate::error::{ConfigError, ConnectionLost};
+
+/// A **stable** origin instant.
+///
+/// `testfix::t0()` is `Instant::now()`, so it hands back a *different* value
+/// on every call. Every deadline assertion in this file is an equality
+/// against an arithmetic offset from one origin, and two origins microseconds
+/// apart fail all of them — for a reason that has nothing to do with the
+/// property under test. So the origin is drawn once.
+fn origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(t0)
+}
 
 /// A third address, for the peer to move to.
 fn c_addr() -> SocketAddr {
@@ -58,8 +71,8 @@ fn count_cleared(d: &crate::core::connection::testfix::Drained) -> usize {
 /// here; both are asserted against.
 #[test]
 fn the_beacon_band_is_one_second_inclusive_to_dead_timeout_exclusive() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0();
+    let mut solo = Solo::installed_at(origin());
+    let now = origin();
 
     for rejected_low in [
         Duration::ZERO,
@@ -118,8 +131,8 @@ fn the_beacon_band_is_one_second_inclusive_to_dead_timeout_exclusive() {
 /// this one.
 #[test]
 fn a_rejected_interval_leaves_the_previous_one_untouched() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0();
+    let mut solo = Solo::installed_at(origin());
+    let now = origin();
 
     solo.conn
         .set_persistent_keepalive(now, Some(Duration::from_secs(5)))
@@ -157,18 +170,18 @@ fn a_rejected_interval_leaves_the_previous_one_untouched() {
 /// arms nothing and emits nothing.
 #[test]
 fn the_passive_keepalive_arms_only_after_a_receive() {
-    let mut solo = Solo::installed_at(t0());
+    let mut solo = Solo::installed_at(origin());
     assert_eq!(
         solo.conn.timer(TimerKind::Keepalive),
         None,
         "S == R at install: R > S is false"
     );
 
-    let now = t0() + Duration::from_secs(1);
+    let now = origin() + Duration::from_secs(1);
     let _ = solo.deliver(now, &[constants::FRAME_PING as u8]);
     assert_eq!(
         solo.conn.timer(TimerKind::Keepalive),
-        Some(t0() + constants::KEEPALIVE_TIMEOUT),
+        Some(origin() + constants::KEEPALIVE_TIMEOUT),
         "armed at S + KEEPALIVE_TIMEOUT, where S is still the install"
     );
 }
@@ -177,11 +190,11 @@ fn the_passive_keepalive_arms_only_after_a_receive() {
 /// empty plaintext, and the send disarms it — `R > S` no longer holds.
 #[test]
 fn the_passive_keepalive_sends_the_empty_plaintext_and_then_disarms() {
-    let mut solo = Solo::installed_at(t0());
-    let recv_at = t0() + Duration::from_secs(1);
+    let mut solo = Solo::installed_at(origin());
+    let recv_at = origin() + Duration::from_secs(1);
     let _ = solo.deliver(recv_at, &[constants::FRAME_PING as u8]);
 
-    let fires = t0() + constants::KEEPALIVE_TIMEOUT;
+    let fires = origin() + constants::KEEPALIVE_TIMEOUT;
     solo.conn.handle_timeout(fires);
     let d = drain(&mut solo.conn);
     let transmits = d.transmits();
@@ -206,8 +219,8 @@ fn the_passive_keepalive_sends_the_empty_plaintext_and_then_disarms() {
 /// `S` on the quiet ACK, and the keepalive deadline slides with it.
 #[test]
 fn a_quiet_send_neither_advances_s_nor_suppresses_the_keepalive() {
-    let mut solo = Solo::installed_at(t0());
-    let recv_at = t0() + Duration::from_secs(2);
+    let mut solo = Solo::installed_at(origin());
+    let recv_at = origin() + Duration::from_secs(2);
     let d = solo.deliver(recv_at, &[constants::FRAME_PING as u8]);
     assert!(
         !d.transmits().is_empty(),
@@ -215,7 +228,7 @@ fn a_quiet_send_neither_advances_s_nor_suppresses_the_keepalive() {
     );
     assert_eq!(
         solo.conn.timer(TimerKind::Keepalive),
-        Some(t0() + constants::KEEPALIVE_TIMEOUT),
+        Some(origin() + constants::KEEPALIVE_TIMEOUT),
         "the quiet ACK did not move S off the install instant"
     );
 }
@@ -224,16 +237,16 @@ fn a_quiet_send_neither_advances_s_nor_suppresses_the_keepalive() {
 /// re-arms from the marking send it just performed.
 #[test]
 fn the_beacon_fires_without_a_receive_and_re_arms_itself() {
-    let mut solo = Solo::installed_at(t0());
+    let mut solo = Solo::installed_at(origin());
     solo.conn
-        .set_persistent_keepalive(t0(), Some(Duration::from_secs(3)))
+        .set_persistent_keepalive(origin(), Some(Duration::from_secs(3)))
         .expect("3 s is inside the band");
     assert_eq!(
         solo.conn.timer(TimerKind::PersistentKeepalive),
-        Some(t0() + Duration::from_secs(3))
+        Some(origin() + Duration::from_secs(3))
     );
 
-    let at = t0() + Duration::from_secs(3);
+    let at = origin() + Duration::from_secs(3);
     solo.conn.handle_timeout(at);
     let d = drain(&mut solo.conn);
     assert_eq!(
@@ -253,15 +266,15 @@ fn the_beacon_fires_without_a_receive_and_re_arms_itself() {
 /// still dies at `R + DEAD_TIMEOUT`.
 #[test]
 fn a_beacon_only_connection_still_dies_at_the_dead_timeout() {
-    let mut solo = Solo::installed_at(t0());
+    let mut solo = Solo::installed_at(origin());
     solo.conn
-        .set_persistent_keepalive(t0(), Some(Duration::from_secs(2)))
+        .set_persistent_keepalive(origin(), Some(Duration::from_secs(2)))
         .expect("2 s is inside the band");
 
     let mut beacons = 0usize;
     let mut death = None;
     for step in 1..=30u64 {
-        let at = t0() + Duration::from_secs(step);
+        let at = origin() + Duration::from_secs(step);
         solo.conn.handle_timeout(at);
         let d = drain(&mut solo.conn);
         beacons += d.transmits().len();
@@ -274,7 +287,7 @@ fn a_beacon_only_connection_still_dies_at_the_dead_timeout() {
     assert!(beacons >= 10, "the beacon did fire repeatedly: {beacons}");
     assert_eq!(
         death,
-        Some((t0() + constants::DEAD_TIMEOUT, ConnectionLost::TimedOut)),
+        Some((origin() + constants::DEAD_TIMEOUT, ConnectionLost::TimedOut)),
         "arming enables death, never defers it (ruling 40)"
     );
 }
@@ -287,11 +300,11 @@ fn a_beacon_only_connection_still_dies_at_the_dead_timeout() {
 /// a new source re-homes the session.
 #[test]
 fn an_authenticated_fresh_packet_from_a_new_source_roams() {
-    let mut solo = Solo::installed_at(t0());
+    let mut solo = Solo::installed_at(origin());
     assert_eq!(solo.conn.remote_address(), Some(a_addr()));
     assert_eq!(solo.conn.path_generation(), 0);
 
-    let now = t0() + Duration::from_millis(10);
+    let now = origin() + Duration::from_millis(10);
     let d = solo.deliver_from(now, c_addr(), &[constants::FRAME_PING as u8]);
 
     assert_eq!(solo.conn.remote_address(), Some(c_addr()), "the anchor moved");
@@ -320,8 +333,8 @@ fn an_authenticated_fresh_packet_from_a_new_source_roams() {
 /// plaintext without draining leaves the event queued for ever.
 #[test]
 fn a_keepalive_from_a_new_source_roams_and_its_event_reaches_the_drain() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
     let d = solo.deliver_from(now, c_addr(), &[]);
 
     assert_eq!(solo.conn.remote_address(), Some(c_addr()));
@@ -331,8 +344,8 @@ fn a_keepalive_from_a_new_source_roams_and_its_event_reaches_the_drain() {
 /// The two negatives §7.3 names, each failing its own conjunct.
 #[test]
 fn neither_a_forgery_nor_a_replay_ever_moves_the_anchor() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     // Conjunct 2 fails: the AEAD tag does not verify.
     let mut forged = crate::core::connection::testfix::data_header(0xdead_beef, 0);
@@ -365,8 +378,8 @@ fn neither_a_forgery_nor_a_replay_ever_moves_the_anchor() {
 /// packet's source"*.
 #[test]
 fn a_closing_connection_does_not_roam() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
     solo.conn.close(now, 0, b"");
     let _ = drain(&mut solo.conn);
     assert!(
@@ -397,10 +410,10 @@ fn a_closing_connection_does_not_roam() {
 /// budget, and the triggering packet is what credits it.
 #[test]
 fn a_dialled_connection_starts_validated_and_a_roam_arms_the_budget() {
-    let mut solo = Solo::installed_at(t0());
+    let mut solo = Solo::installed_at(origin());
     assert_eq!(solo.conn.amplification_budget(), None, "dialled ⇒ validated");
 
-    let now = t0() + Duration::from_millis(10);
+    let now = origin() + Duration::from_millis(10);
     let _ = solo.deliver_from(now, c_addr(), &[]);
 
     let (spent, credited) = solo
@@ -424,7 +437,7 @@ fn a_dialled_connection_starts_validated_and_a_roam_arms_the_budget() {
 fn an_accepted_connection_is_armed_from_its_msg1_anchor() {
     let (_, sa, sb) = Solo::connecting();
     let conn = crate::core::Connection::established(
-        t0(),
+        origin(),
         [0x11u8; 32],
         sb,
         crate::core::Role::Responder,
@@ -448,8 +461,8 @@ fn an_accepted_connection_is_armed_from_its_msg1_anchor() {
 /// all sends the whole write in the first pass.
 #[test]
 fn the_budget_holds_output_and_a_receive_releases_it() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
     // Roam on the smallest possible packet: 30 bytes in, 90 bytes of budget.
     let _ = solo.deliver_from(now, c_addr(), &[]);
 
@@ -485,8 +498,8 @@ fn the_budget_holds_output_and_a_receive_releases_it() {
 /// than on the window mark.
 #[test]
 fn a_replayed_packet_funds_no_budget() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
     let _ = solo.deliver_from(now, c_addr(), &[]);
 
     let dgram = solo.peer.seal(&[constants::FRAME_PING as u8]);
@@ -516,8 +529,8 @@ fn a_replayed_packet_funds_no_budget() {
 /// together, and the `Transmit` precedes the `Event` (§8.1).
 #[test]
 fn a_mark_on_a_validated_address_transmits_at_once() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     let floor = solo.conn.next_counter().expect("established");
     solo.conn.mark_contested(now);
@@ -555,8 +568,8 @@ fn a_mark_on_a_validated_address_transmits_at_once() {
 /// re-arms the deadline passes "no second PING" and fails this.
 #[test]
 fn a_second_mark_is_a_total_no_op_and_the_deadline_does_not_move() {
-    let mut solo = Solo::installed_at(t0());
-    let first = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let first = origin() + Duration::from_millis(10);
     solo.conn.mark_contested(first);
     let _ = drain(&mut solo.conn);
     let deadline = solo.conn.timer(TimerKind::Contested);
@@ -579,8 +592,8 @@ fn a_second_mark_is_a_total_no_op_and_the_deadline_does_not_move() {
 /// Ruling 179: a mark against a closing connection is a **total no-op**.
 #[test]
 fn a_mark_on_a_closing_connection_does_nothing() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
     solo.conn.close(now, 0, b"");
     let _ = drain(&mut solo.conn);
 
@@ -596,8 +609,8 @@ fn a_mark_on_a_closing_connection_does_nothing() {
 /// and **nothing is transmitted**. No third notification either.
 #[test]
 fn an_unanswered_probe_times_the_connection_out_and_sends_nothing() {
-    let mut solo = Solo::installed_at(t0());
-    let marked = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let marked = origin() + Duration::from_millis(10);
     solo.conn.mark_contested(marked);
     let _ = drain(&mut solo.conn);
 
@@ -619,8 +632,8 @@ fn an_unanswered_probe_times_the_connection_out_and_sends_nothing() {
 /// reclaimed in `KEEPALIVE_TIMEOUT` rather than `DEAD_TIMEOUT`.
 #[test]
 fn the_contested_verdict_precedes_the_liveness_deadline() {
-    let mut solo = Solo::installed_at(t0());
-    let marked = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let marked = origin() + Duration::from_millis(10);
     solo.conn.mark_contested(marked);
     let _ = drain(&mut solo.conn);
 
@@ -637,8 +650,8 @@ fn the_contested_verdict_precedes_the_liveness_deadline() {
 /// probe itself is dropped and an ordinary Data packet's ACK does it.
 #[test]
 fn any_ack_covering_the_floor_clears_the_mark() {
-    let mut pair = Pair::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut pair = Pair::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     pair.a.mark_contested(now);
     let _ = pair.drain_a();
@@ -665,8 +678,8 @@ fn any_ack_covering_the_floor_clears_the_mark() {
 /// `KEEPALIVE_TIMEOUT`" refuses the second mark outright.
 #[test]
 fn a_re_mark_after_a_clear_records_a_strictly_greater_floor() {
-    let mut pair = Pair::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut pair = Pair::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     pair.a.mark_contested(now);
     let _ = pair.drain_a();
@@ -696,8 +709,8 @@ fn a_re_mark_after_a_clear_records_a_strictly_greater_floor() {
 /// `bytes_in_flight` — §13.6's list, on both sides.
 #[test]
 fn a_roam_resets_the_controller_and_keeps_the_flight() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
     solo.conn.write(now, r, &[7u8; 800]).expect("a write");
@@ -734,8 +747,8 @@ fn a_roam_resets_the_controller_and_keeps_the_flight() {
 /// becomes the new path's `min_rtt` floor, permanently.
 #[test]
 fn an_ack_for_a_pre_roam_packet_feeds_no_rtt_sample() {
-    let mut solo = Solo::installed_at(t0());
-    let now = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
 
     let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
     solo.conn.write(now, r, &[7u8; 200]).expect("a write");
@@ -770,8 +783,8 @@ fn an_ack_for_a_pre_roam_packet_feeds_no_rtt_sample() {
 /// broken".
 #[test]
 fn an_ack_for_a_post_roam_packet_does_feed_the_estimator() {
-    let mut solo = Solo::installed_at(t0());
-    let roam_at = t0() + Duration::from_millis(10);
+    let mut solo = Solo::installed_at(origin());
+    let roam_at = origin() + Duration::from_millis(10);
     let _ = solo.deliver_from(roam_at, c_addr(), &[]);
 
     // Credit the budget enough to let a data packet out.
