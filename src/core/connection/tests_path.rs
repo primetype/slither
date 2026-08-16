@@ -1003,9 +1003,19 @@ fn a_pending_contested_probe_does_not_block_the_challenge() {
 /// though the §7.3 rank is not, and that is what this test asserts: the
 /// challenge precedes the probe's PING in the packet.
 ///
-/// **This test asserts the disputed reading.** If the maintainer resolves
-/// the conflict the other way, this is the test to invert — not the two
-/// above it.
+/// **[Integrator, ruling 215 — resolved, and this test does NOT invert.]**
+/// The author flagged this as the line to flip if the rank went the other
+/// way, and it did: ruling 212(c) lifted the challenge above the probe and
+/// **ruling 215 reversed that**, restoring §7.3's ranks as written.
+///
+/// The test still stands, because the author's own reasoning above is
+/// sharper than its hedge: the two are **different questions**, and
+/// `SPEC.md` §8.5 says so. §7.3's rank decides *what is built when the
+/// budget cannot hold everything*; §8.5 decides *where bytes go inside a
+/// packet that is being built*. Ruling 215 moved only the first. Under it
+/// the probe outranks the challenge for admission **and** the challenge
+/// still precedes the PING in the bytes — no contradiction, because a
+/// budget that admits either admits both (40 B against a 90 B floor).
 #[test]
 fn the_challenge_outranks_the_contested_probe() {
     let mut solo = Solo::installed_at(origin());
@@ -1035,8 +1045,10 @@ fn the_challenge_outranks_the_contested_probe() {
     if let Some(ping_at) = carrying.iter().position(|f| matches!(f, Wire::Ping)) {
         assert!(
             challenge_at < ping_at,
-            "**ruling 212(c)** / §8.5: the path frames are first among the \
-             control frames, ahead of the probe's PING. Packet: {carrying:?}",
+            "§8.5 (ruling 208, packing order — *not* §7.3's admission rank, \
+             which ruling 215 leaves with the probe above the challenge): \
+             the path frames are first among the control frames, ahead of \
+             the probe's PING. Packet: {carrying:?}",
         );
     }
 }

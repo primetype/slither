@@ -18,10 +18,12 @@
 > was reconciled against the shipped API (§1.3, Appendix A); every other
 > flag was ruled in the 2026/08/14 walkthrough. The flag token appeared
 > nowhere in this document, and a zero count was part of the ratification
-> check. *(**Amended 2026/08/16 by ruling 208**: the count is now **one**,
+> check. *(**Amended 2026/08/16 by ruling 208**: the count rose to **one**,
 > carrying the bracketed marker `FLAGGED FOR RULING`, at its home in §7.3
-> and reconciled in §1.3. This entry stands as written so the history
-> stays legible.)*
+> and reconciled in §1.3. **Ruling 215 closed it the same day and the
+> count is zero again.** Both entries stand as written so the history
+> stays legible: the check worked, which is the only evidence that a
+> zero count means anything.)*
 > The two [OPEN] markers draft v1 carried are
 > resolved (§6.4's re-home rule, §15.2's violation surface); **no [OPEN]
 > markers remain**. British English, Oxford comma, dates `YYYY/MM/DD`.
@@ -468,20 +470,28 @@ against the shipped API (**RECONCILED 2026/08/14**). **No maintainer
 flag remained open in this document at ratification** — the marker token
 appeared nowhere in it, and a zero count was the ratification check.
 
-**[AMENDED 2026/08/16 — ruling 208]** *The count is no longer zero, and
-saying so is the point of keeping the check.* Ruling 208 opened exactly
-one call. It carries the bracketed marker **`FLAGGED FOR RULING`**, which
-appears in bracketed form **exactly once** in this document — at its home,
-never in prose about it, so that grepping the bracketed token still
-answers a count question and **1** is the expected answer. The call:
+**[AMENDED 2026/08/16 — ruling 208, then CLOSED the same day by ruling
+215.]** *The count went to one and back to zero, and saying so is the
+point of keeping the check.* **The bracketed marker `FLAGGED FOR RULING`
+now appears nowhere in this document, and 0 is again the expected answer**
+— §7.3's entry is `[RATIFIED … ruling 215]`. The record of the call is
+kept below rather than deleted, because a check that has never once fired
+is indistinguishable from a check that does not work. The call was:
 §7.3's
 scarce-budget priority order and §7.5's pending contested probe were
 written for the same state and do not compose — a probe that *returns*
 from the send pass suppresses every rank below it, including the
-`PATH_CHALLENGE` that would end the scarcity. It is stated at its home in
-§7.3 with the resolutions that are available and no choice made between
-them. **One** is the expected count until it is ruled; a second appearing
-without a ruling is the same signal a red wire vector is.
+`PATH_CHALLENGE` that would end the scarcity. **Ruling 215 resolved it in
+favour of the third available resolution: the ranks were right and the
+send pump's early return was the defect** — it emits the probe and
+continues building on the same pass, since probe plus challenge is 40 B
+against a 90 B floor. An earlier ruling (212(c)) lifted the challenge
+above the probe instead and was reversed, because §7.5 proves a delayed
+probe *"would silently convert congestion into a liveness verdict"* while
+a delayed challenge only prolongs a cap.
+
+**Zero** is the expected count again. A bracketed marker appearing without
+a ruling is the same signal a red wire vector is.
 
 ## 2. Crypto suites and `channel!` *(DRAFT 2026/08/13)*
 
@@ -2394,9 +2404,11 @@ one another under any budget this protocol can construct, and
 `PATH_RESPONSE` is listed first only because answering an obligation
 before raising one is the conventional reading.
 
-**[FLAGGED FOR RULING — 2026/08/16, rulings 171 × 208. The one open call
-in this document; §1.3 counts it.]** An interaction between ranks 2 and 4
-that neither ruling anticipated, recorded rather than resolved.
+**[RATIFIED 2026/08/16 — ruling 215, closing this section's one open
+flag. §1.3's expected flag count returns to zero.]** An interaction
+between ranks 2 and 4 that neither ruling 171 nor ruling 208 anticipated.
+**The ranks above are correct as written and do not move; the send pump's
+early return is the defect.**
 
 A **pending** contested probe is realised in the send pump as an **early
 return** — the pump emits the probe and stops, so nothing ranked below it
@@ -2417,13 +2429,19 @@ rank 2 outranking rank 4 does not mean rank 4 is never built, only that it
 yields when the budget cannot hold both, and here the budget can: probe
 and challenge together cost 14 B of header + 1 B of PING + 9 B of
 challenge + a 16 B tag = **40 B**, inside the 90 B floor computed above.
-So the resolutions available differ in kind — coalesce the challenge into
-the probe's own packet, lift the challenge above the probe, or hold that
-the priority order was never an early return and the pump is simply wrong
-— and they differ in *what they concede*, which is precisely what a
-maintainer decides and an editor must not. **This entry is a flag, not a
-rule**, and an implementation that hits it should stop and ask rather than
-pick.
+Three resolutions were available — coalesce the challenge into the probe's
+own packet, lift the challenge above the probe, or hold that the priority
+order was never an early return and the pump is simply wrong.
+
+**Ruling 215 takes the third, and it concedes nothing.** Lifting the
+challenge above the probe was ruled first (212(c)) and **reversed**: it
+would demote the probe below a frame whose delay merely prolongs a cap,
+while §7.5 proves the probe's own delay *"would silently convert
+congestion into a liveness verdict"* — an argument that transfers verbatim
+to the budget, and which nothing in the challenge's case answers. The
+ranks above therefore stand exactly as written, and **the send pump may
+emit the probe and continue building on the same pass**, because the
+budget holds both and always does: 40 B against a 90 B floor.
 
 The probe's place is the load-bearing one, and §7.5 already makes the
 argument exactly once, for the congestion gate: *"a probe the gate could

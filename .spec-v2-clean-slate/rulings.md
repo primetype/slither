@@ -6200,3 +6200,61 @@ uncommitted contract cost a blind author ten minutes of guessing an API.
 Here it cost nothing only because both implementers read the rulings and
 reported the discrepancy instead of trusting the file that calls itself
 binding. Contract now updated to point at the rulings.
+
+### 215 — ruling 212(c) is reversed in its rank half. The ranks stand; the pump was always the defect.
+
+**T1, blind, found that ruling 212(c) contradicts `SPEC.md` at T1's own
+base commit** — and that the contradiction is mine twice over: I closed a
+`[FLAGGED FOR RULING]` block in `rulings.md` and **never re-swept §7.3
+with the answer**, so the spec still argued the opposite in three places
+(`:2369-2378`, `:2380-2396`, §14.5 `:4700-4703`).
+
+Worse, the spec's argument is better than my ruling's.
+
+**What I ruled (212(c)):** rank `PATH_CHALLENGE`/`PATH_RESPONSE` above the
+contested probe, because *"everything else in that order competes for the
+budget; the challenge dissolves it."*
+
+**What §7.3 already said:** the path frames are placed **under** the
+contested probe *"because the probe's deadline is a **liveness verdict**
+that a delay converts into a death, where a delayed challenge only
+prolongs a cap."* And §7.5 proves exactly this once already, for the
+congestion gate: *"a probe the gate could delay past its own deadline
+would silently convert congestion into a liveness verdict."* **The
+argument transfers verbatim.**
+
+Working rule 3's tiebreak decides it and decides against me: **follow the
+statement some other proof depends on.** §7.5's congestion-gate proof
+depends on the probe not being delayed. *Nothing* depends on the challenge
+outranking the probe.
+
+**The flag offered three resolutions and I took the weakest.** They were:
+coalesce the challenge into the probe's packet; lift the challenge above
+the probe; or **hold that the priority order was never an early return and
+the pump is simply wrong.** The flag all but names the third as correct —
+*"rank 2 outranking rank 4 does not mean rank 4 is never built, only that
+it yields when the budget cannot hold both, **and here the budget can**"*:
+probe plus challenge is 40 B against the 90 B floor the smallest arming
+produces.
+
+**Ruling: the third resolution. The ranks in §7.3 stand exactly as
+written — CLOSE, probe, `PATH_RESPONSE`, `PATH_CHALLENGE` — and the send
+pump's early return is the defect.** It may emit the probe *and* continue
+building, because the budget holds both and always does. This concedes
+nothing: the probe keeps the liveness priority §7.5 proves it needs, and
+the challenge is still built on the same pass.
+
+212(c)'s **other** half was right and is untouched: the pump's early
+return is wrong as written, and fixing it is the implementer's job. That
+half is common to my resolution and the correct one, which is precisely
+why choosing wrongly between them did not change the code that had to be
+written — and is why an editor's flag saying *"an implementation that hits
+it should stop and ask"* held the line that my ruling did not.
+
+**The process defect, stated plainly: closing a flag is not sweeping the
+spec.** This is the third instance in two days of the same shape —
+committing the rulings is not committing the contract (ruling 214(d)),
+and ratifying a rule is not reviewing its rationale (ruling 64). In every
+case the authoritative artefact was left behind by an update to the record
+*about* it. §7.3's flag block is now replaced by this ruling; §14.5 needs
+no change, because the ranks it describes were right all along.
