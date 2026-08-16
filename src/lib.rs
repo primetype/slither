@@ -161,6 +161,10 @@
 //! - [`shell`] — the I/O shell. Slice by slice it grows the driver and the
 //!   handles; today it carries [`shell::wire::Wire`], the datagram seam an
 //!   application supplies.
+//! - [`compat`] — §16.11's composability surface: `AsyncRead`/`AsyncWrite`
+//!   on the stream handles and the two `io::Error` conversions (ungated),
+//!   plus `Stream`/`Sink`, `tokio_util::codec` and `tower::Service` faces
+//!   behind their features. It adds **no verb and no state**.
 //! - `testutil` — the in-memory `Network` / `FlakyWire` / `FlakyPolicy`
 //!   fabric and the counting DH provider, behind the `test-util` feature.
 //!   Attested surface (ruling 60), not a test convention: it is
@@ -176,11 +180,23 @@
 //! | `test-util` | the `testutil` module, for driving slither in a downstream crate's tests |
 //! | `sink` | `Stream` / `Sink` adapters |
 //! | `codec` | `tokio_util::codec` support; implies `sink` |
-//! | `tower` | a `tower::Service` shape over the message verb |
+//! | `tower` | `tower::Service` shapes — **one bi stream per call** |
+//!
+//! **[RATIFIED 2026/08/16 — ruling 225]** The `tower` row read *"a
+//! `tower::Service` shape over the message verb"*, and that shape cannot
+//! work: slither has **no request/response correlation on the wire**, so a
+//! `Service` over §11 messages would need a request id the transport does
+//! not carry — slither would have to invent application framing above its
+//! own frame layer to find one. The correlation slither already has is a
+//! **stream**: `call()` opens one bi stream, `finish()` ends the request,
+//! EOF ends the response. `PLAN.md` §3.4 is the reasoned statement and it
+//! wins; this row and `Cargo.toml`'s comment were manifest text carrying no
+//! argument.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod compat;
 pub mod config;
 pub mod constants;
 pub mod error;
@@ -205,6 +221,18 @@ pub(crate) mod core;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
 
+/// §16.11's `LocalSet` helper, re-exported at the crate root.
+///
+/// Every slither handle and the driver behind them are `!Send` by
+/// requirement (S21), so a consumer must run them on a current-thread
+/// runtime inside a [`tokio::task::LocalSet`]. This is the one line that
+/// pays that tax; see [`compat::block_on`] for the copy-pasteable example
+/// and for what it panics on.
+///
+/// The adapter **types** are not re-exported here — they are named from
+/// `slither::compat::*`. `block_on` is the exception because it is the first
+/// thing a consumer needs.
+pub use compat::block_on;
 pub use config::{Config, SystemClock, WallClock};
 pub use error::{
     AcceptError, AuthError, ConfigError, ConnectError, ConnectionLost, DatagramError, IntroError,

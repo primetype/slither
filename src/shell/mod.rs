@@ -62,6 +62,21 @@ pub use self::shared::Notification;
 pub use self::staged::{Claimed, Intro, Proven};
 pub use self::stream::{BiStream, RecvStream, SendStream};
 
+/// **[ruling 228]** — the crate-internal name `crate::compat` builds against.
+///
+/// Ruling 228 promoted seven type-erased slot minters on [`Connection`] to
+/// `pub(crate)` *"so `crate::compat` can obtain a key"*, and their return
+/// type is `WakerSlot<Box<dyn FnMut(u64)>>` — a type every `Stream` adapter
+/// stores in a field for its whole life. **`mod shared` is private to
+/// `shell`**, so without this line the type the ruling names is not
+/// nameable from `crate::compat` and the accessors cannot be called at all.
+///
+/// The ruling states the construction and not its scope, which is working
+/// rule 8's shape; this is the smallest thing that discharges it — one
+/// re-export, no module made visible, and no behaviour changed.
+#[cfg(any(feature = "sink", feature = "tower"))]
+pub(crate) use self::shared::WakerSlot;
+
 #[cfg(test)]
 mod tests {
     //! Implementation smoke tests — **not** slice 3b's story tests.

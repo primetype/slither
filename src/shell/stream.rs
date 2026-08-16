@@ -922,6 +922,24 @@ impl<S: Handshake> BiStream<S> {
         (self.send, self.recv)
     }
 
+    /// The send half, for `compat::io`'s `AsyncWrite` delegation.
+    ///
+    /// **Borrowing, deliberately, rather than `split`ing**: §16.11's
+    /// `AsyncWrite for BiStream` writes through the send half while the
+    /// receive half stays attached, because *"a half-closed `BiStream` is
+    /// the shape `copy_bidirectional` and every request/response protocol
+    /// relies on"*. Taking the halves apart would drop one of them.
+    pub(crate) fn send_mut(&mut self) -> &mut SendStream<S> {
+        &mut self.send
+    }
+
+    /// The receive half, for `compat::io`'s `AsyncRead` delegation.
+    ///
+    /// [`send_mut`](Self::send_mut)'s reason, from the other side.
+    pub(crate) fn recv_mut(&mut self) -> &mut RecvStream<S> {
+        &mut self.recv
+    }
+
     /// Put two halves back together — **ruling 120**.
     ///
     /// Both must name the **same stream on the same connection**. On a
