@@ -6075,3 +6075,61 @@ first now reads *"elicit the `PATH_RESPONSE` that ends it"* rather than
 correctly did not touch `src/`. Citing a spec line **by number** from a
 comment is fragile in a document under revision, and the two instances
 here are the argument for citing section and sentence instead.
+
+### 213 — I2's remediation, and a third instance of the claim-about-an-unopened-document defect
+
+**(a) An adversarial reviewer asserted a spec gap that was not there.** The
+handshake review's M1 said §6.1's hazard paragraph *"discusses only the
+claimed static"*. It does not: `SPEC.md:1147-1149` reads *"the same
+discipline applies one stage earlier: `source()` and `sender_index()` are
+exposed at 0 DH and are equally attacker-chosen"*, and `git log -S` dates
+that sentence to the initial ratification commit `2274981`. I verified
+both.
+
+M1's **conclusion** survives — the crate's rustdoc genuinely carried no
+warning on `Intro::source()`, and that is now fixed. Only its premise was
+wrong.
+
+**This is the third instance today of one defect**: rulings 205 and 206
+were mine, this one is a reviewer's. All three asserted something about a
+document without opening it, and all three were one `grep` from
+refutation. Working rule 11's generalisation — *whichever artefact a claim
+is about is the artefact that must be opened* — is now carrying three
+confirmed cases in a single round, which makes it the most active rule in
+the file. I2 refuted this one by opening the section **and** dating the
+text with `git log -S`; that second step is the one nobody else has taken,
+and it is what distinguishes "the spec is silent" from "the spec was
+amended after the code".
+
+**(b) The implementer caught working rule 9 in its own contract.**
+`CONTRACT-7b.md` §5 specified F3's test as *"chunk count and byte content
+unchanged, no read available"*. I2 wrote that test and found it **passes
+against the pre-fix build** — it asserts nothing. It then found a real
+separator: ruling 94's `capacity()` accounting after a **partial** read,
+measured at 4096 → **4080** pre-fix (the realloc shrinks a drained chunk
+to exact capacity) and 4096 → **4096** post-fix.
+
+**Ruling: the contract was wrong and the implementer was right to say so
+rather than ship the test.** The separator is not handed to the blind test
+author T2 — it must derive its own or report that it cannot, which is what
+it was briefed to do. **If T2 reports no separator, the integrator adds
+this one and the disagreement is recorded**; if T2 finds one
+independently, that is two derivations and worth more than either.
+Handing a blind author the answer converts an independent check into a
+transcription.
+
+**(c) `CONTRACT-7b.md` §5 overstates its own invariant.** It claims the
+work becomes *"bounded by bytes that are new to the buffer"*. Bounded by
+the **existence** of a new byte, yes; **not linear in them** — a frame
+bridging two stored chunks still copies the whole span for one new byte.
+Defect class 1 in a contract this time: a stated construction with a scope
+broader than what it delivers.
+
+**(d) H3 is a spec gap, not a code defect — confirmed, and the doc-only
+fix stands.** §16.6 scopes itself to the endpoint core's RNG and the
+per-connection sub-seed; nothing in the spec governs the `Identity`
+provider's RNG, and the code mirrors that scope exactly. A
+`SoftwareIdentity::generate_os()` still wants a ruling. One correction to
+the plan's reasoning: `rand_core` 0.10 ships **no** `OsRng`/`from_os_rng`,
+so the consumer recipe really is `getrandom::fill` + `from_seed`, which is
+what was documented — actionable today rather than blocked on a ruling.
