@@ -6496,3 +6496,157 @@ rule 4(a) sends you to the rest of the sentence group:**
   history attached, because a boundary comment asserting a mechanism is a
   claim about the code beside it — **working rule 11 — and this one went
   unchecked through two rulings and thirty blind tests.**
+
+## Round 36 — slice 8's open questions, answered before dispatch (2026/08/16)
+
+The planner left **ten** open questions and resolved none unilaterally,
+which is working rule 3 applied correctly and is why this round is short.
+Q1 and Q6 were already discharged (ruling 209 moved S31–S33 into
+`STORIES.md`; slice 7b closed green at `cc5e282`). **There is no Q7** — the
+numbering jumps Q6 → Q8, and I record that rather than assume a question
+was lost, because an absent item in a numbered list is exactly the shape
+working rule 8 exists for. Three went to the maintainer; four I took.
+
+### 225 (maintainer) — the `tower` face is **one bi stream per call**, not the message verb
+
+Three statements, two of them wrong. `Cargo.toml` and `src/lib.rs:158`
+both described *"a `tower::Service` shape over the message verb"*;
+`PLAN.md` §3.4 held that this cannot work, because **slither has no
+request/response correlation on the wire** and a `Service` over §11
+messages would need a request id the transport does not carry.
+
+**Ratified: §3.4.** The correlation slither already has is a *stream* —
+`call()` opens one bi stream, `finish()` ends the request, EOF ends the
+response. The alternative required slither to invent application framing
+above its own frame layer to carry a request id, which would have been the
+first place the crate defined wire semantics above §8.
+
+Working rule 3's tiebreak decided it and is worth naming: *follow the
+statement some other proof depends on*. §3.4 carries an argument; the two
+contrary statements were **manifest comments carrying none**. A comment is
+not the formal side of a conflict merely by sitting in a build file.
+
+### 226 (maintainer) — the `Result`-carrying adapters **never end**
+
+After the connection dies they yield `Some(Err(ConnectionLost))` for as
+long as they are polled, never `None`. Faithful to the verbs they wrap:
+the underlying `poll_*` re-report the latched death indefinitely, and
+`ConnectionLost` is `Clone` *for that reason* (`src/error.rs:193`). It
+keeps the **reason** recoverable, which `None` destroys — a consumer
+wanting termination composes one combinator; a consumer handed `None`
+cannot recover what killed it.
+
+The cost is real and goes in the rustdoc of every such adapter: a bare
+`while let Some(_) = s.next().await` **spins**. This is ruling 119's class
+— *the convention whose inversion hangs a reader forever* — and the
+planner was right to refuse to let a blind author guess it.
+
+### 227 (maintainer) — §16.11's `io::ErrorKind` mapping, all nine variants
+
+§16.11 ratified two mappings for two enums totalling nine variants, and
+the second was **a slash with no rule for choosing** over a
+`ConnectionLost` with seven variants, silent on `WriteError::Finished`.
+Ratified as `CONTRACT-8.md` §8 wrote it, and **§16.11 gains §16.11.1** so
+the slash stops being load-bearing.
+
+The rule: *on the write side, a peer or transport that went away under a
+writer is `BrokenPipe`; a connection this side never had or gave up is
+`NotConnected`.* That reads the slash as a **variant** split, not a
+read/write direction split — which is how it was written, the comment
+having sat on the `WriteError` line alone. `TimedOut` is lifted out of
+both because `io::ErrorKind::TimedOut` exists and a `DEAD_TIMEOUT` death
+is what it names; collapsing it makes every death look alike to a consumer
+whose only view is `io::Error`.
+
+Two binding details that are not decoration: `WriteError` is
+`#[non_exhaustive]` (ruling 61 reserves `Stopped`), so the `_ =>` arm maps
+to `Other` and **must not** be `unreachable!()` — a panic on a variant a
+future minor version adds; and every arm constructs
+`io::Error::new(kind, err)` so the original downcasts back out.
+
+### 228 — ruling 122(a) named a real mechanism and an incomplete one
+
+122(a) kept the `poll_*` verbs `pub(crate)` on the ground that *"slice 8's
+`compat/` is in-crate and reaches them"*. True of the verbs; **not true of
+what they require.** Every `poll_*` takes `key: u64`, minted by a
+`WakerSlot` from seven plain `fn`s private to `shell::connection`, so
+`crate::compat` cannot obtain one — and without a slot an adapter has no
+key that is stable for its life and released on drop, which is the whole
+of the verbs' cancel-safety. Worse, `WakerSlot<impl FnMut(u64)>` is
+**unnameable**, so it cannot be an adapter struct's field at all.
+
+This is working rule 11 in a ruling of mine: *a rationale must name a
+mechanism that exists*, and 122(a)'s was checked against the verbs without
+being checked against their arguments.
+
+**Ruling: seven `pub(crate)` type-erased accessors returning
+`WakerSlot<Box<dyn FnMut(u64)>>`, alongside the existing private ones.**
+In-crate, additive, no public signature moves, so ruling 204 is untouched.
+The alternative — moving `compat/` under `src/shell/` — contradicts
+`PLAN.md` §3's layout and buries a consumer-facing surface inside the
+shell.
+
+### 229 — §16.11's adapter list omitted `incoming()`, and `Endpoint` gains `poll_accept`
+
+**Two findings, one cause.** §16.11 listed seven `Stream`/`Sink` faces,
+none of them the endpoint's, while `PLAN.md` §3.2 adds
+`Endpoint::incoming()` as an eighth. **The list is under-scoped, not the
+plan over-scoped:** ruling 58 governs `incoming` identically and nothing
+in §16.11 wanted it excluded. This is the **eighth** ruling of working
+rule 8's shape.
+
+The reason it was missed is the second finding. `accept()` is on ruling
+53's *channel* side, so it is the one adapter with no `poll_*` behind it —
+and an `Incoming` built on the `async fn` must box and store an in-flight
+future, which is **precisely the cost `SPEC.md` names as what ruling 53
+exists to avoid**. A face that could not be built the way the section
+builds every other face is a face that quietly falls off the section's
+list.
+
+**Ruling: `Endpoint` gains `pub(crate) poll_accept`, and `accept()` is
+written as `poll_fn` over it** — ruling 53's *"written once"* rule applied
+to the one verb that escaped it. The adapter then stores a
+`oneshot::Receiver`, which is `Unpin`.
+
+The planner's third observation is recorded and **not** treated as a
+defect: an `Incoming` holds a claim where a dropped `accept()` future
+releases one, so an `Intro` can move out of §6.3's queue and out of
+`INTRO_TTL`'s reach between polls. That is still *at most one item,
+claimed from inside `poll_next`*, so ruling 58 is satisfied; dropping
+`Incoming` mid-claim is §6.2's silent reject, which `accept()`'s rustdoc
+already documents as *"not a loss"*.
+
+### 230 — `Rpc` is **out** of slice 8, and `tower` stays `tower-service` only
+
+`PLAN.md` §3.4's `Rpc<C: Codec>` is defined over `C::Item`, so it cannot
+compile under `tower` alone — it needs either `tower = ["codec", ...]` or
+a `cfg(all(..))` gate. The planner recommended keeping it and cutting it
+"if the slice runs long".
+
+**Ruling: cut it now.** A maybe-item makes Agent B's
+`required-features` ambiguous, and the planner itself said that must be
+settled *before* briefing — an item whose presence is decided at
+integration is an item two blind agents disagree about in public. S33's
+acceptance text is satisfied by the `Service` impl plus `serve` without
+`Rpc`, by the planner's own reading, and ruling 225 makes that the honest
+shape anyway. `tower` therefore stays the cheap dependency §3.4 describes,
+and `story_tower`'s features are `["test-util", "tower"]`.
+
+`tower` **0.5 with `util` only** is added as a dev-dependency: S33 asserts
+`UnsyncBoxService` composes and that type is not in `tower-service`.
+`default-features = false` is deliberate — `tower`'s defaults pull the
+buffered and spawn-ready layers, which §16.11's `!Send` paragraph names as
+exactly what does *not* compose with a `!Send` driver.
+
+### 231 — the adapters borrow, and the rustdoc shows the consequence
+
+Neither handle is `Clone`, and `Connection`'s last-handle-drop rule
+(`close(NO_ERROR, "")`) is load-bearing, so every adapter borrows:
+`Messages<'a, H>`, `Incoming<'a, I>`. `PLAN.md` §3.2 wrote them without
+lifetimes, which reads as owning.
+
+The consequence a consumer meets is that **a borrowed adapter cannot be
+moved into `spawn_local`** — the `Connection` moves in and the adapter is
+built inside the task. That is workable, it is what the rustdoc must show,
+and it is not a defect. Making `Connection: Clone` would change a ratified
+handle's semantics and is emphatically not slice 8's to do.

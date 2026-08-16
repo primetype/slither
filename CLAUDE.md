@@ -33,9 +33,14 @@ code. Do not consult them for current behaviour.
 ## What is being built
 
 A clean rewrite against `SPEC.md`, planned in `PLAN.md` as ten vertical
-slices. **`STORIES.md`'s 30 approved capability stories are the
+slices. **`STORIES.md`'s 33 approved capability stories are the
 acceptance criteria**: a slice is done when its stories are
 paused-clock tests that pass, not when its code compiles.
+
+*(30 until ruling 209 approved S31–S33 into `STORIES.md` §I. This
+sentence read "30" for a full slice afterwards — rule 4's shape, in the
+one file rule 3 already records as the document nothing sweeps but
+deliberate intent.)*
 
 ## Crypto rules
 

@@ -67,7 +67,21 @@ sink = ["dep:futures-core", "dep:futures-sink"]
 # terms of it, so enabling `codec` alone must not be a compile error.
 codec = ["sink", "dep:tokio-util"]
 
-# A `tower_service::Service` shape over the message verb. Slice 8.
+# A `tower_service::Service` shape over §16.2's verbs. Slice 8.
+#
+# **[RATIFIED 2026/08/16 — ruling 225]** This comment read *"over the message
+# verb"* and that shape cannot work: slither has **no request/response
+# correlation on the wire**, so a `Service` over §11 messages would need a
+# request id the transport does not carry — slither would have to invent
+# application framing above its own frame layer to find it. The correlation
+# slither already has is a **stream**: one bi stream per call, opened by
+# `call()`, the request ended by `finish()` and the response by EOF.
+# `PLAN.md` §3.4 is the reasoned statement and it wins; this line and
+# `src/lib.rs`'s feature table were manifest comments carrying no argument.
+#
+# Deliberately still `tower-service` only — the cheap dependency. Ruling 230
+# keeps `Rpc<C: Codec>` out of slice 8 rather than gating it on `codec`, so
+# nothing here implies `tokio-util`.
 tower = ["dep:tower-service"]
 
 [dependencies]
@@ -175,6 +189,15 @@ tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net",
 # derivations checked against a second data point. No runtime dependency, no
 # version change, no wire byte.
 hiss = { version = "0.3.2", features = ["x25519-cryptoxide"] }
+
+# Slice 8, S33 only. NOT the library dependency — that is `tower-service`, the
+# bare trait, and ruling 225 keeps it that way. S33's acceptance asserts that
+# *"`UnsyncBoxService` composes"*, and `UnsyncBoxService` lives in `tower`'s
+# `util` feature, not in `tower-service`. Dev-only, so no consumer inherits it.
+# `util` is deliberately the *only* feature: `tower`'s defaults pull the
+# buffered/spawn-ready layers, which are exactly what §16.11's `!Send`
+# paragraph says does **not** compose with a `!Send` driver.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # ── Integration test targets ──────────────────────────────────────────────
 # The three story/spec suites drive two endpoints over `slither::testutil`,
 # which lives behind `test-util`. Declared here rather than as an inner

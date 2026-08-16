@@ -6202,9 +6202,54 @@ impl BiStream {
 impl tokio::io::AsyncRead  for BiStream {}
 impl tokio::io::AsyncWrite for BiStream {}
 
-impl From<ReadError>  for std::io::Error {}   // Reset → ConnectionReset
-impl From<WriteError> for std::io::Error {}   // ConnectionLost → NotConnected / BrokenPipe
+impl From<ReadError>  for std::io::Error {}   // §16.11.1 — the full table
+impl From<WriteError> for std::io::Error {}   // §16.11.1 — the full table
 ```
+
+#### 16.11.1 The `io::ErrorKind` mapping
+
+**[RATIFIED 2026/08/16 — ruling 227.]** Until this ruling, the two lines
+above read `Reset → ConnectionReset` and `ConnectionLost → NotConnected /
+BrokenPipe`. The first is unambiguous. The second was **a slash between
+two kinds with no rule for choosing**, over a `ConnectionLost` with seven
+variants, and said nothing about `WriteError::Finished` at all — working
+rule 8's defect class, a stated construction with an unstated scope, in a
+conversion an `AsyncRead`/`AsyncWrite` consumer meets on every error.
+
+| Variant | read → `ErrorKind` | write → `ErrorKind` |
+|---|---|---|
+| `Reset(code)` | `ConnectionReset` | `ConnectionReset` |
+| `Finished` | *(not a `ReadError`)* | `BrokenPipe` |
+| `ConnectionLost(TimedOut)` | `TimedOut` | `TimedOut` |
+| `ConnectionLost(NonceExhausted)` | `ConnectionAborted` | `BrokenPipe` |
+| `ConnectionLost(LocallyClosed)` | `NotConnected` | `NotConnected` |
+| `ConnectionLost(PeerClosed { .. })` | `ConnectionAborted` | `BrokenPipe` |
+| `ConnectionLost(ProtocolViolation { .. })` | `ConnectionAborted` | `BrokenPipe` |
+| `ConnectionLost(Replaced)` | `ConnectionAborted` | `BrokenPipe` |
+| `ConnectionLost(EndpointDropped)` | `NotConnected` | `NotConnected` |
+
+**The rule, stated so it can be judged rather than memorised:** on the
+write side, a peer or transport that went away *under a writer* is
+`BrokenPipe`; a connection *this side* never had or gave up is
+`NotConnected`. This reads the original slash as a **variant** split
+rather than a read/write direction split — which is how it was written,
+the comment having sat on the `WriteError` line alone.
+
+`TimedOut` is lifted out of both columns because `io::ErrorKind::TimedOut`
+exists and a `DEAD_TIMEOUT` death is exactly what it names; collapsing it
+would make every death look alike to a consumer whose only view is
+`io::Error`.
+
+Two binding details, both directly testable:
+
+- **`WriteError` is `#[non_exhaustive]`** (ruling 61 reserves `Stopped`),
+  so the conversion needs a `_ =>` arm. It maps to `ErrorKind::Other` and
+  **must not** be `unreachable!()` — that is a panic on a variant a future
+  minor version adds.
+- **The inner error is preserved.** Every arm constructs
+  `io::Error::new(kind, err)`, so `e.into_inner().downcast::<ReadError>()`
+  recovers the original including a reset's `u64` code. The `ErrorKind` is
+  a lossy projection for ecosystem code; nothing is discarded.
 
 - **[Ruling 55 — `open_bi`/`accept_bi` yield `BiStream`.]** §16.2's
   signatures return the duplex object rather than the
@@ -6239,10 +6284,34 @@ impl From<WriteError> for std::io::Error {}   // ConnectionLost → NotConnected
   wrong, and Appendix B pins it.
 
 The `Stream`/`Sink` faces (`messages`, `datagrams`, `incoming_bi`,
-`incoming_uni`, `notifications`, and the two sinks), the codec
+`incoming_uni`, `notifications`, `incoming`, and the two sinks), the codec
 constructors, and any `tower::Service` shapes are ordinary adapters over
 §16.2's verbs under ruling 58 and are otherwise unconstrained by this
 document.
+
+**[ruling 229]** `incoming` — the `Stream` over `Endpoint::accept()` — was
+missing from that list, which named seven faces, none of them the
+endpoint's. **Working rule 8 reads a list as exhaustive whether or not it
+says so**, and this is the eighth ruling of that shape. It is added rather
+than the plan's eighth face being struck, because ruling 58 governs it
+identically and nothing in this section wanted it excluded.
+
+`Endpoint::accept()` is on ruling 53's **channel** side (§6.2 puts the DH
+on the driver task), so it is the one adapter with no `poll_*` behind it.
+An implementation must supply one — see ruling 229 — rather than boxing an
+in-flight future inside the adapter, which is the cost the paragraph below
+ruling 53 names as what that ruling exists to avoid.
+
+**Termination. [RATIFIED 2026/08/16 — ruling 226]** The `Result`-carrying
+faces **never end**: after the connection dies they yield
+`Some(Err(ConnectionLost))` for as long as they are polled, and never
+`None`. This is faithful to the verbs they wrap — the underlying `poll_*`
+re-report the latched death indefinitely, and `ConnectionLost` is `Clone`
+for exactly that reason — and it keeps the *reason* recoverable, which a
+`None` destroys. A consumer wanting the terminating shape composes one
+combinator; a consumer handed `None` cannot recover what killed it. The
+rustdoc on every such adapter must say so, because a bare
+`while let Some(_) = s.next().await` spins.
 
 **The `!Send` boundary, stated so it is not discovered late.** §16.3's
 driver is `!Send` by requirement, not by accident, and S21 is why. The

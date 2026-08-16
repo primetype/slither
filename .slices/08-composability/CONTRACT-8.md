@@ -1,6 +1,59 @@
 # CONTRACT-8 — binding API contract for slice 8 (`compat/`)
 
-**Base commit:** `5ed5bb4`.
+**Base commit:** see §0.0 — **`5ed5bb4` is stale and must not be used.**
+
+---
+
+## 0.0 Amendments — PLAN-8's open questions are all answered
+
+**[2026/08/16, integrator. Read this section before anything else; where it
+contradicts the body, this section wins and the body is marked.]**
+
+`PLAN-8.md` §Open questions left ten items unresolved and said so. All are now
+closed, three by the maintainer and four by ruling. **Nothing below is a
+recommendation any more.**
+
+| Q | Answer | Ruling |
+|---|---|---|
+| Q1 | S31–S33 are in `STORIES.md` §I; the list stands at **33** | 209 |
+| Q2 | Seven `pub(crate)` accessors returning `WakerSlot<Box<dyn FnMut(u64)>>` | **228** |
+| Q3 | `Endpoint` gains `pub(crate) poll_accept`; `accept()` becomes `poll_fn` over it. §16.11's face list gains `incoming` | **229** |
+| Q4 | `tower` is **one bi stream per call**, never the message verb | **225** |
+| Q5 | `Rpc` is **out of scope**; T5 is the `Service` impls plus `serve` | **230** |
+| Q6 | Slice 7b closed green; base below is that commit | — |
+| Q7 | **Does not exist** — PLAN-8 numbers Q6 → Q8 | — |
+| Q8 | The nine-row `io::ErrorKind` table in §8 is ratified; `SPEC.md` gains §16.11.1 | **227** |
+| Q9 | The `Result`-carrying adapters **never end** | **226** |
+| Q10 | Adapters **borrow**; every adapter type carries a lifetime | **231** |
+
+**Consequences that change what you build:**
+
+1. **§8's tables are no longer "recommended".** They are §16.11.1, ratified.
+   The ⚠ banner at the head of §8 is obsolete — read the tables as binding.
+2. **Never-ending streams (226).** Every `Stream` yielding
+   `Result<_, ConnectionLost>` returns `Some(Err(..))` for ever after death and
+   **never** `None`. No adapter carries a "finished" flag. The rustdoc on each
+   must warn that a bare `while let Some(_) = s.next().await` **spins**.
+3. **`tower` (225, 230).** `impl Service<()> for Connection<H>` with
+   `Response = BiStream<H>`: `call()` opens one bi stream and the stream *is*
+   the correlation. Plus `serve`. **No `Rpc`, no `Codec` bound, no `codec`
+   feature interaction.** `story_tower`'s features are
+   `["test-util", "tower"]`. A dev-dependency `tower = { version = "0.5",
+   default-features = false, features = ["util"] }` exists for
+   `UnsyncBoxService`.
+4. **Lifetimes (231).** `Messages<'a, H>`, `Datagrams<'a, H>`,
+   `IncomingBi<'a, H>`, `IncomingUni<'a, H>`, `Notifications<'a, H>`,
+   `Incoming<'a, I>` — every adapter borrows its handle. Each type's rustdoc
+   shows the `spawn_local` shape: move the `Connection` into the task and
+   build the adapter inside it.
+5. **`Incoming` (229)** stores a `oneshot::Receiver<Intro<I>>`, which is
+   `Unpin` — **not** a boxed future.
+
+**Base commit:** `5ed5bb4` was the planner's base and is **superseded**. Cut
+from the commit named in your brief, and check it with `git log --oneline -1`
+as your first command (working rule 14 — slice 7's third author was briefed at
+one commit and cut from another, and caught it only because it ran that check
+first).
 
 **This file is binding on every slice-8 agent.** A blind test author must be
 able to write compiling tests from this file alone (rule 14: slice 4a's author
