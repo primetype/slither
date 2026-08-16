@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter, ReadBuf};
 
 use slither::constants::DEAD_TIMEOUT;
-use slither::testutil::{FlakyPolicy, Pair, addr_a, addr_b, local, settle};
+use slither::testutil::{FlakyPolicy, Pair, TestRecvStream, addr_a, addr_b, local, settle};
 use slither::{ConnectionLost, ReadError, WriteError};
 
 // ══════════════════════════════════════════════════════════════════════
@@ -700,7 +700,13 @@ async fn s31_a_read_into_an_empty_buffer_is_not_end_of_file() {
         let mut empty: [u8; 0] = [];
         let mut rb = ReadBuf::new(&mut empty);
         let mut cx = Context::from_waker(Waker::noop());
-        let r = Pin::new(&mut recv).poll_read(&mut cx, &mut rb);
+        // Fully qualified, and not `Pin::new(&mut recv).poll_read(..)`:
+        // `RecvStream` already has an **inherent** `pub(crate) poll_read`
+        // taking a `&mut [u8]`, and method resolution reaches an inherent
+        // method before a trait one. Spelled the short way this call resolves
+        // to the inherent method and fails as `E0624: method poll_read is
+        // private` — which is what it did here before this comment existed.
+        let r = <TestRecvStream as AsyncRead>::poll_read(Pin::new(&mut recv), &mut cx, &mut rb);
         assert!(
             matches!(r, Poll::Ready(Ok(()))),
             "CONTRACT-8.md §3.2: `remaining() == 0` is short-circuited to \
