@@ -1522,3 +1522,62 @@ fn count_all_events(d: &Drained) -> usize {
         .filter(|o| matches!(o, ConnOutput::Event(_)))
         .count()
 }
+
+// ── Integrator, ruling 221 ────────────────────────────────────────────────
+//
+// §8.7's standing obligation, on the one path this file's thirty blind tests
+// cannot reach: **the challenge packet itself is lost**. Every re-offer
+// asserted above rides a packet the connection was building anyway — real
+// output, a contested probe, or §12.4's delayed ACK. None of them exercises
+// the state §8.7 was written for, and working rule 13 names the reason: the
+// fixture bounds the coverage. `Solo` has no peer, so *every* packet it emits
+// is lost, and that is exactly the fixture this needs.
+//
+// Measured on the build that failed it: the PTO probe emitted `[Ping]` and
+// the connection died at `DEAD_TIMEOUT` with the address never validated —
+// §8.7's *"sent once and lost forever, which §7.3's no-deadlock argument
+// cannot survive"*, verbatim.
+
+/// §8.7: a PTO probe to an unvalidated address carries the challenge, not a
+/// bare PING.
+///
+/// # What the degenerate build does (working rule 9)
+///
+/// A build whose challenge only ever rides output it already owed passes
+/// every other test in this file and fails here on the first probe: it sends
+/// `[Ping]`, because §13.4's `packing.ping()` fires exactly when the first
+/// three packing stages produced nothing that elicits. Asserting "the probe
+/// is ack-eliciting" would **not** separate them — the PING satisfies that
+/// for free. The assertion has to name the frame.
+#[test]
+fn a_pto_probe_to_an_unvalidated_address_carries_the_challenge() {
+    let mut solo = Solo::installed_at(origin());
+
+    let now = origin() + Duration::from_millis(10);
+    let issued = roam_and_collect(&mut solo, now, c_addr());
+    assert_eq!(issued.len(), 1, "the arming offers its challenge once");
+
+    // Nothing answers. The challenge packet is ack-eliciting (§8.3), so it
+    // sits in the sent map and §13.4 arms the PTO on it.
+    let d = drain(&mut solo.conn);
+    let deadline = d.deadline.expect("an unanswered challenge arms a deadline");
+    solo.conn.handle_timeout(deadline);
+    let d = drain(&mut solo.conn);
+    let frames = solo.drain_frames(&d);
+
+    assert_eq!(
+        challenges(&frames),
+        vec![issued[0]],
+        "§8.7: `PATH_CHALLENGE` is **owed for as long as the arming lasts** \
+         and is re-emitted with the **same** eight bytes. The probe carried \
+         {frames:?} instead — a build that emits the challenge once and lets \
+         loss end it is the *\"sent once and lost forever\"* §8.7 says \
+         §7.3's no-deadlock argument cannot survive.",
+    );
+    assert!(
+        !frames.iter().any(|f| matches!(f, Wire::Ping)),
+        "§13.4's PING is owed only when the first three stages produced \
+         nothing that elicits; the challenge elicits, so no PING is owed \
+         beside it. Frames: {frames:?}",
+    );
+}

@@ -6258,3 +6258,86 @@ and ratifying a rule is not reviewing its rationale (ruling 64). In every
 case the authoritative artefact was left behind by an update to the record
 *about* it. §7.3's flag block is now replaced by this ruling; §14.5 needs
 no change, because the ranks it describes were right all along.
+
+## Round 35 — auditing ruling 208's challenge (2026/08/16)
+
+### 221 — **§8.7's standing obligation was not implemented. A lost `PATH_CHALLENGE` was never asked again.**
+
+**[RATIFIED 2026/08/16 — the audit the maintainer asked for, and it found
+a live defect rather than a documentation gap.]**
+
+**The defect.** §8.7 ratifies the challenge as **owed for as long as the
+arming lasts**, re-emitted *"whenever §7.3's budget admits a packet and
+the address is still unvalidated"*, and states its own reason in the
+clause immediately before:
+
+> The distinction matters, because "never retransmitted" would otherwise
+> read as **"sent once and lost forever"**, which §7.3's no-deadlock
+> argument cannot survive.
+
+The send pump offered the challenge only when
+`owes_output() || contested.is_pending() || ack.is_owed()`. None of those
+holds on a connection whose *only* outstanding packet is the challenge
+itself. §13.4 then arms the PTO on that packet — it is ack-eliciting — the
+probe finds nothing owed, and `packing.ping()` builds a **bare PING**. The
+address never validates and the session dies at `DEAD_TIMEOUT`.
+
+The implementation was exactly the sentence §8.7 says the no-deadlock
+argument cannot survive.
+
+**Measured before it was ruled on, on a core with no peer:**
+
+```
+AUDIT arming challenge count = 1
+AUDIT round 0 @ 1.034s: 1 transmits, frames = [Ping]
+AUDIT round 1 @ 3.082s: 0 transmits, frames = []
+...
+AUDIT round 5 @ 25.01s: connection closed
+```
+
+**Ruling. `probe` is the fourth disjunct.** A firing PTO offers the
+challenge, and §13.4's "else a bare PING" arm never fires beside it
+because the challenge elicits on its own. `SPEC.md` **§13.4 gains the
+third case** and §8.3's PING bullet gains the carve-out; §8.7 needed no
+change at all, because §8.7 was right and the code was wrong. That is
+worth stating separately: **this is the first defect of this round where
+the spec was already correct**, and the whole cost was that nobody had
+driven the state it describes.
+
+**Why this is not ruling 217's manufacture.** 217's first draft built a
+packet *for* the challenge and hung the suite, because the pump has no
+memory across calls and every pump emitted a fresh one. Here the packet
+exists because **the PTO fired**; the challenge rides a carrier it did not
+create, and §13.3's doubling paces the re-offer.
+
+**The budget still bounds it, and the measurement shows the bound
+working.** After the fix the offer is made on every probe and rounds 1–4
+emit nothing: `room=10` against the 39 bytes a challenge datagram costs.
+That is §8.7's *"whenever §7.3's budget admits a packet"* discharging
+correctly, not a residual defect — the obligation stands, the budget
+holds it, and `DEAD_TIMEOUT` ends it.
+
+**Ruling 217's `dedicated_sent` machinery is deleted, not wired up.**
+`owes_dedicated_challenge`, `on_dedicated_challenge_sent` and the field
+behind them were called from **nowhere**: an abandoned once-per-arming
+manufacture, left in the tree when 217's first draft was reverted. It was
+an attempt at the gap this ruling closes, and the PTO is the better
+mechanism — it is also the one `Amplification`'s own doc-comment already
+claimed was in force (*"Retransmission of an unanswered challenge is
+§13.4's PTO"*), which is working rule 11 in miniature: a doc describing a
+mechanism that was not there.
+
+### 221(a) — the blind fixture could not have caught this, and says so
+
+All thirty of T1's path tests drive re-offers through a packet the
+connection was building anyway. **Not one of them loses the challenge.**
+This is working rule 13 — *the fixture bounds the coverage* — with an
+unusually sharp edge: `Solo` has no peer, so every packet it emits is
+already lost, and the state was one `handle_timeout` away the whole time.
+
+The new test is the integrator's and is named for what separates the
+builds, not for the property (working rule 9): a build that only rides
+existing output passes every other test in the file and emits `[Ping]`
+here. Asserting *"the probe is ack-eliciting"* would **not** have
+separated them — the PING satisfies that for free. The assertion has to
+name the frame.

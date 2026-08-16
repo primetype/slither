@@ -2151,8 +2151,35 @@ impl<C: Handshake> Connection<C> {
             // `an_idle_unvalidated_connection_owing_nothing_emits_no_challenge`,
             // and the reason this is a disjunct rather than an unconditional
             // `owe_challenge`.
+            //
+            // **[RATIFIED — ruling 221]** `probe` is the fourth disjunct, and
+            // its absence was the defect §8.7 names by its own words: without
+            // it a **lost** challenge is never re-emitted. §13.4 arms the PTO
+            // on the challenge packet (it is ack-eliciting), the probe finds
+            // nothing else owed, `packing.ping()` below builds a bare PING,
+            // and the address stays unvalidated until `DEAD_TIMEOUT` kills
+            // the session — *"sent once and lost forever, which §7.3's
+            // no-deadlock argument cannot survive"* (§8.7), verbatim and
+            // measured.
+            //
+            // This is the **retransmission** half of the standing obligation,
+            // and §8.7 puts it here rather than in loss recovery: neither
+            // path frame is ever re-queued by loss detection, so the PTO — a
+            // timer the challenge itself arms — is the only thing that can
+            // ask again on a connection with nothing else to say. It is what
+            // `Amplification`'s own doc already claimed was happening.
+            //
+            // No livelock: `probe` is set by a firing PTO and cleared after
+            // the first iteration below, so this offers one challenge per
+            // probe on §13.3's doubling schedule, bounded by `DEAD_TIMEOUT`.
+            // It is not the manufacture ruling 217's first draft attempted —
+            // the packet exists because the PTO fired, not because the
+            // challenge wanted one.
             let offer = owe_challenge
-                && (self.owes_output() || self.contested.is_pending() || self.ack.is_owed());
+                && (self.owes_output()
+                    || self.contested.is_pending()
+                    || self.ack.is_owed()
+                    || probe);
             let path = self.pack_path_frames(&mut packing, offer);
             // Stages 2 and 3 — credit grants and RESET_STREAM, then the
             // STREAM and DATAGRAM fill.

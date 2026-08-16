@@ -88,22 +88,6 @@ pub(crate) struct Amplification {
     sent: u64,
     /// Authenticated **and window-fresh** datagram bytes received from it.
     recv: u64,
-    /// **[ruling 217]** Whether this arming has already sent a **dedicated**
-    /// challenge packet — one carrying nothing but the path frames.
-    ///
-    /// §8.7 re-offers the challenge on *every* packet built to an
-    /// unvalidated address, and that ride-along is free. A packet built
-    /// **for** the challenge is not: the pump has no memory across calls, so
-    /// without this flag every pump emits a fresh dedicated packet, and any
-    /// helper that drives a pair to quiescence never reaches it. That is not
-    /// a hypothetical — it hung the suite on ruling 217's first
-    /// implementation.
-    ///
-    /// Reset by construction: `arm()` is the only way to become unvalidated,
-    /// and it builds a whole new value. Retransmission of an unanswered
-    /// challenge is §13.4's PTO, which is exempt from the congestion gate
-    /// and packs the challenge like any other packet.
-    dedicated_sent: bool,
 }
 
 impl Default for Amplification {
@@ -124,7 +108,6 @@ impl Amplification {
             challenge: [0u8; 8],
             sent: 0,
             recv: 0,
-            dedicated_sent: false,
         }
     }
 
@@ -141,7 +124,6 @@ impl Amplification {
             challenge,
             sent: 0,
             recv: credit,
-            dedicated_sent: false,
         }
     }
 
@@ -151,22 +133,6 @@ impl Amplification {
     /// that has already answered one.
     pub(crate) fn outstanding_challenge(&self) -> Option<[u8; 8]> {
         (!self.validated).then_some(self.challenge)
-    }
-
-    /// **[ruling 217]** Whether this arming still owes a **dedicated**
-    /// challenge packet — one built for the challenge rather than carrying
-    /// it alongside real output.
-    ///
-    /// True exactly once per arming. The ride-along offer in the pump's loop
-    /// is governed by [`outstanding_challenge`](Self::outstanding_challenge)
-    /// and is unaffected.
-    pub(crate) fn owes_dedicated_challenge(&self) -> bool {
-        !self.validated && !self.dedicated_sent
-    }
-
-    /// Record that this arming's dedicated challenge packet has left.
-    pub(crate) fn on_dedicated_challenge_sent(&mut self) {
-        self.dedicated_sent = true;
     }
 
     /// Whether a datagram of `len` bytes may leave for this address now.

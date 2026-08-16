@@ -2881,7 +2881,10 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   and the carrier of the contested-connection probe below, sealed via
   `seal_quiet` — liveness-neutral, i.e. non-marking; being
   ack-eliciting it still *arms* the death clock (§7.4, §13.3). Two
-  signals, two masters.
+  signals, two masters. **[ruling 221]** It is not the *only* thing a PTO
+  can carry: on an unvalidated address §13.4's probe carries
+  `PATH_CHALLENGE` instead, which is ack-eliciting in its own right, so no
+  PING is owed beside it.
 - **The contested-connection probe** (ruling 36). When §6.4 refuses an
   `accept()` because the live connection's `replacement_basis` is `None`,
   that connection is marked **contested**. Marking does three things, in
@@ -4523,7 +4526,24 @@ A firing PTO sends one ack-eliciting packet: pending retransmittable
 frames oldest-first if any exist, else a bare PING. The one-packet,
 pending-oldest-first-else-PING content rule is a **deliberate
 simplification** of RFC 9002 §6.2.4, which sends new data before old and
-up to two datagrams. Probes are sealed
+up to two datagrams.
+
+**[RATIFIED 2026/08/16 — ruling 221]** There is a **third** case, and the
+two-case rule above was read as exhaustive because §8 reads every list
+that way. On an **unvalidated** address the probe carries §7.3's
+`PATH_CHALLENGE` — the packet is built for the PTO, and §8.7's standing
+obligation puts the challenge on it exactly as it does on any other packet
+the budget admits. No PING is owed beside it: `PATH_CHALLENGE` is
+ack-eliciting (§8.3), so the "else" arm never fires. This is the **only**
+mechanism by which a lost challenge is asked again — §8.7 keeps both path
+frames out of loss recovery, so on a connection with nothing else to say
+the PTO is the sole timer that can re-ask, and without it §8.7's
+*"sent once and lost forever"* is what the implementation does. The probe
+remains subject to §7.3's budget (below), which is what bounds the
+re-offer: a budget with no room for a 39-byte challenge datagram emits
+nothing, and the session dies at `DEAD_TIMEOUT` as §7.3 intends.
+
+Probes are sealed
 `seal_quiet` (liveness-neutral, §7.4) **and** exempt from the congestion
 admission gate (§14.5) — two independent properties of the same send, for
 different reasons (a partitioned session must still die; a black-holed
