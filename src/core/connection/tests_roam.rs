@@ -457,15 +457,23 @@ fn an_accepted_connection_is_armed_from_its_msg1_anchor() {
     );
     let solo = Solo::around(conn, sa);
 
+    // **[A2]** `sent` is `RESP_PACKET_LEN`, not 0: the endpoint's msg2 went
+    // to this unvalidated anchor before this connection existed, and §7.3
+    // caps *total bytes sent*. Leaving those 107 uncounted measured 3.55×
+    // against a normative MUST of 3.
     assert_eq!(
         solo.conn.amplification_budget(),
-        Some((0, constants::INIT_PACKET_LEN as u64)),
-        "the msg1 credits the budget and nothing has been sent yet"
+        Some((
+            constants::RESP_PACKET_LEN as u64,
+            constants::INIT_PACKET_LEN as u64
+        )),
+        "the msg1 credits the budget and the msg2 it provoked is charged to it"
     );
-    assert_eq!(
-        solo.conn.validation_floor(),
-        0,
-        "the floor is the counter the next seal will use, and none has run"
+    // **[ruling 208]** The floor is gone; what the arming records is the
+    // eight-byte challenge this address must echo.
+    assert!(
+        solo.conn.outstanding_challenge().is_some(),
+        "an armed budget owes a challenge to the address it is armed against"
     );
 }
 

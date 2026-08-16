@@ -172,6 +172,15 @@ pub(crate) struct Driver<I: Identity, W: Wire> {
     /// The identity-erased handle a `Connection` keeps (see [`ShellLink`]).
     /// Built once: every connection handle clones this `Rc`.
     link: Rc<dyn ShellLink>,
+    /// The instant [`handle_timeout`](Self::handle_timeout) last ran, if the
+    /// loop has not seen another kind of event since.
+    ///
+    /// **F1's spin detector, and nothing else reads it.** A deadline that is
+    /// merely *overdue* is ordinary; one still due at the instant the
+    /// timeout pass just ran is a timer its own firing re-armed in the past.
+    /// See [`deadline`](Self::deadline) for why the difference is the whole
+    /// of ruling 141's class.
+    last_timeout: Option<std::time::Instant>,
 }
 
 impl<I: Identity + 'static, W: Wire> Driver<I, W> {
@@ -185,6 +194,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             link: Rc::new(shell.clone()),
             shell,
             commands,
+            last_timeout: None,
             conns: BTreeMap::new(),
             ready: VecDeque::new(),
             waiting: VecDeque::new(),
@@ -258,6 +268,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                     () = sleep_until(deadline), if deadline.is_some() => Event::Timeout,
                 }
             };
+
+            if !matches!(event, Event::Timeout) {
+                self.last_timeout = None;
+            }
 
             match event {
                 Event::Command(Some(command)) => self.handle_command(command),
@@ -885,6 +899,12 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
 
     fn handle_timeout(&mut self) {
         let now = now();
+        // **F1's detector.** Recorded so `deadline` can tell an *overdue*
+        // timer — legitimate, and the ordinary case after the clock advances
+        // while this task is parked — from one the firing itself re-armed in
+        // the past, which is ruling 141's spin and §16.5's idempotence
+        // failing at once. Cleared by every other event below.
+        self.last_timeout = Some(now);
         self.shell.state.borrow_mut().endpoint.handle_timeout(now);
         for record in self.conns.values() {
             let mut cell = record.cell.borrow_mut();
@@ -900,6 +920,46 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// Read out of `poll_output()`'s terminal `Timeout`, which §16.4 makes
     /// "simultaneously the drain sentinel and the next-deadline
     /// announcement".
+    ///
+    /// # The spin detector, and why it is not `deadline >= now` (**F1**)
+    ///
+    /// A core that announces a deadline **already passed** makes step 4's
+    /// `sleep_until` complete immediately, `handle_timeout` re-fire the same
+    /// timer, and the actor spin at 100 % of one core. **Clamping to `now`
+    /// here would change nothing**: `sleep_until(max(d, now))` completes
+    /// immediately for exactly the same set of deadlines, so the loop runs
+    /// at the same rate — it would look like a second-line defence and be a
+    /// no-op. An assertion is the thing that pays. A spin is invisible on
+    /// the wire (ruling 141) and unreachable from `FlakyWire`, which models
+    /// a network and not a CPU (working rule 13), so the one function every
+    /// drain passes through is where the whole class becomes a test failure
+    /// in every debug-mode run — including for the instances nobody has
+    /// found yet.
+    ///
+    /// **`CONTRACT-7b.md` §4.2 specifies that assertion as
+    /// `debug_assert!(deadline >= now)`, and that predicate is too strong.**
+    /// It fires on a **correct** state and does so on an existing test:
+    /// `sd6_a_lost_datagram_is_never_retransmitted_and_never_blocks`
+    /// announces a `Pto` 1.974 s in the past — verified identical at this
+    /// slice's base commit, so it predates every change here. That deadline
+    /// is `last_ack_eliciting + pto`, and when the clock advances while the
+    /// driver is parked it is **already past the first time it is computed**.
+    /// The driver's very next act is to fire it; a probe leaves, the deadline
+    /// moves forward, and nothing spins. *Overdue is not spinning.* A
+    /// spinning core does announce a past deadline, but the converse does not
+    /// hold, and asserting the converse is working rule 12's *true lemma
+    /// about the wrong state*.
+    ///
+    /// What ruling 141's class actually is: a timer **the firing itself
+    /// re-arms in the past**. §16.5 already forbids exactly that, from the
+    /// other side — `handle_timeout` is idempotent, *"every due deadline is
+    /// stopped before its logic runs, so a repeated call at one instant finds
+    /// an empty due set"* — and a deadline still due at the instant the
+    /// timeout pass just ran is that empty set being non-empty. So the
+    /// detector below keys on [`last_timeout`](Self::last_timeout): it fires
+    /// only when the previous loop event was a timer firing at `t` and a core
+    /// is still announcing a deadline at or before `t`. No threshold, no
+    /// tolerance, and no false positive from an overdue timer.
     ///
     /// # It must be called with no yield since the drain
     ///
@@ -934,6 +994,11 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 }
             })
             .chain(endpoint)
+            .inspect(|announced| {
+                if let Some(fired_at) = self.last_timeout {
+                    debug_assert!(*announced > fired_at, "{PAST_DEADLINE}");
+                }
+            })
             .min()
     }
 
@@ -1315,6 +1380,13 @@ fn session_id_of<S: Handshake>(cell: &Rc<RefCell<ConnCell<S>>>) -> Option<hiss::
     let session = borrow.core.as_ref()?.session()?;
     Some(<S as Handshake>::session_id(&session.seal).clone())
 }
+
+/// What [`Driver::deadline`]'s detector says when it fires.
+///
+/// A `const` so the string is written once and so a test that provokes the
+/// class can name what it expects to see.
+const PAST_DEADLINE: &str = "a core announced a deadline in the past — ruling 141's spin class: `sleep_until` \
+     completes at once, `handle_timeout` re-fires, and the actor spins";
 
 /// `tokio::time::sleep_until`, or a future that never completes.
 ///

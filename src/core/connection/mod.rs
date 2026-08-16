@@ -113,9 +113,40 @@ mod tests_sizing;
 // #[cfg(test)]
 // mod tests_message;
 
+// ── slice 7b's core tests, at integration ────────────────────────────────
+//
+// Same discipline, now ruled rather than inferred: **[ruling 211]** amends
+// working rule 6 so an implementer lands the declaration **commented out**
+// and creates nothing at those paths — a `mod` naming a missing file is a
+// compile error, which is `Cargo.toml`'s `[[test]]` failure one layer down.
+// The integrator uncomments these when the authors' files arrive.
+//
+// #[cfg(test)]
+// mod tests_path;
+// #[cfg(test)]
+// mod tests_livelock;
+// #[cfg(test)]
+// mod tests_reassembly;
+//
+// **Integrator — `testfix.rs` has aged out again, and it is the reason 13
+// lib tests are red on this commit.** `parse_frames`' fallback arm panics
+// on frame type `0x1a`, exactly as it did for ACK at slice 5 and for
+// DATAGRAM at slice 6, and its own doc comment says the arm belongs there
+// rather than in the caller (working rule 15). The core now emits
+// `PATH_CHALLENGE`/`PATH_RESPONSE`, so every test that decodes a packet
+// built while an address is unvalidated hits it. Two `Wire` variants and
+// one `parse_frames` arm — eight fixed bytes each, no length prefix — take
+// the suite from 662/675 to 675/675; that was verified here against a
+// temporary patch, which was reverted rather than committed because the
+// file is the integrator's and T1 needs a `path_challenge_frame` builder in
+// it too (`CONTRACT-7b.md` §9).
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
 
 use crate::constants;
 use crate::error::{
@@ -146,6 +177,18 @@ use super::{EstablishedSession, Install, Role, ToEndpoint, Transmit};
 pub(crate) struct Connection<C: Handshake> {
     session: Option<Session<C>>,
     sub_seed: [u8; 32],
+    /// §16.6's connection-side CSPRNG, seeded from [`sub_seed`](Self::sub_seed).
+    ///
+    /// **[rulings 208, 210(b)]** Its one consumer is §7.3's address-validation
+    /// challenge. Ruling 208 as written said *"drawn from the endpoint
+    /// RNG"*, naming a path that does not exist: both arming sites are
+    /// inside this core and `Connection` cannot reach `Endpoint::rng`.
+    /// §16.6 draws the sub-seed **unconditionally** — *"so connection-side
+    /// randomness can never perturb the endpoint's draw order"* — which is
+    /// what makes the correction free: every seeded test still sees the same
+    /// endpoint-side sequence, and *"one root seed reproduces the whole
+    /// system"* still holds.
+    rng: ChaCha20Rng,
     outputs: VecDeque<ConnOutput>,
     installed: bool,
     lifecycle: Lifecycle,
@@ -185,6 +228,15 @@ pub(crate) struct Connection<C: Handshake> {
     amplification: Amplification,
     /// §7.5's contested mark (rulings 36, 41, 45/46, 175–177, 179).
     contested: Contested,
+    /// **[ruling 208]** The eight bytes a received `PATH_CHALLENGE` obliges
+    /// us to echo, if one is outstanding.
+    ///
+    /// **At most one, overwritten rather than queued** (§8.4, §17.5, ruling
+    /// 212(d)): the newest challenge is the only one whose answer can still
+    /// validate anything, and a list here would turn a challenge flood into
+    /// a response flood. Kept across a roam (§13.6): it answers the peer's
+    /// question about *its* path, which our endpoint moving does not change.
+    owed_path_response: Option<[u8; 8]>,
     /// §7.5's beacon interval. `None` disables it, which is the default:
     /// the *passive* keepalive dance needs no opt-in (ruling 39), and this
     /// knob is only for a link that is mutually idle.
@@ -201,6 +253,20 @@ enum Received {
     Structural(Structural),
 }
 
+/// Which of §7.3's two path frames one packet plan carries.
+///
+/// **[ruling 208]** Both obligations are discharged on the **send**, not on
+/// the plan, so the planner reports what it packed and the sender acts on
+/// it — the same shape the datagram queue's `sent_datagram` uses, and for
+/// the same reason: a refused packet must leave both of them owed.
+#[derive(Default)]
+struct PathPacked {
+    /// The response this plan echoes, if the connection owed one.
+    response: Option<[u8; 8]>,
+    /// Whether the plan carries this arming's challenge.
+    challenge: bool,
+}
+
 impl<C: Handshake> Connection<C> {
     /// A connection `connect()` created: no session until its `Install`
     /// arrives.
@@ -208,6 +274,7 @@ impl<C: Handshake> Connection<C> {
         Self {
             session: None,
             sub_seed,
+            rng: ChaCha20Rng::from_seed(sub_seed),
             outputs: VecDeque::new(),
             installed: false,
             lifecycle: Lifecycle::Live,
@@ -228,8 +295,23 @@ impl<C: Handshake> Connection<C> {
             // exactly two events and this is neither.
             amplification: Amplification::validated(),
             contested: Contested::No,
+            owed_path_response: None,
             persistent_keepalive: None,
         }
+    }
+
+    /// **[rulings 208, 210(b)]** Eight fresh bytes for one arming of §7.3's
+    /// budget, from §16.6's per-connection sub-seed.
+    ///
+    /// Drawn at the instant [`Amplification::arm`] is called and at no other
+    /// instant — one challenge per arming, never reused across armings. A
+    /// roam back to a previously-challenged address draws a new value:
+    /// re-arming with the previous one would let a peer bank a response
+    /// before the roam it will be asked to prove.
+    fn draw_challenge(&mut self) -> [u8; 8] {
+        let mut challenge = [0u8; 8];
+        self.rng.fill_bytes(&mut challenge);
+        challenge
     }
 
     /// A connection `accept()` returned: established on arrival, and
@@ -259,10 +341,34 @@ impl<C: Handshake> Connection<C> {
         // can have had.
         //
         // Armed **before** the install so the pump inside it cannot slip a
-        // datagram past an unarmed budget. `install` records the floor once
-        // the session exists, which is the first moment `next_counter()`
-        // means anything.
-        conn.amplification = Amplification::arm(0, constants::INIT_PACKET_LEN as u64);
+        // datagram past an unarmed budget. **[rulings 208, 210(b)]** The
+        // challenge comes from the connection's own RNG, which exists from
+        // `connecting()` — so unlike ruling 168's floor it needs nothing the
+        // session install provides, and the two-phase arming that
+        // `Amplification::set_floor` existed for is gone.
+        let challenge = conn.draw_challenge();
+        conn.amplification = Amplification::arm(challenge, constants::INIT_PACKET_LEN as u64);
+        // **[A2]** The msg2 that provoked this arming has **already gone**
+        // to this address: the endpoint emitted `RESP_PACKET_LEN` bytes to
+        // it (`endpoint/staged.rs`, `endpoint/routing.rs`) before this
+        // connection existed, and `arm` starts `sent` at 0. §7.3 caps
+        // *total bytes sent* to an unvalidated address, so leaving those
+        // 107 uncounted measured 3.55× against a normative MUST of 3.
+        // Ruling 170 forbids an endpoint-side per-address table, so the
+        // charge lands here, where the connection first exists.
+        //
+        // **Once, because msg2 is emitted once per arming.** `frame_resp`
+        // has exactly two call sites — the staged accept and §6.6's
+        // tie-break admission — each of which emits one msg2 and creates
+        // one connection; there is no responder-side msg2 retransmission,
+        // and a repeated msg1 against a live static goes through §6.4's
+        // replacement to a *new* connection with its own arming.
+        //
+        // The budget still admits a challenge with room to spare:
+        // 3 × 196 = 588, less 107, leaves 481 against the 39 bytes a
+        // challenge datagram costs.
+        conn.amplification
+            .on_sent(constants::RESP_PACKET_LEN as u64);
         // `true`: this constructor **is** §6.4's accept path, so the anchor
         // is the msg1 source by construction. The budget is already armed
         // above; passing it here keeps `install`'s rule single-sourced.
@@ -333,10 +439,14 @@ impl<C: Handshake> Connection<C> {
         self.amplification.counters()
     }
 
-    /// §7.3's validation floor (ruling 168), for tests.
+    /// §7.3's outstanding challenge (**[ruling 208]**), for tests. `None`
+    /// once the address has validated and nothing is owed to it.
+    ///
+    /// Replaces `validation_floor()`, which went with ruling 168's
+    /// predicate.
     #[cfg(test)]
-    pub(crate) fn validation_floor(&self) -> u64 {
-        self.amplification.floor()
+    pub(crate) fn outstanding_challenge(&self) -> Option<[u8; 8]> {
+        self.amplification.outstanding_challenge()
     }
 
     /// §7.5's contested mark, for tests.
@@ -503,7 +613,25 @@ impl<C: Handshake> Connection<C> {
             // let a *replayed* packet replenish a security counter — this is
             // credited at exactly the point §7.2's window marks the packet,
             // and nowhere else.
-            None => self.amplification.on_recv(datagram.len() as u64),
+            //
+            // **[A3]** …and only bytes **received from the address being
+            // funded**. `roamed` is `None` under *two* conditions: the
+            // source already **is** the anchor, or the connection is not
+            // live. §15.2 forbids a closing or draining connection from
+            // roaming, so on one every source yields `None` — and the
+            // unguarded form credited an unvalidated anchor for a datagram
+            // that did not come from it, where §7.3 funds the budget from
+            // *"total bytes **received from it**"*.
+            //
+            // The predicate is tested **here**, inside the arm, and
+            // `from_anchor` below is deliberately not hoisted above the
+            // `match`: that binding is computed *after* the roam on purpose,
+            // so the roaming packet itself counts as from-anchor, and moving
+            // it would silently change the `Some` arm's meaning.
+            None if self.remote_address() == Some(src) => {
+                self.amplification.on_recv(datagram.len() as u64)
+            }
+            None => {}
         }
         self.sync_liveness_timer();
         self.fold_ack_policy(now, counter, prev_greatest, &received);
@@ -1203,15 +1331,21 @@ impl<C: Handshake> Connection<C> {
         // stale RTT sample as fresh.
         self.recovery.on_roam(now);
         self.congestion.reset(now);
-        // **[rulings 168, 169, 173]** Both counters reset and the floor is
-        // re-recorded, then the **triggering packet** credits the received
-        // side: it is authenticated and window-fresh by §7.3, which is
-        // exactly what ruling 169 requires of anything that funds the
+        // **[rulings 169, 173, 208]** Both counters reset and **a fresh
+        // challenge is drawn**, then the **triggering packet** credits the
+        // received side: it is authenticated and window-fresh by §7.3, which
+        // is exactly what ruling 169 requires of anything that funds the
         // budget. Without the reset the old address's credit would carry to
         // the new one — *"the reflector §7.3 exists to prevent,
         // reconstructed out of a missing line"*.
-        let floor = self.next_counter().unwrap_or(0);
-        self.amplification = Amplification::arm(floor, datagram_len);
+        //
+        // §13.6's roam-seam table: the outstanding challenge is **re-drawn**
+        // and any earlier one discarded, so a `PATH_RESPONSE` echoing it
+        // validates nothing thereafter. A response *we* owe the peer is
+        // **kept** — see `owed_path_response`, which this deliberately does
+        // not clear.
+        let challenge = self.draw_challenge();
+        self.amplification = Amplification::arm(challenge, datagram_len);
         tracing::debug!(
             target: "slither::roam",
             %from,
@@ -1223,7 +1357,7 @@ impl<C: Handshake> Connection<C> {
     }
 
     /// §12.5's processing of one received ACK.
-    fn on_ack_frame(&mut self, now: Instant, ack: &frame::Ack, from_anchor: bool) {
+    fn on_ack_frame(&mut self, now: Instant, ack: &frame::Ack) {
         let Some(highest_sealed) = self.next_counter().and_then(|next| next.checked_sub(1)) else {
             // Nothing has ever been sealed, so every counter this frame
             // names is above the highest sealed: §12.5 ignores it whole.
@@ -1235,19 +1369,30 @@ impl<C: Handshake> Connection<C> {
         // applies the same test and traces it; this one is silent because
         // the trace would be the same event twice.
         if ack.largest <= highest_sealed {
-            self.on_ack_coverage(ack.largest, from_anchor);
+            self.on_ack_coverage(ack.largest);
         }
         let outcome = self.recovery.on_ack(now, ack, highest_sealed);
         self.apply_ack_outcome(now, outcome);
     }
 
-    /// The two **high-water-mark** predicates one ACK can satisfy.
+    /// §7.5's contested probe floor — the **one** high-water-mark predicate
+    /// an ACK still satisfies.
     ///
     /// `largest` is the greatest counter the frame covers, so *"covers any
-    /// counter at or above the floor"* is exactly `largest >= floor` for
-    /// both of them. They are two independent floors recorded at different
-    /// moments — §7.3's [`Amplification`] floor at the arming, §7.5's probe
-    /// floor at the mark — and they are deliberately **not** one field.
+    /// counter at or above the floor"* is exactly `largest >= floor`.
+    ///
+    /// # There were two floors here, and only one of them was ruling 208's
+    ///
+    /// This function served §7.3's amplification floor as well, gated on
+    /// `from_anchor`. **[ruling 208]** replaced that predicate with a
+    /// challenge echo and its machinery is removed rather than left inert —
+    /// *"leaving both in place would give an attacker the old path as a
+    /// bypass"*. The half below is **not** reached by that ruling and is
+    /// kept byte-for-byte: ruling 210 records deleting this function
+    /// wholesale as the most likely way to break the change, because it
+    /// would silently disable ruling 176's two exits from the pending state
+    /// and **no wire test would notice**. The contested mark's threat model
+    /// is a different one and its floor is a different floor.
     ///
     /// # Ruling 176's two exits from the pending state
     ///
@@ -1268,15 +1413,7 @@ impl<C: Handshake> Connection<C> {
     ///
     /// In every clearing case the §6.4 refusal **stands**; the basis rule is
     /// untouched.
-    fn on_ack_coverage(&mut self, largest: u64, from_anchor: bool) {
-        // **[ruling 168]** The return-routability proof. Only an ACK from
-        // the address in question can validate it: this ACK could only have
-        // been produced by a peer that received something we sent *there*,
-        // after the change.
-        if from_anchor {
-            self.amplification.on_ack_covering(largest);
-        }
-
+    fn on_ack_coverage(&mut self, largest: u64) {
         match self.contested {
             Contested::Armed { floor, .. } if largest >= floor => {
                 self.contested = Contested::No;
@@ -1448,7 +1585,13 @@ impl<C: Handshake> Connection<C> {
                 Frame::Ping => {}
                 // §12.5's processing: the sent-packet map, the RTT sample,
                 // §13.2's loss evaluation and §14's controller.
-                Frame::Ack(ack) => self.on_ack_frame(now, &ack, from_anchor),
+                // **[ruling 208]** No longer gated on `from_anchor`: the
+                // only thing an ACK's source decided was §7.3's validation,
+                // and an ACK no longer decides that. §12.5's processing —
+                // the sent map, the RTT sample, §13.2's loss evaluation,
+                // §14's controller and §7.5's probe floor — was never
+                // source-conditional.
+                Frame::Ack(ack) => self.on_ack_frame(now, &ack),
                 Frame::Stream(stream) => {
                     if let Err(violation) =
                         self.streams
@@ -1489,6 +1632,47 @@ impl<C: Handshake> Connection<C> {
                 }
                 Frame::MaxStreamsBidi(max) => self.on_max_streams(Dir::Bi, max),
                 Frame::MaxStreamsUni(max) => self.on_max_streams(Dir::Uni, max),
+                // **[ruling 208]** §8.4: the obligation is **unconditional**
+                // and the bytes are never interpreted. It is not gated on
+                // the challenge being one we expected, on the source having
+                // roamed, or on anything else — *"a responder that filtered
+                // them would be answering a question it cannot see the point
+                // of"*. It is the peer's budget, not ours, that the response
+                // unlocks.
+                //
+                // A newer challenge **overwrites** an unanswered older one
+                // rather than queueing behind it (§17.5): the newest is the
+                // only one whose answer can still validate anything, and
+                // this is what stops a challenge flood becoming a response
+                // flood.
+                Frame::PathChallenge(value) => {
+                    tracing::debug!(
+                        target: "slither::roam",
+                        "a PATH_CHALLENGE arrived; one PATH_RESPONSE is owed"
+                    );
+                    self.owed_path_response = Some(value);
+                }
+                // **[ruling 208]** Gated on `from_anchor`, and that gate is
+                // the whole predicate rather than a refinement of it: a peer
+                // that echoes from its **old** address has proved nothing
+                // about the new one, which is the address the budget is
+                // armed against.
+                //
+                // A mismatch is a **semantic no-op** (§8.4, ruling 212(d)):
+                // traced, never an error. `PROTOCOL_VIOLATION` here would be
+                // a keyless remote kill primitive for anyone who can guess a
+                // frame boundary.
+                Frame::PathResponse(echo) => {
+                    if from_anchor {
+                        self.amplification.on_path_response(&echo);
+                    }
+                    tracing::debug!(
+                        target: "slither::roam",
+                        from_anchor,
+                        validated = self.amplification.is_validated(),
+                        "a PATH_RESPONSE arrived"
+                    );
+                }
                 // §11: the unreliable path. Flow-control exempt (§10.7), so
                 // nothing is charged and nothing is checked — §11.4's
                 // receiver oversize rule is unrepresentable, the frame's
@@ -1518,6 +1702,16 @@ impl<C: Handshake> Connection<C> {
                 }
             }
         }
+
+        // **F1:** the two holds a keepalive can be under both lift on a
+        // *received* packet, and this packet's **frames** may have lifted
+        // either: an ACK covering the probe floor clears a pending mark, a
+        // matching `PATH_RESPONSE` disarms the budget. `handle_datagram`
+        // synced before the frames were applied, so without this the
+        // keepalive would stay unarmed until some later receive — and on a
+        // connection that receives nothing further, a lifted hold that never
+        // re-arms is a session that goes quiet and dies at `DEAD_TIMEOUT`.
+        self.sync_liveness_timer();
 
         // §16.4's generation order: the events a packet caused, then the
         // packet its arrival made us owe.
@@ -1753,11 +1947,14 @@ impl<C: Handshake> Connection<C> {
         // cap never applied to it — a reflector on the one path where a
         // dialler adopts an address it did not choose.
         if anchor_from_msg1 && self.amplification.is_validated() {
-            self.amplification = Amplification::arm(0, constants::INIT_PACKET_LEN as u64);
-        }
-        if !self.amplification.is_validated() {
-            let floor = self.next_counter().unwrap_or(0);
-            self.amplification.set_floor(floor);
+            let challenge = self.draw_challenge();
+            self.amplification = Amplification::arm(challenge, constants::INIT_PACKET_LEN as u64);
+            // **[A2]** As in `established`: the endpoint's msg2 went to this
+            // anchor before the `Install` arrived, and §7.3 counts total
+            // bytes sent. This is §6.6's tie-break loser, which is the other
+            // path that writes a msg2 (`endpoint/routing.rs`).
+            self.amplification
+                .on_sent(constants::RESP_PACKET_LEN as u64);
         }
         self.sync_liveness_timer();
         self.outputs
@@ -1779,8 +1976,9 @@ impl<C: Handshake> Connection<C> {
     /// | **RESET_STREAM** | `seal_quiet` | yes |
     /// | MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS_BIDI / MAX_STREAMS_UNI | `seal_quiet` | yes |
     ///
-    /// §7.4 (`SPEC.md:1953–1958`) enumerates the quiet set and RESET_STREAM
-    /// is **in** it — the plan's table put it on the marking `seal` "by
+    /// §7.4's *"`seal_quiet` does not touch `last_send` — the **quiet
+    /// set**"* sentence enumerates it and RESET_STREAM is **in** it — the
+    /// plan's table put it on the marking `seal` "by
     /// omission from §10.3", which is backwards and would have deferred
     /// keepalives forever. `session.rs`'s `seal_quiet` doc comment has
     /// quoted the correct set since slice 3a.
@@ -1829,11 +2027,17 @@ impl<C: Handshake> Connection<C> {
     /// and asks afterwards therefore holds everything until the budget grows
     /// to 1200 — while the budget only grows on received bytes, and on a
     /// connection carried by §7.5's keepalive dance the only received bytes
-    /// are 30-byte empty plaintexts that are **not ack-eliciting** and so can
-    /// never produce the ACK covering `validation_floor` that ends the
-    /// unvalidated state (ruling 168). 2 048 bytes of application data then
+    /// are 30-byte empty plaintexts. 2 048 bytes of application data then
     /// wait ~20 keepalive rounds (~200 s) for a budget a ~90-byte packet
     /// would have escaped in one round trip.
+    ///
+    /// **[ruling 208]** *"Ruling 203's sizing fix stands and becomes more
+    /// important, not less: the challenge must fit inside the armed budget,
+    /// and a pump that cannot shrink cannot emit one."* The escape ruling
+    /// 203 described was an ACK covering a floor; it is now a
+    /// `PATH_RESPONSE`, and the packet that must be small enough to leave is
+    /// the one carrying the `PATH_CHALLENGE` — 39 bytes against the 90 the
+    /// smallest arming funds.
     ///
     /// # The units, which are the trap
     ///
@@ -1870,23 +2074,46 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
-        // **[ruling 171]** Priority 1, ahead of everything. A pending probe
-        // the budget cannot admit stops the pump: anything sent underneath
-        // it would spend budget the probe is waiting for, and the probe's
-        // deadline does not exist until it leaves.
+        // **[ruling 212(c)]** §7.3's ranks 2 and 3 — `PATH_RESPONSE` and
+        // `PATH_CHALLENGE`, immediately after CLOSE and **above** the
+        // contested probe. *"Everything else in the order competes for the
+        // budget; the challenge dissolves it. Ranking the output that
+        // removes the constraint above the outputs that consume it is not a
+        // preference, it is the only ordering that terminates."*
+        //
+        // **This pre-pass exists because the probe's early return below
+        // would otherwise deny them**, which ruling 212(c) names as wrong
+        // as written: *"it may not block the one frame that ends the state
+        // it is protecting."* It runs **only** while a mark is pending —
+        // when none is, the loop below packs the same frames into the packet
+        // it is already building, which is what §8.5 prefers and what keeps
+        // a challenge from costing a datagram of its own.
+        //
+        // Worth stating because it bounds how much this can matter: the
+        // early return fires only when the budget refuses the probe's 31
+        // bytes, and a challenge datagram is 39, so in the *blocked* state
+        // neither could have left. What this reordering changes is the case
+        // where the budget admits both but not both at once — there the
+        // probe's spend used to deny the challenge, inverting the rank.
+        let mut owe_challenge = true;
+        if self.contested.is_pending() && self.pump_path_frames(now) {
+            owe_challenge = false;
+        }
+
+        // **[ruling 171]** Rank 4. A pending probe the budget cannot admit
+        // stops everything **below** it: anything sent underneath would
+        // spend budget the probe is waiting for, and the probe's deadline
+        // does not exist until it leaves.
         if !self.pump_contested_probe(now) {
             return;
         }
 
-        // **[ruling 207(b)]** One elicitation is owed per pump while §7.3's
-        // budget is armed — see the PING stage below for what it is for and
-        // for the three cases it deliberately does not cover.
-        let mut owe_elicit = !self.amplification.is_validated();
-
         // Bounded by construction: every iteration that transmits has moved
         // stream bytes out of the pending set, cleared a regenerate
-        // identity or packed the owed ACK, and one that does none of those
-        // breaks below.
+        // identity, packed the owed ACK, or discharged one of §7.3's two
+        // path obligations — the response by sending it, the challenge by
+        // spending `owe_challenge` — and one that does none of those builds
+        // an empty plan and breaks below.
         loop {
             let mut packed = streams::Packed::default();
             // **[ruling 203]** Sized to §7.3's remaining room, not to §8.6's
@@ -1896,6 +2123,19 @@ impl<C: Handshake> Connection<C> {
             // Stage 1 — §12.4: *"An owed ACK rides the next outgoing packet
             // (packing order §8.5)"*.
             let ack_packed = self.pack_ack(now, &mut packing);
+            // Stage 2, **first among the control frames** — **[ruling 208,
+            // §8.5 as amended]** §7.3's two path frames, ahead of every
+            // credit grant, so that in a packet shrunk to the budget's
+            // admitted room the frame that **ends** the scarcity is not the
+            // one trimmed out of it.
+            //
+            // The challenge's two gates are §7.3's boundaries, unchanged in
+            // force from the PING they replace: one offer per pump
+            // (`owe_challenge`), and only while something is actually owed
+            // to the address. A pending contested probe counts as owed —
+            // it is output waiting on exactly this budget.
+            let offer = owe_challenge && (self.owes_output() || self.contested.is_pending());
+            let path = self.pack_path_frames(&mut packing, offer);
             // Stages 2 and 3 — credit grants and RESET_STREAM, then the
             // STREAM and DATAGRAM fill.
             self.streams
@@ -1943,74 +2183,75 @@ impl<C: Handshake> Connection<C> {
             // Stage 4 — §13.4: *"A firing PTO sends one ack-eliciting
             // packet: pending retransmittable frames oldest-first if any
             // exist, else a bare PING."* The PING is owed only when the
-            // first three stages produced nothing that elicits.
+            // first three stages produced nothing that elicits, and — **[
+            // ruling 208]** — it is owed **only** for the PTO now. A PTO
+            // probe is about loss detection; address validation is the
+            // challenge's job, and merging the two would put a PING where a
+            // challenge belongs.
             //
-            // **[ruling 207(b)] — the second reason a PING is owed, and the
-            // deliberate answer to the question that ruling leaves open.**
+            // **This is where ruling 207(b)'s question was answered with "a
+            // PING", and where ruling 208 changes the answer to "a
+            // `PATH_CHALLENGE`".** Sizing alone was never the fix: a packet
+            // shrunk to fit the budget is useless if what fits cannot end
+            // the unvalidated state. Under ruling 168 that meant *cannot
+            // elicit an ACK*; under ruling 208 an ACK validates **nothing**,
+            // so a build that left `packing.ping()` serving both branches
+            // would reproduce ruling 203's stall exactly — the pump shrinks
+            // a packet, the packet elicits, the ACK arrives, and the address
+            // stays unvalidated forever. §7.3's no-deadlock argument is a
+            // claim about the **sender** — *"the budget always admits
+            // something … and what it admits is enough to elicit the
+            // `PATH_RESPONSE` that ends it"* (§7.3, *disarming*) — and only
+            // the stage-2 packing above can make it true: `Packing` can
+            // shrink a packet but cannot make one carry a challenge.
             //
-            // *Yes, the pump owes a PING when the admitted room holds
-            // nothing ack-eliciting — but only while output is owed.*
+            // **The challenge's four boundaries, stated because rule 8 reads
+            // a construction's scope as exhaustive whether or not it says
+            // so.** They are the PING's, unchanged in force:
             //
-            // Sizing alone is not the fix. Validation arrives only on an ACK
-            // covering `validation_floor` (ruling 168), so a packet shrunk to
-            // fit the budget is useless if what fits elicits nothing: the
-            // connection stalls exactly as it did, one indirection later.
-            // §7.3's own no-deadlock argument is what settles it — *"the
-            // budget always admits something … and what it admits is enough
-            // to elicit the ACK that ends it"* (`SPEC.md:2172`). That
-            // sentence is a claim about the **sender**, and only this stage
-            // can make it true: `Packing` can shrink a packet but cannot
-            // make one elicit. Working rule 3's tiebreak — follow the
-            // statement some other proof depends on — and §7.3's escape
-            // proof depends on this one.
-            //
-            // **Its four boundaries, stated because rule 8 reads a
-            // construction's scope as exhaustive whether or not it says
-            // so.**
-            //
-            // 1. **Nothing is owed.** An idle unvalidated connection gets no
-            //    PING. Validation is not a goal in itself — it is what lets
-            //    held output leave, and there is none. A PING here would be
-            //    an unprompted probe train on every pump, and §7.5's
-            //    keepalive dance already carries liveness.
+            // 1. **Nothing is owed.** An idle unvalidated connection sends
+            //    no challenge. Validation is not a goal in itself — it is
+            //    what lets held output leave, and there is none. A challenge
+            //    here would be an unprompted probe train on every pump, and
+            //    §7.5's keepalive dance already carries liveness.
             // 2. **A bare ACK with nothing else owed.** Every accepted
             //    connection begins unvalidated (§7.3), so this is the
-            //    ordinary receive path, not an edge: PINGing it would make
-            //    every delayed ACK ack-eliciting, put it in the sent map and
-            //    spend congestion window, for a validation the connection
-            //    has no use for. When it does acquire a use — output the
-            //    budget is holding — `owes_output()` turns true and the PING
-            //    is owed on the same instant.
-            // 3. **§14.5's window.** The PING is **not** exempt from the
-            //    congestion gate below. §14.5 enumerates its exemptions —
-            //    PTO probes, the contested probe, non-ack-eliciting control
-            //    packets — and a validation PING is not among them; rule 8
-            //    reads that list as closed. A PING the window refuses is
-            //    reached again by §13.4's PTO, which *is* exempt and *is*
-            //    ack-eliciting, so the escape survives a full window.
-            // 4. **The seal.** A validation PING is never marking, and needs
-            //    no rule to make it so: the PING is added only when the plan
-            //    does not already elicit, and every marking contributor
-            //    (a first-transmission STREAM frame, a DATAGRAM) elicits — so
-            //    `marking` is false wherever this fires and the packet is
-            //    sealed `seal_quiet`. That is §7.5's contested-probe
-            //    treatment verbatim — *"not fresh application intent, so it
-            //    does not move `last_send` and cannot suppress a
-            //    keepalive"* — and it still arms the death clock, because
-            //    §7.3 has *"any ack-eliciting output we aim at the address
-            //    arms the death clock by itself, even where nothing marking
-            //    is sent"* (`SPEC.md:2170`). A new address that never answers
-            //    therefore still kills the session at `DEAD_TIMEOUT`.
+            //    ordinary receive path, not an edge: challenging it would
+            //    make every delayed ACK ack-eliciting, put it in the sent
+            //    map and spend congestion window, for a validation the
+            //    connection has no use for. When it acquires one —
+            //    output the budget is holding, or a probe it is
+            //    delaying — the challenge is owed on the same instant.
+            // 3. **§14.5's window.** The challenge is **not** exempt from
+            //    the congestion gate below. §14.5 enumerates its exemptions
+            //    — PTO probes, the contested probe, non-ack-eliciting
+            //    control packets — and the path frames are not among them;
+            //    rule 8 reads that list as closed. A challenge the window
+            //    refuses is carried by §13.4's PTO, which *is* exempt and
+            //    packs stage 2 like any other packet, so the escape survives
+            //    a full window.
+            // 4. **The seal.** A challenge is never marking, and needs no
+            //    rule to make it so: every marking contributor (a
+            //    first-transmission STREAM frame, a DATAGRAM) is a stage-3
+            //    frame, so `marking` is false on a packet the challenge
+            //    carries alone and the packet is sealed `seal_quiet`. That
+            //    is §7.5's contested-probe treatment verbatim — *"not fresh
+            //    application intent, so it does not move `last_send` and
+            //    cannot suppress a keepalive"* — and it still arms the death
+            //    clock, because §7.3 has *"any ack-eliciting output we aim
+            //    at the address arms the death clock by itself, even where
+            //    nothing marking is sent"* (§7.3, *disarming*; §7.4), and
+            //    `PATH_CHALLENGE` is itself ack-eliciting. A new address
+            //    that never answers therefore still kills the session at
+            //    `DEAD_TIMEOUT`, with no new timer and no new variant.
             //
-            // It is self-limiting rather than rate-limited: any ack-eliciting
-            // packet that lands is answered by an ACK at or above the floor,
-            // which validates the address and disarms the budget, so the
-            // whole mechanism costs at most one round trip. `owe_elicit`
-            // bounds it to one packet per pump so a large-but-shrunk room
-            // cannot spend itself on a burst of PINGs.
+            // It is self-limiting rather than rate-limited: a challenge that
+            // lands is answered by a `PATH_RESPONSE` that disarms the
+            // budget, so the whole mechanism costs at most one round trip.
+            // `owe_challenge` bounds it to one per pump so a large-but-shrunk
+            // room cannot spend itself on a burst of challenges.
             let elicits = frame::packet_is_ack_eliciting(packing.frames());
-            let validate = owe_elicit && self.owes_output();
-            if (probe || validate) && !elicits {
+            if probe && !elicits {
                 packing.ping();
             }
 
@@ -2156,20 +2397,129 @@ impl<C: Handshake> Connection<C> {
 
             // §13.4: **one** ack-eliciting packet per firing.
             probe = false;
-            // **[ruling 207(b)]** One elicitation is enough: this packet will
-            // be acknowledged at or above `validation_floor`, and that ACK is
-            // the whole of what the unvalidated state is waiting for. Cleared
-            // on **any** ack-eliciting packet, not only on one carrying the
-            // PING — a STREAM frame that fit the shrunken room does the same
-            // job, and is the ordinary case.
-            if ack_eliciting {
-                owe_elicit = false;
+            // **[ruling 208]** The obligations discharge **on the send**,
+            // never on the plan: everything above this point restores what
+            // it packed when the packet is refused, and these two are no
+            // different.
+            //
+            // The response is discharged by one emission (§8.7). If it is
+            // lost the peer's still-standing challenge asks again, and this
+            // field is overwritten by whichever challenge is newest — never
+            // queued.
+            //
+            // The challenge is **not** discharged by its emission: it stands
+            // for as long as the arming does, and is re-offered by the next
+            // pump. What clears here is only the one-per-pump bound, and it
+            // clears on the challenge going out rather than on **any**
+            // ack-eliciting packet — the pre-208 rule, which was right when
+            // an ACK was the proof and is wrong now that one proves nothing.
+            if path.response.is_some() {
+                self.owed_path_response = None;
+            }
+            if path.challenge {
+                owe_challenge = false;
             }
 
             if !self.owes_output() && !self.ack.is_owed() {
                 break;
             }
         }
+    }
+
+    /// §8.5 stage 2, first among the control frames — §7.3's two path
+    /// frames, **[ruling 208]**.
+    ///
+    /// Written once and called from both emission sites (the pump's loop and
+    /// [`pump_path_frames`](Self::pump_path_frames)) so what is owed, and in
+    /// what order, is stated in one place. `challenge` is the caller's
+    /// answer to §7.3's boundary conditions; the response has none — it is
+    /// owed unconditionally on receipt (§8.4).
+    ///
+    /// Nothing is discharged here. The obligations clear when the packet
+    /// carrying them is **sent**, because every plan this participates in
+    /// can still be refused by the budget or the window.
+    fn pack_path_frames(&mut self, packing: &mut Packing, challenge: bool) -> PathPacked {
+        let mut packed = PathPacked::default();
+        // Answering an obligation before raising one — §7.3: *"between
+        // themselves the order is free"*, and this is the conventional
+        // reading. They never contend: 14 B of header + 18 B of frames + a
+        // 16 B tag = 48 B, inside the 90 B floor the smallest arming funds.
+        if let Some(value) = self.owed_path_response
+            && packing.path_response(value)
+        {
+            packed.response = Some(value);
+        }
+        if challenge
+            && let Some(value) = self.amplification.outstanding_challenge()
+            && packing.path_challenge(value)
+        {
+            packed.challenge = true;
+        }
+        packed
+    }
+
+    /// One packet carrying nothing but §7.3's path frames, for the one state
+    /// in which the pump's loop cannot carry them: a **pending** contested
+    /// probe (**[ruling 212(c)]**).
+    ///
+    /// Returns whether a challenge went out, which is what stops the loop
+    /// re-offering the same one in the same pump.
+    ///
+    /// Sealed `seal_quiet` and **counted** in the sent map: the frames are
+    /// ack-eliciting (§8.3) and §14.5's exemption list — PTO probes, the
+    /// contested probe, non-ack-eliciting control packets — does not name
+    /// them, so unlike the probe beside it this packet is gated by the
+    /// congestion window as well as by the budget.
+    fn pump_path_frames(&mut self, now: Instant) -> bool {
+        let mut packing = self.packing();
+        let packed = self.pack_path_frames(&mut packing, true);
+        if packed.response.is_none() && !packed.challenge {
+            return false;
+        }
+        let plaintext = packing.into_plaintext();
+        let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        if !self.amplification.admits(size) || !self.admits(size) {
+            // Held, not dropped: both obligations still stand and the next
+            // pump re-offers them.
+            return false;
+        }
+
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        // §7.4's quiet set: a challenge is not fresh application intent, so
+        // it neither moves `last_send` nor suppresses a keepalive. It **is**
+        // ack-eliciting, which arms the death clock on the answer.
+        let sealed = match session.seal_quiet(now, &plaintext, true) {
+            Ok(sealed) => sealed,
+            Err(_) => {
+                self.die(ConnectionLost::NonceExhausted);
+                return false;
+            }
+        };
+        let to = session.established().anchor;
+        self.outputs.push_back(ConnOutput::Transmit(Transmit {
+            to,
+            data: sealed.datagram,
+        }));
+        self.amplification.on_sent(size);
+        self.sync_liveness_timer();
+        self.recovery.on_sent(SentPacket {
+            counter: sealed.counter,
+            time_sent: now,
+            size,
+            app_limited: false,
+            path_gen: self.recovery.path_gen(),
+            // §8.7: neither frame is ever re-queued by loss detection. The
+            // challenge's reliability is the standing obligation above; the
+            // response's is the peer's standing challenge.
+            frames: Vec::new(),
+        });
+        self.congestion.on_sent(now, size);
+        if packed.response.is_some() {
+            self.owed_path_response = None;
+        }
+        packed.challenge
     }
 
     /// §8.5 stage 1 — the owed ACK, derived from §7.2's window (§12.2).
@@ -2285,6 +2635,32 @@ impl<C: Handshake> Connection<C> {
     /// install + `DEAD_TIMEOUT`. That is ruling 39's *"a connection with no
     /// authenticated receive since install dies in silence"*, delivered by
     /// the predicate rather than by a special case.
+    ///
+    /// # Neither keepalive is armed while one cannot leave (**F1**)
+    ///
+    /// Both keepalive deadlines are functions of `last_send`, and
+    /// [`transmit_keepalive`](Self::transmit_keepalive) **returns without
+    /// moving `last_send`** when §7.3's budget or a pending contested mark
+    /// holds the packet. Arming from `last_send` regardless put the deadline
+    /// at an instant already passed: the driver's `sleep_until` completed
+    /// immediately, `handle_timeout` re-fired the same timer, and the actor
+    /// spun at 100 % of one core — invisible on the wire (ruling 141) and
+    /// unreachable from `FlakyWire`, which models a network and not a CPU.
+    ///
+    /// **Arming nothing is right and arming later is wrong.** Both holds
+    /// lift only on a **received** packet — the budget grows on `on_recv`,
+    /// the mark clears on an ACK covering its floor — so no future instant
+    /// is predictable and there is no correct deadline to arm. Every receive
+    /// path ends in this function, so the timer is restored on the one event
+    /// that can lift the hold. That is *held, not dropped* expressed in the
+    /// timer table, and the resulting state is a connection that announces
+    /// `Timeout(None)` and parks: **quiet, not immortal**.
+    ///
+    /// [`TimerKind::Liveness`] is deliberately **not** suppressed. The death
+    /// clock keeps whatever `Liveness::deadline()` returns; suppressing it
+    /// too would turn a spinning connection into an immortal one, which is
+    /// the collapse ruling 182's beacon proof warns about and is strictly
+    /// worse than the spin.
     fn sync_liveness_timer(&mut self) {
         if !self.lifecycle.is_live() {
             return;
@@ -2293,23 +2669,37 @@ impl<C: Handshake> Connection<C> {
         let deadline = clocks.and_then(|liveness| liveness.deadline());
         self.timers.set(TimerKind::Liveness, deadline);
 
+        let can_leave = self.keepalive_can_leave();
+
         // Ruling 195: the flag, not `R > S`. The comparison is false when
         // the two instants coincide — which the driver's once-per-turn
         // `now()` makes ordinary — and a receive that cannot bootstrap the
         // dance leaves a connection that neither talks nor dies.
-        let passive = clocks.filter(|l| l.owes_passive_keepalive());
+        let passive = clocks.filter(|l| l.owes_passive_keepalive() && can_leave);
         self.timers.set(
             TimerKind::Keepalive,
             passive.map(|l| l.last_send() + constants::KEEPALIVE_TIMEOUT),
         );
 
-        let beacon = self.persistent_keepalive;
+        let beacon = self.persistent_keepalive.filter(|_| can_leave);
         self.timers.set(
             TimerKind::PersistentKeepalive,
             clocks
                 .zip(beacon)
                 .map(|(liveness, interval)| liveness.last_send() + interval),
         );
+    }
+
+    /// Whether §7.5's keepalive can leave right now (**F1**).
+    ///
+    /// [`transmit_keepalive`](Self::transmit_keepalive)'s guard and
+    /// [`sync_liveness_timer`](Self::sync_liveness_timer)'s arming condition
+    /// are the same question, and a build that states it twice is the build
+    /// that drifts — the drift here is a timer armed in the past, which is a
+    /// spin rather than a wrong packet.
+    fn keepalive_can_leave(&self) -> bool {
+        let size = (constants::DATA_HEADER_LEN + constants::AEAD_TAG_LEN) as u64;
+        !self.contested.is_pending() && self.amplification.admits(size)
     }
 
     /// §7.5's keepalive, re-checked against what the rest of the evaluation
@@ -2363,10 +2753,14 @@ impl<C: Handshake> Connection<C> {
             return;
         }
         let size = (constants::DATA_HEADER_LEN + constants::AEAD_TAG_LEN) as u64;
-        // §7.3 binds **all** output, and a keepalive sits at priority 5 in
-        // ruling 171's order — below a pending contested probe, which
-        // outranks everything.
-        if self.contested.is_pending() || !self.amplification.admits(size) {
+        // §7.3 binds **all** output, and a keepalive sits at rank 7 in
+        // §7.3's order — below CLOSE, both path frames, a pending contested
+        // probe, pure ACKs and PTO probes.
+        //
+        // **F1:** this returns **without moving `last_send`**, which is
+        // exactly why `sync_liveness_timer` may not arm from `last_send`
+        // without asking the same question. One predicate, two callers.
+        if !self.keepalive_can_leave() {
             return;
         }
         let Some(session) = self.session.as_mut() else {

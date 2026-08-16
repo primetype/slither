@@ -6,7 +6,7 @@
 //! length the AEAD supplies (§8.2 — there is no packet-level length
 //! prefix).
 //!
-//! # Four frames, and why the table still has twelve rows
+//! # Four frames, and why the table still has fourteen rows
 //!
 //! Slice 3 implements PADDING (`0x00`), PING (`0x01`), ACK (`0x02`) and
 //! CLOSE (`0x1c`). ACK is **codec only** here: §12's derivation and
@@ -18,7 +18,8 @@
 //! connection on a legal packet.
 //!
 //! The **classifiers** ([`is_ack_eliciting`], [`retransmission`]) cover all
-//! twelve rows of §8.3, including the eight types the parser cannot yet
+//! fourteen rows of §8.3 — twelve at slice 3, plus §7.3's two path frames
+//! (**[ruling 208]**) — including the types the parser cannot yet
 //! build. That is deliberate and it is the only way they are testable:
 //! every frame slice 3 builds is in the `never` retransmission class and
 //! PING is the only ack-eliciting one among them, so a two-arm classifier
@@ -56,6 +57,16 @@ use super::stream_id::StreamId;
 /// packet in one pass while two streams alternate within one.
 pub(super) const STREAM_FILL_QUANTUM: usize = 1024;
 
+/// §8.4's fixed body width for `PATH_CHALLENGE`/`PATH_RESPONSE`: **eight
+/// opaque bytes, not a varint**. **[ruling 208]**
+///
+/// It lives here rather than in [`crate::constants`] for the same reason
+/// [`STREAM_FILL_QUANTUM`] does not — except inverted: this one *is* wire,
+/// and it is already pinned there by the §1.6 const assertion and by the
+/// frame's own round-trip tests. A second name for it in the constants
+/// table would be a second place to change it.
+pub(super) const PATH_CHALLENGE_LEN: usize = 8;
+
 /// A parsed frame. §8.3, §8.4.
 ///
 /// The types this build does not implement are **absent rather than
@@ -82,6 +93,12 @@ pub(crate) enum Frame {
     MaxStreamsBidi(u64),
     /// `0x13` — §10.4's cumulative unidirectional stream allowance.
     MaxStreamsUni(u64),
+    /// `0x1a` — §7.3's return-routability challenge, eight opaque bytes.
+    /// Ack-eliciting. **[ruling 208]**
+    PathChallenge([u8; 8]),
+    /// `0x1b` — `0x1a`'s eight bytes, echoed verbatim. Ack-eliciting.
+    /// **[ruling 208]**
+    PathResponse([u8; 8]),
     /// `0x1c` — §15's teardown signal.
     Close(Close),
     /// `0x30`/`0x31` — §11's unreliable payload. §8.4.
@@ -101,6 +118,8 @@ impl Frame {
             Frame::MaxStreamData(_) => constants::FRAME_MAX_STREAM_DATA,
             Frame::MaxStreamsBidi(_) => constants::FRAME_MAX_STREAMS_BIDI,
             Frame::MaxStreamsUni(_) => constants::FRAME_MAX_STREAMS_UNI,
+            Frame::PathChallenge(_) => constants::FRAME_PATH_CHALLENGE,
+            Frame::PathResponse(_) => constants::FRAME_PATH_RESPONSE,
             Frame::Close(_) => constants::FRAME_CLOSE,
             Frame::Datagram(datagram) => datagram.type_code(),
         }
@@ -122,6 +141,10 @@ impl Frame {
                 1 + varint_len(*max)
             }
             Frame::MaxStreamData(grant) => 1 + grant.body_len(),
+            // **[ruling 208]** Nine bytes, fixed: the one-byte type code
+            // (both codes are far below 64, §8.1) and eight opaque bytes
+            // with no length prefix.
+            Frame::PathChallenge(_) | Frame::PathResponse(_) => 1 + PATH_CHALLENGE_LEN,
             Frame::Close(close) => 1 + close.body_len(),
             Frame::Datagram(datagram) => 1 + datagram.body_len(),
         }
@@ -161,6 +184,9 @@ impl Frame {
                 put_varint(*max, out)
             }
             Frame::MaxStreamData(grant) => grant.encode_body(out),
+            Frame::PathChallenge(value) | Frame::PathResponse(value) => {
+                out.extend_from_slice(value)
+            }
             Frame::Close(close) => close.encode_body(out),
             Frame::Datagram(datagram) => datagram.encode_body(out),
         }
@@ -746,6 +772,22 @@ pub(crate) fn parse(plaintext: &[u8]) -> Result<Vec<Frame>, Structural> {
                     Frame::MaxStreamsUni(max)
                 }
             }
+            // **[ruling 208]** §8.4: *"fewer than 8 bytes remain in the
+            // plaintext after the type byte"* is the **only** structural
+            // error either frame has, and it is the existing
+            // [`Structural::LengthOverrun`] — §8.2 answers every structural
+            // failure identically and the variants exist for the trace, so a
+            // new one would be an invention. Exactly eight bytes are taken:
+            // a ninth belongs to the next frame, not to this one.
+            ty @ (constants::FRAME_PATH_CHALLENGE | constants::FRAME_PATH_RESPONSE) => {
+                let mut value = [0u8; PATH_CHALLENGE_LEN];
+                value.copy_from_slice(cursor.bytes(PATH_CHALLENGE_LEN)?);
+                if ty == constants::FRAME_PATH_CHALLENGE {
+                    Frame::PathChallenge(value)
+                } else {
+                    Frame::PathResponse(value)
+                }
+            }
             constants::FRAME_CLOSE => {
                 let (close, used) = Close::parse_body(cursor.rest())?;
                 cursor.advance(used);
@@ -776,8 +818,9 @@ pub(crate) fn packet_is_ack_eliciting(frames: &[Frame]) -> bool {
 
 /// §8.3's ack-eliciting column, as a pure function of the type code.
 ///
-/// Table-driven over **all twelve rows**, including the types this slice
-/// cannot construct — see the module docs for why that is the only way this
+/// Table-driven over **all fourteen rows** — §8.3's twelve plus ruling
+/// 208's `PATH_CHALLENGE`/`PATH_RESPONSE` — including the types this slice
+/// cannot construct; see the module docs for why that is the only way this
 /// is testable at all.
 ///
 /// A code outside the table is not ack-eliciting because it is not a frame:
@@ -796,6 +839,10 @@ pub(crate) fn is_ack_eliciting(ty: u64) -> bool {
         | constants::FRAME_MAX_STREAM_DATA
         | constants::FRAME_MAX_STREAMS_BIDI
         | constants::FRAME_MAX_STREAMS_UNI => true,
+        // **[ruling 208]** Load-bearing twice over (§8.4): it is what puts
+        // the challenge in the sent map so §7.3's death clock arms on it,
+        // and it is what makes the response elicit the peer's own ACK.
+        constants::FRAME_PATH_CHALLENGE | constants::FRAME_PATH_RESPONSE => true,
         constants::FRAME_CLOSE => false,
         constants::FRAME_DATAGRAM | constants::FRAME_DATAGRAM_LEN => true,
         _ => false,
@@ -831,6 +878,16 @@ pub(crate) fn retransmission(ty: u64) -> Option<Retransmission> {
         | constants::FRAME_MAX_STREAM_DATA
         | constants::FRAME_MAX_STREAMS_BIDI
         | constants::FRAME_MAX_STREAMS_UNI => Some(Retransmission::Regenerate),
+        // **[ruling 208]** `never` — **plus a standing obligation** (§8.7,
+        // ruling 212(d)). Neither frame is ever re-queued by loss
+        // detection: the challenge is re-offered by §7.3's pump for as long
+        // as the arming stands, and a lost response is asked for again by
+        // the peer's still-standing challenge. "Never retransmitted" here
+        // does not mean "sent once and lost forever", which §7.3's
+        // no-deadlock argument could not survive.
+        constants::FRAME_PATH_CHALLENGE | constants::FRAME_PATH_RESPONSE => {
+            Some(Retransmission::Never)
+        }
         // §8.7 lists CLOSE under `never`; §8.3's column calls the same
         // thing "linger rule (§15.2)". They agree: CLOSE is never
         // *loss*-retransmitted, and the linger's reply is a separate
@@ -844,9 +901,16 @@ pub(crate) fn retransmission(ty: u64) -> Option<Retransmission> {
 /// §8.5's packing order, expressed as stages that can only run forwards.
 ///
 /// *"Within a packet the sender packs in this order: the ACK first (if
-/// owed), then control frames (credit grants, RESET_STREAM, CLOSE), then
-/// STREAM and DATAGRAM fill, then PING last if a probe still owes
-/// ack-eliciting content."*
+/// owed), then control frames — **[AMENDED 2026/08/16 — ruling 208]**
+/// `PATH_RESPONSE` and `PATH_CHALLENGE` **first among the control frames**,
+/// then credit grants, RESET_STREAM, CLOSE — then STREAM and DATAGRAM fill,
+/// then PING last if a probe still owes ack-eliciting content."*
+///
+/// **§8.5 and §7.3's priority order answer different questions.** §8.5
+/// decides byte placement inside a packet whose size is already settled;
+/// §7.3 decides which class of output gets a scarce budget at all. That is
+/// why the path frames sit inside stage 2 here while ranking above the pure
+/// ACK there: a packet carrying both carries both.
 ///
 /// Slice 3 has three of those stages' contents (ACK, CLOSE, PING). The
 /// missing middle is slice 4's STREAM fill and slice 6's DATAGRAM fill:
@@ -911,6 +975,26 @@ impl Packing {
     /// Stage 2 — control frames: credit grants, RESET_STREAM, CLOSE.
     pub(crate) fn control(&mut self, frame: Frame) -> bool {
         self.push(Stage::Control, frame)
+    }
+
+    /// Stage 2, **first among the control frames** — §7.3's challenge.
+    ///
+    /// **[ruling 208, §8.5 as amended]** *"Packing the path frames ahead of
+    /// every other control frame is what keeps the frame that **ends** the
+    /// scarcity inside the packet the scarcity allowed, rather than trimmed
+    /// out of it by a credit grant."* It is emphatically **not**
+    /// [`Stage::Ping`]: that stage is last, and under a room clamped near
+    /// 39 bytes, last is nowhere.
+    ///
+    /// `false` when fewer than nine bytes remain, like every other planner
+    /// verb — the frame is not truncated and the caller keeps owing it.
+    pub(crate) fn path_challenge(&mut self, value: [u8; PATH_CHALLENGE_LEN]) -> bool {
+        self.push(Stage::Control, Frame::PathChallenge(value))
+    }
+
+    /// Stage 2, beside [`path_challenge`](Self::path_challenge) — the echo.
+    pub(crate) fn path_response(&mut self, value: [u8; PATH_CHALLENGE_LEN]) -> bool {
+        self.push(Stage::Control, Frame::PathResponse(value))
     }
 
     /// Stage 3 — the STREAM and DATAGRAM fill (§8.5).
@@ -1129,6 +1213,22 @@ mod tests {
         bytes.clear();
         Frame::Ping.encode(&mut bytes);
         assert_eq!(bytes, vec![0x01]);
+    }
+
+    /// **[ruling 208]** §8.4's two fixed-width frames: nine bytes each, the
+    /// eight opaque bytes carried verbatim and in order.
+    #[test]
+    fn the_path_frames_round_trip_as_nine_fixed_bytes() {
+        let value = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        for frame in [Frame::PathChallenge(value), Frame::PathResponse(value)] {
+            assert_eq!(frame.encoded_len(), 9, "1 type byte + 8 opaque bytes");
+            assert_eq!(round_trip(&frame), vec![frame.clone()]);
+
+            let mut bytes = Vec::new();
+            frame.encode(&mut bytes);
+            assert_eq!(bytes[0], frame.type_code() as u8);
+            assert_eq!(&bytes[1..], &value, "the body is the eight bytes, raw");
+        }
     }
 
     /// §8.4: "any number may appear anywhere" — before, between and after.
@@ -1351,9 +1451,13 @@ mod tests {
         assert_eq!(parse(&[0x40, 0x01]).unwrap(), vec![Frame::Ping]);
     }
 
-    /// §8.3's ack-eliciting column, **every row** — including the eight
-    /// types this slice cannot construct. A two-arm classifier is correct
+    /// §8.3's ack-eliciting column, **every row** — including the types
+    /// this slice cannot construct. A two-arm classifier is correct
     /// by accident for the whole of slice 3; this is what separates them.
+    ///
+    /// **[ruling 208]** §8.3 gained two rows and so did this table. Both
+    /// are `true`, and both are load-bearing: the challenge's arms §7.3's
+    /// death clock, the response's elicits the peer's ACK.
     #[test]
     fn ack_eliciting_matches_the_whole_of_table_8_3() {
         let expected: &[(u64, bool)] = &[
@@ -1373,10 +1477,18 @@ mod tests {
             (constants::FRAME_MAX_STREAM_DATA, true),
             (constants::FRAME_MAX_STREAMS_BIDI, true),
             (constants::FRAME_MAX_STREAMS_UNI, true),
+            (constants::FRAME_PATH_CHALLENGE, true),
+            (constants::FRAME_PATH_RESPONSE, true),
             (constants::FRAME_CLOSE, false),
             (constants::FRAME_DATAGRAM, true),
             (constants::FRAME_DATAGRAM_LEN, true),
         ];
+        assert_eq!(
+            expected.len(),
+            21,
+            "§8.3's fourteen rows, less the reserved `0x05`, with the STREAM \
+             and DATAGRAM rows expanded to their eight and two codes"
+        );
         for (ty, want) in expected {
             assert_eq!(is_ack_eliciting(*ty), *want, "type {ty:#x}");
         }
@@ -1398,6 +1510,8 @@ mod tests {
             (constants::FRAME_MAX_STREAM_DATA, Some(Regenerate)),
             (constants::FRAME_MAX_STREAMS_BIDI, Some(Regenerate)),
             (constants::FRAME_MAX_STREAMS_UNI, Some(Regenerate)),
+            (constants::FRAME_PATH_CHALLENGE, Some(Never)),
+            (constants::FRAME_PATH_RESPONSE, Some(Never)),
             (constants::FRAME_CLOSE, Some(Never)),
             (constants::FRAME_DATAGRAM, Some(Never)),
             (constants::FRAME_DATAGRAM_LEN, Some(Never)),
