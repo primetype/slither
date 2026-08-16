@@ -113,6 +113,20 @@ pub(crate) enum Wire {
     /// CLAUDE.md working rule 15's residue, and a nastier instance than the
     /// `Cargo.toml` one, because the tree still *compiles*: nothing fails
     /// until the tests run, and the panic message accuses the wrong party.
+    /// §8.4's DATAGRAM. Added by the **integrator before slice 6's
+    /// worktrees were cut** (working rule 15): slice 6 emits a frame type
+    /// this decoder did not know, and its fallback arm panics — while the
+    /// tree still *compiles*, so it would fail only when the tests run and
+    /// the message would accuse the implementer. The `Wire::Ack` arm below
+    /// was added at slice 5's integration for exactly the same reason.
+    Datagram {
+        data: Vec<u8>,
+        /// `false` ⇒ type `0x30`, no length field: the frame extends to
+        /// the end of the plaintext and must be the packet's last. This is
+        /// the only form in which a maximum-size (1169-byte) datagram fits
+        /// at all — see ruling 155.
+        had_len: bool,
+    },
     Ack {
         largest: u64,
         ack_delay: u64,
@@ -195,6 +209,19 @@ pub(crate) fn parse_frames(pt: &[u8]) -> Vec<Wire> {
             }
             t if t == FRAME_MAX_STREAMS_UNI => {
                 out.push(Wire::MaxStreamsUni(take_varint(pt, &mut at)));
+            }
+            t if t == crate::constants::FRAME_DATAGRAM
+                || t == crate::constants::FRAME_DATAGRAM_LEN =>
+            {
+                let had_len = t == crate::constants::FRAME_DATAGRAM_LEN;
+                let len = if had_len {
+                    take_varint(pt, &mut at) as usize
+                } else {
+                    pt.len() - at
+                };
+                let data = pt[at..at + len].to_vec();
+                at += len;
+                out.push(Wire::Datagram { data, had_len });
             }
             t if t == crate::constants::FRAME_ACK => {
                 let largest = take_varint(pt, &mut at);

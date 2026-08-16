@@ -3291,11 +3291,20 @@ exempt from dying. Sugar-consumed streams never earn stream-level credit
 
 **Retirement advances connection credit.** When a receive half is retired
 for any reason — read to its final size, reset observed, handle abandoned
-(§16.2), surfaced as a message (§9.8), or final size reached with no
-reader (§9.7) — **all of its bytes up to its final size count as consumed
+(§16.2), or surfaced as a message (§9.8) — **all of its bytes up to its
+final size count as consumed
 for connection-level credit-advance**, exactly as if the application had
 read them; stream-level credit is simply never re-granted for a retired
-stream (there is no stream to grant to). Without this rule, MAX_DATA is
+stream (there is no stream to grant to).
+**[AMENDED 2026/08/16 — ruling 154]** This list had a **fifth** entry,
+"final size reached with no reader (§9.7)", and **§9.7 — the section it
+cited — does not contain it**: a receive half frees on three triggers
+there, and arrival with no reader is not one. Had it been real, a complete
+but unclaimed message stream would retire and true up connection credit at
+the FIN, *before* `recv_message()` claimed it — contradicting §10.6's
+"message and datagram payloads stay accounted inside the core … until the
+handle takes them" and §16.4's backpressure-by-retention. Three statements,
+at most two of which could hold; retention until claimed is the rule. Without this rule, MAX_DATA is
 an absolute limit advanced only by reads, and cumulative discarded or
 reset bytes march the connection into a permanent send stall after
 `INITIAL_MAX_DATA` with no error and no timer — reachable in honest
@@ -4360,7 +4369,20 @@ drops state, so a stream that fully arrived is still there.
 death survives it.* While the connection still holds a stream's received
 state, `read` serves the buffered bytes and then the FIN's `Ok(None)`,
 and `accept_bi`/`accept_uni` hand over streams opened before the death;
-when nothing is left, both report `ConnectionLost`. **Parking is never
+when nothing is left, both report `ConnectionLost`.
+**[AMENDED 2026/08/16 — ruling 152]** *That enumeration was short:
+`recv_message` and `recv_datagram` drain on the same terms.* Appendix B
+ratifies an obligation the two-verb reading cannot satisfy —
+`send_message(m)`, then `acked()`, then `close()`, then drop every handle,
+and the peer must still receive `m` in full from `recv_message()` — where
+the peer's driver processes the data and the CLOSE in one pass, which is
+this ruling's own worked example. The *rationale* already described
+messages: §16.2 names `send_message(msg); acked(); close()` as the idiom
+`acked()` exists for; only the *list* omitted them. `recv_datagram` joins
+by symmetry — nothing is promised for a datagram, but the asymmetry would
+be a trap for exactly the reason given here, that a receiver woken after
+the latch cannot win the race by being prompt.
+**Parking is never
 permitted on a dead connection** — nothing further can arrive, so a
 `read` with no data and no FIN is an error rather than a wait. `closed()`
 is unaffected and still resolves at the death: the connection *is* dead,
@@ -4844,7 +4866,7 @@ impl core::Connection {
     fn close(&mut self, now: Instant, code: u64, reason: &[u8]);
     // claim verbs — the pull model (§10.6, §11.3, §9.8):
     fn accept(&mut self, dir: Dir) -> Option<StreamRef>;  // claim a peer-opened stream
-    fn recv_message(&mut self) -> Option<Vec<u8>>;        // claim the oldest complete unclaimed message
+    fn recv_message(&mut self, now: Instant) -> Option<Vec<u8>>;   // ruling 151        // claim the oldest complete unclaimed message
     fn recv_datagram(&mut self) -> Option<Vec<u8>>;       // claim the oldest queued datagram
     fn poll_output(&mut self) -> ConnOutput;
 }

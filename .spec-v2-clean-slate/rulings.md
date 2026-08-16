@@ -3793,3 +3793,183 @@ contract's waker list).
 split.** The 5b implementer's own summary is the pattern in one line: it
 shipped a red on purpose, because the red was a finding about a ruling
 rather than a bug in its code, and it declined to patch around it.
+
+---
+
+## Round 26 — slice 6 planning: messages and datagrams (2026/08/16)
+
+Eight open questions, six conflicts, nine unstated-scope findings. Two of
+the conflicts are in ratified text of mine, and one of those is in **ruling
+128**, which was itself written to fix a list that had been read as
+exhaustive.
+
+**Ruling 150 — `send_message` admits the whole payload or nothing, and
+§10.6 is the reason.**
+
+§16.4 gives `core::send_message` a `Result<(), MessageError>`, and
+`MessageError` is **exhaustive and already shipped** — `TooLarge` and
+`ConnectionLost`, nothing else, pinned by `spec_errors`. So the type
+cannot express "not now", while §16.2's own prose says the verb *"waits
+for stream allowance"* and `core::write` is credit-gated at admission.
+
+The planner's three candidates are decided by **§10.6, not by
+ergonomics**: *credit is the buffer commitment*. Accepting a payload
+beyond the peer's credit — the "core-side tail", quinn's shape and the
+most literal reading of §9.8's *"writes the whole payload"* — makes
+sender-side buffering `(uncredited message streams) × MESSAGE_RECV_MAX`,
+which at `INITIAL_MAX_STREAMS_UNI` = 128 is **32 MiB, a term §17.5's
+ceiling table does not contain**. That is a memory-bound change requiring
+its own ratification, not an implementation choice. Note this is *not* in
+tension with ruling 134: 134 lets `write()` accept what the **congestion
+window** cannot send, and congestion is not a buffer bound; flow control
+is, and it still gates admission.
+
+The shell-decomposes option is excluded outright: a dropped
+`send_message` future would leave a FIN-less, half-written uni stream,
+which against a message-mode receiver is §9.8's overflow case — so an
+application's own `timeout(d, send_message(..))` would **manufacture the
+failure S30 exists to diagnose**.
+
+**The cost is one wake and it is payable.** A `send_message` refused for
+allowance already has `ConnEvent::StreamsAvailable { dir: Uni }`; refused
+for **connection credit** it has nothing, because `StreamWritable { r }`
+fires only for a half with a blocked writer and a pending message has no
+stream yet. Slice 6 mints one `pub(crate)` `ConnEvent` variant for it.
+That enum is internal, the addition is additive, and slice 4 already
+added six — nothing on the wire moves.
+
+**Ruling 151 — `core::recv_message` takes `now: Instant`;
+`recv_datagram` does not, and the asymmetry is stated so nobody "fixes"
+it.** §16.4 gives `recv_message` no instant, but it **retires a receive
+half** (owing MAX_DATA under §10.3) and can **emit RESET_STREAM** (§9.8's
+overflow check runs *"at the instant such a claim is made"*), while §16.7
+puts sealing inside the mutating call and this core has no `Instant`
+field at all. Without `now`, S30's reset waits for the next `now`-bearing
+call — on an idle connection, a timer — **delaying by seconds the one
+path whose entire purpose is to fail promptly instead of stalling.**
+`abandon_recv` already takes `now` for the *weaker* of those two reasons.
+This is ruling 71's shape and ruling 108's remedy. `recv_datagram` stays
+`now`-free because datagrams are flow-control **exempt** (§10.7): claiming
+one advances no credit and emits nothing.
+
+**Ruling 152 — ruling 128's post-death drain covers `recv_message` and
+`recv_datagram` too. My list was short, for the third time.**
+
+Ruling 128 names *"`read` … and `accept_bi`/`accept_uni`"*. Appendix B
+ratifies an obligation the enumeration cannot satisfy (SPEC.md:6238-6241):
+*"`send_message(m)`, then `acked()`, then `close()`, then drop every
+handle. Assert endpoint B receives `m` in full from `recv_message()`."*
+B's driver processes the data and the CLOSE in one pass — **ruling 128's
+own worked example** — so `recv_message()` runs after the latch and, under
+the two-verb reading, answers `Err(PeerClosed)`.
+
+The rule's *rationale* already described messages: §16.2 names
+`send_message(msg); acked(); close()` as **the** idiom `acked()` exists
+for. Its *enumeration* omitted them. `recv_datagram` joins by symmetry —
+nothing is promised for a datagram, but the asymmetry would be a trap for
+precisely ruling 128's reason, that a receiver woken after the latch
+cannot win the race by being prompt.
+
+**Three of my lists have now been read as exhaustive and found short**
+(§16.4's stage-0 accessors, ruling 128's verbs, `CONTRACT-5b`'s waker
+list), and every one was found by an agent *building against it* rather
+than by review. Working rule 8 is about the spec; it applies to rulings
+with no discount.
+
+**Ruling 153 — the overflow predicate is the highest received offset, and
+`send_message` MUST carry the FIN on its last data frame.**
+
+§9.8 never says which quantity "reaches `MESSAGE_RECV_MAX`". The
+contiguous-prefix reading never fires when a middle byte was lost —
+exactly the case where the sender is stalled at the window and needs
+rescuing, so it reintroduces ruling 51's permanent stall. The
+highest-offset reading fires correctly under loss **but appears to reset a
+legitimate 262 144-byte message whose FIN is still in flight**, with
+`MESSAGE_OVERFLOW` — producing precisely the *"transfers die at 256 KiB"*
+post-mortem ruling 59 describes, pointing at the wrong cause.
+
+The race closes on the **sender's** side, not the predicate's: if
+`send_message` attaches the FIN to its final data frame rather than
+emitting a separate empty FIN frame, `high_water == MESSAGE_RECV_MAX`
+implies that frame arrived, which implies the final size is pinned, and
+the predicate cannot fire on a well-formed maximum-size message. The
+residual case — `open_uni()` + `write(262 144)` + a separate `finish()`
+aimed at a message-mode receiver — **is** ruling 51's mixing error, whose
+defined loud failure is this exact reset.
+
+This is the finding most likely to have shipped silently: a false positive
+on a *conforming* application, and a requirement nobody infers from
+"writes the whole payload, sets FIN".
+
+**Ruling 154 — §10.3's fifth retirement trigger is struck.** §10.3 lists
+five triggers *"— read to its final size, reset observed, handle
+abandoned, surfaced as a message, or **final size reached with no reader
+(§9.7)**"* — and **§9.7, the section it cites, lists three and does not
+contain the fifth.** If it were real, a complete but unclaimed message
+stream would retire and true up connection credit at the FIN, *before*
+`recv_message()` claims it — contradicting §10.6 (*"message and datagram
+payloads stay accounted inside the core … until the handle takes them"*)
+and §16.4's backpressure-by-retention. Three statements, at most two of
+which can hold; the two that agree with each other and with the design win.
+Retention until claimed is the rule.
+
+**Ruling 155 — one datagram per packet, packed before the stream fill,
+and the `0x30` form is mandatory rather than an optimisation.**
+
+Of the three packing orders, datagrams-after-the-fill is the one an
+implementer writes by accident, because appending after the existing
+`streams.fill(...)` is the smallest diff — and it is the worst: a
+saturated stream fills all 1170 bytes of every packet, datagrams **never**
+go out, and the bounded queue evicts continuously. **Silent data loss,
+with no counter that distinguishes it from ordinary pressure.**
+Drain-the-whole-queue starves a bulk stream for up to 64 packets. One per
+packet, before the fill, is the only order whose starvation is bounded in
+both directions and statable: a stream waits at most one packet per queued
+datagram, a datagram at most one packet per predecessor.
+
+Separately and not optionally: `MAX_DATAGRAM_PAYLOAD` is 1169 and
+`MAX_PLAINTEXT` is 1170, so a maximum-size datagram in the `0x31` form
+needs 1 + 2 + 1169 = 1172 bytes and **cannot be sent at all**. The `0x30`
+extends-to-end form is what makes the ratified maximum reachable. slither
+has never emitted an extends-to-end frame before this slice.
+
+**Ruling 156 — four smaller answers.** (a) The pending-claim flag is
+cleared by a `recv_message()` that returns `Some` — the literal reading of
+*"while a claim is pending, and at the instant such a claim is made"*, and
+its failure mode is bounded delay rather than a reset the application did
+not earn. (b) **Two** drop counters, send and recv: §11.5's singular sits
+four words from its own plural, and one counter cannot answer the operator
+question the counters exist for — *is my application over-producing, or is
+my peer over-sending?* (c) `earns_stream_credit` stays `true` everywhere;
+§10.3's *"consumption, not arrival, drives credit"* and the fact that
+`take_grant()` is reachable only from `Streams::read` already give §9.8's
+bound, and the planner answered this from the spec rather than raising it.
+(d) `recv_datagram` drains after death (ruling 152).
+
+**Ruling 157 — slice 6 is not cut.** One implementer across core *and*
+shell, plus **two blind test authors split by behaviour rather than
+layer** — datagrams (§11, S15) and messages-plus-overflow (§9.8, S16,
+S30). A 6a/6b cut would put the review boundary on the half with no design
+questions, while every open question above is a core question decided on
+both sides of the seam by one agent; and S30's ratified acceptance shape
+is an integration test through shell handles, so a 6a would close **no
+story**. At ~1.5k lines — half of slice 4 or 5 — that is a poor trade.
+
+**Ruling 158 — working rule 3's own count was stale, and that is the rule
+failing on itself.** `CLAUDE.md` still read *"Three times … most recently
+ruling 69"* while the count is five and the most recent is ruling 131. I
+have been citing the current figure in briefs and never swept the rule
+that carries it. **Working rule 4 — grep for the rationale, not only the
+token — applied to the rules file itself**, which is the one document in
+this project that no slice ever puts on an agent's path. Swept, and the
+count is now maintained with the rulings that move it.
+
+### Two corrections to my brief, both the planner's
+
+The `SentFrame`/DATAGRAM paragraph is `CONTRACT-5b.md` §2.7, not 5a's —
+5a has no §2.7. The claim itself verifies true. And the brief quoted
+*"801 tests"*, which is the `--all-features` figure; bare `cargo test` is
+726, because six targets sit behind `required-features = ["test-util"]`.
+Neither changes a decision, and both are the kind of thing an agent is
+right to correct rather than absorb. **Fifteen of sixteen agents that
+declined or corrected an instruction here have been right.**
