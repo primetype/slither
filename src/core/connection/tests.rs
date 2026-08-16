@@ -183,11 +183,6 @@ impl Peer {
         dgram
     }
 
-    /// The counter the peer's next seal will use.
-    fn next_counter(&self) -> u64 {
-        self.seal.next_counter()
-    }
-
     /// Seal `plaintext` so that it lands on exactly `counter`, burning (and
     /// discarding) the packets in between.
     ///
@@ -256,9 +251,6 @@ struct Fixture {
     peer: Peer,
     /// The connection's own session index — what `Retired` must carry.
     our_index: u32,
-    /// The instant the session was installed. §7.4 pins both liveness
-    /// clocks here.
-    installed_at: Instant,
 }
 
 impl Fixture {
@@ -429,7 +421,6 @@ fn established_at_with_epoch(now: Instant, epoch: NonZeroU64) -> Fixture {
         conn,
         peer,
         our_index,
-        installed_at: now,
     };
     let d = f.drain();
     assert!(
@@ -456,7 +447,6 @@ fn accepted_at(now: Instant) -> Fixture {
         conn,
         peer,
         our_index,
-        installed_at: now,
     };
     let _ = f.drain();
     f

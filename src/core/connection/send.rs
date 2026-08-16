@@ -354,11 +354,6 @@ impl SendHalf {
         true
     }
 
-    /// The peer's §9.8 reset code, if one arrived.
-    pub(crate) fn peer_reset(&self) -> Option<u64> {
-        self.peer_reset
-    }
-
     // ── the wire ────────────────────────────────────────────────────────
 
     /// Take one round-robin quantum's worth of stream data (§8.5).

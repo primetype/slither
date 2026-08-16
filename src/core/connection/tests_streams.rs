@@ -69,12 +69,9 @@ use crate::constants::{
 use crate::core::{Install, Role};
 use crate::error::{ReadError, WriteError};
 use crate::packet::ReferenceSuite;
-use crate::testutil::CountingIdentity;
 use crate::varint::VarInt;
 
 type Suite = ReferenceSuite;
-type Id = CountingIdentity<Suite>;
-
 /// **The one signature this file guesses.**
 ///
 /// Ruling 93 and its amendment require a core-level abandonment of a

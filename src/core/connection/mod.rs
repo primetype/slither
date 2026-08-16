@@ -393,11 +393,6 @@ impl<C: Handshake> Connection<C> {
         self.session.as_ref().map(Session::established)
     }
 
-    /// §7.2's replay window — also §12.2's received-packet record.
-    pub(crate) fn replay(&self) -> Option<&session::ReplayWindow> {
-        self.session.as_ref().map(Session::replay)
-    }
-
     /// §7.4's liveness clocks.
     pub(crate) fn liveness(&self) -> Option<&session::Liveness> {
         self.session.as_ref().map(Session::liveness)
@@ -1124,17 +1119,6 @@ impl<C: Handshake> Connection<C> {
         self.datagrams.pop_recv()
     }
 
-    /// §11.5's two counters.
-    ///
-    /// `#[cfg(test)]`: §16.2's accessor list is exhaustive (working rule 8)
-    /// and does not contain this, and §11.5 asks only for the **trace**. It
-    /// is here so a core test can pin the eviction discipline, which the
-    /// trace cannot be asserted on with today's fixtures.
-    #[cfg(test)]
-    pub(crate) fn datagram_drops(&self) -> datagram::DatagramDrops {
-        self.datagrams.drops()
-    }
-
     /// Emit anything owed on the wire.
     ///
     /// **Additive**, and after the `now` correction it is a convenience
@@ -1186,13 +1170,6 @@ impl<C: Handshake> Connection<C> {
         fin: bool,
     ) {
         self.streams.on_lost_range(r, range, fin);
-        self.pump(now);
-    }
-
-    /// §9.6's RESET_STREAM acknowledged. **Uncalled from the wire** in slice
-    /// 4.
-    pub(crate) fn on_reset_acked(&mut self, now: Instant, r: StreamRef) {
-        self.streams.on_reset_acked(r, &mut self.flow);
         self.pump(now);
     }
 

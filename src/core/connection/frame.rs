@@ -359,14 +359,6 @@ impl Stream {
         ty
     }
 
-    /// The end offset — §9.5's *"`offset + data length`"*.
-    ///
-    /// Saturating; the sum is bounded by [`parse`]'s structural check that
-    /// `offset + length` does not exceed 2⁶² − 1.
-    pub(crate) fn end(&self) -> u64 {
-        self.offset.saturating_add(self.data.len() as u64)
-    }
-
     fn body_len(&self) -> usize {
         varint_len(self.id.as_u64())
             + if self.off_present {

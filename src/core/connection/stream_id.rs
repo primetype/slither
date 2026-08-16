@@ -120,14 +120,6 @@ impl StreamId {
             Opener::Responder
         }
     }
-
-    /// The §9.1 space this id belongs to.
-    pub(crate) fn space(self) -> Space {
-        Space {
-            dir: self.dir(),
-            opener: self.opener(),
-        }
-    }
 }
 
 impl ::core::fmt::Display for StreamId {
@@ -193,15 +185,6 @@ impl Opener {
             Opener::Responder => Opener::Initiator,
         }
     }
-}
-
-/// One of §9.1's four independent ID spaces.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Space {
-    /// The direction half of the tag.
-    pub dir: Dir,
-    /// The opener half of the tag.
-    pub opener: Opener,
 }
 
 #[cfg(test)]

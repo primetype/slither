@@ -366,11 +366,6 @@ impl<I: Identity> IntroQueue<I> {
         self.entries.values().map(IntroEntry::deadline).min()
     }
 
-    /// How many chains are held, both tiers.
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// How many chains a source holds, both tiers.
     pub(crate) fn count_for(&self, key: SourceKey) -> u32 {
         self.per_source.get(&key).copied().unwrap_or(0)

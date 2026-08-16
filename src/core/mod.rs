@@ -29,12 +29,27 @@
 //! §5.6 arms it here by recording the anchor, and the budget is enforced
 //! there).
 
-// Slice 2a builds the core; the shell that drives it is slice 3, so from
-// `cargo build`'s point of view almost everything here is unreachable while
-// being exactly the surface §16.4 specifies. The same allow, for the same
-// reason, that `packet` carried through slice 1. It comes off when the
-// driver lands.
-#![allow(dead_code)]
+// **[RATIFIED — ruling 222]** Slice 2a carried a blanket
+// `#![allow(dead_code)]` here, scoped by its own words — *"the shell that
+// drives it is slice 3 … it comes off when the driver lands"*. The driver
+// landed in slice 3 and it did not come off. For five slices the release
+// table's *"Lints — zero warnings"* bar did not apply to the two state
+// machines that hold the protocol, and it hid ruling 217's abandoned
+// machinery until an audit found it by hand.
+//
+// It cannot simply be deleted, and the reason is structural rather than a
+// concession. These cores are **sans-io**: a great many accessors exist so
+// that a paused-clock test can observe state the shell has no reason to
+// read — `Closing::until`, `ReplayWindow::would_accept` (which exists
+// precisely *"so a test can separate the two"* rejection paths), ruling
+// 94's `capacity` accounting. Under `cfg(test)` every one of them has a
+// caller; without it none does. Deleting them deletes the observability
+// the whole test strategy rests on.
+//
+// So the allow is scoped to exactly the build in which it is honest. In
+// the test build — the one where every caller exists — the lint is live,
+// and anything it names there is dead for real.
+#![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod connection;
 pub(crate) mod endpoint;
@@ -313,13 +328,6 @@ pub enum EndpointOutput<C: Handshake> {
     /// **Terminal.** The drain is empty; the next armed deadline follows,
     /// or `None` if nothing is armed.
     Timeout(Option<Instant>),
-}
-
-impl<C: Handshake> EndpointOutput<C> {
-    /// Whether this is the drain sentinel.
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, EndpointOutput::Timeout(_))
-    }
 }
 
 impl<C: Handshake> std::fmt::Debug for EndpointOutput<C> {

@@ -116,11 +116,6 @@ impl Datagrams {
         !self.send.is_empty()
     }
 
-    /// §11.5's counters, for the `#[cfg(test)]` accessor.
-    pub(crate) fn drops(&self) -> DatagramDrops {
-        self.drops
-    }
-
     /// §15.2: `close()` drops state immediately, and §11.1 promises nothing
     /// about a queued datagram — so the send queue is **discarded**, never
     /// flushed into the CLOSE packet.

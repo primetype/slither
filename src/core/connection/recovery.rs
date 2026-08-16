@@ -410,16 +410,6 @@ impl Recovery {
         &self.rtt
     }
 
-    /// §13's backoff exponent — `2^pto_count` multiplies the PTO interval.
-    pub(crate) fn pto_count(&self) -> u32 {
-        self.pto_count
-    }
-
-    /// The largest counter the peer has acknowledged, if any.
-    pub(crate) fn largest_acked(&self) -> Option<u64> {
-        self.largest_acked
-    }
-
     /// §13.6's roam seam. Keeps the map — *"ACKs for packets in flight to
     /// the old address still resolve, and `bytes_in_flight` remains
     /// consistent with the retained map"* — and re-seeds `min_rtt` on the
@@ -723,11 +713,6 @@ impl RttEstimator {
         let deviation = smoothed.abs_diff(adjusted);
         self.rttvar = self.rttvar * 3 / 4 + deviation / 4;
         self.smoothed = Some(smoothed * 7 / 8 + adjusted / 8);
-    }
-
-    /// The latest sample, or zero before any.
-    pub(crate) fn latest_rtt(&self) -> Duration {
-        self.latest
     }
 
     /// `K_INITIAL_RTT` before any sample.

@@ -245,20 +245,6 @@ impl Amplification {
     pub(crate) fn counters(&self) -> Option<(u64, u64)> {
         (!self.validated).then_some((self.sent, self.recv))
     }
-
-    /// This arming's challenge bytes, for tests.
-    ///
-    /// **`set_floor` went with ruling 168's predicate and needs no
-    /// replacement.** It existed for one reason: the msg1-anchor arming
-    /// happens in [`Connection::established`](super::Connection::established)
-    /// *before* the session is installed, and the floor — *"the counter the
-    /// next seal will use"* — is unreadable until the install. A challenge
-    /// has no such dependency: it comes from the connection's own RNG, which
-    /// exists from `connecting()`. The two-phase arming collapses to one.
-    #[cfg(test)]
-    pub(crate) fn challenge(&self) -> [u8; 8] {
-        self.challenge
-    }
 }
 
 /// §7.5's contested mark. **Three states, not two** (ruling 46).

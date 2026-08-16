@@ -213,15 +213,6 @@ impl Packed {
         self.chunks.clear();
     }
 
-    /// Whether anything at all was taken.
-    pub(crate) fn is_empty(&self) -> bool {
-        !self.max_data
-            && !self.max_streams.iter().any(|owed| *owed)
-            && self.max_stream_data.is_empty()
-            && self.resets.is_empty()
-            && self.chunks.is_empty()
-    }
-
     /// §13.5's *"frame identities aboard"*, in §8.5's packing order.
     ///
     /// **May be empty**, and that is not a defect: a bare-PING PTO probe is
@@ -357,11 +348,6 @@ impl Streams {
         }
     }
 
-    /// **[ruling 106]** The role, fixed at install.
-    pub(crate) fn role(&self) -> Option<Role> {
-        self.role
-    }
-
     pub(crate) fn set_role(&mut self, role: Role) {
         self.role = Some(role);
     }
@@ -487,16 +473,6 @@ impl Streams {
         // a reset the application did not earn.
         self.message_claim_pending = false;
         Some(payload)
-    }
-
-    /// The final size a send half has pinned, if any — read by the ACK
-    /// entry points to tell whether an acknowledged range carried the FIN.
-    pub(crate) fn final_size(&self, r: StreamRef) -> Option<u64> {
-        self.entries
-            .get(&r)?
-            .send
-            .as_ref()
-            .and_then(SendHalf::final_size)
     }
 
     /// §16.4's `write`. `Ok(0)` is *blocked*, not *finished*.

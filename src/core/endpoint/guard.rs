@@ -503,9 +503,4 @@ impl TimestampGuard {
             }
         }
     }
-
-    /// How many entries are held. Diagnostics only.
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }

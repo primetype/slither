@@ -197,11 +197,6 @@ impl<I: Identity> Endpoint<I> {
         }
     }
 
-    /// The identity this endpoint runs on.
-    pub(crate) fn identity(&self) -> &I {
-        &self.identity
-    }
-
     /// Our static's canonical §2.4 octets.
     pub(crate) fn our_static(&self) -> &[u8] {
         &self.our_static_bytes

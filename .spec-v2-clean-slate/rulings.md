@@ -6341,3 +6341,74 @@ existing output passes every other test in the file and emits `[Ping]`
 here. Asserting *"the probe is ack-eliciting"* would **not** have
 separated them — the PING satisfies that for free. The assertion has to
 name the frame.
+
+### 222 — **the lint gate has not applied to either core since slice 2a**, and the allow said so itself
+
+**[RATIFIED 2026/08/16.]**
+
+`src/core/mod.rs` carried `#![allow(dead_code)]` over **both** sans-io
+cores, with its own expiry written into the comment above it:
+
+> Slice 2a builds the core; the shell that drives it is slice 3 … **It
+> comes off when the driver lands.**
+
+The driver landed in slice 3. It is now the end of slice 7b. For five
+slices the release table's *"Lints — zero warnings"* bar did not apply to
+the two state machines that hold the entire protocol, and the first thing
+found underneath it was ruling 217's abandoned machinery — three items
+called from nowhere, which no gate could have named while the allow stood.
+
+**Ruling: the allow is scoped, not deleted — `#![cfg_attr(not(test),
+allow(dead_code))]` — and the eighteen items dead underneath it are
+removed.**
+
+**Why scoping is right and deletion is wrong.** The cores are *sans-io*.
+A large family of accessors exists so a paused-clock test can observe
+state the shell has no reason to read: `Closing::until`,
+`ReplayWindow::would_accept` — whose doc says it exists *"so a test can
+separate the two"* rejection paths — ruling 94's `capacity` accounting.
+Under `cfg(test)` each has a caller; without it none does. A bare removal
+of the allow makes the lint demand the deletion of exactly the
+observability the test strategy is built on. Scoping puts the lint fully
+live in the build where every caller exists, which is the build in which
+"dead" means dead.
+
+**The eighteen removed**, all confirmed dead with every test compiled:
+`is_timeout`, `Connection::{replay, datagram_drops, on_reset_acked}`,
+`Datagrams::drops`, `Stream::end`, `Amplification::challenge` (already
+`#[cfg(test)]` and still unreferenced), `Recovery::{pto_count,
+largest_acked, latest_rtt}`, `SendHalf::peer_reset`, `StreamId::space`
+with the `Space` struct behind it, `Streams::{is_empty, role,
+final_size}`, `TimestampGuard::len`, `IntroQueue::len`,
+`Endpoint::identity`, and three fixture leftovers. Two were **transitively**
+dead — `Datagrams::drops` was reachable only from `datagram_drops`, itself
+dead — which is why the sweep took three passes and why the compiler, not
+a list, has to drive it.
+
+### 222(a) — I measured the wrong thing first, and the build caught me
+
+The first pass proposed deleting **37** items, on the stated ground that
+they were *"dead even under `--all-targets`"*. They were not. `cargo
+clippy --all-targets` compiles the lib **twice** — once without `cfg(test)`
+and once with — and I had `sort -u`'d the two streams together, so every
+item used *only* by an in-file `#[cfg(test)] mod tests` looked dead. The
+deletion pass then failed to compile with errors like *"no method named
+`until` found … field, not a method"*, from a caller sitting in the very
+test module that made it live.
+
+I then tried to separate the two with cargo's JSON `target.test` flag,
+which does not mean what it looks like: it is the manifest's *"run this
+under `cargo test`"* setting, true for the plain lib target too. Second
+wrong measurement, same conclusion.
+
+**What finally separated them was `cfg(test)` itself** — the discriminator
+was the thing being measured all along, and once that was seen the
+measurement and the fix turned out to be the same edit.
+
+This is **working rule 12 in the maintainer's hands**: *a true lemma about
+the wrong state proves nothing*. Every warning I read was real; the state
+they described was a build I had not isolated. It is also the second time
+this round that a claim of mine survived only until something executed it —
+the first being ruling 221's, which held. **The build is the reviewer that
+does not agree out of politeness**, and 37 deletions with a clean argument
+attached would have shipped if `cargo build` had not refused them.
