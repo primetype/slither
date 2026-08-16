@@ -1703,6 +1703,27 @@ the guard pass (§6.6's order) is it applied:
 - **The peer's static is smaller** ⇒ we cancel our pending now — post-`ss`,
   on the authenticated inbound (the pending and its index dropped; no
   give-up, no error) — and the tie-break admits and writes msg2 as
+
+  > **[RATIFIED 2026/08/16 — ruling 191] The loser's *dial* resolves
+  > differently on the two routes, and the difference is forced.** The
+  > winner-side note above says the only visible difference between the
+  > routes is `AcceptError::Stale` versus a silent drop; on the **loser**
+  > side there is a second one. By this internal route the pending is
+  > **promoted in place** — the same connection receives
+  > `Install { role: Responder }`, so the application's own `Connecting`
+  > resolves **`Ok(Connection)`**. By §6.4's staged route the pending is
+  > dropped and its `Connecting` resolves
+  > **`Err(ConnectError::AlreadyConnected)`**, with a *new* connection
+  > minted for the accepted initiation.
+  > Neither is a defect, because the routes differ in **which call owns
+  > the resulting handle**: on the staged route the application drove
+  > `read_identity()` → `authenticate()` → `accept()`, and `accept()`
+  > returns the connection, so the dial has nothing left to deliver; on
+  > this route §6.6 guarantees the application never sees an accept, so
+  > the `Connecting` is the **only** handle that can carry it. Each route
+  > delivers exactly one connection and they differ only in which verb
+  > delivers it — but an application writes code against that difference,
+  > so it is stated rather than left to be discovered.
   responder (§6.6 step 4).
 
 **What a replay can still do here, stated honestly.** A forgery cannot

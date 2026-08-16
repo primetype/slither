@@ -899,7 +899,25 @@ Read left-to-right as "fires first". Additionally:
 
 ### 8.3 The mark / transmission / verdict separation
 
-**Binding, and the single most testable property in the slice:**
+**Binding as behaviour. ⛔ But "the single most testable property in the
+slice" is STRUCK — ruling 193.** The pending row is **not reachable from
+an integration test at all**, and the two blind test authors established
+that independently, from unrelated directions:
+
+- **by arithmetic** — after a roam `budget_sent == 0` and the probe is
+  ~31 B against `3 ×` the roam trigger (itself ≥ a ~30 B keepalive), so
+  ~90 B admits it outright; and driving the spend up is self-defeating,
+  because every small packet the peer sends raises the cap by 3× what a
+  reply costs;
+- **by construction** — the fixture cannot build a connection that both
+  roams *and* is contested: `SharedWire` has no public constructor,
+  `FlakyWire` is not `Clone`, and `EndpointBuilder::wire` takes by value,
+  so only `Pair`/`Peer` endpoints can rebind — and `Peer` exposes no
+  `Identity`, which a contest requires.
+
+**The coverage is owed at core level**, where `Solo::deliver_from` reaches
+it, and by working rule 6 it may not be written by anyone who has seen the
+implementation.
 
 | Moment | `notified()` yields | `slither::policy` traces |
 |---|---|---|
@@ -1041,7 +1059,7 @@ The keepalive's empty plaintext yields `vec![]`.
 |---|---|
 | `ConfigError` | **none.** Both variants exist at `error.rs:293,296` and are pinned by `spec_errors.rs`. Slice 7 **constructs** them for the first time. |
 | `ConnectionLost` | **none.** `Replaced` exists and is constructed for the first time. The contested verdict reuses `TimedOut` — **no new variant** (§15.4 L4105–4120). |
-| `ConnectError` | **none.** `AlreadyConnected` already covers S3a and the tie-break-loser's cancelled pending. |
+| `ConnectError` | **none.** `AlreadyConnected` covers S3a, and the tie-break loser's pending **on the staged route only** — **[corrected, ruling 191]**. The two routes resolve the *dial* differently and both are correct: **staged** (§6.4's PENDING branch) drops the pending and resolves its `Connecting` **`Err(AlreadyConnected)`**, with a new connection minted for the accepted initiation; **internal** (§6.6) **promotes the pending in place**, so the same `Connecting` resolves **`Ok(Connection)`** as `Role::Responder`. The difference is forced by which call owns the handle — on the staged route `accept()` returns the connection, so the dial has nothing left to deliver; on the internal route §6.6 guarantees the application never sees an accept, so the `Connecting` is the only handle there is. **The earlier one-row form, read as exhaustive, sends you to the wrong assertion on the more common route.** |
 | `AcceptError` | **none.** `Stale` covers every refusal. **There is no `AcceptError::AlreadyConnected`** — deleted as unreachable (§6.4 L1362–1365). |
 | `IntroError`, `AuthError`, `WriteError`, `ReadError`, `MessageError`, `DatagramError` | **none.** |
 

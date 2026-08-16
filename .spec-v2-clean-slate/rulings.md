@@ -5130,3 +5130,137 @@ which cannot be sampled atomically.
 **`cargo clippy` was blocked twice by this environment's permission
 classifier, and T-K did not claim it green.** Working rule 7 observed
 exactly.
+
+### 191 (T-M's finding 3) — the two tie-break routes resolve the **dial** differently, and both are right
+
+`CONTRACT-7.md` §10 says *"`AlreadyConnected` covers the tie-break-loser's
+cancelled pending"*. T-M, blind, found that this is true on **one** of the
+two routes, and that read as exhaustive (working rule 8) it sends an author
+to the wrong assertion on the **more common** one. Verified in the code
+rather than the text (working rule 11):
+
+- **Staged route** (§6.4's PENDING branch, ruling 35) —
+  `cancel_pending_losing_tiebreak` (`routing.rs:688`) drops the pending and
+  emits `HandshakeFailed(dial, ConnectError::AlreadyConnected)`, so the
+  loser's `Connecting` resolves **`Err(AlreadyConnected)`**, and a *new*
+  connection is minted for the accepted initiation.
+- **Internal route** (§6.6) — the pending is **promoted in place**
+  (`routing.rs:544–562`): the same connection receives `Install { role:
+  Role::Responder }`, so the loser's own `Connecting` resolves
+  **`Ok(Connection)`**.
+
+**Ruling: both stand, and §6.7's claim is amended.** §6.7 says the only
+visible difference between the routes is `AcceptError::Stale` versus a
+silent drop. That is now false — there is a **second** difference, on the
+dial side — and it must be stated, because it is the one an application
+actually writes code against.
+
+**And the difference is forced, not incidental**, which is why neither
+route changes: the two routes differ in **which call owns the resulting
+handle**. On the staged route the application drove
+`read_identity()` → `authenticate()` → `accept()`, and `accept()` returns
+the connection, so the dial has nothing left to deliver and
+`AlreadyConnected` is the honest answer. On the internal route §6.6
+guarantees *"the application never sees it"* — there is no `accept()` to
+return anything — so the `Connecting` is the **only** handle that can
+carry the connection, and promoting in place is the only way to hand it
+over. Each route delivers exactly one connection; they differ only in
+which verb delivers it.
+
+`CONTRACT-7.md` §10 is corrected to state both rows.
+
+### 192 (T-M's finding 1) — S4's mixed staged/internal case has an ordering precondition
+
+S4 requires the tie-break to hold *"when one side reaches the decision via
+the staged path and the other via the internal tie-break"*. T-M found that
+the obvious construction cannot produce it: §6.5's eager path reclaims a
+**parked** initiation whose claim is in the pending outbound remotes, so a
+`read_identity()` issued **after** the local `connect()` returns
+`IntroError::Internal`, and §6.4's staged PENDING branch is never entered.
+Observed directly: `dial = Ok(...)`, `ladder = Err(Intro(Internal))`.
+
+**Ruling:** the precondition is real and belongs in the contract, not in
+each author's rediscovery — **the Intro must be climbed to `Proven`
+before the local dial** for the staged route to be reachable. This is a
+consequence of §6.5's routing rule, which is correct as written; nothing
+in the protocol changes. `CONTRACT-7.md` gains the ordering note beside
+its S4 sequence.
+
+Related and **not** a defect: T-M's finding 2, that §4.1's `t_cand <= t`
+row is unreachable from a story test because §17.1's guard is consulted in
+`authenticate()` (`staged.rs:491`), so a stale candidate dies at stage 2
+with `AuthError::Replay` and `accept()` is never reached. The row is right
+at core level; it is simply not pinnable from the shell, and T-M asserting
+the *outcome* while accepting either refusal is the correct response.
+
+### 193 — the mark/transmission separation is unreachable at integration. **Both blind authors found it, from different directions.**
+
+`CONTRACT-7.md` §8.3 calls the mark/transmission separation *"the single
+most testable property in the slice"*. **It is not testable at that level
+at all**, and the two test authors established this independently, neither
+knowing the other existed, by two unrelated arguments:
+
+- **T-K, by arithmetic.** After a roam `budget_sent == 0`, and the probe is
+  ~31 B against `3 ×` the roam trigger (itself ≥ a ~30 B keepalive), so
+  ~90 B admits it outright. Driving the spend up is self-defeating: every
+  small packet the peer sends raises the cap by 3× what a reply costs.
+- **T-M, by construction.** The fixture cannot build a connection that
+  both roams **and** is contested. `SharedWire` has no public constructor,
+  `FlakyWire` is not `Clone`, and `EndpointBuilder::wire` takes by value —
+  so only `Pair`/`Peer` endpoints can rebind, and `Peer` never exposes an
+  `Identity`, which a contest requires.
+
+Round 5 recorded that two independent reviews finding the same blocker from
+different directions is *"the strongest confirmation this process
+produces."* This is the second occurrence, and the first between agents who
+were mutually blind by construction rather than merely run separately.
+
+**Ruling, three parts.**
+(a) `CONTRACT-7.md` §8.3's claim is **struck**; the property is core-level.
+(b) The coverage is **owed**, and by working rule 6 it may not be written
+by anyone who has seen the implementation. If the implementer's own tests
+do not reach it, the integrator dispatches a **fresh blind agent** against
+the contract — not a test written directly by the integrator.
+(c) T-M's structural finding is a **fixture** gap in its own right and is
+recorded as such: a connection that can both roam and be contested is not
+constructible, and slice 8 or 9 should decide whether `Peer` grows an
+identity accessor or `EndpointBuilder::wire` takes a shared handle. **Not
+fixed now** — changing the builder's signature mid-slice would edit a path
+the implementer holds.
+
+This is working rule 13 twice over, and it says something sharper than
+before: **the fixture bounded the coverage, and the budget arithmetic
+bounded it independently, so no amount of fixture work alone would have
+exposed the whole gap.**
+
+### 194 (T-M, for the integrator) — the `[[test]]` stanzas are required for the gate to run, not for tidiness
+
+T-M verified that `Cargo.toml` carries no `autotests = false`, so cargo
+**auto-discovers** `tests/story_mobility.rs` *without* its
+`required-features`, and `cargo test --test story_mobility` fails on
+`unresolved import slither::testutil`. So the stanza is not cosmetic:
+**without it the feature-less `cargo test` gate cannot pass at all.**
+
+Recorded because working rule 15 established that these stanzas are the
+integrator's — cargo *refuses to parse* a manifest naming a missing test
+file, so an implementer adding them early leaves a tree on which no gate
+runs. The rule said *whose* job it is; this says **what breaks if the job
+is skipped**, which is the half that was missing. A slice could otherwise
+end with an integrator seeing a green `cargo test --all-features` and a
+red bare `cargo test` and mistaking a manifest gap for a test failure.
+
+### Round 31's shape so far
+
+Both test authors delivered, mutually blind, on disjoint paths: **28
+story tests, ~3 500 lines.** Each verified its own compile errors
+**positively** — temporarily shimming the missing APIs, confirming a clean
+build, then reverting — so that "all my errors name contract-promised
+APIs" is evidence rather than inspection. T-M went further and ran the
+shimmed suite: **6 passed, 10 failed**, every failure at the first slice-7
+behaviour its test touches, and **both S4 tests among the six that pass** —
+which is §1.2's predicted correct outcome, ruling 91 having moved that work
+into slice 4.
+
+Neither claimed a gate it had not run. T-K reported clippy blocked by the
+environment; T-M reported it clean on its own target with the shim in
+place.
