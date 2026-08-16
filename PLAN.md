@@ -285,7 +285,7 @@ code compiles, but when its stories are paused-clock tests that pass.
 | 5 | **Reliability** | §12 ACK fused to the replay window + delayed ACK, §13 RFC 9002 (reuse v0.1 arithmetic), §14 NewReno, ruling 47's `acked()` / `flush()` | S12 (full, over `FlakyWire`), S28 |
 | 6 | **Sugar** | §9.8 messages + `MESSAGE_OVERFLOW` + the guarded overflow check, §11 datagrams + drop-oldest + counters | S15, S16, S30 |
 | 7 | **Mobility & contest** | §7.3 roaming + amplification budget, §7.5 keepalive + persistent keepalive + the contested probe *(§7.4's liveness half moved to 3a — round 12)*, §5.4 / §6.4 / §6.7–6.8 replacement + tie-break + restart *(§6.5 and §6.6 moved to slice 4 — ruling 91)*, `notified()` + `Notification` | S3, S4, S5, S11, S18, S19, S20, S27 (full) |
-| 8 | **Composability** | all of §3 above: `compat/{io,stream,codec,tower}.rs`, **`BiStream`'s `AsyncRead`/`AsyncWrite` impls** (the type itself, with `split`/`join`, lands in slice 4 — ruling 96), the `io::Error` conversions, the no-prefetch pin | S25, and S31–S33 (drafted, §7) |
+| 8 | **Composability** | all of §3 above: `compat/{io,stream,codec,tower}.rs`, **`BiStream`'s `AsyncRead`/`AsyncWrite` impls** (the type itself, with `split`/`join`, lands in slice 4 — ruling 96), the `io::Error` conversions, the no-prefetch pin | S25, and S31–S33 (approved, ruling 209, `STORIES.md` §I) |
 | 9 | **Ship** | the five documentation obligations, Appendix B complete, all eight gates, MSRV 1.96, `cargo deny`, rustdoc `-D warnings`, bubble-engine cutover | — |
 
 **Slices 0–3 are the spine and 3b is the risk.** It is the slice where
@@ -349,7 +349,7 @@ match (§16.3, §16.2, and the new §16.11).
 | **D6** | A `Send` façade for multi-thread runtimes, buffered service layers, hyper. | **Deferred past v0.2 by design.** It re-crosses the seam that produced round 7's defects. §16.11's handle shapes stay compatible with adding it later without a breaking change. |
 | **D7** | Adapters in-crate behind features, or companion crates? | **In-crate**, additive features `sink` / `codec` / `tower`. Gates already run `--all-features`; three tiny stable deps plus `tokio-util` under `codec`. |
 | **D9** | v0.2 in place, or alongside v0.1? | **Rewrite on main.** Maintainer's ruling. `bubble-engine`'s `path = "../../slither"` does resolve here, so its build stops until the cutover — accepted; bubble is not a constraint on the rewrite and will be updated once this lands. |
-| **D10** → **ruling 59** | S29 and S30, drafted from rulings 50–52. | **Approved 2026/08/14, both amended.** S29 pins that a cancel-and-redial loop **replaces rather than accumulates** (4 DH + one `Replaced` per cycle, bounded by §16.1). S30 gains **ruling 59**: the receiver MUST trace the overflow reset under `slither::frames`, because it is the end that caused the conflict and the only end that otherwise learns nothing. `STORIES.md` is complete at **30 approved stories**. |
+| **D10** → **ruling 59** | S29 and S30, drafted from rulings 50–52. | **Approved 2026/08/14, both amended.** S29 pins that a cancel-and-redial loop **replaces rather than accumulates** (4 DH + one `Replaced` per cycle, bounded by §16.1). S30 gains **ruling 59**: the receiver MUST trace the overflow reset under `slither::frames`, because it is the end that caused the conflict and the only end that otherwise learns nothing. `STORIES.md` was complete at **30 approved stories**; **ruling 209** (2026/08/16) approved S31–S33 and moved them into `STORIES.md` §I, so the list now stands at **33**. |
 
 ---
 
@@ -358,6 +358,13 @@ match (§16.3, §16.2, and the new §16.11).
 The composability layer is new capability, so it owes stories on the same
 terms as everything else. Drafted here, to move into `STORIES.md` on
 approval.
+
+> **[APPROVED 2026/08/16 — ruling 209.] These three now live in
+> `STORIES.md` §I and are the authority; the drafts below are kept as
+> the record of what was approved.** Slice 8's planner found its brief
+> citing them in `STORIES.md` when they were only ever here — the same
+> defect that cost slice 4a's blind author ten minutes of guessing an
+> API, caught this time before anyone was briefed.
 
 - **S31 — a user can treat a stream as an `AsyncRead`/`AsyncWrite`.**
   `tokio::io::copy` a file into a `BiStream` behind a `BufWriter`,

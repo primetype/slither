@@ -5806,3 +5806,99 @@ A fix that caps the plaintext at the remaining *datagram* bytes overshoots
 by 30 and re-refuses its own packet. The two units differ by exactly the
 overhead, and ruling 201 already cost one round to a units error in this
 area.
+
+---
+
+## Round 34 — the adversarial protocol review (2026/08/16)
+
+Three reviewers, disjoint lenses, blind to each other. Seventeen findings.
+The reviews are at `.slices/07-mobility/ADVERSARIAL-{amplification,handshake,liveness}.md`.
+
+### 208 — **ruling 168 is superseded. Return routability gets an unforgeable challenge, and the wire gains two frame types.**
+
+**[RATIFIED 2026/08/16 by the maintainer — the first wire change since v1
+was frozen.]**
+
+**The defect.** Ruling 168 validates a roamed address on an ACK covering
+`validation_floor`, reasoning that *"only an ACK proves the peer receives
+at the address we are sending to."* An ACK is
+`{ largest, ack_delay, first_range, ranges }` — four plaintext integers
+under AEAD. **`largest` is not a proof of receipt; it is an assertion by
+whoever holds the key**, and §7.3's roaming threat model *is* the key
+holder: the peer is the party that tells us where to send.
+
+A connected peer therefore announces a move to victim V, waits for one
+sealed packet, and returns a forged ACK spoofed from V. Cost: **two small
+packets**, after which the budget is gone and reflection at V is
+unbounded. Pre-168 the same attacker paid a third of the reflected volume
+*continuously*. §7.3's stated purpose — *"forces an attacker to pay a
+third of any flood it reflects"* — is defeated at O(1).
+
+The attacker needs source-address spoofing, but it needed that to fake the
+move; 168 adds no requirement, it removes the ongoing cost.
+
+**§7.3's own proof already scoped itself out of this, and nobody read the
+scope.** `SPEC.md:2165` argues that an ACK's coverage *"derives from the
+peer's replay window … which cannot contain a counter the peer never
+received, and **an attacker** holds only packets we sealed before the
+floor."* That is sound — against a **third party**. It says nothing about
+the peer, and the sentence's own word "attacker" is what disguises the
+gap. **Defect class 1, in the proof of the ruling that reversed a
+declination**: a stated construction with an unstated scope. This is the
+~26th instance and the most expensive.
+
+**Ruling.** The proof of return routability becomes a value the peer
+**cannot fabricate**: a random challenge sent to the new address, echoed
+back. A peer that did not receive at that address cannot guess it. This is
+QUIC's `PATH_CHALLENGE`/`PATH_RESPONSE` and it is the correct engineering
+answer; slither's frame layer is QUIC-shaped and has the room.
+
+**Why now, and why this is not a wire violation.** CLAUDE.md freezes the
+v1 wire, and this moves wire bytes. It is ratified anyway because **v0.2
+is unreleased**: `bubble-engine` is the only consumer, its build is
+already broken pending slice 9's cutover, and no third party has ever
+seen a slither datagram. The price of this change is strictly lower today
+than on any future day, and after publication it becomes a v2 problem
+permanently. **The freeze exists to stop casual drift, not to make the
+protocol unfixable before it ships.**
+
+**The wire, proposed by me under the maintainer's ratification of the
+mechanism — the code points are mine and are the part to override if you
+disagree:**
+
+| Frame | Code | Payload |
+|---|---|---|
+| `PATH_CHALLENGE` | `0x1a` | 8 opaque bytes |
+| `PATH_RESPONSE` | `0x1b` | the same 8 bytes, echoed |
+
+`0x1a`/`0x1b` are unused in slither and are **QUIC's own code points for
+these two frames**, which costs nothing and saves every future reader a
+lookup. Both are ack-eliciting. The challenge is drawn from the endpoint
+RNG, is per-arming, and is never reused across armings.
+
+**What this does not change.** The 3× budget, `AMPLIFICATION_FACTOR`, the
+arming triggers, and the *held-not-dropped* discipline all stand. Ruling
+203's sizing fix stands and becomes more important, not less: the
+challenge must fit inside the armed budget, and a pump that cannot shrink
+cannot emit one.
+
+**Consequences to carry into the remediation slice.** `validation_floor`
+and `on_ack_covering` lose their security role — ruling 168's machinery is
+replaced, not supplemented, and leaving both in place would give an
+attacker the old path as a bypass. §7.3, §7.5 and §12 all need reading for
+prose still arguing the ACK proof (**working rule 4**: grep the rationale,
+not only the token).
+
+### 209 — S31–S33 are approved; `STORIES.md`'s D10 moves to 33
+
+Slice 8's planner found its own acceptance criteria missing: the brief
+cited S31–S33 in `STORIES.md`, they exist only as drafts in `PLAN.md` §7,
+and D10 declares the list *"complete at 30 approved stories"*. Ratified by
+the maintainer: the three drafts are approved as written and move into
+`STORIES.md`; D10 reads 33.
+
+This is slice 4a's defect in a new place — **a document that calls itself
+binding, cited by a brief, not containing what the brief says it
+contains.** There it cost a blind author ten minutes of guessing an API;
+here the planner caught it before any agent was briefed, which is the
+whole value of planning before dispatching.

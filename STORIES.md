@@ -538,6 +538,71 @@ The one configuration slither cannot repair, made diagnosable (rulings
 
 ---
 
+## I. Composability *(APPROVED 2026/08/16 — ruling 209)*
+
+Drafted in `PLAN.md` §7 and moved here on the maintainer's approval. The
+composability layer is new capability, so it owes stories on the same
+terms as everything else — and slice 8's planner found it had none,
+because its brief cited these three as already living here.
+
+### S31 — a user can treat a stream as an `AsyncRead`/`AsyncWrite`
+
+The ecosystem's byte-stream shape, on the object that actually is one.
+
+- **Accepts:** `tokio::io::copy` a file into a `BiStream` behind a
+  `BufWriter`, then `shutdown()`, and the peer reads identical bytes and
+  observes EOF. Over `FlakyWire` with loss, on the paused clock.
+- **Accepts:** errors arrive as `io::Error`, and a peer's reset surfaces
+  as `ConnectionReset` rather than as a silent truncation — the failure
+  mode a byte-stream consumer cannot otherwise distinguish from a clean
+  end.
+- **Accepts:** `poll_shutdown` is `finish()` **and then** `acked()`
+  (ruling 57), so `copy(…).await; shutdown().await` does not lose its
+  tail. It resolves in error if the connection dies first, so it cannot
+  hang past `DEAD_TIMEOUT`.
+- **Does not promise:** that `flush()` means delivery. `poll_flush` is a
+  no-op returning `Ready` (ruling 56) — bytes accepted by `poll_write`
+  are already in send state, and there is no shell buffer to push.
+- **Anchor:** §16.11, §3.1 of `PLAN.md`, rulings 55–57. **Paused clock:**
+  yes.
+
+### S32 — a user can stream typed objects with a codec
+
+Framing, for free, from the byte streams.
+
+- **Accepts:** `Framed<BiStream, LengthDelimitedCodec>` round-trips a
+  sequence of objects **in order**.
+- **Accepts:** `Stream`/`Sink` backpressure maps onto flow-control credit
+  rather than onto an intermediate buffer.
+- **Accepts (the invariant, asserted rather than described):** a consumer
+  that polls **once** finds that **exactly one** item was claimed. This
+  is §16.11 / ruling 58 — *an adapter never claims ahead of its
+  consumer* — and it is the single easiest way to get this layer wrong,
+  because a read-ahead task looks like an ergonomic convenience and is
+  in fact the unbounded shell queue §10.6 forbids.
+- **Anchor:** §16.11, §10.6, ruling 58. **Paused clock:** yes.
+
+### S33 — a user can drive slither from a `tower::Service`
+
+The service shape, typed honestly rather than aspirationally.
+
+- **Accepts:** a `Service` call opens **one bi stream**, writes the
+  request, finishes, and reads the response to EOF. The stream *is* the
+  request/response correlation, because the wire carries no request id
+  and a `Service` over the message verb therefore cannot work.
+- **Accepts:** concurrent calls do not head-of-line block each other.
+  `serve()` drives the accepting side.
+- **Accepts (the caveat is rustdoc, not folklore):** the `!Send`
+  boundary is asserted — `UnsyncBoxService` composes; `tower::buffer::Buffer`,
+  `spawn_ready`, `BoxService`, hyper and plain `tokio::spawn` do not,
+  because they spawn onto a work-stealing executor.
+- **Does not promise:** a `Send` façade. D6's `bridge` is deliberately
+  out of v0.2 scope — it re-crosses the core→shell seam with channels,
+  which is exactly where round 7's five defects lived.
+- **Anchor:** §3.4 of `PLAN.md`, §16.3, S21. **Paused clock:** yes.
+
+---
+
 ## Carried forward from the walkthrough
 
 **Resolved at approval:**
