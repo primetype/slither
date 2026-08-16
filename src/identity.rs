@@ -148,6 +148,62 @@ pub enum SoftwareIdentityError {
 /// Drawing a sub-seed advances the parent, so every handshake gets a
 /// distinct stream and a seeded parent still makes the whole sequence
 /// reproducible.
+///
+/// # `R` must be seeded from OS entropy in production
+///
+/// **This type takes no OS default, and that is the one thing to know
+/// about it.** `R` is not a convenience RNG: it is the source of the
+/// static scalar in [`generate`](Self::generate) *and* of every handshake
+/// ephemeral this identity ever produces, in both roles, through the
+/// sub-seed `open()` draws. Reproducibility is a **testing** property
+/// here, exactly as
+/// [`EndpointBuilder::rng_seed`](crate::EndpointBuilder::rng_seed) says it
+/// is for §16.6's endpoint RNG — but that one defaults to OS entropy when
+/// the caller says nothing, and this one has no default to fall back to,
+/// because `R` is a constructor argument. The asymmetry is a trap: the
+/// less critical RNG is the one that is safe by default.
+///
+/// What a predictable `R` costs, stated separately because the two
+/// constructors lose different things:
+///
+/// - [`generate`](Self::generate) draws the **static private key** from
+///   `R`. Predict `R` and the identity itself is recoverable — total
+///   compromise, indefinitely, with no session to expire.
+/// - [`from_scalar`](Self::from_scalar) keeps the static safe but still
+///   feeds every ephemeral. Predict `R` and an initiator's ephemeral
+///   private key follows, so `es = DH(e_i, S_r)` is computable from public
+///   data alone — which decrypts msg1's static field and its timestamp.
+///   That voids §5.3's stated guarantee that those are *"opaque to any
+///   passive observer"*, and forward secrecy with them. (`ss` still blocks
+///   a full transcript break, so this is identity and metadata exposure,
+///   not immediate session compromise.)
+///
+/// **The `R: CryptoRng` bound does not carry this.** `ChaCha20Rng` is a
+/// CSPRNG *given an unpredictable seed*; the bound describes the
+/// algorithm and says nothing about where the seed came from.
+///
+/// The production shape, which is also what
+/// [`EndpointBuilder::build`](crate::EndpointBuilder::build) does for the
+/// endpoint RNG:
+///
+/// ```no_run
+/// use rand_chacha::ChaCha20Rng;
+/// use rand_chacha::rand_core::SeedableRng;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut seed = [0u8; 32];
+/// getrandom::fill(&mut seed)?;
+/// let rng = ChaCha20Rng::from_seed(seed);
+/// // …then `SoftwareIdentity::<MySuite>::generate(rng)`.
+/// # let _ = rng;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `rand_core` 0.10 ships no `OsRng` of its own (it moved to `rand` as
+/// `SysRng`), so the two lines above — or `rand`'s equivalent — are the
+/// whole of it. A seeded `R` belongs in tests, where the `testutil`
+/// fabric uses exactly that and is right to.
 pub struct SoftwareIdentity<S, R = ChaCha20Rng> {
     scalar: [u8; 32],
     public: P256r1PublicKey,
@@ -168,6 +224,11 @@ where
 {
     /// Build an identity from the canonical big-endian encoding of a
     /// secp256r1 private scalar, plus the CSPRNG sub-seeds are drawn from.
+    ///
+    /// **`rng` must be seeded from OS entropy in production** — it feeds
+    /// every handshake ephemeral this identity produces, and a predictable
+    /// one makes msg1's static field and timestamp readable by a passive
+    /// observer (§5.3). See [the type's note](Self#r-must-be-seeded-from-os-entropy-in-production).
     pub fn from_scalar(scalar: [u8; 32], rng: R) -> Result<Self, SoftwareIdentityError> {
         let key =
             P256r1PrivateKey::from_bytes(scalar).map_err(SoftwareIdentityError::InvalidScalar)?;
@@ -182,6 +243,13 @@ where
 
     /// Generate a fresh static key from `rng`, and keep `rng` as the
     /// sub-seed source.
+    ///
+    /// **`rng` must be seeded from OS entropy.** This is the constructor
+    /// that draws the **static private key** itself, so a predictable
+    /// `rng` here does not degrade a property — it hands over the
+    /// identity. See [the type's
+    /// note](Self#r-must-be-seeded-from-os-entropy-in-production) for the
+    /// two-line recipe.
     pub fn generate(mut rng: R) -> Result<Self, SoftwareIdentityError> {
         let mut scalar = [0u8; 32];
         loop {

@@ -69,6 +69,26 @@ impl<I: Identity> Intro<I> {
 
     /// Where this initiation came from.
     ///
+    /// **Attacker-chosen, at 0 DH, with no return-routability proof — do
+    /// not key durable state on it.** §6.1 forbids that in terms, and it
+    /// names **three** quantities, not one: *"Nothing durable may be keyed
+    /// on the claimed static, the source address, or `sender_index` — no
+    /// map insertion, no rate-limit bucket, no unbounded logging."* This is
+    /// documentation obligation #2 (see the [crate docs](crate)) at the
+    /// rung *below* the claimed static, and the address is the **cheaper**
+    /// of the two to abuse, not the safer: a claimed static costs an
+    /// attacker one DH and requires knowing some real public key, while a
+    /// source address costs nothing and can name any host on the internet.
+    /// Nothing has answered from this address at stage 0 — the ladder's
+    /// first reply is msg2, which `accept()` sends — so a spoofed source is
+    /// free, and a denylist or a rate-limit bucket keyed here bans whoever
+    /// the attacker wrote in the packet. Under the flood §6.3 describes,
+    /// that is precisely the reflex to expect.
+    ///
+    /// Use it to **route, log at bounded volume, and decide** — an address
+    /// is legitimate input to an authorisation policy. Never use it to
+    /// punish, and never let it grow a map.
+    ///
     /// Read **live** from the parked entry (ruling 71): §6.3 requires a
     /// refreshed entry's accessors to reflect the newest bytes at call
     /// time. For the source address that happens to be invariant under
@@ -86,6 +106,13 @@ impl<I: Identity> Intro<I> {
     }
 
     /// The `sender_index` on the initiation currently parked here.
+    ///
+    /// **The third of §6.1's three attacker-chosen quantities — do not key
+    /// durable state on it either**, and see [`source`](Self::source) for
+    /// the rule and the reason. This one carries its own trap: §5.5 mints a
+    /// fresh random index on **every retransmit**, so it is not stable even
+    /// for a genuine peer, and a map keyed on it grows one entry per
+    /// retransmit of one honest initiation.
     ///
     /// Read **live**, and here it is load-bearing (ruling 71): §5.5 mints a
     /// **new random index on every retransmit**, and §6.3's dedup replaces
@@ -155,6 +182,15 @@ impl<I: Identity> Drop for Intro<I> {
 
 impl<I: Identity> std::fmt::Debug for Intro<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both fields printed here are §6.1 attacker-chosen quantities, and
+        // `Claimed`'s `Debug` below suppresses its one for that reason —
+        // so whether this should suppress too is a live question and is
+        // **deliberately not answered here**. It stays as it is: an
+        // `Intro`'s `Debug` is an operator's only view of a stage-0
+        // arrival, and the two values are diagnostics rather than a
+        // secret-ish assertion of identity. What §6.1 forbids is *unbounded
+        // logging* and durable keying, which is a property of the caller's
+        // loop and not of this impl — see `source()` for the warning.
         f.debug_struct("Intro")
             .field("source", &self.source())
             .field("sender_index", &self.sender_index())

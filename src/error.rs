@@ -140,6 +140,42 @@ pub enum IntroError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     /// The timestamp guard rejected this initiation as a replay.
+    ///
+    /// **This says the initiation is not fresh. It never says the peer
+    /// misbehaved, and the difference is the whole note.**
+    ///
+    /// The variant arrives one rung *above* [`IntroError`]'s: the `ss` has
+    /// already succeeded, so the static handed to the application is
+    /// genuinely **proven** — which is exactly what makes this look like
+    /// trustworthy evidence about that peer. It is not. The bytes that
+    /// produce it are the peer's own, and anyone who has seen them can
+    /// replay them:
+    ///
+    /// - a passive observer captures a genuine initiation off the wire —
+    ///   mac1 keys on **our** public static, so nothing in it is secret to
+    ///   the attacker or bound to the sender's address;
+    /// - it replays those bytes at us from any address it likes. They park,
+    ///   they authenticate — the tail tag verifies, because they are real —
+    ///   and only then does §17.1's guard find the timestamp stale;
+    /// - the application gets `Replay`, attributed to a peer that sent
+    ///   nothing. A peer with a live connection to us holds a **pinned**
+    ///   guard entry, so the rejection is reliable rather than incidental,
+    ///   and a captured retransmit train (§6.7 — about eighteen initiations
+    ///   over `HANDSHAKE_GIVEUP`) supplies fresh spare bytes for as long as
+    ///   the attacker cares to continue.
+    ///
+    /// So an application that denylists, rate-limits or alerts on this
+    /// variant punishes the victim, on demand, from a single captured
+    /// packet. §17.1's honesty clause already prices the observable
+    /// consequence the same way — *"a spurious **unaccepted** `Intro`
+    /// attributed to a real peer at an attacker-chosen address"* — and this
+    /// is the error type that consequence reaches the application through.
+    /// Documentation obligation #2 in the [crate docs](crate) is the general
+    /// statement; this is its sharpest instance, because it is the one where
+    /// the static really is proven.
+    ///
+    /// The safe reading is the literal one: **this initiation cannot open a
+    /// connection.** Retry, back off, ignore — do not attribute.
     #[error("the timestamp guard rejected this initiation as a replay")]
     Replay,
     /// The handshake failed to authenticate.

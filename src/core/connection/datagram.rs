@@ -67,12 +67,16 @@ impl Datagrams {
         evicted
     }
 
-    /// Queue an arrived datagram, on [`push_send`](Self::push_send)'s terms.
+    /// Queue an arrived datagram, on [`push_send`](Self::push_send)'s terms —
+    /// **except that the trace is rate-limited**, because this side's rate is
+    /// the peer's to choose. See [`traces_eviction`].
     pub(crate) fn push_recv(&mut self, data: Vec<u8>) -> bool {
         let evicted = Self::push(&mut self.recv, data, constants::DATAGRAM_RECV_QUEUE);
         if evicted {
             self.drops.recv += 1;
-            trace_drop("recv", self.drops.recv);
+            if traces_eviction(self.drops.recv) {
+                trace_drop("recv", self.drops.recv);
+            }
         }
         evicted
     }
@@ -136,6 +140,37 @@ impl Datagrams {
     }
 }
 
+/// Whether the `count`-th eviction on a queue earns a record: **1, 2, 4, 8,
+/// 16, …**
+///
+/// **[F5]** §11.5 requires that the drop be **visible** and says nothing
+/// about the **rate** — working rule 8's shape, and the two are separable.
+/// A peer that sends datagrams this application never claims produces one
+/// eviction per datagram past `DATAGRAM_RECV_QUEUE`, so a record per
+/// eviction hands the peer a log-write amplifier: ~31 B on the wire buys a
+/// formatted structured record on our disk, at the peer's chosen rate,
+/// forever, per connection. Every record carries the same message text, so
+/// a backend that de-duplicates on the message does not save us either.
+///
+/// Powers of two keep §11.5's visibility whole — the **first** eviction is
+/// still reported the instant it happens, and the cumulative total rides
+/// every record, so an operator loses no information about magnitude — and
+/// bound the records at `log₂(n)`: a peer that forces a billion evictions
+/// buys thirty lines.
+///
+/// No constant and no configuration: §11.5 names neither, and inventing a
+/// knob for a bound nothing tunes is scope this finding does not carry.
+///
+/// `pub(crate)` for one reason: the backoff is otherwise **untestable**.
+/// Its only other effect is a `tracing` record, the crate has no
+/// subscriber-capture dev-dependency, and [`Datagrams::drops`] counts every
+/// eviction whether or not it was traced — so without this seam a test can
+/// assert the counter (unchanged by this fix) and nothing else, which is
+/// working rule 9's "a name is not a pin" in advance.
+pub(crate) fn traces_eviction(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
 /// §11.5's obligation: *"A silent drop is a known operability weakness of
 /// the precedent and is deliberately not copied."*
 ///
@@ -144,6 +179,12 @@ impl Datagrams {
 /// is written for. The cumulative counter rides every record, because
 /// §11.5 asks for the *counter* and there is no public accessor for it
 /// (§16.2's list is exhaustive — working rule 8).
+///
+/// **The two callers differ, deliberately.** `push_send`'s rate is the
+/// application's own — it is not an attack surface, and an application
+/// over-producing wants to hear about it every time. `push_recv`'s rate is
+/// the peer's, so it goes through [`traces_eviction`]. Rate-limiting both
+/// would spend §11.5's visibility where nothing threatens it.
 fn trace_drop(queue: &'static str, count: u64) {
     tracing::warn!(
         target: "slither::frames",

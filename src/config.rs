@@ -99,6 +99,26 @@ impl Config {
     }
 
     /// Override the endpoint-wide stage-0 queue cap (§6.3).
+    ///
+    /// The default is [`INTRO_QUEUE_CAP`](crate::constants::INTRO_QUEUE_CAP)
+    /// (1024). This value is **not validated**, and two of the things it
+    /// buys are load-bearing rather than advisory:
+    ///
+    /// - **`0` disables every inbound accept, permanently and silently.**
+    ///   An arrival finds `entries.len() >= cap` with nothing evictable, so
+    ///   it is dropped; no introduction is ever surfaced, `accept()` never
+    ///   resolves, and there is no error, no event and no trace to say why.
+    ///   Outbound `connect()` still works, which is what makes the
+    ///   misconfiguration look like a peer problem.
+    /// - **It is the numerator of §6.3's occupancy bound.** *"Filling the
+    ///   queue needs ≥ 256 distinct sources"* is exactly this value divided
+    ///   by [`with_intro_max_per_source`](Self::with_intro_max_per_source);
+    ///   lowering one without the other lowers the number of sources an
+    ///   attacker needs. §6.3 also prices sustained full occupancy at
+    ///   ≈ 68 packets/second from `cap / INTRO_TTL`, so a larger cap costs
+    ///   an attacker proportionally more bandwidth — and costs this
+    ///   endpoint proportionally more memory (§17.5 bounds a parked chain at
+    ///   ≈ 0.5–1 KB).
     #[must_use]
     pub fn with_intro_queue_cap(mut self, cap: usize) -> Self {
         self.intro_queue_cap = cap;
@@ -106,6 +126,38 @@ impl Config {
     }
 
     /// Override the per-source chain cap (§6.3).
+    ///
+    /// The default is
+    /// [`INTRO_MAX_PER_SOURCE`](crate::constants::INTRO_MAX_PER_SOURCE)
+    /// (4). This value is **not validated**, and §6.3 calls what it buys
+    /// *"the only occupant-shaped defence"* the protocol has until the
+    /// deferred cookies/mac2 round (§19):
+    ///
+    /// - **`0` disables every inbound accept**, exactly as
+    ///   [`with_intro_queue_cap(0)`](Self::with_intro_queue_cap) does and
+    ///   for the same reason — the per-source check fires on the first
+    ///   arrival and finds nothing to evict.
+    /// - **Any value `>= intro_queue_cap` deletes the bound entirely.** The
+    ///   per-source check can then never fire before the global one, so a
+    ///   **single** source — one IP, one port, no spoofing capability,
+    ///   since mac1's key is public data — can hold every slot in the
+    ///   queue. §6.3's *"≥ 256 distinct sources"* is `cap /
+    ///   max_per_source`, and at parity that number is 1.
+    ///   [`constants`] pins
+    ///   `INTRO_MAX_PER_SOURCE <= INTRO_QUEUE_CAP` as a compile-time
+    ///   assertion for the **defaults**; nothing pins it for these two
+    ///   builders.
+    ///
+    /// **There is a legitimate reason to raise it, which is why this note
+    /// exists — and it turns on which key is which.** §6.3's *dedup* key is
+    /// the full source address, so *"distinct initiators behind one NAT
+    /// present distinct ports"* and each gets its own queue entry. This
+    /// **cap** is keyed one level coarser: *"4 chains per source IP (per
+    /// /64 for IPv6)"*. Every client behind one NAT therefore shares a
+    /// single allowance of 4, and an operator serving many of them has a
+    /// real reason to raise this knob. Doing so trades occupancy resistance
+    /// for reachability, knowingly; raising it to or past the queue cap is
+    /// not a trade, it is a removal.
     #[must_use]
     pub fn with_intro_max_per_source(mut self, cap: usize) -> Self {
         self.intro_max_per_source = cap;

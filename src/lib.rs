@@ -80,11 +80,32 @@
 //!    CLOSE is sealed, and the static is released when the connection's
 //!    state is actually dropped (§16.4's `Retired`). Dialling before then
 //!    races the release.
-//! 2. **A *claimed* static is not an authenticated one.** The identity
-//!    `read_identity()` reveals during a staged accept is an
-//!    **unauthenticated assertion**, made before any DH proves possession.
-//!    Denylisting on it lets an attacker claim any public key in order to
-//!    get its owner banned. Authorise on it; do not punish on it.
+//! 2. **Do not punish on evidence a third party can manufacture.**
+//!    Authorise on it; do not punish on it. The rule is one sentence and it
+//!    reaches three rungs of the handshake, because *"an attacker gets an
+//!    innocent peer banned"* is the same hazard at all three.
+//!
+//!    - **A *claimed* static is not an authenticated one.** The identity
+//!      `read_identity()` reveals during a staged accept is an
+//!      **unauthenticated assertion**, made before any DH proves
+//!      possession. Denylisting on it lets an attacker claim any public key
+//!      in order to get its owner banned.
+//!    - **The source address and `sender_index` are worse, not better.**
+//!      §6.1 forbids durable state keyed on **three** quantities — the
+//!      claimed static, the source address, and `sender_index` — and the
+//!      two beside the static are the *cheaper* keys to abuse: a spoofed
+//!      source costs an attacker no DH at all, needs no knowledge of
+//!      anyone's public key, and has no return-routability proof at stage
+//!      0. A source-address denylist under the flood §6.3 describes bans
+//!      spoofed victims. See [`Intro::source`](shell::Intro::source) and
+//!      [`Intro::sender_index`](shell::Intro::sender_index).
+//!    - **A *proven* static does not make the accusation true.**
+//!      [`AuthError::Replay`] is delivered after the `ss` has genuinely
+//!      proven the static, which is exactly what makes it look like
+//!      trustworthy evidence about that peer. It is not: one captured
+//!      initiation lets a third party produce it at will, from any address,
+//!      against a peer that has done nothing. It reports *this initiation
+//!      is not fresh*, never *this peer misbehaved*.
 //! 3. **A connection with nothing to say dies — in 25 s, in silence.**
 //!    A connection that has received **no authenticated packet since it was
 //!    installed** transmits *nothing at all* and is torn down at

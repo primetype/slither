@@ -464,6 +464,42 @@ impl Reassembly {
 
     /// Insert a received range, coalescing with everything it overlaps or
     /// touches.
+    ///
+    /// # A frame that adds no byte does no work
+    ///
+    /// **[F3]** The merge below allocates and copies the whole merged span,
+    /// and the span is the *stored* chunk's, not the arriving frame's. A
+    /// frame lying **wholly inside** already-received offset space would
+    /// therefore pay a span-sized allocation to reproduce bytes that are
+    /// already there — and it is free to the peer twice over: `check_stream`
+    /// accepts it (`end <= high_water` violates nothing) and it charges
+    /// `delta = 0` flow credit, so neither §10's ledger nor §17.5's memory
+    /// bound sees it. One 1-byte frame at offset 5, against a 256 KiB chunk
+    /// at offset 1 whose byte 0 never arrives — so nothing is ever readable
+    /// and `read_offset` stays 0 — costs ~512 KiB of memory traffic per
+    /// ~40-byte datagram, at a rate the peer picks.
+    ///
+    /// The covered case returns early, and what that buys is stated
+    /// precisely: **every allocation this function performs is now paid for
+    /// by at least one byte that is new to the buffer.** New bytes are
+    /// bounded by flow credit, so the peer can no longer buy reassembly work
+    /// at zero credit or at an unbounded rate. It is *not* the claim that
+    /// the work is linear in the new bytes — a frame that bridges two stored
+    /// chunks still copies the merged span for one new byte. That case makes
+    /// progress, is bounded by credit, and is left alone; F3 is exactly the
+    /// **zero**-progress case.
+    ///
+    /// **One stored chunk is the whole test, and that is the load-bearing
+    /// lemma.** Chunks are pairwise disjoint *and* non-adjacent (this
+    /// function merges on adjacency, not merely on overlap). A range covered
+    /// by the union of two or more stored chunks would need them to touch,
+    /// which the invariant forbids — so covered-by-the-union **is**
+    /// covered-by-one-chunk, and the one chunk it can be is the first with
+    /// `end() >= offset`, which the `lo` scan already finds.
+    ///
+    /// The frame stays **legal**: it is ordinary retransmission, and
+    /// rejecting it as a violation would kill connections over routine loss
+    /// recovery. Only the work is refused, never the packet.
     fn insert(
         &mut self,
         mut offset: u64,
@@ -494,6 +530,18 @@ impl Reassembly {
         while lo < self.chunks.len() && self.chunks[lo].end() < offset {
             lo += 1;
         }
+
+        // **[F3]** Nothing new: return before allocating anything. See the
+        // lemma in this function's doc comment for why `lo` is the only
+        // chunk that can cover the range.
+        if self
+            .chunks
+            .get(lo)
+            .is_some_and(|c| c.offset <= offset && end <= c.end())
+        {
+            return Ok(());
+        }
+
         let mut hi = lo;
         while hi < self.chunks.len() && self.chunks[hi].offset <= end {
             hi += 1;
