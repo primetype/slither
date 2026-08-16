@@ -135,7 +135,41 @@ pub(crate) enum Wire {
         ranges: Vec<(u64, u64)>,
         first_range: u64,
     },
+    // ───────────────────────────────────────────────────────────────────
+    // INTEGRATION (slice 7b) — see the header on `path_challenge_frame`
+    // below. Added by the blind **test author**, which `CONTRACT-7b.md` §9
+    // says is the integrator's job. The author added them anyway because
+    // without them every test it was briefed to write panics in
+    // `parse_frames`; the conflict is reported rather than resolved
+    // silently (working rule 3/5). If the integrator has an equivalent from
+    // the other side, keep one.
+    // ───────────────────────────────────────────────────────────────────
+    /// §8.4's `0x1a` PATH_CHALLENGE — eight opaque bytes, no length
+    /// prefix. **[ruling 208]**
+    PathChallenge([u8; 8]),
+    /// §8.4's `0x1b` PATH_RESPONSE — the same eight bytes, echoed.
+    /// **[ruling 208]**
+    PathResponse([u8; 8]),
 }
+
+/// §8.3's `0x1a`, as a literal rather than `constants::FRAME_PATH_CHALLENGE`.
+///
+/// **This is deliberate and it is this file's own stated philosophy**: the
+/// `Wire` enum exists because "a codec that agrees with itself about a
+/// private type and writes the wrong bytes must fail here". Decoding with
+/// the crate's own constant is exactly that self-agreement — an
+/// implementer who wrote `0x2a` would have a decoder that matched it and a
+/// green test run. The literal is the ratified code point (ruling 208,
+/// SPEC.md §8.3:3267) and `tests/spec_constants.rs` pins the crate
+/// constant to the same value from the other side.
+///
+/// It has a second, practical virtue: it lets this fixture compile before
+/// the implementer's `constants.rs` lands, so `testfix.rs` is never the
+/// reason the tree is red.
+pub(crate) const WIRE_PATH_CHALLENGE: u64 = 0x1a;
+
+/// §8.3's `0x1b`. See [`WIRE_PATH_CHALLENGE`].
+pub(crate) const WIRE_PATH_RESPONSE: u64 = 0x1b;
 
 /// Pull one varint, advancing the cursor. Panics on truncation — a
 /// truncated frame stream is a failure, not a `None`.
@@ -241,6 +275,33 @@ pub(crate) fn parse_frames(pt: &[u8]) -> Vec<Wire> {
                     first_range,
                 });
             }
+            // **[ruling 208, slice 7b]** The third instance of this file's
+            // own aged-out-decoder problem, after `Ack` (slice 5) and
+            // `Datagram` (slice 6). Both path frames are fixed width: eight
+            // opaque bytes, no varint and no length prefix (§8.4:3435).
+            //
+            // The bounds check is an assertion, not leniency: §8.4 makes
+            // "fewer than 8 bytes remain" the *only* structural error either
+            // frame has, so a core that emitted a truncated one has produced
+            // a packet its peer must kill the connection over, and this
+            // fixture must say so rather than index out of bounds.
+            t if t == WIRE_PATH_CHALLENGE || t == WIRE_PATH_RESPONSE => {
+                assert!(
+                    pt.len() - at >= 8,
+                    "§8.4: a path frame carries exactly 8 opaque bytes; the \
+                     core emitted {} — that is §8.2's structural class and \
+                     the peer would CLOSE on it",
+                    pt.len() - at,
+                );
+                let mut v = [0u8; 8];
+                v.copy_from_slice(&pt[at..at + 8]);
+                at += 8;
+                if t == WIRE_PATH_CHALLENGE {
+                    out.push(Wire::PathChallenge(v));
+                } else {
+                    out.push(Wire::PathResponse(v));
+                }
+            }
             other => panic!(
                 "the core emitted frame type {other:#x}, which §8.3 does not \
                  place in any slice built so far — if this is a frame a new \
@@ -295,6 +356,54 @@ pub(crate) fn max_data_frame(max: u64) -> Vec<u8> {
     let mut f = Vec::new();
     put(&mut f, FRAME_MAX_DATA);
     put(&mut f, max);
+    f
+}
+
+// ── INTEGRATION (slice 7b): ruling 208's two raw frame builders ────────
+//
+// `CONTRACT-7b.md` §9's table marks `path_challenge_frame` **integrator-
+// owned**. The blind test author's brief instead grants it `testfix.rs`
+// exclusively and tells it to add the helpers it needs. Those two
+// instructions cannot both be followed, so the author followed the one
+// that produces working tests and **reported the conflict** rather than
+// picking silently (working rules 3 and 5). Nothing here depends on the
+// implementer's types, so it compiles standalone; if the integrator holds
+// an equivalent, keep one copy.
+
+/// §8.4's `0x1a` PATH_CHALLENGE, as raw plaintext bytes.
+///
+/// Nine bytes, fixed: one type byte (the code is < 64, so its varint is
+/// one byte) and eight opaque bytes with no length prefix.
+pub(crate) fn path_challenge_frame(v: [u8; 8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    put(&mut f, WIRE_PATH_CHALLENGE);
+    f.extend_from_slice(&v);
+    f
+}
+
+/// §8.4's `0x1b` PATH_RESPONSE, as raw plaintext bytes.
+pub(crate) fn path_response_frame(v: [u8; 8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    put(&mut f, WIRE_PATH_RESPONSE);
+    f.extend_from_slice(&v);
+    f
+}
+
+/// A path frame with a **deliberately wrong body length**, for §8.4's one
+/// structural error and for slice 1's one-sided-boundary trap.
+///
+/// `body` is written verbatim after the type byte, so `len != 8` produces
+/// exactly the malformed frame §8.4 names: *"fewer than 8 bytes remain in
+/// the plaintext after the type byte"* is the **only** structural error
+/// either frame has.
+///
+/// **Why this exists rather than a `Vec<u8>` literal in the test**: the
+/// nine-byte encoding is the thing under test, so a test that hand-rolls
+/// the bytes and gets the type varint wrong fails for the wrong reason.
+pub(crate) fn path_frame_with_body(ty: u64, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    put(&mut f, ty);
+    f.extend_from_slice(body);
     f
 }
 
@@ -614,6 +723,44 @@ impl Pair {
     /// Drain both and move everything both ways until the wire is quiet,
     /// accumulating every output each side produced.
     pub(crate) fn pump(&mut self, now: Instant) -> (Drained, Drained) {
+        self.pump_from(now, a_addr(), b_addr())
+    }
+
+    /// [`pump`](Pair::pump) with explicit source addresses for each
+    /// direction — **the fixture gap slice 7 hit twice, added by slice 7b's
+    /// blind test author.**
+    ///
+    /// # Why this is needed and `pump` is not enough
+    ///
+    /// Before this, `Pair` could not express *"advance one side's timers
+    /// **and** deliver from a chosen address"*. The two halves lived in
+    /// different methods and neither did the other's job:
+    ///
+    /// - [`pump`](Pair::pump) drives `handle_timeout` on both cores, but
+    ///   hard-codes [`a_addr`]/[`b_addr`] through
+    ///   [`flush_a_to_b`](Pair::flush_a_to_b), so a **roamed** peer's
+    ///   packets arrive from the address it has already left.
+    /// - [`flush_a_to_b_from`](Pair::flush_a_to_b_from) sets the address
+    ///   but never calls `handle_timeout`, so nothing that is owed *by a
+    ///   timer* — a keepalive, a PTO probe, a re-offered `PATH_CHALLENGE`
+    ///   (§8.7's standing obligation) — is ever built.
+    ///
+    /// §7.3's whole subject is a connection that has roamed and is under a
+    /// budget, and every interesting thing it does after the roam is timer
+    /// driven. Two false reds in slice 7 came from that gap: a test roams
+    /// A to `c_addr`, calls `pump`, and the core it is testing sees a
+    /// *second* roam back to `a_addr` on the next packet — so the budget
+    /// re-arms, a fresh challenge is drawn, and the assertion fails for a
+    /// reason the test never intended to exercise.
+    ///
+    /// `a_src` is where **A's** packets appear to come from, as seen by B;
+    /// `b_src` likewise for B's, as seen by A.
+    pub(crate) fn pump_from(
+        &mut self,
+        now: Instant,
+        a_src: SocketAddr,
+        b_src: SocketAddr,
+    ) -> (Drained, Drained) {
         let mut da = Drained::default();
         let mut db = Drained::default();
         for _ in 0..4096 {
@@ -629,12 +776,40 @@ impl Pair {
             if self.a_to_b.is_empty() && self.b_to_a.is_empty() {
                 return (da, db);
             }
-            let d = self.flush_a_to_b(now);
+            let d = self.flush_a_to_b_from(now, a_src);
             db.outs.extend(d.outs);
-            let d = self.flush_b_to_a(now);
+            let d = self.flush_b_to_a_from(now, b_src);
             da.outs.extend(d.outs);
         }
         panic!("the two cores never went quiet");
+    }
+
+    /// One round of [`pump_from`](Pair::pump_from), never more.
+    ///
+    /// **`pump_from` loops to quiescence, which is wrong for anything this
+    /// slice asserts about *ordering*.** §7.3's priority list and §8.5's
+    /// packing order are statements about **one pass** of the send pump: a
+    /// fixture that runs the pump to a fixed point observes the union of
+    /// every pass and can no longer see which output a scarce budget
+    /// admitted *first*. Ruling 212(c) is exactly such a statement, and it
+    /// is unassertable through `pump_from`.
+    ///
+    /// Returns `(A's outputs, B's outputs)` from the single round.
+    pub(crate) fn step_from(
+        &mut self,
+        now: Instant,
+        a_src: SocketAddr,
+        b_src: SocketAddr,
+    ) -> (Drained, Drained) {
+        self.a.handle_timeout(now);
+        self.b.handle_timeout(now);
+        let mut da = self.drain_a();
+        let mut db = self.drain_b();
+        let d = self.flush_a_to_b_from(now, a_src);
+        db.outs.extend(d.outs);
+        let d = self.flush_b_to_a_from(now, b_src);
+        da.outs.extend(d.outs);
+        (da, db)
     }
 }
 
