@@ -6412,3 +6412,87 @@ this round that a claim of mine survived only until something executed it —
 the first being ruling 221's, which held. **The build is the reviewer that
 does not agree out of politeness**, and 37 deletions with a clean argument
 attached would have shipped if `cargo build` had not refused them.
+
+### 223 — S12's probe detector counts datagrams, and ruling 208 gave it a non-probe to count
+
+**[RATIFIED 2026/08/16.]**
+
+S12 observes §13.3's backoff by sampling `Network::sends() - tap().len()`
+while `a → b` is blocked, on the stated identity that this is *"exactly
+A's probe count during the window"*. Ruling 208 broke that identity:
+B accepted the connection, so §7.3 armed a budget and B owes a standing
+`PATH_CHALLENGE`; every challenge that reaches A obliges A to emit a
+`PATH_RESPONSE`, an `a → b` datagram that is not a probe.
+
+**The mechanism, measured rather than argued.** `settle()` yields — **it
+does not advance the paused clock**. With a 10 ms fabric delay and §12.4's
+25 ms delayed-ACK timer, the challenge was still in flight when the window
+opened, and the first `advance(5ms)` released the whole exchange at once:
+three `a → b` datagrams on one instant, both intervals `0 ns`.
+
+**Ruling: the body quiesces path validation before blocking the path.**
+Eight 10 ms advances complete the exchange while it is healthy; B
+validates, owes nothing further, and `blackholed` is A's probe count
+again. **No assertion is weakened** — the premise loses a confound, which
+is the repair ruling 219 made to the mobility fixture for the same reason.
+The doc comment's identity claim now names the precondition that makes it
+true, and names the symptom (*several samples on one instant*) so the next
+instance is recognised rather than re-derived.
+
+**S12 named this hazard class itself and could not have sized against
+it.** Its window comment reserves 8 s specifically to stay under
+`KEEPALIVE_TIMEOUT`, *"past which §7.5's keepalive would start
+contributing blackholed sends that are not probes and silently corrupt
+this count"* — the right worry, and the mitigation was **sizing**. No
+window size excludes path validation, because it is owed from the first
+packet of the connection rather than after 10 s. A correct mitigation
+against the known instance of a class is not a mitigation against the
+class.
+
+### 224 — a boundary comment stood arguing the position ruling 217 had reversed
+
+**[RATIFIED 2026/08/16.]** `pump_packets` documents four boundaries on the
+challenge. Boundary 2 read:
+
+> **A bare ACK with nothing else owed.** … challenging it would make every
+> delayed ACK ack-eliciting, put it in the sent map and spend congestion
+> window, for a validation the connection has no use for.
+
+It landed at `522bcdf` for **ruling 203's PING**, whose boundaries really
+are those, and was carried onto ruling 208's challenge without being
+re-derived. Ruling 217 then added `ack.is_owed()` to the offer — reversing
+it — and left it standing **eighty lines below the line being edited, in
+the same function**.
+
+This is **working rule 4** exactly: *grep for the rationale, not only the
+token*, and its companion *(a) when you correct one clause of a sentence,
+read the other clauses*. The rule was written after this defect shipped a
+self-contradicting spec section; here it shipped a self-contradicting
+function, in code the same integrator had just edited.
+
+**Ruling: §8.7 outranks the comment and the comment is corrected in
+place, struck through rather than deleted** — a reader who finds the old
+argument persuasive should find the reason it lost, not silence.
+
+**Its objection was accurate and is simply outranked.** The delayed ACK
+*does* become ack-eliciting, *does* enter the sent map, *does* spend
+window. And it predicted the fixture cost correctly: that is ruling 223.
+**A reversed argument is not a refuted one** — recording which half of it
+survived is what stops the next reversal from looking free.
+
+**Two neighbours were wrong for different reasons, found only because
+rule 4(a) sends you to the rest of the sentence group:**
+
+- **Boundary 1** said an idle unvalidated connection sends no challenge.
+  Under ruling 221 a connection with an unanswered challenge is not idle —
+  the challenge armed a PTO, and when it fires a packet is being built.
+  The boundary was always against **manufacture**, never against riding a
+  carrier something else created; it now says so.
+- **Boundary 3** asserted that a challenge the congestion window refuses
+  *"is carried by §13.4's PTO … so the escape survives a full window"*.
+  **That was not true when it was written.** The PTO packed stage 2 with
+  `offer` false, so the probe carried a bare PING and the escape did not
+  exist. Ruling 221 made the sentence true. It is left visible with that
+  history attached, because a boundary comment asserting a mechanism is a
+  claim about the code beside it — **working rule 11 — and this one went
+  unchecked through two rulings and thirty blind tests.**

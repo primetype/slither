@@ -2231,19 +2231,43 @@ impl<C: Handshake> Connection<C> {
             // a construction's scope as exhaustive whether or not it says
             // so.** They are the PING's, unchanged in force:
             //
-            // 1. **Nothing is owed.** An idle unvalidated connection sends
-            //    no challenge. Validation is not a goal in itself — it is
-            //    what lets held output leave, and there is none. A challenge
-            //    here would be an unprompted probe train on every pump, and
-            //    §7.5's keepalive dance already carries liveness.
-            // 2. **A bare ACK with nothing else owed.** Every accepted
-            //    connection begins unvalidated (§7.3), so this is the
-            //    ordinary receive path, not an edge: challenging it would
-            //    make every delayed ACK ack-eliciting, put it in the sent
-            //    map and spend congestion window, for a validation the
-            //    connection has no use for. When it acquires one —
-            //    output the budget is holding, or a probe it is
-            //    delaying — the challenge is owed on the same instant.
+            // 1. **Nothing is owed *and no packet is being built*.** An idle
+            //    unvalidated connection sends no challenge. Validation is
+            //    not a goal in itself — it is what lets held output leave,
+            //    and there is none. A challenge here would be an unprompted
+            //    probe train on every pump, and §7.5's keepalive dance
+            //    already carries liveness.
+            //
+            //    **[ruling 221]** The second half of that condition is not
+            //    decoration. A connection with an **unanswered challenge**
+            //    outstanding is not idle in the sense that matters: the
+            //    challenge packet is ack-eliciting, so §13.4 armed a PTO on
+            //    it, and when that fires a packet *is* being built and the
+            //    challenge rides it. The boundary is against **manufacture**
+            //    — building a packet for the challenge — which is what
+            //    ruling 217's first draft did and what the blind author's
+            //    `an_idle_unvalidated_connection_owing_nothing_emits_no_challenge`
+            //    forbids. It was never a boundary against riding a carrier
+            //    something else created.
+            // 2. ~~**A bare ACK with nothing else owed.**~~ **[REVERSED by
+            //    ruling 217; the text stood arguing the old position until
+            //    ruling 224 read it.]** This boundary was written at
+            //    `522bcdf` for ruling 203's **PING**, whose boundaries are
+            //    genuinely these, and was carried onto the challenge without
+            //    being re-derived against §8.7. It is now wrong: §8.7 owes
+            //    the challenge *"whenever §7.3's budget admits a packet"*,
+            //    an owed ACK builds one, and `ack.is_owed()` is a disjunct
+            //    of `offer` above. Every accepted connection begins
+            //    unvalidated, so this is the **commonest** post-roam packet
+            //    in the protocol, not an edge.
+            //
+            //    Its objection was accurate and is simply outranked: the
+            //    delayed ACK does become ack-eliciting, does enter the sent
+            //    map, and does spend congestion window. §8.7 is ratified
+            //    text and this comment was not. What the objection *did*
+            //    predict correctly is the fixture cost — S12 counts
+            //    blackholed datagrams as PTO probes and ruling 223 had to
+            //    quiesce path validation before its window opens.
             // 3. **§14.5's window.** The challenge is **not** exempt from
             //    the congestion gate below. §14.5 enumerates its exemptions
             //    — PTO probes, the contested probe, non-ack-eliciting
@@ -2252,6 +2276,15 @@ impl<C: Handshake> Connection<C> {
             //    refuses is carried by §13.4's PTO, which *is* exempt and
             //    packs stage 2 like any other packet, so the escape survives
             //    a full window.
+            //
+            //    **[ruling 221]** This sentence was written as a statement
+            //    of fact and was **not one until ruling 221**: the PTO
+            //    packed stage 2 with `offer` false, so the probe carried a
+            //    bare PING and the escape it describes did not exist. It is
+            //    true now. Worth leaving visible — a boundary comment
+            //    asserting a mechanism is a claim about the code beside it
+            //    (working rule 11), and this one went unchecked through two
+            //    rulings and thirty blind tests.
             // 4. **The seal.** A challenge is never marking, and needs no
             //    rule to make it so: every marking contributor (a
             //    first-transmission STREAM frame, a DATAGRAM) is a stage-3

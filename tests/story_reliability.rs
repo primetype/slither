@@ -621,6 +621,16 @@ async fn s12_a_stream_completes_when_the_acknowledgements_are_lost() {
 /// steps gives the probe instants to that resolution — which is ample
 /// against intervals that must double.
 ///
+/// **[ruling 223]** That identity holds only while A owes nothing else
+/// that would leave on this path, and it is a **precondition the body
+/// establishes**, not a property of the fabric. §7.3's path validation is
+/// the case that broke it: B's standing `PATH_CHALLENGE` (ruling 208)
+/// obliges A to emit a `PATH_RESPONSE`, which this counter cannot tell
+/// from a probe. The body quiesces that exchange before blocking the path.
+/// Anything else that makes A send without being a probe belongs in the
+/// same quiesce, and the symptom to recognise is **several samples on one
+/// instant**, which reads out as a 0 ns interval.
+///
 /// # BROKEN BUILD
 ///
 /// * **A build whose backoff resets on its own probes** rather than on
@@ -654,6 +664,39 @@ async fn s12_the_probe_train_backs_off_and_the_transfer_completes_on_heal() {
         let mut recv = within(cb.accept_uni(), "accept_uni")
             .await
             .expect("accept_uni");
+
+        // **[ruling 223]** Quiesce §7.3's path validation before the window
+        // opens, or its traffic is counted as probes.
+        //
+        // B accepted this connection, so §7.3 armed a budget against A's
+        // address and B owes a `PATH_CHALLENGE` until A answers it (ruling
+        // 208). Every challenge that reaches A obliges A to emit a
+        // `PATH_RESPONSE` — an `a → b` datagram that is **not** a probe, and
+        // one this test would count as a probe if it left during the window.
+        //
+        // `settle()` cannot flush that exchange: it yields, it does not
+        // advance the paused clock, so with a 10 ms fabric delay and §12.4's
+        // 25 ms delayed-ACK timer the challenge is still in flight here.
+        // Measured on the build that failed: the first `advance(5ms)` below
+        // released it, three `a → b` datagrams landed on one instant, and
+        // both intervals read 0 ns.
+        //
+        // Advancing until the exchange completes validates B's address while
+        // the path is still healthy, after which B owes nothing, A answers
+        // nothing, and `blackholed` is A's probe count again. **No assertion
+        // below is weakened** — this removes a confound from the premise,
+        // which is the same repair ruling 219 made to the mobility fixture
+        // for the same reason.
+        //
+        // This is the hazard the window comment below already names for
+        // §7.5's keepalive, arriving from a direction that comment could not
+        // have anticipated: the keepalive was kept out by *sizing*, and no
+        // window size excludes this one, because path validation is owed
+        // from the first packet of the connection rather than after 10 s.
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            settle().await;
+        }
 
         // ── blackhole the forward path, mid-transfer ────────────────────
         pair.net.block_path(pair.a.addr(), pair.b.addr());
