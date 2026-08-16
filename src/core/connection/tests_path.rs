@@ -93,6 +93,28 @@ fn ping_frame() -> Vec<u8> {
     out
 }
 
+/// The greatest counter the core has actually sealed.
+///
+/// **An ACK naming anything above this is discarded whole** —
+/// `mod.rs:1239` is `if ack.largest <= highest_sealed`, realising §12.5's
+/// *"ignore whole"*. Every test here that needs an ACK to **reach** the
+/// code under test must therefore build it from this value, not from a
+/// large literal. The first draft of this file did the latter and shipped
+/// two tests that asserted nothing; see
+/// [`an_ack_covering_everything_validates_nothing`].
+fn highest_sealed(solo: &Solo) -> u64 {
+    let next = solo
+        .conn
+        .next_counter()
+        .expect("a live session has a next counter");
+    assert!(
+        next >= 1,
+        "the core has sealed nothing, so no ACK can cover anything — the \
+         test's setup, not the core, is wrong",
+    );
+    next - 1
+}
+
 /// Every `PATH_CHALLENGE` value in a frame list, in order.
 fn challenges(frames: &[Wire]) -> Vec<[u8; 8]> {
     frames
@@ -135,6 +157,15 @@ fn roam_and_collect(solo: &mut Solo, now: Instant, to: SocketAddr) -> Vec<[u8; 8
 // `LEN-1` were tested and `LEN+1` was not. §8.4 makes "fewer than 8 bytes
 // remain" the **only** structural error either frame has, so 7 is the
 // error and 8 **and 9** must both parse.
+//
+// ⚠ REPORTED: the two seven-byte tests **pass before the implementation
+// exists**, for the wrong reason — `0x1a` is today an unknown frame type
+// and §8.2 kills the connection on those too, so the right verdict is
+// reached by the wrong route. They are not separators on their own. What
+// separates a correct codec is the pair: they must stay green *while*
+// `a_path_challenge_body_of_eight_bytes_parses` and
+// `a_path_challenge_does_not_consume_the_rest_of_the_packet` turn green,
+// and a build that treats the type as unknown fails those two.
 // ═══════════════════════════════════════════════════════════════════════
 
 /// A seven-byte body is §8.2's structural class.
@@ -300,9 +331,23 @@ fn a_validated_connection_still_answers_a_challenge() {
 /// validates **nothing**. Ruling 208 replaced the ACK predicate; it did not
 /// supplement it.
 ///
-/// `largest` is `u32::MAX` so the ACK covers any floor a surviving
-/// `validation_floor` could hold — the test cannot be passed by a build
-/// whose floor merely happens to sit above the value chosen.
+/// # The `largest` this ACK carries is load-bearing, and the obvious
+/// choice is wrong
+///
+/// The first draft of this test used `u32::MAX`, reasoning that an ACK
+/// covering everything must cover any floor a surviving `validation_floor`
+/// could hold. **It passed against the pre-remediation build, which
+/// validates on exactly this ACK** — because `mod.rs:1239` guards the whole
+/// predicate with `if ack.largest <= highest_sealed`, and §12.5 *"ignores
+/// whole"* an ACK naming a counter above the highest sealed. The ACK was
+/// discarded before reaching the code under test, and the test asserted
+/// nothing.
+///
+/// That is working rule 9's exact failure mode — slice 2a's "a name is not
+/// a pin" — and it was caught only by running this file against a tree with
+/// no implementation in it, where **this test is required to be red**. The
+/// `largest` must therefore be a counter that has genuinely been sealed:
+/// high enough to clear the floor, low enough to be processed at all.
 #[test]
 fn an_ack_covering_everything_validates_nothing() {
     let mut solo = Solo::installed_from_msg1_at(origin());
@@ -312,8 +357,15 @@ fn an_ack_covering_everything_validates_nothing() {
          (ruling 200)",
     );
 
+    // Make the core seal a packet, so an ACK can legitimately cover one.
+    // The floor is "the counter the next seal will use", recorded at the
+    // arming, so anything sealed after the arming is at or above it.
     let now = origin() + Duration::from_millis(10);
-    let d = solo.deliver(now, &ack_frame(u32::MAX as u64));
+    let _ = solo.deliver(now, &ping_frame());
+    let sealed = highest_sealed(&solo);
+
+    let now = now + Duration::from_millis(10);
+    let d = solo.deliver(now, &ack_frame(sealed));
     assert_alive(&d);
 
     assert!(
@@ -333,22 +385,28 @@ fn an_ack_covering_everything_validates_nothing() {
 /// pins the msg1 anchor, this one pins the roam, and ruling 208's §7.3
 /// arms the budget on *both* triggers. A build that unwired the ACK
 /// predicate on one arming path only passes one of the two.
+///
+/// The `largest` is chosen the same way and for the same reason — see the
+/// note on [`an_ack_covering_everything_validates_nothing`].
 #[test]
 fn a_forged_ack_from_the_new_address_does_not_lift_the_budget() {
     let mut solo = Solo::installed_at(origin());
 
-    // The peer roams the session to the victim's address.
+    // The peer roams the session to the victim's address. Our reply to the
+    // PING is the "one sealed packet" the attack waits for, and its counter
+    // is at or above the floor the roam just recorded.
     let now = origin() + Duration::from_millis(10);
     let _ = solo.deliver_from(now, c_addr(), &ping_frame());
     let armed = solo
         .conn
         .amplification_budget()
         .expect("the roam arms the budget");
+    let sealed = highest_sealed(&solo);
 
-    // ... waits for one sealed packet, then returns a forged ACK from the
-    // victim's address. Two packets, per ruling 208.
+    // ... then returns a forged ACK from the victim's address. Two packets,
+    // per ruling 208.
     let now = now + Duration::from_millis(20);
-    let d = solo.deliver_from(now, c_addr(), &ack_frame(u32::MAX as u64));
+    let d = solo.deliver_from(now, c_addr(), &ack_frame(sealed));
     assert_alive(&d);
 
     let still = solo
@@ -1170,6 +1228,33 @@ fn an_idle_unvalidated_connection_owing_nothing_emits_no_challenge() {
 /// against a build that suppresses **the death clock too** it also passes —
 /// so a **second** assertion is required."* That second assertion is the
 /// `Liveness` timer half below.
+///
+/// # ⚠ REPORTED: this test does **not** separate the build it names, and
+/// the reason is a fact about the tree rather than about the test
+///
+/// `CONTRACT-7b.md` §4.3 says *"against today's build it fails"*. **It does
+/// not** — this author ran it against `c131904` with no remediation in it
+/// and it passed. The state it needs is not reachable there, and the
+/// arithmetic says why: `transmit_keepalive`'s guard is
+/// `contested.is_pending() || !amplification.admits(30)`, and on the
+/// pre-sizing build **neither disjunct can become true**.
+///
+/// * `admits(30)` is `sent + 30 <= 3 × recv`. Every received packet raises
+///   the ceiling by 3× its size while the ACK it provokes spends 1×, so the
+///   headroom grows monotonically on every exchange. The only thing that
+///   could outrun it is held application data — and without ruling 203's
+///   sizing fix the pump builds a full-size packet, has it refused, and
+///   sends **nothing**, so `sent` never advances.
+/// * `Contested::Pending` requires the probe to be *held*, which is the
+///   same predicate. With the budget admitting, `mark_contested` transmits
+///   immediately and lands in `Armed`, never `Pending`.
+///
+/// So the livelock's precondition is created by **ruling 203's sizing fix**
+/// — the other half of this very slice. The test is inert today and becomes
+/// live the moment sizing lands, which is the right time for it to bite;
+/// but it must not be read as evidence of anything until then. Working rule
+/// 13 in its own small way: the reachable state space bounds the coverage,
+/// and here the bound moves during the slice.
 #[test]
 fn a_held_keepalive_never_announces_a_deadline_in_the_past() {
     let mut solo = Solo::installed_at(origin());
@@ -1308,6 +1393,19 @@ fn two_real_cores_validate_a_roamed_address() {
 /// applied to the whole exchange rather than to one contrived state.
 /// Working rule 13 in miniature — the fixture bounds the coverage, and a
 /// spin is invisible on the wire.
+///
+/// # ⚠ REPORTED: a sweep, not a separator
+///
+/// Like [`a_held_keepalive_never_announces_a_deadline_in_the_past`], this
+/// passes against a tree with no remediation in it, for the reason set out
+/// there: the held state is unreachable before ruling 203's sizing fix. It
+/// is kept deliberately and its value is different in kind — it asserts the
+/// invariant over **every** deadline both cores announce across a
+/// multi-round roam, so it catches a *future* instance of ruling 141's spin
+/// class rather than this one. `CONTRACT-7b.md` §4.2 makes exactly that
+/// argument for the shell-side `debug_assert!`: *"converts the whole class
+/// into a test failure in every debug-mode run, forever — including for
+/// instances nobody has found yet."*
 #[test]
 fn no_core_announces_a_past_deadline_across_a_roam() {
     let mut pair = Pair::installed_at(origin());
