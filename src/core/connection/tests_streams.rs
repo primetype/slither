@@ -2512,6 +2512,7 @@ mod packing {
             Install {
                 session: sb,
                 role: Role::Responder,
+                anchor_from_msg1: false,
             },
         );
         let d = drain(&mut conn);

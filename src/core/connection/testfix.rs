@@ -489,6 +489,7 @@ impl Pair {
             Install {
                 session: sa,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         b.handle_endpoint_event(
@@ -496,6 +497,7 @@ impl Pair {
             Install {
                 session: sb,
                 role: Role::Responder,
+                anchor_from_msg1: false,
             },
         );
         let mut p = Self {
@@ -529,6 +531,7 @@ impl Pair {
             Install {
                 session: sa,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         self.b.handle_endpoint_event(
@@ -536,6 +539,7 @@ impl Pair {
             Install {
                 session: sb,
                 role: Role::Responder,
+                anchor_from_msg1: false,
             },
         );
     }
@@ -925,6 +929,25 @@ impl Solo {
     }
 
     pub(crate) fn installed_at(now: Instant) -> Self {
+        Self::installed_with(now, false)
+    }
+
+    /// [`installed_at`](Solo::installed_at) with §7.3's budget **armed**,
+    /// as an endpoint anchoring at a msg1 source installs it (ruling 200).
+    ///
+    /// The plain constructor installs a `Role::Responder` core with the
+    /// budget **validated**, which is a synthesis no production path
+    /// produces — a real responder is always msg1-anchored. It stays the
+    /// default because every pre-slice-7 core test uses it to drive
+    /// multi-packet flows, and a 588-byte cap would throttle them for a
+    /// reason their subject has nothing to do with. Ruling 200 keeps the
+    /// choice explicit rather than inferring it from the role, exactly so
+    /// that this fixture can make it.
+    pub(crate) fn installed_from_msg1_at(now: Instant) -> Self {
+        Self::installed_with(now, true)
+    }
+
+    fn installed_with(now: Instant, anchor_from_msg1: bool) -> Self {
         let (sa, sb) = handshake_pair();
         let mut conn = Connection::connecting([0xa5u8; 32]);
         conn.handle_endpoint_event(
@@ -932,6 +955,7 @@ impl Solo {
             Install {
                 session: sb,
                 role: Role::Responder,
+                anchor_from_msg1,
             },
         );
         let _ = drain(&mut conn);

@@ -860,6 +860,16 @@ async fn s3c_a_refusal_against_a_none_basis_is_stale_and_marks_contested() {
         // one's retransmit being re-accepted. (Either would be `Stale` and
         // neither may mark again, so the assertion is the same; the drop is
         // for the reader.)
+        // **Integrator, ruling 202.** Block the *original* peer's return
+        // path before the second refusal. Without this the live peer ACKs
+        // the first probe within a round trip, the mark **clears**, and the
+        // second refusal is a full second mark — which ruling 175 says is
+        // correct, so the assertion below would be pinning the behaviour
+        // ruling 43 had and ruling 175 removed. S11's no-op guarantee is
+        // scoped to a refusal *while the connection is still contested*, and
+        // this is what keeps it so.
+        net.block_path(b.addr, a.addr);
+
         drop(contender);
         let b3 = Node::spawn(
             &net,

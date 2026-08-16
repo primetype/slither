@@ -233,8 +233,17 @@ the spec rounds.
    fault is absent from the results, suspect the harness before the
    authors.
 14. **An isolated agent sees a commit, not a working tree — cut its
-   worktree from a commit that contains its brief's inputs, and name that
-   commit in the brief.** Worktree isolation fixed slice 3b's blindness
+   worktree from a commit that contains its brief's inputs, name that
+   commit in the brief, and *verify the cut actually happened*.**
+   **The verification half is not optional** (ruling 200's round): slice
+   7's third blind author was briefed at `195c57a` and its worktree was
+   cut from `ddda950`, which contained the very implementation it existed
+   to be blind to. It caught this on its **first command**, before reading
+   any source, reset, and said so — and nothing in its output would have
+   looked wrong had it not. A brief that names a commit and tooling that
+   cuts from `HEAD` destroy the blind split **silently**. An isolated
+   agent's first act is to check its base and report it.
+   Worktree isolation fixed slice 3b's blindness
    leak and introduced this in doing it. Slice 4a's test author was cut at
    `fdf5972`; `CONTRACT-4a.md`, which its brief calls *binding*, was
    uncommitted at that moment and landed at `74fa5f2`. It reconstructed

@@ -759,6 +759,9 @@ impl<I: Identity> Endpoint<I> {
             Install {
                 session,
                 role: Role::Initiator,
+                // Ruling 200: we dialled and msg2 completed it, so the
+                // anchor is the address `connect()` was given. Validated.
+                anchor_from_msg1: false,
             },
         ));
     }

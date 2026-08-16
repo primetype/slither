@@ -222,6 +222,25 @@ pub struct Install<C: Handshake> {
     /// an associated type with no bounds. The endpoint is the only party
     /// that knows the tie-break's outcome, so the endpoint states it.
     pub role: Role,
+    /// **[RATIFIED 2026/08/16 — ruling 200]** Whether this session's anchor
+    /// is a **msg1 source** — a peer-supplied address with no
+    /// return-routability proof — and therefore whether §7.3's
+    /// anti-amplification budget arms.
+    ///
+    /// Stated by the endpoint for the same reason [`role`](Self::role) is,
+    /// and the same path forces it: §6.6's internal tie-break **loser
+    /// dialled**, lost, and installs here as `Role::Responder` with the
+    /// msg1 source as its anchor (`endpoint/routing.rs`). So neither *"I
+    /// was created by `connect()`"* nor the role alone answers the
+    /// question — a dialler can end up anchored at an address it did not
+    /// choose, which is exactly the case §7.3 exists for.
+    ///
+    /// Inferring it from `Role::Responder` was tried and rejected: it is
+    /// true of every *production* path but conflates the role label with
+    /// the anchoring event, so a core installed as a responder without an
+    /// anchoring msg1 — which is what a fixture synthesises — would be
+    /// capped for a reason that never happened.
+    pub anchor_from_msg1: bool,
 }
 
 /// The one connection→endpoint event (§16.4).

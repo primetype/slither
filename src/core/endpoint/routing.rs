@@ -558,6 +558,11 @@ impl<I: Identity> Endpoint<I> {
                 // §6.6 step 4: we dialled and lost the tie-break, so we
                 // wrote msg2 and install as the **responder** (ruling 106).
                 role: Role::Responder,
+                // **Ruling 200.** The anchor above is `src`, the **msg1
+                // source** — peer-supplied, with no return-routability
+                // proof — even though this connection began as our dial.
+                // This is the path that forced the flag to exist.
+                anchor_from_msg1: true,
             },
         ));
     }

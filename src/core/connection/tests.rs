@@ -422,6 +422,7 @@ fn established_at_with_epoch(now: Instant, epoch: NonZeroU64) -> Fixture {
         Install {
             session,
             role: Role::Initiator,
+            anchor_from_msg1: false,
         },
     );
     let mut f = Fixture {
@@ -672,6 +673,7 @@ mod poll_contract {
             Install {
                 session,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         let _ = drain_bare(&mut conn);
@@ -776,6 +778,7 @@ mod poll_contract {
             Install {
                 session,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         let d = drain_bare(&mut conn);

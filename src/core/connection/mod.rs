@@ -81,6 +81,15 @@ mod tests_recovery;
 #[cfg(test)]
 mod tests_roam;
 
+// **[ruling 193(b)]** The `Contested::Pending` gap, written by a **third**
+// blind author after both story-test authors proved — independently, one by
+// arithmetic and one by construction — that the state is unreachable from an
+// integration test. The declaration is the integrator's (working rule 15):
+// it is valid only once the file and the implementation both exist, and a
+// `mod` for a missing file reds every gate at once.
+#[cfg(test)]
+mod tests_contested;
+
 // ── slice 6's core tests, at integration ─────────────────────────────────
 //
 // Written from `SPEC.md` §9.8/§11 and `CONTRACT-6.md` by two authors who
@@ -246,7 +255,10 @@ impl<C: Handshake> Connection<C> {
         // the session exists, which is the first moment `next_counter()`
         // means anything.
         conn.amplification = Amplification::arm(0, constants::INIT_PACKET_LEN as u64);
-        conn.install(now, session, role);
+        // `true`: this constructor **is** §6.4's accept path, so the anchor
+        // is the msg1 source by construction. The budget is already armed
+        // above; passing it here keeps `install`'s rule single-sourced.
+        conn.install(now, session, role, true);
         conn
     }
 
@@ -377,7 +389,7 @@ impl<C: Handshake> Connection<C> {
             // would resurrect it, and §16.4 emits `Closed` once.
             return;
         }
-        self.install(now, ev.session, ev.role);
+        self.install(now, ev.session, ev.role, ev.anchor_from_msg1);
     }
 
     /// §16.4's `handle_datagram`.
@@ -1711,15 +1723,30 @@ impl<C: Handshake> Connection<C> {
     // Internals
     // ═══════════════════════════════════════════════════════════════════
 
-    fn install(&mut self, now: Instant, session: EstablishedSession<C>, role: Role) {
+    fn install(
+        &mut self,
+        now: Instant,
+        session: EstablishedSession<C>,
+        role: Role,
+        anchor_from_msg1: bool,
+    ) {
         self.installed = true;
         self.role = Some(role);
         self.streams.set_role(role);
         self.session = Some(Session::install(now, session));
-        // Ruling 168's floor, for a budget armed by [`established`] before
-        // the session existed. A no-op on the `Install` path: a dialled
-        // connection is validated, and `arm` is the only thing that clears
-        // that.
+        // **[RATIFIED 2026/08/16 — ruling 200]** §7.3 arms the budget for an
+        // address *"first anchored from a msg1 source"*. That is endpoint
+        // knowledge, so the endpoint states it — see `Install`.
+        //
+        // Keying it on the **constructor** left a hole: §6.6's internal
+        // tie-break loser *dialled*, lost, and installs through this path
+        // with `anchor: src`, the msg1 source (`endpoint/routing.rs:520`).
+        // That peer-supplied address was treated as **validated**, so the 3×
+        // cap never applied to it — a reflector on the one path where a
+        // dialler adopts an address it did not choose.
+        if anchor_from_msg1 && self.amplification.is_validated() {
+            self.amplification = Amplification::arm(0, constants::INIT_PACKET_LEN as u64);
+        }
         if !self.amplification.is_validated() {
             let floor = self.next_counter().unwrap_or(0);
             self.amplification.set_floor(floor);
@@ -2737,6 +2764,7 @@ mod smoke {
             Install {
                 session: a_session,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         b.handle_endpoint_event(
@@ -2744,6 +2772,7 @@ mod smoke {
             Install {
                 session: b_session,
                 role: Role::Responder,
+                anchor_from_msg1: false,
             },
         );
         (a, b)
@@ -2956,6 +2985,7 @@ mod smoke {
             Install {
                 session: a_session,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
 
@@ -3324,6 +3354,7 @@ mod smoke {
             Install {
                 session: a_session,
                 role: Role::Initiator,
+                anchor_from_msg1: false,
             },
         );
         assert_eq!(

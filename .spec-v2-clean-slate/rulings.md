@@ -5464,3 +5464,157 @@ express "this peer died" other than by getting an ordering right.
 adding an explicit `abandon()`/`kill()` verb — it is API surface for a
 testing concern, and slice 8's API review is the place to raise it if the
 review wants it.
+
+## Round 32 — the third blind author, and two defects it exposed (2026/08/16)
+
+Ruling 193(b) required the `Contested::Pending` coverage to come from an
+author who had not seen the implementation. A third blind agent wrote it:
+**15 core tests, ~1 100 lines**, and it **compiled against the
+implementation with zero changes** — including `mark_contested`, the one
+API it flagged as *"possibly invented"* because `CONTRACT-7.md` specifies
+the mark's behaviour and never names its method. Two agents, blind to each
+other, chose the same name.
+
+**Process defect, mine, and only the agent's discipline contained it.**
+The brief named base commit `195c57a`; **the worktree was actually cut from
+`ddda950`**, which contains the slice-7 implementation. The agent caught it
+on its *first command*, before reading any source, reset to `195c57a`, and
+reported it. Working rule 14 says an isolated agent sees a commit, not a
+working tree, and to cut its worktree from a commit containing its inputs —
+it did not say **verify the cut actually happened**. A brief that names a
+commit and tooling that cuts from `HEAD` silently destroy the blind split,
+and nothing in the result would have looked wrong. **Working rule 14 gains:
+check the worktree's base before reading anything, and say what it was.**
+
+### 200 — the amplification budget arms on `Role::Responder`, not on the constructor
+
+The blind tests failed at once on `amplification_budget()` returning `None`
+where a responder-anchored core must have one — which is exactly conflict
+**C3** the same agent had reported: *"§3.2 arms on 'the connection was
+created by `accept()`', but `Install { session, role }` is the core's only
+signal, and `Role::Responder` does not imply 'created by accept()'."*
+
+Verified in the code (working rule 11): §6.6's **internal tie-break loser
+dialled**, lost, and installs through the `Install` path as
+`Role::Responder` with `anchor: src` — *"§5.6's anchor — the **msg1
+source**, because on this branch we are the responder"*
+(`endpoint/routing.rs:520`). The implementation armed the budget only in
+`Connection::established`, the staged-accept constructor, so **that
+peer-supplied address was treated as validated** and §7.3's 3× cap never
+applied to it. An off-path attacker replaying a captured initiation
+(ruling 37's window) against a side that happens to be dialling gets a
+reflector on the one path where a dialler adopts an address it did not
+choose.
+
+**Ruling: arm on `Role::Responder`.** A responder is by definition a side
+that received msg1 and answered, so **its anchor is always the msg1 source
+and never an address the application supplied** — the role *is* §7.3's
+predicate, on every path, and it is the only form of it the core can see.
+The blind author's assumption was right and the implementation's was wrong;
+the two disagreed exactly where C3 said they would.
+
+### 201 — ruling 184 over-read ruling 155, and `0x31` is not withdrawn
+
+Ruling 184 (mine) told `CONTRACT-7.md` that *"the `0x31` escape is
+**withdrawn for datagrams** — ruling 155 makes `0x30` mandatory"*. The
+blind author built its packet arithmetic on that and every shaping
+assertion missed by 2 bytes.
+
+**Measured**: payload 1169 → packet 1200 (overhead 31, the `0x30`
+extends-to-end form); payloads 1140 and 100 → overhead **33** (`0x31` with
+a 2-byte length varint). The implementation picks `0x30` **only when the
+datagram genuinely runs to the end of the packet**.
+
+**It is right, and ruling 184 was wrong.** Ruling 155's *"not optionally"*
+is about the **maximum-size** case only, and its arithmetic says so:
+1 + 2 + 1169 = 1172 > `MAX_PLAINTEXT`, so `0x31` cannot express the
+ratified maximum. It does not follow that `0x30` is mandatory everywhere —
+and it cannot be, because **ruling 155 also packs datagrams *before* the
+stream fill** while an extends-to-end frame must be **last**. Mandating
+`0x30` universally would forbid any packet carrying a datagram *and* stream
+data, which is the ordinary case ruling 155's own packing order
+contemplates.
+
+**Ruling:** `0x30` where the datagram runs to the end of the packet;
+**`0x31` with a length varint otherwise, required rather than permitted.**
+Frame overhead is 1 + the varint — 1 byte below 64, 2 up to 16383 (§8.1),
+and **both sizes occur inside a single test file**, which is why a
+one-constant model of it fails.
+
+**This is the defect class in my own ruling, for the fifth time**, and with
+a new twist: ruling 184 was itself written to *correct* an over-narrow
+reading of §8.5, and it over-corrected in the other direction. **A ruling
+that widens a scope should say what still bounds it.** Ruling 184's own
+closing line — *"when a spec-text conflict is about capacity, do the
+arithmetic before taking a position"* — is the rule it broke: I did the
+arithmetic for the maximum case and generalised from the one case where the
+answer is forced.
+
+### The result
+
+**15/15 pass.** Two implementation-facing defects (200, and the earlier 195)
+and two of my own document defects (201, and 198's stale contract) came out
+of a slice whose implementer reported every gate green. **Neither 200 nor
+195 was reachable from any test written by anyone who had seen the code.**
+
+### 202 (from T-M's s3c) — a second refusal is a no-op only *while the mark is outstanding*
+
+T-M's `s3c_a_refusal_against_a_none_basis_is_stale_and_marks_contested`
+asserted that a second refusal yields no notification. Diagnosed by
+printing what actually arrived: **`ContestCleared`**. The original peer is
+alive, answered the first probe within a round trip, and the mark had
+already **cleared** — so the second refusal was a full second mark, which
+**ruling 175 says is correct**.
+
+The test was pinning the behaviour ruling 43 had and ruling 175 removed.
+**Corrected the test, not the code**, and by blocking the live peer's
+return path before the second refusal so the mark is genuinely still
+`Armed` — which is the scope S11's guarantee actually has. Recorded rather
+than done quietly, because at integration the cheap move is to adjust
+whichever side is easier, and that is how working rule 6 dies.
+
+### 203 — **a keepalive-only dance never validates a roamed address, and application data then stalls.** Slice 7 does not close on this.
+
+T-M's `s18_a_running_keepalive_dance_carries_the_move_by_itself` fails,
+and it is **not** a test defect.
+
+- §7.5's keepalive is **§3.4's empty plaintext** — no frames, therefore
+  **no ACK**, therefore not ack-eliciting.
+- Ruling 168 validates an address only on **an ACK covering
+  `validation_floor`**.
+- So a connection carried purely by the passive dance **never validates**
+  the address it roamed to. Its cap stays at `3 ×` the roaming packet —
+  90 bytes for a 30-byte keepalive — and each further keepalive round nets
+  only ~60 bytes of headroom.
+- The pump builds a full-size candidate, `admits()` refuses it, and
+  **nothing shrinks to fit**, so 2 048 bytes of application data cannot
+  leave for ~20 keepalive rounds (~200 s) even though a ~90-byte packet
+  would fit immediately, be ack-eliciting, and validate the address in one
+  round trip.
+
+**This is ruling 198's residual in its sharpest form** — that ruling
+recorded the *ordering* of classes under a scarce budget as unbuilt; this
+shows the deeper gap is that the sender never **sizes** output to the
+budget at all. §7.3 says refused output is *"held"*, and says nothing about
+shrinking, so the implementation is defensible against the text and wrong
+against the protocol's purpose: the budget exists to be *escaped* by a
+round trip, and holding a full packet is the one behaviour that prevents
+the escape.
+
+**Ruling: this blocks slice 7.** The fix is to bound the packing target by
+the remaining budget — `min(MAX_DATAGRAM, room)` — so the first post-roam
+packet is small, ack-eliciting, and validates the address at once. That is
+a change to `pump_packets`' sizing, and it must **not** be made by the
+integrator against a failing test at the end of a slice: it is exactly the
+shape of change that wants its own blind pass.
+
+**Ruling 168 is confirmed correct and the interaction is its cost, not its
+refutation.** The ACK requirement is load-bearing: an authenticated,
+window-fresh packet proves the *peer* sent it, and an on-path attacker can
+rewrite its source to a victim's address — only an ACK proves the peer
+**receives** at the address we are sending to. Validating on mere receipt
+would reopen exactly the reflector §7.3 exists to close. The defect is in
+the sender's sizing, not in the predicate.
+
+**Status: slice 7 is NOT closed.** 887 passing, **1 failing**, and the
+failure is a real protocol defect found by a blind story test.
