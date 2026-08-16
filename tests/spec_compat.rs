@@ -70,6 +70,36 @@
 //! reading `src/compat/**/*.rs` — see [`compat_source_scan`]'s module
 //! section. The scan is deliberately narrow and strips `//` comments first,
 //! so the contract's own prohibitions quoted in rustdoc do not trip it.
+//!
+//! # What this suite needs from `Cargo.toml` (the integrator's, working rule 15)
+//!
+//! ```toml
+//! [[test]]
+//! name = "spec_compat"
+//! required-features = ["test-util", "sink"]
+//! ```
+//!
+//! **Ruling 194 applies and is not cosmetic:** there is no `autotests =
+//! false`, so cargo auto-discovers this file *without* its
+//! `required-features`, and the feature-less `cargo test` gate fails on
+//! `unresolved import slither::compat` until the stanza exists.
+//!
+//! Two dev-dependencies are owed, and one of them has a trap in it.
+//! `CONTRACT-8.md` §10 promises both as integrator-added; neither is in the
+//! manifest at base `704a4ae`:
+//!
+//! * `tokio` needs **`io-util`** added to its dev-dependency feature list —
+//!   `AsyncReadExt` / `AsyncWriteExt` live there, and the library's own
+//!   `tokio` does not enable it.
+//! * `futures-util` needs **`features = ["sink"]`**. This is the trap:
+//!   `futures-util`'s `sink` module is **not** in its default features, so a
+//!   plain `futures-util = "0.3"` gives `futures_util::stream::Stream` and
+//!   **not** `futures_util::sink::Sink` — the compiler says *"found an item
+//!   that was configured out"*, which reads like a version problem rather
+//!   than a feature one. Verified by building this suite's non-`compat`
+//!   half against both spellings. `CONTRACT-8.md` §10 names `SinkExt::send`
+//!   as a thing the test authors may rely on, and it is in that same gated
+//!   module — so the **story author's suite needs this too**.
 
 use std::future::Future;
 use std::io;
