@@ -453,7 +453,7 @@ impl Network {
         let wire_seed = seed ^ (ordinal as u64).wrapping_mul(SEED_STRIDE);
 
         FlakyWire {
-            addr,
+            addr: Cell::new(addr),
             net: Rc::clone(&self.0),
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(wire_seed)),
             policy: RefCell::new(FlakyPolicy::perfect()),
@@ -575,7 +575,15 @@ fn deliver(inner: &mut Inner, src: SocketAddr, dst: SocketAddr, bytes: Vec<u8>, 
 /// `Send`, so a `Send` `FlakyWire` would let a `Send` bound creep into the
 /// driver unnoticed.
 pub struct FlakyWire {
-    addr: SocketAddr,
+    /// **[ruling 180]** A `Cell`, not a plain field, because
+    /// [`rebind`](FlakyWire::rebind) moves this wire between addresses and
+    /// every `Wire` method takes `&self`. Before ruling 180 this was
+    /// immutable and **stories S18 and S19 were unreachable by
+    /// construction** — nothing could make an endpoint originate from a new
+    /// address, so a roam could only ever be simulated by
+    /// [`Network::inject`]'s spoofed source, which §7.2's replay window
+    /// rejects.
+    addr: Cell<SocketAddr>,
     net: Rc<RefCell<Inner>>,
     rng: RefCell<ChaCha20Rng>,
     policy: RefCell<FlakyPolicy>,
@@ -586,8 +594,73 @@ pub struct FlakyWire {
 
 impl FlakyWire {
     /// The address this wire is registered at.
+    ///
+    /// Follows [`rebind`](FlakyWire::rebind).
     pub fn local_addr(&self) -> SocketAddr {
-        self.addr
+        self.addr.get()
+    }
+
+    /// **[RATIFIED 2026/08/16 — ruling 180]** Move this wire to
+    /// `new_addr`: an interface change, or a NAT rebind.
+    ///
+    /// This is the fixture half of §7.3's roaming. The peer re-homes on the
+    /// next authenticated, window-fresh packet we send — roaming is driven
+    /// by **authenticated receipt**, so the mover must send, and S18 makes
+    /// that a positive obligation rather than a transport probe.
+    ///
+    /// **In-flight datagrams addressed to the old address are dropped.**
+    /// The new address gets a fresh, empty inbox. That models what an
+    /// interface change and a NAT rebind actually do, and it is what makes
+    /// S18's obligation bite: were the inbox carried across, a peer could
+    /// move, stay silent, and still receive — so "a peer that moves and
+    /// stays silent is indistinguishable from one that vanished" would pass
+    /// for the wrong reason, which is a bound the degenerate implementation
+    /// satisfies for free.
+    ///
+    /// Datagrams sent to the old address *after* the rebind need no special
+    /// handling: an unregistered destination is already dropped, exactly as
+    /// a real socket's mapping would.
+    ///
+    /// The `Notify` is **carried, not replaced** — a driver's receive loop
+    /// is parked on this wire's existing handle, and a fresh one would park
+    /// it for ever.
+    ///
+    /// # Panics
+    ///
+    /// If `new_addr` is already registered on this network. Rebinding to
+    /// the address a wire already holds is a no-op, not a panic.
+    pub fn rebind(&self, new_addr: SocketAddr) {
+        let old = self.addr.get();
+        if old == new_addr {
+            return;
+        }
+        {
+            let mut inner = self.net.borrow_mut();
+            assert!(
+                !inner.endpoints.contains_key(&new_addr),
+                "{new_addr} is already registered on this network"
+            );
+            // The old inbox is dropped with the entry; only the notify
+            // handle crosses, because the driver is parked on it.
+            inner.endpoints.remove(&old);
+            inner.endpoints.insert(
+                new_addr,
+                EndpointState {
+                    inbox: BinaryHeap::new(),
+                    notify: Rc::clone(&self.notify),
+                },
+            );
+            // A partition or a blocked path is a property of the *address*,
+            // not of the wire: a rebind lands on a fresh address, which is
+            // by definition neither partitioned nor blocked. Anything the
+            // test wants to hold across the move it re-applies to the new
+            // address.
+            inner.partitioned.remove(&old);
+            inner.blocked.retain(|(from, to)| *from != old && *to != old);
+        }
+        self.addr.set(new_addr);
+        // Anything parked on the old inbox must re-examine the new one.
+        self.notify.notify_waiters();
     }
 
     /// Replace this wire's policy. Takes effect from the next send.
@@ -660,6 +733,10 @@ impl Wire for FlakyWire {
         self.sent.set(index + 1);
         self.net.borrow_mut().sends += 1;
 
+        // **[ruling 180]** Read once: one send leaves from one source, even
+        // if a `rebind` lands between two sends.
+        let src = self.addr.get();
+
         let policy = self.policy.borrow().clone();
 
         // 2. Injected send failure — the timed window, or the toggle.
@@ -675,14 +752,14 @@ impl Wire for FlakyWire {
         // 3. Topology. A blackhole, not an error.
         {
             let net = self.net.borrow();
-            if net.partitioned.contains(&self.addr) || net.blocked.contains(&(self.addr, addr)) {
+            if net.partitioned.contains(&src) || net.blocked.contains(&(src, addr)) {
                 return Ok(buf.len());
             }
         }
 
         // 4. Tap.
         self.net.borrow().log.borrow_mut().push(Spied {
-            src: self.addr,
+            src,
             dst: addr,
             bytes: buf.to_vec(),
         });
@@ -705,7 +782,7 @@ impl Wire for FlakyWire {
         for _ in 0..deliveries {
             let delay = self.draw_delay(&policy);
             let mut net = self.net.borrow_mut();
-            deliver(&mut net, self.addr, addr, buf.to_vec(), now + delay);
+            deliver(&mut net, src, addr, buf.to_vec(), now + delay);
         }
 
         Ok(buf.len())
@@ -731,10 +808,16 @@ impl Wire for FlakyWire {
     /// at §3.5's length gate.
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
+            // **[ruling 180]** Re-read every iteration, never hoisted: a
+            // `rebind` can land while we are parked below, and after one the
+            // inbox we must examine is the **new** address's. Anything still
+            // queued for the old address is gone with it, which is what a
+            // NAT rebind does to a datagram already in flight.
+            let me = self.addr.get();
             let next = {
                 let net = self.net.borrow();
                 net.endpoints
-                    .get(&self.addr)
+                    .get(&me)
                     .and_then(|ep| ep.inbox.peek().map(|Reverse(q)| q.deliver_at))
             };
 
@@ -752,7 +835,10 @@ impl Wire for FlakyWire {
 
             // Only now do we take it.
             let mut net = self.net.borrow_mut();
-            let Some(ep) = net.endpoints.get_mut(&self.addr) else {
+            // `self.addr`, not `me`: a rebind during the sleep above moves
+            // us, and the datagram we waited for was addressed to where we
+            // no longer are.
+            let Some(ep) = net.endpoints.get_mut(&self.addr.get()) else {
                 continue;
             };
             let due = ep
@@ -1727,5 +1813,145 @@ mod tests {
                 _drives_any_wire(&b);
             })
             .await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Ruling 180 — `rebind`, the fixture half of §7.3's roaming
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// A rebound wire **sends from** its new address and **receives at** it.
+    ///
+    /// This is what S18 and S19 need and what nothing before ruling 180
+    /// could express: `Network::inject` can forge a source, but only a real
+    /// wire can originate the authenticated, window-fresh packet §7.3
+    /// requires to move an endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn a_rebound_wire_sends_from_and_receives_at_its_new_address() {
+        let net = Network::seeded(0x510AD);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+
+        a.send_to(b"before", addr(2)).await.expect("send");
+        let mut buf = [0u8; 16];
+        let (n, src) = recv_ok(&b, &mut buf).await;
+        assert_eq!(&buf[..n], b"before");
+        assert_eq!(src, addr(1), "the pre-move source");
+
+        a.rebind(addr(9));
+        assert_eq!(a.local_addr(), addr(9), "local_addr follows the rebind");
+
+        // Sends now carry the new source — this is the observation that
+        // roams a peer.
+        a.send_to(b"after", addr(2)).await.expect("send");
+        let (n, src) = recv_ok(&b, &mut buf).await;
+        assert_eq!(&buf[..n], b"after");
+        assert_eq!(src, addr(9), "§7.3: the source a peer would re-home to");
+
+        // And the return path reaches us where we now are.
+        b.send_to(b"reply", addr(9)).await.expect("send");
+        let (n, src) = recv_ok(&a, &mut buf).await;
+        assert_eq!(&buf[..n], b"reply");
+        assert_eq!(src, addr(2));
+    }
+
+    /// The old address stops delivering: a datagram sent to it after the
+    /// move is dropped, exactly as an unregistered destination is.
+    #[tokio::test(start_paused = true)]
+    async fn the_vacated_address_delivers_nothing() {
+        let net = Network::seeded(0x510AE);
+        let a = net.endpoint(addr(1));
+        let b = net.endpoint(addr(2));
+
+        a.rebind(addr(9));
+        b.send_to(b"to the old mapping", addr(1))
+            .await
+            .expect("send reports success — a blackhole is not an error");
+
+        let mut buf = [0u8; 32];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), a.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a datagram to the vacated address must never arrive"
+        );
+    }
+
+    /// **The ruling-180 decision, asserted from the side that separates the
+    /// two options.**
+    ///
+    /// A datagram already queued for the old address when the rebind lands
+    /// is **dropped**, not carried across. Under the rejected alternative
+    /// (carry the inbox) this test hangs at the `timeout` — so it fails
+    /// against the implementation the ruling declined, which is what makes
+    /// it a pin rather than a name (working rule 9).
+    ///
+    /// It matters because S18 says a peer that moves and stays silent is
+    /// indistinguishable from one that vanished. If in-flight datagrams
+    /// followed the mover, a silent mover would keep receiving and that
+    /// claim would pass for the wrong reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_in_flight_to_the_old_address_is_lost_on_rebind() {
+        let net = Network::seeded(0x510AF);
+        let a = net.wire_with(
+            addr(1),
+            FlakyPolicy::perfect().with_delay(Duration::from_secs(2), Duration::ZERO),
+        );
+        let b = net.endpoint(addr(2));
+
+        // In flight toward `a`, due in 2 s of virtual time.
+        b.send_to(b"in flight", addr(1)).await.expect("send");
+
+        // `a` moves before it lands.
+        a.rebind(addr(9));
+
+        let mut buf = [0u8; 32];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), a.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "ruling 180: the old address's inbox is abandoned, not carried"
+        );
+
+        // The wire is not broken by the loss — it still works at the new
+        // address. Without this the test above would pass for a wire that
+        // had simply died.
+        b.send_to(b"after the move", addr(9)).await.expect("send");
+        let (n, _src) = recv_ok(&a, &mut buf).await;
+        assert_eq!(&buf[..n], b"after the move");
+    }
+
+    /// Rebinding onto a live address panics, as `Network::endpoint` does —
+    /// two wires at one address would silently share an inbox.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "is already registered on this network")]
+    async fn rebinding_onto_a_registered_address_panics() {
+        let net = Network::seeded(0x510B0);
+        let a = net.endpoint(addr(1));
+        let _b = net.endpoint(addr(2));
+        a.rebind(addr(2));
+    }
+
+    /// Rebinding to the address we already hold is a no-op, **not** a
+    /// panic — and in particular does not drop the inbox, which the naive
+    /// remove-then-insert would.
+    #[tokio::test(start_paused = true)]
+    async fn rebinding_to_the_same_address_keeps_the_inbox() {
+        let net = Network::seeded(0x510B1);
+        let a = net.wire_with(
+            addr(1),
+            FlakyPolicy::perfect().with_delay(Duration::from_secs(2), Duration::ZERO),
+        );
+        let b = net.endpoint(addr(2));
+
+        b.send_to(b"queued", addr(1)).await.expect("send");
+        a.rebind(addr(1));
+
+        let mut buf = [0u8; 32];
+        let (n, _src) = recv_ok(&a, &mut buf).await;
+        assert_eq!(
+            &buf[..n],
+            b"queued",
+            "a same-address rebind must not discard the inbox"
+        );
     }
 }

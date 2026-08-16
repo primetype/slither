@@ -103,21 +103,36 @@ the spec rounds.
    later has not persisted. If you have read something worth keeping, it
    belongs on disk before you read the next thing.
 3. **When you find two statements in conflict, do not default to the
-   code-like rule.** **Six times** in this project the prose held the
+   code-like rule.** **Eight times** in this project the prose held the
    correct intent and the formal rule held the bug — most recently ruling
-   154, where §10.3 listed five retirement triggers and cited §9.7 for the
-   fifth, which §9.7 does not contain; and ruling 131, where §13.2's prose
-   named the survivors and its own parenthetical ranged over every
-   in-flight packet. The pattern before those was ruling 69, where §6.3's
-   evict-oldest rule said "by park time" while the rationale two bullets
-   above promised a retransmitting peer "the same per-packet race as any
-   fresh initiator", which park-time ordering inverts exactly.
+   169, where §7.3 funded a security counter from "§7.2's authenticated
+   class" while §7.2's own invariant is authenticated *and window-marked*,
+   so on the literal text a replayed packet replenishes it; and ruling
+   168, where §7.3's *"the 3× ratio is never lifted"* contradicted four
+   sections describing an address that "validates by traffic". Before
+   those: ruling 154 (§10.3 listed five retirement triggers and cited §9.7
+   for the fifth, which §9.7 does not contain), ruling 131 (§13.2's prose
+   named the survivors, its own parenthetical ranged over every in-flight
+   packet), and ruling 69 (§6.3's evict-oldest rule said "by park time"
+   while the rationale two bullets above promised a retransmitting peer
+   "the same per-packet race as any fresh initiator", which park-time
+   ordering inverts exactly).
    Report the conflict; do not silently pick one. **Every agent that has
    reported rather than resolved has been right.**
    *This count was itself stale for three slices* (ruling 158): it read
    "three times … ruling 69" while briefs cited five. Rule 4 applies to
    this file too — and this file is the one document no slice ever puts on
    an agent's path, so nothing sweeps it but deliberate intent.
+   **But the rule is *do not default*, not *always take the prose*, and a
+   one-directional tally decays into exactly the reflex it warns against.**
+   Ruling 182 is the first case that went the other way: §7.5's prose
+   stated the passive keepalive over *"has not sent"* while its formal
+   definition read `S` = *marking sends only*, and the **formal** one held
+   the intent — because the beacon's soundness proof two subsections later
+   rests on *"every send that can establish `S > R` is a marking send, so
+   the death clock is armed there"*, which the prose reading collapses into
+   an immortal half-open session. The tiebreak that decided it, and the one
+   to reach for: **follow the statement some other proof depends on.**
 4. **Grep for the rationale, not only the token.** A verification that
    greps for a changed value will miss prose still arguing the position
    you reversed. This happened, and shipped a self-contradicting section.

@@ -4234,3 +4234,577 @@ ratified text of mine** and **two reversed rulings I had made hours
 earlier**. Five consecutive slices with zero implementation defects from
 the blind split — and this slice, for the first time, a defect from the
 integrator.
+
+---
+
+## Round 30 — slice 7 planning: the mobility audit (2026/08/16)
+
+An adversarial spec auditor was run against slice 7's surface (§5.4, §5.7,
+§6.3–6.4, §6.7–6.9, §7.2–7.3, §7.5, §13.6, §14.6, §17.4) **blind to the
+planner**, hunting working rule 8's defect class. It returned **twelve
+findings**, and its "checked and clean" section is as valuable as its
+findings: S11's three collapse claims agree across three sections, the
+notification-at-transmission rule agrees across four sites, the probe
+floor is safe across ratchet/roam/nonce-exhaustion, every slice-7 death
+path already exists in `error.rs`, and the tie-break basis is consistent
+across §6.7, §17.4 and slice 4's code.
+
+**Eleven of the twelve stand. One is corrected — and the correction is
+working rule 12 again**, on an agent that was otherwise the best this
+project has run.
+
+### 168 (F-C, the round's most consequential) — the amplification budget disarms on a return-routability proof. **This reverses a recorded declination.**
+
+§7.3 states the anti-amplification budget as a standing inequality and
+closes the door on ending it: *"The 3× ratio is **never lifted**"*. Four
+other sections describe validation as an event that **occurs** — §5.6
+(923) *"until the address validates by traffic"*, §6.9 twice (1816, 1821),
+and §7.4 (2004) *"and then goes quiet **until the address validates**"*.
+§7.3 defines no predicate that ends the unvalidated state.
+
+**The literal reading is untenable, and not marginally.** The budget arms
+*"whenever a session's endpoint address changes (a roam) **or is first
+anchored from a msg1 source**"* — so **every responder-side connection
+begins unvalidated**. Under a permanent cap, an accepting endpoint may
+never send more than 3× what it receives, for the connection's entire
+life. A peer downloading a file replies with ACKs only: ~40 bytes per
+~2400 sent (§12.4's delayed ACK), funding ~120 bytes of budget against
+2400 bytes of demand. **An endpoint that accepts connections could never
+serve one.** That is not a protocol anyone ratified; it is a throughput
+cliff invisible today only because nothing anchors a budget yet.
+
+**Two independent tells that the literal reading is a defect, not a
+decision.**
+
+1. §7.3 grounds "never lifted" in *"the amplification factor QUIC accepts
+   (RFC 9000 §8.2/§9.3)"* — and in QUIC that limit binds **only until the
+   address is validated**. The sentence cites as its authority a
+   specification in which the thing *is* lifted.
+2. The clause that makes the permanence sound harmless — *"a genuine peer
+   clears it within about one round trip, because its own authenticated
+   traffic funds the budget continuously"* — is true for a symmetric
+   request/response exchange and **false for every asymmetric one**. It is
+   working rule 11's shape inside the spec: a rationale naming a mechanism
+   that does not do what it is claimed to do. "Clears it" is transition
+   language; under the literal rule nothing is ever cleared.
+
+So §7.3's declination of an unlock was taken **on the premise that no
+unlock was needed**, and that premise does not hold. Working rule 3
+applies in its usual direction: the prose in §5.6/§6.9/§7.4 carries the
+intent; the formal rule in §7.3 carries the bug. **Seventh time.**
+
+**Ruling.** The budget **disarms on a return-routability proof**, and the
+proof is a primitive slice 7 is already building:
+
+> At each address change (roam, or first anchor from a msg1 source),
+> record `validation_floor` = **the counter the next seal will use** —
+> hiss's `next_counter()`, the same construction ruling 41 records as
+> `probe_floor`. The address becomes **validated**, and the budget
+> disarms, when an authenticated, window-fresh packet **from that
+> address** carries an ACK covering **any counter ≥ `validation_floor`**.
+> Until then the 3× cap binds all output, exactly as §7.3 states today.
+> The counters are freed at validation and re-armed at the next address
+> change.
+
+An ACK at or above the floor can only have been produced by a peer that
+**received a packet we sent to that address after the change** — which is
+return-routability, proven, with no new frame and no new state beyond one
+`u64` and one `bool`.
+
+**Why this is not the declined alternative.** §7.3 declined *"an
+N-authenticated-packets-over-1-RTT validation unlock (more state, the same
+reflection property)"* and *"explicit PATH_CHALLENGE/PATH_RESPONSE"* (two
+new frame types, wire-affecting, golden-wire pin red). This is neither: it
+is a **single** round-trip proof carrying **less** state than the
+N-packet scheme, it is wire-free, and unlike the N-packet unlock it does
+**not** have "the same reflection property" — N authenticated packets can
+be replayed by an off-path attacker, whereas an ACK covering a counter we
+chose *after* the address change cannot be manufactured without the key.
+The declined option was weaker than this one, which is likely why it was
+declined.
+
+**The 3× ratio itself is still never lifted** — it is never raised, never
+configurable, and binds every §14.5/§13.4 cwnd exemption for as long as
+the address is unvalidated. What ends is the *unvalidated state*, which
+§7.3 always intended to be temporary and never said how to leave.
+
+**Flagged for the maintainer.** This is the one ruling this round that
+**reverses a decision the spec records as taken**. It is wire-free and
+turns no golden vector, and slice 7 cannot be built without answering the
+question one way or the other — but it belongs at the top of the
+**adversarial protocol review already scheduled after this slice**, and it
+is the ruling I most want attacked. Recorded in full so that reversing it
+is a ruling and not an excavation.
+
+### 169 (F-F) — the budget is funded by authenticated **and window-fresh** bytes
+
+§7.2 states the invariant: *"Liveness and roaming are driven only by
+packets that are both authenticated and window-marked (fresh). No replayed
+packet ever moves the endpoint or refreshes liveness."* §7.3 funds the
+budget on bytes *"received from it and **authenticated**"*, citing *"§7.2's
+authenticated class"* — the **broader** class — and excludes only
+*"unauthenticated or undecryptable"* bytes. Rule 8 reads that exclusion
+list as exhaustive, so **on the literal text a replayed packet replenishes
+a security counter**, letting a keyless on-path attacker inflate our send
+budget toward an address.
+
+**Ruling:** fund the budget only on **authenticated and window-fresh**
+bytes, matching §7.2's invariant and §7.3's own summary line 1897
+(*"Nothing unauthenticated, and no replayed packet, ever moves it"*).
+The literal text is a scope slip: the sentence set out to exclude
+*unauthenticated* bytes and did not notice that citing the broader class
+also admitted *replayed* ones. No argument exists anywhere for letting
+duplicates fund a security budget. Working rule 3, prose over formal rule
+— **eighth time**.
+
+### 170 (F-D) — the budget is **per session**, and the constant table is corrected
+
+The rule scopes the counter *"on this session"*; the constant table (1945)
+and the appendix (6375) both say *"per unvalidated address"*. They differ
+whenever two connections share a peer address — routine under NAT, and
+routine in §6.9's own threat model.
+
+**Ruling: per session.** It is the normative sentence, it is the only form
+implementable inside `core::Connection` (where §13.6/§14.6 put the roam
+seam), and §17.5's per-connection state census budgets no endpoint-side
+per-address table. Both table sites are corrected to *"per unvalidated
+address, per session"*. The residual — N sessions to one address multiply
+the reflector by N — is stated in §7.3 rather than left to inference.
+
+Exactly the §2.3 `TAG`-beside-`PK` shape: **a parenthetical in a constant
+table asserting a scope the normative text does not deliver.**
+
+### 171 (F-E) — priority within a scarce budget, and the starvation path
+
+§7.3 binds *all* output to the budget; §7.5 lets a probe the budget will
+not admit leave the mark **pending**. Nothing states which output wins
+when the budget admits less than is owed. The auditor's attack: an
+adversary with harvested peer→us Data injects one small packet just under
+`DEAD_TIMEOUT` **from a fresh source each time**, which (a) refreshes
+liveness, (b) roams the session — resetting the budget counters to that
+one packet's bytes — and (c) leaves too little budget for the probe to win
+against the ACK also owed. The zombie the probe exists to reap becomes
+immortal and `Contested` never fires. §6.8 (1694–1711) asserts *"the
+zombie dies within `KEEPALIVE_TIMEOUT` of the probe"* **in the same
+paragraph that establishes the attacker roams the session**, and never
+joins the two — in a section whose own method is *"that bound rests on a
+premise, and the premise must be named"*.
+
+**Ruling, two parts.**
+(a) **The pending contested probe takes priority over all other output to
+an unvalidated address**, ahead of ACKs, keepalives, PTO probes,
+retransmissions and new Data. §7.5 already argues this exactly once, for
+the congestion gate: *"a probe the gate could delay past its own deadline
+would silently convert congestion into a liveness verdict."* The argument
+transfers verbatim to the budget, and the budget cannot be waived, so
+priority is the only lever left.
+(b) §7.3 states the full priority order, not just the probe's place, so
+the remaining classes are not left to queue order.
+
+Note that **ruling 168 independently defuses the attack's engine**: the
+budget now disarms on a return-routability proof, and an off-path injector
+cannot produce one. (a) and (b) still stand — an attacker who *can* keep
+the address unvalidated must not be able to starve the verdict.
+
+### 172 (F-B) — §14.6's fence assignment: the code is right, the texts disagree three ways, and the auditor's consequence is corrected
+
+§13.6 and §14.6 name **four** fences for pre-roam packets: no congestion
+event, no persistent-congestion walk, no RTT sample, no `app_limited`
+growth. Three texts give three answers:
+
+- **Ruling 137** assigns the congestion event and `app_limited` to
+  `recovery_start`, the RTT sample to `path_gen`, and **never assigns the
+  persistent-congestion walk** — first, fourth, third, and the second
+  named in the enumeration and dropped. It then closes *"a defect that
+  would otherwise be written into **four** fences"*, reading as all four.
+- **§14.6's closing clause** says *"§13.6's fences read that stamp rather
+  than the recovery marker"* — plural, unqualified, **0/4 on the marker** —
+  reversing its own opening clause two sentences earlier.
+- **The code** (`congestion.rs:70–80`) shipped a **2/2 split** that
+  neither text states, written in a doc comment on an uncalled function.
+
+The auditor ranked this **high**, arguing the readings "differ in
+observable behaviour" and that the 2/2 hybrid reintroduces the silent
+failure ruling 137 warns about. **That half is wrong, and the reason is
+worth recording.** The argument requires `recovery_start` to be
+*clearable* — so that a late-resolving pre-roam packet could escape the
+fence once the roam's episode closed. It is not clearable:
+`congestion.rs:181`, **ruling 139(b)**, *"`recovery_start` is **not**
+cleared. RFC 9002 §7.6.2 clears it; §14.4 asks only that slow start
+restart"* — and it is only ever assigned `Some(now)`, so it moves
+**monotonically forward**. Every pre-roam packet has
+`sent_time ≤ roam_instant ≤ every later recovery_start`, so `in_recovery`
+stays true for it **permanently**. The two readings are behaviourally
+identical.
+
+**Working rule 12, fourth confirmed instance: a true lemma about the wrong
+state.** The auditor verified something true — three texts, three answers —
+and attached a consequence that assumed a state ruling 139(b) forbids. It
+read ruling 139 and cited 139(a) as clean; it read `congestion.rs` lines
+70–100 and the never-cleared note is at 181. **The fixture bounds the
+coverage applies to reading, too: a range chosen for one purpose bounded
+what could be found.**
+
+**Ruling:** the code's **2/2 split is ratified** — `recovery_start` fences
+the congestion event and `app_limited` growth; `path_gen` fences the RTT
+sample and the persistent-congestion walk. §14.6's closing clause is
+corrected to state the split explicitly and stop claiming all four read the
+stamp; ruling 137's enumeration gains its missing fourth assignment. The
+defect is **documentation, not behaviour**, and it is downgraded from
+high to medium accordingly — but all three texts must be made to say the
+one thing the code does, because slice 7 is where a blind test author reads
+§14.6 and asserts 0/4.
+
+**And a correction of my own, twice made this session.** I described
+ruling 137's fences as open carried debt for slice 7. They are not: ruling
+137 identified the gap and slice 5 closed it in the same stroke.
+`Congestion::reset()` is written and merely uncalled; `path_gen` is pinned
+at 0 by a live `debug_assert` at `recovery.rs:198` that fires the moment
+roaming works. What slice 7 owes here is **wiring, not design**.
+
+### 173 (F-A) — §13.6's title claims a scope its body does not cover
+
+§13.6 is titled **"What resets when — the roam seam"** and lists only
+recovery and congestion state. §7.3 mandates a different reset on the
+*same* seam — *"both counters resetting at each such address change"* —
+and §13.6 does not mention it. Rule 8 reads a list as exhaustive whether
+or not it says so; **this one carries a title that says so.** An
+implementer building `on_roam()` from §13.6 touches the controller and the
+sent map, and the amplification budget silently carries the old address's
+credit to the new one — funding sends to a fresh attacker-supplied address
+with credit earned from the genuine peer. That is the reflector §7.3
+exists to prevent, reconstructed out of a missing line.
+
+**Ruling:** §13.6 grows an explicit cross-referenced list of **every**
+per-connection reset on the roam seam — the amplification counters and
+`validation_floor` (§7.3, ruling 168), the congestion controller (§14.6),
+the path generation, the pending contested mark (ruling 176), and the
+items it already resolves (the sent map kept, PTO undisturbed, RTT
+suspect-but-kept). Narrowing the title instead was considered and
+declined: rule 8's whole point is that the omission is invisible until
+someone builds against it, and the list is the thing that has to exist.
+**§7.2's anti-replay window is explicitly named as "not reset"** — the
+auditor checked this and found it clean by construction (one session, one
+never-reset counter space, §7.7:2476), but "clean by construction" is
+exactly what a list like this must say out loud.
+
+### 174 (F-G) — §16.5's equal-deadline list calls itself exhaustive and is not a total order
+
+§16.5: *"This list is **exhaustive**: every pair of deadlines that can fall
+on one instant is ordered here."* The stated relations leave two
+pair-groups unordered — `{Liveness, CloseLinger, Contested}` against
+`{Loss, Pto, AckDelay}`, and `{Loss, Pto, AckDelay}` against `Keepalive`.
+`timers.rs:33–65` already froze an answer via a derived `Ord` over the
+declaration order, and its module doc says it exists to stop slices 5 and
+7 "re-deriving it from prose".
+
+**This is slice 7's problem specifically:** only five of the eight timers
+are ever armed before it. Slice 7 arms `Contested`, `Keepalive` and
+`PersistentKeepalive` for the first time, so **every collision in the two
+unordered groups becomes reachable in this slice**, and a blind test author
+working from §16.5 (as working rule 6 requires) can derive `Loss` before
+`Contested` and write a confident assertion against the frozen enum.
+
+**Ruling:** `timers.rs`'s order is authoritative; §16.5 gains the two
+missing relations — *teardown collection precedes loss/PTO evaluation*,
+and *loss/PTO/`AckDelay` precede keepalive evaluation*. The second does
+**not** follow from §16.5's stated governing principle ("a terminal outcome
+precedes a routine one, and state removal precedes emission"), because
+`AckDelay` before `Keepalive` is emission-before-emission, which the
+principle does not reach — so it must be stated, not derived. The word
+"exhaustive" is the same self-certifying scope claim as §13.6's title, one
+section apart.
+
+### 175 (F-I) — the probe-rate bound is restated honestly; **no cooldown**
+
+§7.5 and §6.9 both state *"at most one packet per `KEEPALIVE_TIMEOUT` per
+connection … a bound the attacker cannot move"*. The collapse rule only
+suppresses refusals landing **while the mark is outstanding**, and on a
+**live** connection the peer ACKs in ~1 RTT, clearing the mark; the next
+refusal lands uncontested and is a full second mark. The true rate is
+`min(refusal rate, 1/RTT)` — on a 10 ms LAN path up to ~100 probes/s
+rather than 0.1/s, a factor of ~1000.
+
+Ruling 43 replaced one dishonest bound with another. Both texts say the
+same thing and both are wrong the same way, which is why review passed it —
+**not a working-rule-3 conflict; a working-rule-8 unstated scope, agreed
+upon.**
+
+**Ruling:** state it honestly — *"at most one probe per mark, at most one
+mark per uncontested refusal, and marks cannot overlap; the refusal rate
+is the application's own `accept()` rate."* **No cooldown is added.** A
+cooldown would leave a genuine second doubt unprobed for its duration,
+which trades a cost bound for a security hole. The security half is
+untouched either way: **every re-mark records a fresh floor**, so each
+probe still demands acknowledged progress *after* the doubt that raised it.
+This is a **cost** defect, and it is the exact sentence ruling 43 exists to
+make true.
+
+### 176 (F-J) — the pending mark's two unstated exits
+
+The mark-pending state (probe marked, budget not yet admitting) has one
+stated entry and one stated exit. Two more are reachable and unstated:
+
+- **An ACK covering the floor arrives while still pending.** Ordinary, not
+  exotic: the floor is *"the counter the next seal will use"*, so any
+  post-mark seal — keepalive, retransmission, pure ACK, application Data —
+  lands at or above it. On the literal text §16.4 emits `ContestCleared`
+  *"when the mark clears"*, unconditionally, so **`ContestCleared` fires
+  with no preceding `Contested`** — an unmatched notification, which is
+  precisely the mis-read ruling 46 deleted `under_probe: bool` to prevent.
+  And §7.5's *"the endpoint sends it, and arms, at the first instant the
+  budget allows"* carries no condition, so a **stray probe** goes out and
+  arms a `KEEPALIVE_TIMEOUT` verdict deadline for a mark that no longer
+  exists — which §16.5's disarm rule cannot cancel, because it disarms on
+  an ACK covering a floor that has already been satisfied.
+- **The connection roams again while still pending**, discontinuously
+  changing the pending probe's budget prospects.
+
+**Ruling:** clearing a pending mark **cancels the pending probe and emits
+nothing** — the *"the mark-pending gap emits nothing"* principle §16.4
+already states for the gap governs its exit too. §7.5's send rule gains
+*"unless the mark has already cleared"*; §16.4 gains *"`ContestCleared` is
+emitted only where `Contested` was"*. A roam leaves the pending mark
+intact with its floor unchanged (the counter space is never reset, §7.7)
+and is listed as such in §13.6 per ruling 173.
+
+### 177 (F-H) — a contested mark requires **admission**; walk exhaustion joins the `Stale` list
+
+Two defects, one bullet. §6.4's `Stale` enumeration covers "no initiation
+parked", "admitted candidate fails the basis rule", and "PENDING and we are
+the tie-break winner" — and **omits re-home-walk exhaustion**, a distinct
+case reachable precisely when initiations *are* parked and all fail. §6.9
+supplies the answer in passing (*"before it returns `Stale`"*); §6.4's list,
+read as exhaustive, leaves the path with no return value.
+
+The consequential half: §6.4 scopes the contested mark to **admission**;
+§6.9 scopes it to **any refusal**. An exhausted walk is a refusal that
+reached no admission — so the two texts disagree on whether **an attacker
+who can only park mac1-valid rubbish can provoke a contested mark**, with
+no key material at all.
+
+**Ruling:** §6.4's narrower rule governs — **the mark requires an admitted
+candidate** proving the same static with a verifying tail tag. §7.5's own
+security argument prices the primitive in captured genuine initiations
+(*"an attacker's replay supply buys refusals"*), and §6.9's DoS table
+prices the rubbish rows at *"0 DH … one bounded queue slot"* and never at a
+probe. §6.9's sentence is a cost summary written loosely and is corrected;
+§6.4's `Stale` list gains exhaustion explicitly.
+
+### 178 (F-K) — ruling 91's open predicate, closed: **PENDING means a pending exists, not a datagram in flight**
+
+Ruling 91's amendment recorded, explicitly unresolved, that ruling 90's
+`mint_pending`/`start_attempt` split makes *"an in-flight outbound
+initiation exists"* ambiguous — a minted pending has **no initiation in
+flight** — and that the ambiguity reaches §6.4's PENDING branch, §6.5's
+hint set and §17.4. The auditor confirmed by grep that nothing since closes
+it, and it sits directly in slice 7's path.
+
+**Ruling:** the predicate is **membership in the pending tables**, not
+whether a datagram has left. §6.4, §6.5 and §17.4 are reworded from *"an
+in-flight outbound initiation exists"* to *"a pending exists for the proven
+static"*.
+
+**Why this and not the other reading:** a minted pending is a declared
+intent to dial. If a peer's initiation arriving in that window took §5.4's
+NONE row, we would install as responder and *then* `start_attempt` would
+fire — two key sets, both msg2s dropped, mutually dark for `DEAD_TIMEOUT`,
+which is **exactly the divergence ruling 35 was made to prevent**. Round 8
+already verified the mechanism: all three readers of "is this static
+PENDING?" read the same pending tables that ruling 50's cancellation
+empties, and there is no separate per-static flag. This ruling states what
+that verification implies.
+
+### 179 (F-L) — the closing/draining carve-out is stated where the mark is taken
+
+§7.5 makes a contested mark on an already-closing or draining connection a
+**no-op**; §6.4, which is where the mark is taken, never mentions it. A
+closing connection remains in §17.4's map for its linger (that is what
+makes the `Retired` event and the guard pin necessary), so §6.4's rule as
+written takes the mark and §7.5 must undo it.
+
+**Ruling:** §6.4's admission rule carries the carve-out explicitly.
+Behaviourally minor; stated because §6.4 is where an implementer writes
+the code, and a rule enforced only in the section that *describes* the
+state rather than the section that *enters* it is a rule that gets missed.
+
+### 180 (fixture) — `FlakyWire::rebind`, and what a rebind does to in-flight datagrams
+
+Verified at `b649575`, not inferred: `FlakyWire.addr` is a plain immutable
+field and `Network.endpoints` is keyed by it, so **no wire can change its
+address**. Stories **S18 and S19 are unreachable from the fixture by
+construction** — working rule 13's exact shape. `Network::inject` delivers
+with a spoofed source and no policy; it can simulate a datagram *arriving*
+from a new address but cannot make a real endpoint *originate* from one,
+so it cannot produce the authenticated, window-fresh packet a roam
+requires except by replaying bytes — which §7.2's window rejects.
+
+**The gap is one-sided, in the now-familiar way:** the *receiving* half of
+a roam is testable today; the *originating* half is not testable at all,
+and the originating half is what S18 and S19 are about.
+
+**Ruling:** add `FlakyWire::rebind(new_addr)` — `addr` becomes a `Cell`
+(the wire is `!Send` and every other mutable field is already a
+`Cell`/`RefCell`), `Network` moves the `EndpointState` between keys
+**carrying the existing `Rc<Notify>`** (the driver's recv loop is parked on
+that exact `Rc`; a fresh one hangs it), and rebinding onto a registered
+address panics as `Network::endpoint` already does.
+
+**In-flight datagrams are abandoned**, not carried: the new address gets a
+fresh empty inbox. This models what an interface change and a NAT rebind
+actually do, and it is what makes S18's "positive obligation on the mover"
+bite — under the carry-across alternative a peer could move, stay silent
+and still receive, so the story's central claim would pass **for the wrong
+reason**, a bound the degenerate implementation satisfies for free
+(working rule 9). No change to `deliver` is needed: an unregistered
+destination already drops, so vacating the old key handles everything sent
+*after* the rebind for free.
+
+**`src/testutil/mod.rs` lands committed before dispatch**, as a contract
+input. It is a single path that both the implementer and the test authors
+need before either can start, so rule 6 forbids giving it to either of
+them mid-slice, and working rule 14 forbids letting it arrive after the
+worktrees are cut.
+
+### What this round says about the process
+
+**Twelve findings, eleven upheld, from an agent that read no more than
+~1 200 lines of a 6 300-line spec.** The one correction is working rule
+12's fourth confirmed instance, and it has a new twist: the auditor's
+false consequence came from a **read range** chosen for a different
+purpose — it read `congestion.rs:70–100` and ruling 139(b)'s note is at
+line 181. Working rule 13 said *the fixture bounds the coverage*; this
+says **the excerpt bounds the audit**, and an agent under working rule 1's
+context discipline is structurally exposed to it. That is a cost of the
+discipline, not an argument against it — the alternative killed an agent —
+but it means a finding whose consequence turns on code the auditor
+excerpted deserves the integrator opening the *whole* function.
+
+**Six of the twelve are the same defect**: a construction whose scope is
+stated in one place and contradicted or omitted in another (F-A's title,
+F-B's enumeration, F-C's missing predicate, F-D's parenthetical, F-G's
+"exhaustive", F-H's list). That is now ~25 instances, and **still not one
+has been a wrong value.**
+
+**F-C is the largest single finding of the project so far.** Not because
+it is subtle — a permanent 3× cap on every accepting endpoint is not
+subtle — but because it survived the full spec walkthrough, four
+adversarial review rounds, and eighty rulings, protected by a sentence
+that *sounded* like a disarm condition (*"a genuine peer clears it within
+about one round trip"*) without being one. Nobody re-read it because
+everybody had already read it.
+
+### 181 (planner Q5) — two frames claim "final position"; one claim is structural and wins
+
+§8.5 (2829–2832) packs *"the ACK first (if owed), then control frames …,
+then STREAM and DATAGRAM fill, **then PING last** if a probe still owes
+ack-eliciting content. At most one extends-to-end frame (¬LEN STREAM, or
+`0x30` DATAGRAM) per packet, **in final position**."* Two frames are told
+to be last. Slice 7 makes the collision routine: the contested probe and
+the PTO probe both emit PING into packets that may already carry an
+extends-to-end frame.
+
+**Ruling:** the two rules are not in conflict once the senses are
+separated, and the separation is forced by the parser.
+
+- An extends-to-end frame carries **no length prefix** — it is defined as
+  running to the end of the packet. Its final position is **structural**:
+  nothing *can* follow it, because anything that did would be parsed as
+  part of it. This claim is not negotiable.
+- PING's "last" is **ordinal** — a placement preference among
+  length-prefixed frames. A 1-byte frame's position carries no semantics.
+
+So: **PING is packed immediately before the extends-to-end frame**, and
+"PING last" reads as *last among length-prefixed frames*. §8.5 is
+corrected to say so. The sender may equally emit the datagram in its
+`0x31` LEN form and keep PING physically last; both parse identically and
+the choice is the sender's, but the ¬LEN form must never be followed by
+anything.
+
+**Ruling 155's bias does not measurably worsen.** The debt asked whether
+slice 7's new control frames deepen the preference for delaying a
+maximum-size datagram. They do not: **the keepalive is the empty
+plaintext (§7.5:2053), which bypasses the frame layer entirely** and so
+never competes for packet space, and the contested PING is one byte
+emitted at most once per mark (ruling 175). The bias is unchanged in kind
+and negligibly changed in degree. Debt discharged.
+
+### 182 (planner Q7) — the passive keepalive reads **marking sends only**. **The first time the formal rule held the intent.**
+
+§7.5:2056 states the passive rule in prose over any send — *"a side that
+has received since it last sent, and **has not sent** for
+`KEEPALIVE_TIMEOUT`, sends a keepalive"* — while §7.5:2117 defines the
+variable it reads as *"`S` = `last_send` (**marking sends only**)"*. Wire
+traces diverge from the first non-marking send onward.
+
+**Ruling:** the **formal definition governs**. The passive rule reads
+`S` = last *marking* send; §7.5:2056 is corrected from "has not sent" to
+"has not made a marking send".
+
+**Why, and why this is not a reflex.** Working rule 3 exists because six
+times the prose held the intent and the formal rule held the bug — but the
+rule says *do not **default** to the code-like rule*, not *always take the
+prose*. Here the reasoning runs the other way, and it is decisive: the
+beacon's soundness proof at 2123–2126 rests on *"every send that can
+establish `S > R` is a marking send, so the death clock is armed there
+(§7.4)"*. Under the prose reading a **non-marking** send blocks the dance
+— "has not sent" becomes false — **without arming the death clock**, and
+the proof collapses into precisely the immortal half-open session that
+SECV5-2 was applied to prevent. The formal definition is load-bearing for
+a security property two subsections later; the prose is shorthand that
+predates it.
+
+**This is the first time in this project that the formal rule carried the
+intent, and it is worth naming.** Working rule 3's tally has been
+one-directional for eleven rounds, and a one-directional tally decays into
+a reflex — which is itself the defect it warns about. Ruling 158 already
+caught that tally going stale in `CLAUDE.md`. The rule is *report the
+conflict and reason*, and the reasoning here is: **follow the statement
+some other proof depends on.** Working rule 3 is amended to say so.
+
+**Not settled here:** which individual sends are marking. §7.4 already
+carries that classification and the contract must **quote it, not
+re-derive it** — a PTO probe's class in particular is §7.4's answer, not
+slice 7's to invent.
+
+### 183 (planner, surviving ruling 172) — `time_sent == recovery_start` on a paused clock
+
+The planner's objection to the 2/2 fence split survives ruling 172's
+rebuttal in one half. Ruling 172 answers **pre-roam** packets: they stay
+fenced permanently because `recovery_start` is never cleared and moves
+only forward. But a **post-roam** packet sent in the *same virtual
+instant* as the roam has `time_sent == recovery_start`, and
+`in_recovery`'s test is `sent_time <= start` — so it **is** fenced, though
+it belongs to the new path.
+
+In production this is a sub-microsecond window. **On tokio's paused clock
+it is the norm**, because `reset(now)` and the sends that follow share one
+`Instant` unless the test advances between them.
+
+**Ruling:** the `≤` stands — it is §14.3's ordinary rule, RFC-correct for
+the recovery case, and the roam case errs conservatively (a fenced
+post-roam packet suppresses a cwnd *cut*, never inflates a window). This
+is a **test-authoring instruction, not a defect**: a test asserting *"a
+post-roam loss cuts cwnd"* must advance the paused clock after the roam,
+or it asserts the opposite of what it names. It goes in `CONTRACT-7.md`
+where both blind test authors will read it, because it is exactly the
+shape of working rule 9's degenerate pass — the assertion looks right, the
+name looks right, and the mechanism under test never runs.
+
+### Round 30, closing note
+
+**Sixteen rulings (168–183) from two agents run blind to each other**, on
+a slice not yet dispatched. The planner and the auditor independently
+found **six of the same defects**, which is the strongest signal this
+arrangement produces — and each found several the other did not. The
+planner also invoked **working rule 5** against its own brief: my scope
+statement was narrower than ruling 91's amendment, which had moved §6.4's
+PENDING branch into slice 4. **S4 is therefore already built**; its tests
+are still written, and a pass with no implementation change is the correct
+outcome, not a wasted slice item.
+
+**Unverified and flagged rather than asserted** (planner, out of budget):
+ADV-S-4, §6.9/§17.5's cost accounting for the probe. The auditor
+separately did not read §6.3's stage-0 queue or §12's ACK derivation, on
+which rulings 175 and 176 both lean. Recorded so the adversarial review
+after this slice knows where the floor is thin.
