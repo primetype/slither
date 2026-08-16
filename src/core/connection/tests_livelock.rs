@@ -319,10 +319,30 @@ fn beacon_refused_by_the_budget_does_not_re_arm_in_the_past() {
     );
 
     let fire = start + BEACON;
+    // **[Integrator, ruling 220 — premise inverted, and the test is
+    // stronger for it.]** This author expected the beacon *armed* at `fire`,
+    // then fired, refused, and re-armed in the future. The implementer —
+    // blind to this file — closed F1 the other way: one
+    // `keepalive_can_leave()` predicate gates `transmit_keepalive`'s guard
+    // **and** `sync_liveness_timer`'s arming, so while the hold is on there
+    // is no beacon deadline at all.
+    //
+    // Both prevent the spin, and suppression is the stronger of the two:
+    // there is no wake to waste, and the state this file was written to
+    // catch becomes **unreachable by construction** rather than merely
+    // survivable. That is why the assertions below now pass easily — not
+    // because the test decayed, but because the defect class is gone.
+    //
+    // The premise is **inverted rather than deleted**, for exactly the
+    // reason this author gave it: a vacuous pass and a correct one must stay
+    // distinguishable. What makes suppression safe — that the beacon returns
+    // when the hold lifts — is pinned by
+    // `the_beacon_returns_when_the_hold_lifts` below.
     assert_eq!(
         s.conn.timer(TimerKind::PersistentKeepalive),
-        Some(fire),
-        "fixture: the beacon is armed one interval past the marking send"
+        None,
+        "the budget admits nothing at room 0, so no beacon deadline is armed \
+         at all — F1's spin is unreachable rather than survivable"
     );
     // The shaping datagram is ack-eliciting (§8.3), so a PTO is armed too.
     // It must not be due at `fire`, or the timer under test is not the one
@@ -460,10 +480,30 @@ fn beacon_blocked_by_a_pending_mark_does_not_re_arm_in_the_past() {
     let _ = drain(&mut s.conn);
 
     let fire = start + BEACON;
+    // **[Integrator, ruling 220 — premise inverted, and the test is
+    // stronger for it.]** This author expected the beacon *armed* at `fire`,
+    // then fired, refused, and re-armed in the future. The implementer —
+    // blind to this file — closed F1 the other way: one
+    // `keepalive_can_leave()` predicate gates `transmit_keepalive`'s guard
+    // **and** `sync_liveness_timer`'s arming, so while the hold is on there
+    // is no beacon deadline at all.
+    //
+    // Both prevent the spin, and suppression is the stronger of the two:
+    // there is no wake to waste, and the state this file was written to
+    // catch becomes **unreachable by construction** rather than merely
+    // survivable. That is why the assertions below now pass easily — not
+    // because the test decayed, but because the defect class is gone.
+    //
+    // The premise is **inverted rather than deleted**, for exactly the
+    // reason this author gave it: a vacuous pass and a correct one must stay
+    // distinguishable. What makes suppression safe — that the beacon returns
+    // when the hold lifts — is pinned by
+    // `the_beacon_returns_when_the_hold_lifts` below.
     assert_eq!(
         s.conn.timer(TimerKind::PersistentKeepalive),
-        Some(fire),
-        "fixture: the beacon is armed one interval past the marking send"
+        None,
+        "the budget admits nothing at room 0, so no beacon deadline is armed \
+         at all — F1's spin is unreachable rather than survivable"
     );
     assert!(
         s.conn.timer(TimerKind::Pto).is_none_or(|p| p > fire),
@@ -885,3 +925,69 @@ fn a_freshly_installed_core_announces_its_death_clock_and_not_none() {
 /// is what this file tests. Reported, not resolved (working rule 3).
 #[allow(dead_code)]
 fn the_passive_form() {}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5. What makes suppression safe — the integrator's addition
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A suppressed beacon **comes back** when the hold lifts.
+///
+/// **[Integrator, ruling 220.]** This author and the implementer closed F1
+/// differently, both correctly: the author expected the beacon armed in the
+/// future while held, the implementer suppresses it entirely. Suppression is
+/// stronger — it makes the spin unreachable rather than survivable — but it
+/// moves a burden the author's design did not carry. **An armed-in-the-future
+/// beacon is self-healing; a suppressed one is only as good as whatever
+/// re-arms it.**
+///
+/// So this is the assertion that the disagreement created, and neither blind
+/// agent could have been asked for it: the author's design did not need it,
+/// and the implementer had no test file to write it in.
+///
+/// Working rule 9: the degenerate build this separates is the one that
+/// suppresses and **never re-arms** — a silently disabled keepalive on a
+/// connection that has explicitly configured one. Every other assertion in
+/// this file passes against that build, including all of section 2's, since
+/// "no deadline in the past" is satisfied most easily by no deadline at all.
+#[test]
+fn the_beacon_returns_when_the_hold_lifts() {
+    let start = t0();
+    let mut s = responder_at(start);
+    spend_leaving(&mut s, start, 0);
+    s.conn
+        .set_persistent_keepalive(start, Some(BEACON))
+        .expect("§7.5's floor");
+    let _ = drain(&mut s.conn);
+
+    assert_eq!(
+        s.conn.timer(TimerKind::PersistentKeepalive),
+        None,
+        "premise: at room 0 the beacon is suppressed, which is the state \
+         whose exit this test is about"
+    );
+    assert_eq!(room(&s), 0, "premise: the hold really is on");
+
+    // The hold lifts the only way it can: an authenticated, window-fresh
+    // packet from the anchor credits `3 × len` (§7.3, ruling 169). This is
+    // the same event `apply_live` re-syncs the liveness timers after, and
+    // the whole safety of suppression rests on that ordering.
+    let recv_at = start + Duration::from_millis(100);
+    let _ = s.deliver(recv_at, &[]);
+
+    assert!(
+        room(&s) > 0,
+        "premise: the receive credited the budget, so the beacon can leave \
+         again — got room {}",
+        room(&s)
+    );
+    assert!(
+        s.conn.timer(TimerKind::PersistentKeepalive).is_some(),
+        "a suppressed beacon must be re-armed by the event that lifts its \
+         hold; without this, suppression is a silently disabled keepalive"
+    );
+    assert_not_retrospective(
+        &drain(&mut s.conn),
+        recv_at,
+        "the beacon re-armed after the hold lifted",
+    );
+}

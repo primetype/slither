@@ -146,7 +146,31 @@ fn responses(frames: &[Wire]) -> Vec<[u8; 8]> {
 /// built on an empty plaintext pins that stall, not this mechanism.
 fn roam_and_collect(solo: &mut Solo, now: Instant, to: SocketAddr) -> Vec<[u8; 8]> {
     let d = solo.deliver_from(now, to, &ping_frame());
-    let frames = solo.drain_frames(&d);
+    let mut frames = solo.drain_frames(&d);
+
+    // **[Integrator, ruling 219]** Settle §12.4's delayed-ACK timer before
+    // collecting.
+    //
+    // §8.7 re-offers the challenge on *a packet the budget admits*, and a
+    // roam does not always build one on the instant it lands: §12.4 owes
+    // that ACK on the delayed timer unless the packet is out of order, so
+    // the *first* roam of a run emits immediately and later ones emit one
+    // `MAX_ACK_DELAY` later. Measured, not assumed — the second delivery in
+    // `the_same_arming_re_offers_the_same_challenge` produced **zero**
+    // frames on its instant.
+    //
+    // Collecting only the instant's output therefore made this helper
+    // report "no challenge" for a build that emits one a few milliseconds
+    // later, which is a fixture artefact and not the property any caller
+    // here is about. Settling the timer is the migration; **no assertion in
+    // any test using this helper was weakened**, and the alternative —
+    // manufacturing a packet for the challenge — is forbidden by this
+    // author's own `an_idle_unvalidated_connection_owing_nothing_emits_no_challenge`.
+    let later = now + constants::MAX_ACK_DELAY + Duration::from_millis(1);
+    solo.conn.handle_timeout(later);
+    let d = drain(&mut solo.conn);
+    frames.extend(solo.drain_frames(&d));
+
     challenges(&frames)
 }
 
@@ -640,8 +664,26 @@ fn the_same_arming_re_offers_the_same_challenge() {
 
     // A second ack-eliciting packet from the same address: still the same
     // arming, because the source has not changed.
+    // **[Integrator, ruling 219 — trigger migrated, assertion untouched.]**
+    // As written this delivered one further ack-eliciting packet and
+    // expected the challenge back on the same instant. It is not: §12.4
+    // owes that ACK on the **delayed-ACK timer**, so no packet is built at
+    // all on the delivery, and §8.7 re-offers the challenge on *a packet
+    // the budget admits* — not on a receive. Measured: the second delivery
+    // emits zero frames.
+    //
+    // The re-offer really does happen, one `MAX_ACK_DELAY` later, when the
+    // timer builds the ACK. So the clock is advanced to that packet rather
+    // than the assertion being weakened — this test's stated purpose is to
+    // pin that the **bytes are stable** across re-offers, which is what
+    // makes `each_arming_draws_a_fresh_challenge` mean anything, and that
+    // purpose is served identically here.
     let now = now + Duration::from_millis(20);
-    let again = roam_and_collect(&mut solo, now, c_addr());
+    let _ = solo.deliver_from(now, c_addr(), &ping_frame());
+    let now = now + constants::MAX_ACK_DELAY + Duration::from_millis(1);
+    solo.conn.handle_timeout(now);
+    let d = drain(&mut solo.conn);
+    let again = challenges(&solo.drain_frames(&d));
     assert_eq!(
         again.len(),
         1,

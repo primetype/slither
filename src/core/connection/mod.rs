@@ -124,9 +124,9 @@ mod tests_sizing;
 //
 // Uncommented by the integrator, 2026/08/16, all three files present.
 #[cfg(test)]
-mod tests_path;
-#[cfg(test)]
 mod tests_livelock;
+#[cfg(test)]
+mod tests_path;
 #[cfg(test)]
 mod tests_reassembly;
 //
