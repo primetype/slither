@@ -245,6 +245,22 @@ pub(crate) struct ConnCell<S: Handshake> {
     /// finished stream for the connection's life, which for §9.8's message
     /// streams is once per message.
     pub(crate) finished_senders: BTreeSet<StreamRef>,
+    /// §9.8's **peer**-emitted reset, latched per stream — **ruling 165**.
+    ///
+    /// The mirror of ruling 121's receive-side latch, and it exists for the
+    /// same reason. `SendHalf::is_terminal()` is true for a peer-reset half,
+    /// so the next ACK frees it through `on_ack_range` and emits
+    /// `StreamFinished` — after which `write` answers `Finished` and
+    /// `acked()` answers `Ok(())` for a stream **the peer destroyed**. That
+    /// is ruling 121's misreport with the sign flipped, in its most damaging
+    /// form: an application waiting for delivery confirmation is told its
+    /// data arrived when it was discarded. §16.2 requires `acked()` to
+    /// return `Reset(code)` for exactly this case.
+    ///
+    /// Filled by the driver from `ConnEvent::StreamReset`, which carries the
+    /// code and fires **before** any ACK can free the half. Removed when the
+    /// handle drops, so the map is bounded by live handles.
+    pub(crate) peer_resets: BTreeMap<StreamRef, u64>,
     /// §16.2's `Connection::acked()` waiters — rulings 47 and 54.
     ///
     /// `closed_wakers`' sibling and not a per-`StreamRef` map: the verb is
@@ -309,6 +325,7 @@ impl<S: Handshake> ConnCell<S> {
             handles: 0,
             blocked_readers: BTreeMap::new(),
             blocked_writers: BTreeMap::new(),
+            peer_resets: BTreeMap::new(),
             blocked_ackers: BTreeMap::new(),
             finished_senders: BTreeSet::new(),
             settled_wakers: Wakers::default(),

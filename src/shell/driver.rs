@@ -529,7 +529,13 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             // that writer is parked in `blocked_writers`, and without this
             // line it is woken by nothing and stalls for ever anyway —
             // §9.8's loud failure delivered as the silent one it replaces.
-            ConnEvent::StreamReset { r, .. } => {
+            ConnEvent::StreamReset { r, error_code } => {
+                // **Ruling 165: latch before waking.** The next ACK frees a
+                // peer-reset half and emits `StreamFinished`; without the
+                // latch, the writer this wake unparks would then be told
+                // `Finished` and `acked()` would answer `Ok(())` — success
+                // reported over data the peer discarded.
+                cell.borrow_mut().peer_resets.insert(r, error_code);
                 Self::wake_stream(cell, |cell| cell.blocked_readers.get_mut(&r));
                 Self::wake_stream(cell, |cell| cell.blocked_writers.get_mut(&r));
                 Self::wake_stream(cell, |cell| cell.blocked_ackers.get_mut(&r));

@@ -4127,3 +4127,110 @@ document defect that two independent readers both trip over is not a
 readability problem, it is a correctness problem** — and the process
 surfaced it twice in one slice without either author knowing the other
 existed.
+
+---
+
+## Round 29 — slice 6 integration, and slice 6 closed (2026/08/16)
+
+Both blind test files compiled on first contact. **832 passing, 0 failing,
+0 ignored**, all nine gates green.
+
+**Ruling 165 — a peer's §9.8 reset is latched at the handle, because the
+core frees the half and calls it `Finished`.**
+
+The blind author's `s30_the_overflow_reset_trues_up_connection_credit`
+failed on one stream of four: three answered `Reset(MESSAGE_OVERFLOW)` and
+**stream 1 answered `Finished`**. The cause is not the overflow scan —
+that drains its whole candidate set correctly. It is that
+`SendHalf::is_terminal()` is **true for a peer-reset half**, so the next
+ACK frees it through `on_ack_range` and pushes
+**`ConnEvent::StreamFinished`**.
+
+That is much worse than the failing assertion shows. `StreamFinished` is
+what `SendStream::acked()` resolves on, so an application awaiting
+delivery confirmation for a stream **the peer destroyed** would be told
+its data arrived. §16.2 states the opposite in terms: `acked()` *"returns
+`Reset(code)` if the stream was reset before its data was acknowledged (a
+local reset, **or the peer's §9.8 overflow reset**)"*. This is ruling
+121's misreport — data loss presented as success — reached on the send
+half, and it is the fourth time this project has found that shape.
+
+The fix is ruling 121's, mirrored: the **shell latches** the code from
+`ConnEvent::StreamReset`, which carries it and fires *before* any ACK can
+free the half, and `write`, `finish` and `acked` all answer from the latch
+ahead of everything else — ahead even of ruling 124's own terminal state,
+because "the peer discarded your bytes" outranks "you closed this". The
+core keeps its per-call honesty; the map is bounded by live handles, freed
+in `Drop`.
+
+The core's own comment at `is_terminal` says a peer-reset half is *"not
+freed here, because only an observation can"* — and then `on_ack_range`
+frees it anyway, three hundred lines away. **A comment that states an
+invariant is not an invariant.**
+
+**Ruling 166 — ruling 159 is REVERSED, and the way it went wrong is worse
+than the ruling.**
+
+Ruling 159 said the `0x30`-not-final check *"already exists"* at
+`frame.rs:705`, that `CONTRACT-6.md` §2.2's three claims about it were
+*"all wrong"*, and — in as many words — that the planner had been
+careless. **All of that is false.** `git show f19cb99:…/frame.rs | grep -c
+TrailingFrame` is **0**. The check did not exist at the base commit; the
+contract was **correct**; the guard is the slice-6 implementer's own work.
+
+How I got there is the part worth recording. I read `frame.rs` **out of
+the shared main working tree while the implementer was mid-task**, saw its
+uncommitted guard, and attributed it to the base commit. Then my Round 27
+commit ran `git add -A` and **swept that uncommitted work into a commit of
+mine** — which is why `git log -S TrailingFrame` now names `bc4e895`,
+Round 27, as the origin of code the implementer wrote.
+
+Two rules I have been enforcing on agents all week, failing on me:
+**working rule 12** — a true lemma about the wrong state proves nothing; I
+verified a real fact about a tree that was not the one under discussion —
+and **working rule 10**, *commit before mutating*, whose hazard I named
+aloud earlier in this same session and then walked into from the other
+side. **Ruling 160 fell the same way**: it required the implementer to
+bound `finished_senders`, which `note_send_finished` already bounds by
+returning above its insert. Two rulings, one contaminated read.
+
+**New working rule 16: when the integrator inspects the tree while an
+implementer holds it, read from the commit — `git show <base>:<path>` —
+never from the working copy; and never `git add -A` while another agent is
+writing.** This is the first defect in this project caused by the
+*integrator's* own tooling rather than by a document, and it produced a
+ruling that libelled a planner who was right.
+
+**Ruling 167 — the blind author's first-flight bound was arithmetic about
+the wrong layer, and the fix is ruling 134's consequence.** Two S16 tests
+blackholed a path and asserted that at least `min_packets(16 KiB)` ≈ 14
+datagrams died. They did not: ruling 150 admits the whole payload into
+send state, but §14.5's gate only lets `INITIAL_WINDOW` (12 000 B ≈ 10
+packets) leave before an ACK returns, and on a blackholed path none does.
+The bound is now `INITIAL_WINDOW / MAX_DATAGRAM`, still a **strict lower**
+bound — which is what working rule 9 needs here, since without it the test
+would pass on a wire that lost nothing. Both tests' own "otherwise this
+proves nothing" guards are what caught it, which is the second time this
+slice that an author's self-check earned its keep.
+
+### The finding that mattered most was the implementer's
+
+§9.8's receiver-emitted RESET_STREAM was being **rejected** by
+`check_peer_may_send` and killing the connection with
+`STREAM_STATE_ERROR`, so the mixing sender got `ProtocolViolation` instead
+of `WriteError::Reset(MESSAGE_OVERFLOW)` — **story S30 could not have
+passed.** §8.4 states the rule *with* its exception (*"with exactly one
+exception, the message-mode overflow reset of §9.8, in which the receiver
+of a uni stream emits RESET_STREAM"*); slice 4's generalisation dropped
+the exception, and nothing could see it until slice 6 made the case
+constructible. Working rule 8's shape, latent for two slices. The
+implementer's own note: *"I found this by running it, not by reading."*
+
+### Slice 6 closed
+
+**832 tests, nine gates, no ignored obligations.** S15, S16 and S30 close.
+Twenty rulings across Rounds 26–29 (150–167), of which **five corrected
+ratified text of mine** and **two reversed rulings I had made hours
+earlier**. Five consecutive slices with zero implementation defects from
+the blind split — and this slice, for the first time, a defect from the
+integrator.

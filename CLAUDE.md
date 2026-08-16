@@ -230,6 +230,20 @@ the spec rounds.
    them commented out under an integration header and asked whose job it
    was. It is the integrator's.
 
+16. **When you inspect the tree while another agent holds it, read from
+   the commit — `git show <base>:<path>` — never from the working copy;
+   and never `git add -A` while another agent is writing.** Ruling 166:
+   the integrator read a file out of the shared main tree mid-slice, saw
+   the implementer's *uncommitted* guard, and ruled that a check "already
+   exists" and that the planner's contrary claim was "all wrong". It did
+   not exist; the planner was right. Then `git add -A` swept that
+   uncommitted work into the integrator's own commit, so `git log -S` now
+   names the wrong origin for it. Two rulings (159, 160) came from that one
+   contaminated read, and one of them publicly faulted an agent that had
+   been correct. This is rule 12 — *a true lemma about the wrong state
+   proves nothing* — and rule 10 — *commit before mutating* — both failing
+   on the person enforcing them.
+
 ## Release gates (hard rules)
 
 A release may be cut **only when every gate below is green on the exact

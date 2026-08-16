@@ -269,6 +269,15 @@ impl<S: Handshake> SendStream<S> {
         let (outcome, dirty) = {
             let mut cell = self.cell.borrow_mut();
 
+            // **[RATIFIED 2026/08/16 — ruling 165]** The **peer's** reset
+            // outranks even our own terminal state: §9.8's overflow reset
+            // means the bytes were discarded, and `Finished` would report
+            // that as an orderly close. The core cannot answer this for us —
+            // the next ACK frees a peer-reset half, after which it reports
+            // `Finished` like any absent half.
+            if let Some(code) = cell.peer_resets.get(&self.r).copied() {
+                return Poll::Ready(Err(WriteError::Reset(code)));
+            }
             // **[RATIFIED 2026/08/15 — ruling 124]** Terminal state first,
             // on this half as on the receive half: a handle reports the fate
             // of *its own stream*, and the connection's fate is `closed()`'s
@@ -352,6 +361,10 @@ impl<S: Handshake> SendStream<S> {
             // outrank the connection's death: the FIN was accepted into send
             // state when it was accepted, and the connection dying later
             // does not un-accept it.
+            // Ruling 165, ahead of our own terminal state — see `poll_write`.
+            if let Some(code) = cell.peer_resets.get(&self.r).copied() {
+                return Poll::Ready(Err(WriteError::Reset(code)));
+            }
             match self.local_end {
                 LocalEnd::Finished => return Poll::Ready(Ok(())),
                 LocalEnd::Reset(_) => return Poll::Ready(Err(WriteError::Finished)),
@@ -450,6 +463,14 @@ impl<S: Handshake> SendStream<S> {
         // `ConnectionLost` over a transfer that was fully delivered and
         // fully acknowledged — in a race the sender cannot win. This is
         // ruling 128's defect on the sender's side.
+        // **Ruling 165.** §16.2: `acked()` returns `Reset(code)` if the
+        // stream was reset before its data was acknowledged — "a local
+        // reset, or the peer's §9.8 overflow reset". This must precede the
+        // `finished_senders` latch, because the ACK that frees a peer-reset
+        // half emits `StreamFinished`.
+        if let Some(code) = cell.peer_resets.get(&self.r).copied() {
+            return Poll::Ready(Err(WriteError::Reset(code)));
+        }
         if cell.finished_senders.contains(&self.r) {
             return Poll::Ready(Ok(()));
         }
@@ -539,6 +560,8 @@ impl<S: Handshake> Drop for SendStream<S> {
         let dirty = {
             let mut cell = self.cell.borrow_mut();
             release_waker_slot(&mut cell.blocked_writers, self.r, self.key);
+            // Ruling 165's latch is bounded by live handles.
+            cell.peer_resets.remove(&self.r);
             // Ruling 47's two slots go with it. This handle is the sole
             // owner of both — `SendStream` is not `Clone` — so removing
             // the latch here is what bounds `finished_senders` by the
