@@ -878,10 +878,26 @@ enum Stage {
 impl Packing {
     /// A packet plan with `MAX_PLAINTEXT` of room (§8.6).
     pub(crate) fn new() -> Self {
+        Self::bounded(constants::MAX_PLAINTEXT)
+    }
+
+    /// A packet plan bounded by something **smaller** than §8.6's budget.
+    ///
+    /// **[ruling 203]** §7.3's remaining anti-amplification room is the one
+    /// such bound today. The pump sizes what it *builds* to what the budget
+    /// will admit instead of building at full size and discovering the
+    /// refusal, because a refusal is a **hold**: the packet that would have
+    /// escaped the budget in one round trip is the one the full-size build
+    /// never emits.
+    ///
+    /// `budget` is a **plaintext** length — ruling 207(c)'s units, not the
+    /// datagram's — and is clamped to `MAX_PLAINTEXT`, so this can only ever
+    /// shrink a packet and never widen §8.6's bound.
+    pub(crate) fn bounded(budget: usize) -> Self {
         Self {
             frames: Vec::new(),
             used: 0,
-            budget: constants::MAX_PLAINTEXT,
+            budget: budget.min(constants::MAX_PLAINTEXT),
             stage: Stage::Ack,
             extends_to_end: false,
         }

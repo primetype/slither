@@ -123,6 +123,38 @@ impl Amplification {
         self.sent.saturating_add(len) <= constants::AMPLIFICATION_FACTOR.saturating_mul(self.recv)
     }
 
+    /// The datagram bytes this address may still be sent — `3 × recv −
+    /// sent` — or `None` when the address is validated and no cap binds.
+    ///
+    /// # This is not a second predicate
+    ///
+    /// **[ruling 207(a)]** `admits` is correct and does not move. This is
+    /// its **inverse**, added for one purpose: so the sender can size what
+    /// it *builds* to what the budget will *permit* (ruling 203). Nothing
+    /// here decides admission, and no caller may use it to send what
+    /// [`admits`](Self::admits) would refuse.
+    ///
+    /// The two agree exactly. `admits(len)` is `sent + len <= 3 × recv`, and
+    /// `len <= room()` is the same inequality rearranged, because
+    /// `sent <= 3 × recv` always holds: [`on_sent`](Self::on_sent) is only
+    /// ever called for a length `admits` has already passed, on every one of
+    /// its five call sites.
+    ///
+    /// # Units
+    ///
+    /// **Datagram** bytes, like both counters. **[ruling 207(c)]** a caller
+    /// sizing a *plaintext* must first subtract §3.4's `DATA_HEADER_LEN +
+    /// AEAD_TAG_LEN`; the two units differ by exactly that overhead, and a
+    /// plaintext capped at the remaining datagram bytes overshoots by 30 and
+    /// re-refuses its own packet.
+    pub(crate) fn room(&self) -> Option<u64> {
+        (!self.validated).then(|| {
+            constants::AMPLIFICATION_FACTOR
+                .saturating_mul(self.recv)
+                .saturating_sub(self.sent)
+        })
+    }
+
     /// Charge a datagram that left for this address.
     pub(crate) fn on_sent(&mut self, len: u64) {
         if self.validated {
