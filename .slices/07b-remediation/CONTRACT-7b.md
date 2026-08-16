@@ -1,16 +1,35 @@
 # CONTRACT-7b — binding API and wire contract for the remediation slice
 
-Base commit: `23d0409`. **Binding** on both blind agents: the test author
-writes against this file, the implementer implements to it. Where this file
-and the reviews disagree, this file wins; where this file and `SPEC.md`
-disagree, that is an open question in `PLAN-7b.md`, not a licence to choose.
+Base commit: **`c131904`** (was `23d0409` when drafted). **Binding** on both
+blind agents: the test author writes against this file, the implementer
+implements to it. Where this file and the reviews disagree, this file wins;
+where this file and `SPEC.md` disagree, that is an open question in
+`PLAN-7b.md`, not a licence to choose.
 
-**Status: awaiting phase 0.** Four open questions in `PLAN-7b.md` block
-dispatch — **Q17** (the `SPEC.md` sweep), **Q13** (where the challenge's
-bytes come from), **Q18** (§19's conflicting row) and **Q14** (priority and
-packing order). Q13 and Q14 change §1 of this file directly. The maintainer
-amends this file where a ruling contradicts it, **and commits it, before
-either blind agent is cut** — working rule 14, both halves.
+**Status: DISPATCHED.** All four blocking questions are resolved and the
+resolutions are in `rulings.md`, not here — **read them there, and prefer
+them over anything below that disagrees:**
+
+- **Q17** (the `SPEC.md` sweep) — done, ruling 212. §7.3 is rewritten;
+  §6.9, §8.3, §8.4, §8.5, §13.6, §19 and Appendix B all moved with it.
+- **Q13** (where the challenge's bytes come from) — **ruling 210(b)**:
+  §16.6's **per-connection sub-seed**, *not* the endpoint RNG, which
+  `Connection` cannot reach. Ruling 208 said "endpoint RNG" and was wrong.
+- **Q18** (§19's conflicting row) — ruling 212: rewritten, not deleted.
+  The frames ship; validation-*before*-roam-commit stays deferred.
+- **Q14** (priority and packing order) — **ruling 212(c)**:
+  `PATH_CHALLENGE`/`PATH_RESPONSE` rank **straight after CLOSE, above the
+  contested probe**, and `pump_packets`' early return is wrong as written.
+
+> **Integrator's note, recorded rather than quietly corrected.** This
+> status block said *"awaiting phase 0 … the maintainer amends this file
+> **and commits it, before either blind agent is cut**"* at the moment all
+> four agents were cut. The questions really were resolved — in
+> `rulings.md` — but the binding document still said they were not, and
+> **both implementers noticed and reported it.** That is working rule 14's
+> second half failing on the person who wrote the rule into the brief:
+> committing the *rulings* is not committing the *contract*. Slice 4a's
+> defect, one artefact over.
 
 ---
 

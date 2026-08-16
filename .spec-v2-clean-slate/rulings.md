@@ -6133,3 +6133,70 @@ provider's RNG, and the code mirrors that scope exactly. A
 the plan's reasoning: `rand_core` 0.10 ships **no** `OsRng`/`from_os_rng`,
 so the consumer recipe really is `getrandom::fill` + `from_seed`, which is
 what was documented — actionable today rather than blocked on a ruling.
+
+### 214 — two blind agents derived the same separator independently, and the harness could not see the attack
+
+**(a) The convergence.** I2 (implementer) and T2 (test author), blind to
+each other, both found that F3's fix is invisible to the test shape
+`CONTRACT-7b.md` §5 specified, and both landed on **the same separator**:
+ruling 94's `reassembly_capacity()` measured after a **partial read**.
+`Reassembly::read` drains the front chunk with `Vec::drain`, which does not
+shrink the allocation — so a covered-range insert is visible as a capacity
+**collapse** in the broken build and no change in the fixed one. I2
+measured 4096 → 4080; T2 read 16 000 of 16 384 and measured 16 384 → 384.
+
+Same mechanism, different constructions, neither able to see the other.
+This is the second time in this project that mutually blind agents have
+converged on one property (ruling 193 was the first), and it is the
+strongest evidence the split produces: **a separator two independent
+derivations reach is a property of the code, not an artefact of one
+agent's reasoning.**
+
+**(b) The finding is not observable in the attack's own configuration, and
+T2 said so in the test.** The F3 attack withholds byte 0, so nothing is
+ever read, so there is no slack in any allocation, so the re-allocated
+span has the same capacity as the chunk it replaced and
+`reassembly_capacity()` is **blind to it**. T2's pin therefore exercises
+the same line of `insert` in the one buffer state where the allocation is
+visible, and the test that reproduces the finding's own sequence carries a
+doc comment saying it does **not** separate the builds.
+
+That is working rule 13 in its sharpest form yet — not "the fixture cannot
+reach the behaviour" but **"the fixture cannot reach the behaviour in the
+configuration that makes it a defect"** — and it was disclosed in the test
+rather than papered over. A test named for the attack that silently failed
+to pin it is precisely the slice-2a failure.
+
+**(c) A reviewer's "unbounded" claim, refuted by arithmetic.** The liveness
+review called F1's `armed == false` variant unbounded. T2 could not build
+it and showed why: the passive debt is set only by an authenticated fresh
+receive, and that same datagram credits §7.3 by `3 × len ≥ 90` bytes —
+strictly more than the 30-byte keepalive and the 31-byte probe — so **the
+receive that creates the debt also lifts both holds.** Returning below 30
+while preserving `armed == false` needs a non-marking, non-ack-eliciting
+send, and the only one is a pure ACK (~35 B) against the ≥ 90 B its own
+trigger credited: the room grows monotonically.
+
+**Ruling: F1's unbounded variant is withdrawn; the bounded variant
+stands** and is pinned. T2 explicitly declined to claim the neighbouring
+case (a large quiet retransmission draining the room in one packet, which
+would spin with `armed == true`) because building it needs assumptions
+about `Packing`'s budget clamp a blind author would be guessing at. It
+also stated the gap it leaves: **if the implementer wires the new guard
+into the beacon's arming but not the passive one, nothing in its file
+catches it.** The integrator owns that check.
+
+**(d) The contract was stale at dispatch, and both implementers caught
+it.** `CONTRACT-7b.md` still read *"Status: awaiting phase 0 … four open
+questions block dispatch … the maintainer amends this file **and commits
+it, before either blind agent is cut**"* at the moment all four were cut.
+The questions were genuinely resolved — in rulings 210 and 212 — but the
+**binding** document said otherwise.
+
+**Committing the rulings is not committing the contract.** This is working
+rule 14's second half failing on the person who wrote that very sentence
+into the briefs, and it is slice 4a's defect one artefact over: there, an
+uncommitted contract cost a blind author ten minutes of guessing an API.
+Here it cost nothing only because both implementers read the rulings and
+reported the discrepancy instead of trusting the file that calls itself
+binding. Contract now updated to point at the rulings.
