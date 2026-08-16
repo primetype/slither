@@ -90,6 +90,14 @@ mod tests_roam;
 #[cfg(test)]
 mod tests_contested;
 
+// **[ruling 203/207]** The budget-shaped sizing of `pump_packets`, written by
+// an author blind to this pass's implementation. The file is **theirs
+// alone**: this implementer declared the module and created nothing at the
+// path (working rule 6 — slice 2a's placeholder stub destroyed 68
+// independently-written tests because both briefs named one file).
+#[cfg(test)]
+mod tests_sizing;
+
 // ── slice 6's core tests, at integration ─────────────────────────────────
 //
 // Written from `SPEC.md` §9.8/§11 and `CONTRACT-6.md` by two authors who
@@ -1808,6 +1816,53 @@ impl<C: Handshake> Connection<C> {
         self.sync_recovery_timers();
     }
 
+    /// A packet plan already sized to what §7.3's budget will admit.
+    ///
+    /// **[ruling 203]** *"Bound the packing target by the remaining budget —
+    /// `min(MAX_DATAGRAM, room)` — so the first post-roam packet is small,
+    /// ack-eliciting, and validates the address at once."*
+    ///
+    /// # Why building at full size was wrong
+    ///
+    /// [`Amplification::admits`] answers about a **finished** candidate, and
+    /// a refusal is a *hold*, not a truncation. A pump that plans 1200 bytes
+    /// and asks afterwards therefore holds everything until the budget grows
+    /// to 1200 — while the budget only grows on received bytes, and on a
+    /// connection carried by §7.5's keepalive dance the only received bytes
+    /// are 30-byte empty plaintexts that are **not ack-eliciting** and so can
+    /// never produce the ACK covering `validation_floor` that ends the
+    /// unvalidated state (ruling 168). 2 048 bytes of application data then
+    /// wait ~20 keepalive rounds (~200 s) for a budget a ~90-byte packet
+    /// would have escaped in one round trip.
+    ///
+    /// # The units, which are the trap
+    ///
+    /// **[ruling 207(c)]** [`Amplification::room`] is in **datagram** bytes;
+    /// [`Packing`]'s budget is in **plaintext** bytes. They differ by exactly
+    /// §3.4's `DATA_HEADER_LEN + AEAD_TAG_LEN` = 30 (ruling 136 charges the
+    /// full datagram). Capping the plaintext at the remaining *datagram*
+    /// bytes overshoots by 30 and re-refuses the packet it just sized.
+    ///
+    /// # What this does **not** do
+    ///
+    /// **[ruling 207(a)]** The predicate does not move. The candidate this
+    /// plan produces is still put to [`Amplification::admits`] unchanged, and
+    /// no packet is exempted from it — the clamp only means the answer is
+    /// now normally *yes*.
+    fn packing(&self) -> Packing {
+        const OVERHEAD: u64 = (constants::DATA_HEADER_LEN + constants::AEAD_TAG_LEN) as u64;
+        let Some(room) = self.amplification.room() else {
+            return Packing::new();
+        };
+        // `min` before the cast: `room` is a `u64` and `Packing::bounded`
+        // clamps to `MAX_PLAINTEXT` anyway, so this is the same value by two
+        // routes and cannot truncate.
+        let plaintext = room
+            .saturating_sub(OVERHEAD)
+            .min(constants::MAX_PLAINTEXT as u64) as usize;
+        Packing::bounded(plaintext)
+    }
+
     fn pump_packets(&mut self, now: Instant, mut probe: bool) {
         if !self.lifecycle.is_live() || self.session.is_none() {
             // §16.9: *"no frame is emitted before install (nothing sends
@@ -1823,13 +1878,20 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
+        // **[ruling 207(b)]** One elicitation is owed per pump while §7.3's
+        // budget is armed — see the PING stage below for what it is for and
+        // for the three cases it deliberately does not cover.
+        let mut owe_elicit = !self.amplification.is_validated();
+
         // Bounded by construction: every iteration that transmits has moved
         // stream bytes out of the pending set, cleared a regenerate
         // identity or packed the owed ACK, and one that does none of those
         // breaks below.
         loop {
             let mut packed = streams::Packed::default();
-            let mut packing = Packing::new();
+            // **[ruling 203]** Sized to §7.3's remaining room, not to §8.6's
+            // maximum — see [`packing`](Self::packing).
+            let mut packing = self.packing();
 
             // Stage 1 — §12.4: *"An owed ACK rides the next outgoing packet
             // (packing order §8.5)"*.
@@ -1882,7 +1944,73 @@ impl<C: Handshake> Connection<C> {
             // packet: pending retransmittable frames oldest-first if any
             // exist, else a bare PING."* The PING is owed only when the
             // first three stages produced nothing that elicits.
-            if probe && !frame::packet_is_ack_eliciting(packing.frames()) {
+            //
+            // **[ruling 207(b)] — the second reason a PING is owed, and the
+            // deliberate answer to the question that ruling leaves open.**
+            //
+            // *Yes, the pump owes a PING when the admitted room holds
+            // nothing ack-eliciting — but only while output is owed.*
+            //
+            // Sizing alone is not the fix. Validation arrives only on an ACK
+            // covering `validation_floor` (ruling 168), so a packet shrunk to
+            // fit the budget is useless if what fits elicits nothing: the
+            // connection stalls exactly as it did, one indirection later.
+            // §7.3's own no-deadlock argument is what settles it — *"the
+            // budget always admits something … and what it admits is enough
+            // to elicit the ACK that ends it"* (`SPEC.md:2172`). That
+            // sentence is a claim about the **sender**, and only this stage
+            // can make it true: `Packing` can shrink a packet but cannot
+            // make one elicit. Working rule 3's tiebreak — follow the
+            // statement some other proof depends on — and §7.3's escape
+            // proof depends on this one.
+            //
+            // **Its four boundaries, stated because rule 8 reads a
+            // construction's scope as exhaustive whether or not it says
+            // so.**
+            //
+            // 1. **Nothing is owed.** An idle unvalidated connection gets no
+            //    PING. Validation is not a goal in itself — it is what lets
+            //    held output leave, and there is none. A PING here would be
+            //    an unprompted probe train on every pump, and §7.5's
+            //    keepalive dance already carries liveness.
+            // 2. **A bare ACK with nothing else owed.** Every accepted
+            //    connection begins unvalidated (§7.3), so this is the
+            //    ordinary receive path, not an edge: PINGing it would make
+            //    every delayed ACK ack-eliciting, put it in the sent map and
+            //    spend congestion window, for a validation the connection
+            //    has no use for. When it does acquire a use — output the
+            //    budget is holding — `owes_output()` turns true and the PING
+            //    is owed on the same instant.
+            // 3. **§14.5's window.** The PING is **not** exempt from the
+            //    congestion gate below. §14.5 enumerates its exemptions —
+            //    PTO probes, the contested probe, non-ack-eliciting control
+            //    packets — and a validation PING is not among them; rule 8
+            //    reads that list as closed. A PING the window refuses is
+            //    reached again by §13.4's PTO, which *is* exempt and *is*
+            //    ack-eliciting, so the escape survives a full window.
+            // 4. **The seal.** A validation PING is never marking, and needs
+            //    no rule to make it so: the PING is added only when the plan
+            //    does not already elicit, and every marking contributor
+            //    (a first-transmission STREAM frame, a DATAGRAM) elicits — so
+            //    `marking` is false wherever this fires and the packet is
+            //    sealed `seal_quiet`. That is §7.5's contested-probe
+            //    treatment verbatim — *"not fresh application intent, so it
+            //    does not move `last_send` and cannot suppress a
+            //    keepalive"* — and it still arms the death clock, because
+            //    §7.3 has *"any ack-eliciting output we aim at the address
+            //    arms the death clock by itself, even where nothing marking
+            //    is sent"* (`SPEC.md:2170`). A new address that never answers
+            //    therefore still kills the session at `DEAD_TIMEOUT`.
+            //
+            // It is self-limiting rather than rate-limited: any ack-eliciting
+            // packet that lands is answered by an ACK at or above the floor,
+            // which validates the address and disarms the budget, so the
+            // whole mechanism costs at most one round trip. `owe_elicit`
+            // bounds it to one packet per pump so a large-but-shrunk room
+            // cannot spend itself on a burst of PINGs.
+            let elicits = frame::packet_is_ack_eliciting(packing.frames());
+            let validate = owe_elicit && self.owes_output();
+            if (probe || validate) && !elicits {
                 packing.ping();
             }
 
@@ -2028,6 +2156,15 @@ impl<C: Handshake> Connection<C> {
 
             // §13.4: **one** ack-eliciting packet per firing.
             probe = false;
+            // **[ruling 207(b)]** One elicitation is enough: this packet will
+            // be acknowledged at or above `validation_floor`, and that ACK is
+            // the whole of what the unvalidated state is waiting for. Cleared
+            // on **any** ack-eliciting packet, not only on one carrying the
+            // PING — a STREAM frame that fit the shrunken room does the same
+            // job, and is the ordinary case.
+            if ack_eliciting {
+                owe_elicit = false;
+            }
 
             if !self.owes_output() && !self.ack.is_owed() {
                 break;
@@ -2060,7 +2197,16 @@ impl<C: Handshake> Connection<C> {
     /// terms, "no ACK-of-ACK loops" — never tracked for loss, and it
     /// bypasses the congestion window (§14.5's third exemption).
     fn transmit_pure_ack(&mut self, now: Instant) {
-        let mut packing = Packing::new();
+        // **[ruling 203]** Sized to §7.3's room like the pump's own plan.
+        // Ruling 171 ranks pure ACKs **above** retransmissions and new
+        // application data under a scarce budget, so this is the one packet
+        // class that must not be the one left un-shrunk: a full-size ACK the
+        // room refuses stays owed while the data it outranks has already been
+        // sized down and left. `ack::derive` truncates newest-first, so a
+        // shrunken ACK drops the oldest ranges — *"exactly the ones prior
+        // ACKs most likely already carried"* (§12.2) — and drops the frame
+        // entirely, leaving it owed, when not even the first block fits.
+        let mut packing = self.packing();
         if !self.pack_ack(now, &mut packing) {
             return;
         }
