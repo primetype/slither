@@ -5662,8 +5662,10 @@ excavation:
    documented rather than engineered away.
 8. **The wire erasure point stays inside the driver.** `Endpoint<I>` does
    not carry `W`; `Wire` stays dyn-incompatible.
-9. **`open_bi()` keeps returning `BiStream`** (ruling 96). See ruling 205
-   — the divergence to fix is in the spec's text, not in the code.
+9. **`open_bi()` keeps returning `BiStream`** — decided by **ruling 55**,
+   not ruling 96 as this ruling first wrote. §16.2 was amended at the time
+   and already matches the code; there is no divergence. See ruling 205,
+   which is withdrawn.
 10. **`testutil`'s attestation holds** as ruling 60 wrote it. See ruling
     206 for what that implies about a change already made.
 
@@ -5675,22 +5677,45 @@ compatibility layer is **not** ratified here — it is unbuilt, and the
 question of whether its adapters read correctly is a question about code
 that does not exist yet.
 
-### 205 — §16.2 still writes the tuple ruling 96 replaced
+### 205 — **WITHDRAWN.** There was no divergence, and the citation was wrong twice over
 
-`open_bi()` and `accept_bi()` return `BiStream`, decided by ruling 96 and
-shipped in slice 4. §16.2's normative signature still writes the spec's
-original tuple.
+As first written, this ruling claimed §16.2 still wrote the
+`(SendStream, RecvStream)` tuple that `open_bi()` had replaced, and
+directed that the spec be amended to match the code. **Both halves were
+false.**
 
-CLAUDE.md's hard rule is that **the code must match the spec, never the
-other way round** — but that rule governs *unratified* drift. Here a
-ruling already moved the decision and the spec's text simply did not
-follow it, which is a stale document rather than a code defect. Ruling 204
-question 9 confirms the shipped shape.
+`SPEC.md:4692` and `:4694` already read
+`pub async fn open_bi(&self) -> Result<BiStream, ConnectionLost>` with
+`// .split() → the pair` beside them, and `SPEC.md:5852` carries the
+decision note in full: *"[Ruling 55 — `open_bi`/`accept_bi` yield
+`BiStream`.] §16.2's signatures return the duplex object rather than the
+`(SendStream, RecvStream)` tuple."* The spec was amended when the decision
+was taken and has matched the code ever since.
 
-**Ruling: amend §16.2 to write `BiStream`, citing ruling 96.** This is
-recording an existing decision, not making a new one. Working rule 4
-applies to the amendment: the surrounding prose is to be read for other
-clauses still arguing the tuple, not merely the signature line greped for.
+The decision is **ruling 55**. Ruling 96 is a *scheduling* ruling — it
+places `BiStream` the type in slice 4 and its `AsyncRead`/`AsyncWrite`
+impls in slice 8 — and says nothing about the return shape. Ruling 204's
+item 9 mis-cited it too, and is corrected above.
+
+**How this was produced, because the shape matters more than the error.**
+The API review read the *code* exhaustively — every `pub fn`, every error
+variant, every constant — and then asserted a claim about the **spec**
+without opening it. That is working rule 11 (*a rationale must name a
+mechanism that exists — check it against the code, not only the spec*)
+running in the direction the rule does not name: the rule was written for
+rationales that describe code, and this one described a document. The
+generalisation the rule wants: **whichever artefact a claim is about is
+the artefact that must be opened.** Greping `open_bi` in `SPEC.md` — one
+command — would have refuted it before it was written.
+
+It is also working rule 4's companion (a) at one remove. The review found
+nine real questions by reading one artefact carefully, and the tenth was
+manufactured by reasoning about a second artefact from memory of the
+first. **Nine sound findings are exactly the conditions under which the
+tenth is not checked.**
+
+No action follows. §16.2 is correct, the code is correct, and ruling 55
+stands.
 
 ### 206 — `FlakyWire`'s field became a method mid-slice, and ruling 60 makes that breaking
 
@@ -5706,16 +5731,51 @@ because the attestation is a promise about names and the compiler only
 sees the crate's own call sites.
 
 **Ruling: the attestation is about the three type names, not their
-members, and the change stands.** A fixture whose *fields* were frozen
-could not have gained `rebind()` at all, and ruling 180 needed it. But the
-scope was genuinely unstated — this is defect class 1 again, in ruling 60:
-**a stated construction with an unstated scope**, the most productive
-defect class in this project, now found in the attestation rule itself.
+members, and the change stands. Ruling 60 needs no amendment — it already
+said so, by reference, and this ruling's first draft did not read the
+reference.**
 
-Ruling 60's text is to gain the missing sentence: the attestation covers
-the three type names and the constructor spellings a downstream test
-writes, and does not freeze fields, inherent methods or internal
-behaviour.
+Ruling 60's actual words are: *"The three names are contract on §18.2's
+terms."* **§18.2 is `Trace targets — the operator contract`** — a table of
+five strings (`slither::policy`, `slither::replay`, `slither::frames`,
+`slither::roam`, `slither::io`) under the sentence *"The targets are
+operator-visible contract: renaming or dropping one is a protocol
+revision."*
+
+A trace target is a **bare string**. It has no fields, no methods, no
+members of any kind — there is nothing about it to freeze *except* its
+name. So importing "§18.2's terms" imports, precisely and unambiguously, a
+**names-only** contract. The scope was never unstated. It was stated by
+reference, and the reference is exact. `src/lib.rs:145`'s gloss —
+*"renaming one of those three types is a protocol revision"* — is faithful
+to it.
+
+`FlakyWire::addr` becoming `addr()` plus `rebind()` was therefore never
+covered, and needed no ruling at the time.
+
+**This ruling's first draft claimed the opposite** — that the scope was
+"genuinely unstated", and that this was defect class 1 found in the
+attestation rule itself. That claim was produced by reading `lib.rs`'s
+paraphrase of ruling 60 instead of ruling 60, and then not reading the
+section ruling 60 points at.
+
+**Twice in this round, and the same shape both times.** Ruling 205 was
+manufactured by asserting a claim about `SPEC.md` without opening
+`SPEC.md`; this one by asserting a claim about ruling 60 and §18.2 without
+opening either. Working rule 11 says a rationale must name a mechanism
+that exists and must be checked *against the code*. Both failures are
+outside the letter of that rule and inside its intent, so the rule is
+generalised: **whichever artefact a claim is about is the artefact that
+must be opened — code, spec, or the ruling record — and a citation is a
+claim about the cited text.** A ruling that cites another ruling's
+authority has not been checked until the cited ruling is read; a ruling
+that cites a *section* has not been checked until the section is read.
+Both here were one `grep` away.
+
+The finding survives its own reasoning: **the conclusion was right and the
+argument for it was wrong**, which is exactly the state working rule 12
+warns about from the other side. Had the argument been reviewed instead of
+the conclusion, the review would have cleared it.
 
 ### 207 — ruling 203's fix goes out as its own blind pass, and here is what it may not do
 

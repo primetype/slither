@@ -213,6 +213,29 @@ the spec rounds.
    prevent 90, whose defect is an **absent** clause rather than a false
    one: reading the code confirms what the rationale says and cannot
    surface what it fails to say.
+   **Generalised after two failures in one round (rulings 205, 206):
+   *whichever artefact a claim is about is the artefact that must be
+   opened* — code, spec, or the ruling record.** The rule said "check it
+   against the code" because 87 and 89 were claims about code; both new
+   failures were claims about *documents*, and both slipped the letter
+   while sitting squarely inside the intent. 205 asserted that §16.2 still
+   wrote a signature the code had replaced — §16.2 had been amended when
+   the decision was taken, and one `grep` refutes it. 206 asserted that
+   ruling 60's attestation had an unstated scope, having read `lib.rs`'s
+   *paraphrase* of ruling 60 rather than ruling 60, which states the scope
+   by reference to §18.2 — a section neither read. **A citation is a claim
+   about the cited text**: a ruling citing another ruling is unchecked
+   until that ruling is read, and one citing a section is unchecked until
+   the section is read.
+   Two further things this pair demonstrated, both worth more than the
+   errors. *(a)* Both were produced **alongside sound work** — 205 was the
+   tenth question in an API review whose other nine were built by reading
+   every `pub fn` in the crate. Nine sound findings are exactly the
+   conditions under which the tenth is not checked; thoroughness in one
+   artefact reads, from the inside, as licence to reason about a second
+   from memory. *(b)* 206's **conclusion was right and its argument was
+   wrong** — the inverse of rule 12, and invisible to any review that
+   checks conclusions. A finding is not verified by agreeing with it.
 12. **A verification is only as good as its applicability: a true lemma
    about the wrong state proves nothing.** The seam review ran two agents
    blind to each other, and they disagreed on fact twice. Both times the
