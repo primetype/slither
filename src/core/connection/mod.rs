@@ -517,6 +517,16 @@ impl<C: Handshake> Connection<C> {
         // §16.7 satisfied (nothing is deferred to `poll_output`) while
         // making ruling 76's stated consequence actually happen.
         let mut probe = false;
+        // §7.5's two keepalives are **planned** here for the same reason,
+        // and ruling 174 makes the reason explicit: *loss/PTO/`AckDelay`
+        // precede keepalive evaluation*, and that relation is
+        // **emission-before-emission** rather than the evaluation-order one
+        // §16.5's governing principle gives. A keepalive sealed inside its
+        // own arm would be on the wire before the pump packed the ACK
+        // `AckDelay` had just made owed — and the keepalive carries no
+        // frames, so it cannot carry that ACK itself.
+        let mut passive_keepalive = false;
+        let mut beacon = false;
 
         for kind in self.timers.take_due(now).iter() {
             match kind {
@@ -558,9 +568,8 @@ impl<C: Handshake> Connection<C> {
                 // therefore arming sends: a connection whose entire output
                 // is beacons still dies at `R + DEAD_TIMEOUT` (ruling 40 —
                 // *"arming enables death, never defers it"*).
-                TimerKind::Keepalive | TimerKind::PersistentKeepalive => {
-                    self.transmit_keepalive(now);
-                }
+                TimerKind::Keepalive => passive_keepalive = true,
+                TimerKind::PersistentKeepalive => beacon = true,
             }
 
             if self.lifecycle.is_dead() {
@@ -572,6 +581,10 @@ impl<C: Handshake> Connection<C> {
         // packets it made us owe.
         self.drain_events();
         self.pump_inner(now, probe);
+        // …and §7.5's beacons last of all (§16.5, ruling 174).
+        if passive_keepalive || beacon {
+            self.transmit_keepalive_if_owed(now, passive_keepalive);
+        }
     }
 
     /// §16.4's `close`. §15.2's local close.
@@ -2122,6 +2135,41 @@ impl<C: Handshake> Connection<C> {
         );
     }
 
+    /// §7.5's keepalive, re-checked against what the rest of the evaluation
+    /// already sent (§16.5, ruling 174).
+    ///
+    /// *"`PersistentKeepalive` is evaluated last: any marking send the
+    /// instant produced re-arms it, so it does not fire redundantly."* The
+    /// same holds for the passive keepalive from the other side — a marking
+    /// send at this instant is `S = now`, which makes `R > S` false and
+    /// **is** the thing the keepalive would have been sent to do.
+    ///
+    /// So a keepalive is owed only if nothing marking left in this
+    /// evaluation, and — for the passive one — only if §7.5's predicate
+    /// still holds. A session already collected for teardown owes none
+    /// either, which [`transmit_keepalive`](Self::transmit_keepalive)'s own
+    /// liveness guard delivers.
+    fn transmit_keepalive_if_owed(&mut self, now: Instant, passive: bool) {
+        let Some(liveness) = self.liveness().copied() else {
+            return;
+        };
+        if liveness.last_send() >= now {
+            // A marking send at this instant has done the job and re-armed
+            // both timers through `sync_liveness_timer`.
+            return;
+        }
+        // The beacon fires **unconditionally** — it does not consult `R` —
+        // so reaching here at all is enough for it. The passive rule
+        // re-checks its own predicate.
+        if !passive || liveness.last_authenticated_recv() > liveness.last_send() {
+            self.transmit_keepalive(now);
+        }
+        // Whether or not one went out, the two deadlines are derived state
+        // and `take_due` disarmed them: re-derive, or a skipped keepalive is
+        // never re-armed.
+        self.sync_liveness_timer();
+    }
+
     /// §7.5's keepalive: §3.4's **empty plaintext**, sealed **marking**.
     ///
     /// A 16-byte tag-only ciphertext — a **30-byte datagram** — carrying no
@@ -2278,8 +2326,7 @@ impl<C: Handshake> Connection<C> {
         let fits = packing.ping();
         debug_assert!(fits, "a PING is one byte and MAX_PLAINTEXT is 1170");
         let plaintext = packing.into_plaintext();
-        let size =
-            (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
         if !self.amplification.admits(size) {
             return false;
         }
@@ -2386,9 +2433,7 @@ impl<C: Handshake> Connection<C> {
 /// `DEAD_TIMEOUT` itself and gets **no named constant** (ruling 63: *"a
 /// named ceiling would be a second place `DEAD_TIMEOUT` is written down, and
 /// therefore a place it can drift"*).
-pub(crate) fn validate_persistent_keepalive(
-    interval: Option<Duration>,
-) -> Result<(), ConfigError> {
+pub(crate) fn validate_persistent_keepalive(interval: Option<Duration>) -> Result<(), ConfigError> {
     let Some(interval) = interval else {
         return Ok(());
     };

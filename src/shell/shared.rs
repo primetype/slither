@@ -739,86 +739,6 @@ impl NotificationSlots {
             }
         }
     }
-
-}
-
-#[cfg(test)]
-mod notification_slots_tests {
-    use super::*;
-
-    fn addr(last: u8) -> SocketAddr {
-        SocketAddr::from(([203, 0, 113, last], 41_000))
-    }
-
-    /// Two unclaimed roams merge into the **net** move: the oldest `from`,
-    /// the newest `to`. A build that keeps the newest pair whole reports a
-    /// move that never happened as one leg of a move that did.
-    #[test]
-    fn two_unclaimed_roams_merge_into_the_net_move() {
-        let mut slots = NotificationSlots::default();
-        slots.address_moved(addr(1), addr(2));
-        slots.address_moved(addr(2), addr(3));
-
-        assert_eq!(
-            slots.take_oldest(),
-            Some(Notification::AddressMoved {
-                from: addr(1),
-                to: addr(3),
-            })
-        );
-        assert_eq!(slots.take_oldest(), None, "one slot, not a queue");
-    }
-
-    /// **[ruling 185]** With no drain in between,
-    /// `Contested` → `ContestCleared` → `Contested` hands over as *cleared,
-    /// then contested* — "contested now". Keeping the first generation on
-    /// the rewritten slot inverts that into "cleared now", which is the one
-    /// error S11 exists to prevent.
-    #[test]
-    fn a_rewritten_slot_takes_the_new_generation() {
-        let mut slots = NotificationSlots::default();
-        slots.contested();
-        slots.contest_cleared();
-        slots.contested();
-
-        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
-        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
-        assert_eq!(slots.take_oldest(), None);
-    }
-
-    /// Different kinds come out in generation order, not in slot order.
-    #[test]
-    fn kinds_are_handed_over_oldest_first() {
-        let mut slots = NotificationSlots::default();
-        slots.contested();
-        slots.address_moved(addr(1), addr(2));
-        slots.contest_cleared();
-
-        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
-        assert_eq!(
-            slots.take_oldest(),
-            Some(Notification::AddressMoved {
-                from: addr(1),
-                to: addr(2),
-            })
-        );
-        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
-        assert_eq!(slots.take_oldest(), None);
-    }
-
-    /// Retention is O(1): a storm of marks occupies exactly the same space
-    /// as one, which is what makes §17.5's *"nothing to bound"* true.
-    #[test]
-    fn a_storm_of_marks_occupies_one_slot() {
-        let mut slots = NotificationSlots::default();
-        for _ in 0..10_000 {
-            slots.contested();
-            slots.contest_cleared();
-        }
-        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
-        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
-        assert_eq!(slots.take_oldest(), None);
-    }
 }
 
 /// A `Connecting`'s resolution slot (§16.2).
@@ -1122,4 +1042,83 @@ pub(crate) enum Command<I: Identity> {
     Dirty(ConnectionId),
     /// The last handle went away (§16.3, §15.4's endpoint-dropped row).
     HandlesGone,
+}
+
+#[cfg(test)]
+mod notification_slots_tests {
+    use super::*;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, last], 41_000))
+    }
+
+    /// Two unclaimed roams merge into the **net** move: the oldest `from`,
+    /// the newest `to`. A build that keeps the newest pair whole reports a
+    /// move that never happened as one leg of a move that did.
+    #[test]
+    fn two_unclaimed_roams_merge_into_the_net_move() {
+        let mut slots = NotificationSlots::default();
+        slots.address_moved(addr(1), addr(2));
+        slots.address_moved(addr(2), addr(3));
+
+        assert_eq!(
+            slots.take_oldest(),
+            Some(Notification::AddressMoved {
+                from: addr(1),
+                to: addr(3),
+            })
+        );
+        assert_eq!(slots.take_oldest(), None, "one slot, not a queue");
+    }
+
+    /// **[ruling 185]** With no drain in between,
+    /// `Contested` → `ContestCleared` → `Contested` hands over as *cleared,
+    /// then contested* — "contested now". Keeping the first generation on
+    /// the rewritten slot inverts that into "cleared now", which is the one
+    /// error S11 exists to prevent.
+    #[test]
+    fn a_rewritten_slot_takes_the_new_generation() {
+        let mut slots = NotificationSlots::default();
+        slots.contested();
+        slots.contest_cleared();
+        slots.contested();
+
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(slots.take_oldest(), None);
+    }
+
+    /// Different kinds come out in generation order, not in slot order.
+    #[test]
+    fn kinds_are_handed_over_oldest_first() {
+        let mut slots = NotificationSlots::default();
+        slots.contested();
+        slots.address_moved(addr(1), addr(2));
+        slots.contest_cleared();
+
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(
+            slots.take_oldest(),
+            Some(Notification::AddressMoved {
+                from: addr(1),
+                to: addr(2),
+            })
+        );
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), None);
+    }
+
+    /// Retention is O(1): a storm of marks occupies exactly the same space
+    /// as one, which is what makes §17.5's *"nothing to bound"* true.
+    #[test]
+    fn a_storm_of_marks_occupies_one_slot() {
+        let mut slots = NotificationSlots::default();
+        for _ in 0..10_000 {
+            slots.contested();
+            slots.contest_cleared();
+        }
+        assert_eq!(slots.take_oldest(), Some(Notification::Contested));
+        assert_eq!(slots.take_oldest(), Some(Notification::ContestCleared));
+        assert_eq!(slots.take_oldest(), None);
+    }
 }

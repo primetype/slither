@@ -1384,7 +1384,10 @@ mod tests {
         let resp = {
             let drained = third.feed(t, large.addr, &msg1);
             let (id, _src) = drained.intros[0];
-            third.ep.authenticate(t, id).expect("a real msg1 authenticates");
+            third
+                .ep
+                .authenticate(t, id)
+                .expect("a real msg1 authenticates");
             let (_conn, _c) = third.ep.accept(t, id).expect("third has no row for large");
             third.drain().transmits[0].data.clone()
         };

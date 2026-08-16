@@ -58,8 +58,8 @@ mod stream;
 
 pub use self::connection::Connection;
 pub use self::endpoint::{Connecting, Endpoint, EndpointBuilder};
-pub use self::staged::{Claimed, Intro, Proven};
 pub use self::shared::Notification;
+pub use self::staged::{Claimed, Intro, Proven};
 pub use self::stream::{BiStream, RecvStream, SendStream};
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::constants;
 use crate::core::connection::mobility::Contested;
-use crate::core::connection::testfix::{Pair, Solo, a_addr, b_addr, drain, put, t0, v4};
+use crate::core::connection::testfix::{Pair, Solo, Wire, a_addr, b_addr, drain, put, t0, v4};
 use crate::core::connection::timers::TimerKind;
 use crate::core::connection::{ConnEvent, ConnOutput};
 use crate::error::{ConfigError, ConnectionLost};
@@ -307,7 +307,11 @@ fn an_authenticated_fresh_packet_from_a_new_source_roams() {
     let now = origin() + Duration::from_millis(10);
     let d = solo.deliver_from(now, c_addr(), &[constants::FRAME_PING as u8]);
 
-    assert_eq!(solo.conn.remote_address(), Some(c_addr()), "the anchor moved");
+    assert_eq!(
+        solo.conn.remote_address(),
+        Some(c_addr()),
+        "the anchor moved"
+    );
     assert_eq!(solo.conn.path_generation(), 1, "one committed roam");
     assert_eq!(count_moved(&d), 1, "one AddressMoved: {:?}", d.outs);
     assert!(
@@ -338,7 +342,12 @@ fn a_keepalive_from_a_new_source_roams_and_its_event_reaches_the_drain() {
     let d = solo.deliver_from(now, c_addr(), &[]);
 
     assert_eq!(solo.conn.remote_address(), Some(c_addr()));
-    assert_eq!(count_moved(&d), 1, "the event is in *this* drain: {:?}", d.outs);
+    assert_eq!(
+        count_moved(&d),
+        1,
+        "the event is in *this* drain: {:?}",
+        d.outs
+    );
 }
 
 /// The two negatives §7.3 names, each failing its own conjunct.
@@ -411,7 +420,11 @@ fn a_closing_connection_does_not_roam() {
 #[test]
 fn a_dialled_connection_starts_validated_and_a_roam_arms_the_budget() {
     let mut solo = Solo::installed_at(origin());
-    assert_eq!(solo.conn.amplification_budget(), None, "dialled ⇒ validated");
+    assert_eq!(
+        solo.conn.amplification_budget(),
+        None,
+        "dialled ⇒ validated"
+    );
 
     let now = origin() + Duration::from_millis(10);
     let _ = solo.deliver_from(now, c_addr(), &[]);
@@ -481,15 +494,14 @@ fn the_budget_holds_output_and_a_receive_releases_it() {
     // A credited receive from the new anchor raises the ceiling.
     let before = solo.conn.amplification_budget().expect("still unvalidated");
     let _ = solo.deliver_from(now, c_addr(), &[constants::FRAME_PADDING as u8; 200]);
-    let after = solo.conn.amplification_budget();
-    match after {
-        Some((_, credited)) => assert!(
+    // `None` here is not a miss: a packet carrying an ACK above the floor
+    // validates the address outright (ruling 168), which is the strictly
+    // stronger outcome and admits everything.
+    if let Some((_, credited)) = solo.conn.amplification_budget() {
+        assert!(
             credited > before.1,
             "an authenticated fresh packet credits the budget"
-        ),
-        // A packet carrying an ACK above the floor validates the address
-        // outright (ruling 168), which is the stronger outcome.
-        None => {}
+        );
     }
 }
 
@@ -698,7 +710,11 @@ fn a_re_mark_after_a_clear_records_a_strictly_greater_floor() {
         second > first,
         "a fresh floor: {second} must exceed {first} (ruling 175)"
     );
-    assert_eq!(count_contested(&d), 1, "a full second mark, and a second probe");
+    assert_eq!(
+        count_contested(&d),
+        1,
+        "a full second mark, and a second probe"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -775,7 +791,11 @@ fn an_ack_for_a_pre_roam_packet_feeds_no_rtt_sample() {
         constants::K_INITIAL_RTT,
         "and it never entered the estimator at all"
     );
-    assert_eq!(solo.conn.bytes_in_flight(), 0, "but it did leave the flight");
+    assert_eq!(
+        solo.conn.bytes_in_flight(),
+        0,
+        "but it did leave the flight"
+    );
 }
 
 /// A **post-roam** packet is not fenced: its ACK does take a sample. The
@@ -795,7 +815,12 @@ fn an_ack_for_a_post_roam_packet_does_feed_the_estimator() {
     solo.conn.write(sent_at, r, &[7u8; 100]).expect("a write");
     solo.conn.flush(sent_at);
     let d = drain(&mut solo.conn);
-    assert_eq!(d.transmits().len(), 1, "the budget admitted it: {:?}", d.outs);
+    assert_eq!(
+        d.transmits().len(),
+        1,
+        "the budget admitted it: {:?}",
+        d.outs
+    );
     let sealed_counter = solo.conn.next_counter().expect("established") - 1;
 
     let ack_at = sent_at + Duration::from_millis(40);
@@ -812,4 +837,90 @@ fn an_ack_for_a_post_roam_packet_does_feed_the_estimator() {
 fn _addresses_are_distinct() {
     assert_ne!(a_addr(), b_addr());
     assert_ne!(a_addr(), c_addr());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §16.5 — the two relations ruling 174 added
+// ═══════════════════════════════════════════════════════════════════════
+
+/// **[ruling 174]** *"Loss/PTO/`AckDelay` precede keepalive evaluation."*
+///
+/// This one does **not** follow from §16.5's governing principle — it is
+/// `AckDelay` before `Keepalive`, which is emission-before-emission — so it
+/// is stated rather than derived, and it has to be pinned rather than
+/// argued.
+///
+/// The separating shape is a build that seals the keepalive inside its own
+/// timer arm: the keepalive is §3.4's empty plaintext and carries **no
+/// frames**, so it cannot carry the owed ACK itself, and the ACK's own
+/// packet would then follow it onto the wire.
+#[test]
+fn an_owed_ack_is_emitted_before_the_keepalive_at_one_instant() {
+    let mut solo = Solo::installed_at(origin());
+
+    // One in-order packet arms `AckDelay` rather than acking at once
+    // (§12.4), and the receive puts `R > S`, which arms `Keepalive` at
+    // `S + KEEPALIVE_TIMEOUT` — `S` being the install.
+    let recv_at = origin() + Duration::from_millis(1);
+    let d = solo.deliver(recv_at, &[constants::FRAME_PING as u8]);
+    let ack_delay = solo.conn.timer(TimerKind::AckDelay);
+    let keepalive = solo
+        .conn
+        .timer(TimerKind::Keepalive)
+        .expect("§7.5 armed it");
+    let Some(ack_delay) = ack_delay else {
+        // §12.4 acked immediately, so the two cannot be collided here and
+        // the relation is not reachable from this shape.
+        assert!(!d.transmits().is_empty());
+        return;
+    };
+
+    // Collide them: an evaluation late enough that both are due.
+    let both = ack_delay.max(keepalive) + Duration::from_millis(1);
+    solo.conn.handle_timeout(both);
+    let d = drain(&mut solo.conn);
+
+    let packets = solo.packets(&d);
+    assert_eq!(packets.len(), 2, "one ACK packet and one keepalive");
+    assert!(
+        packets[0].iter().any(|f| matches!(f, Wire::Ack { .. })),
+        "the owed ACK is emitted first: {packets:?}"
+    );
+    assert!(
+        packets[1].is_empty(),
+        "then §3.4's empty plaintext, which carries no frames at all: {packets:?}"
+    );
+}
+
+/// The companion that keeps the test above a *rule* rather than an
+/// accident: a keepalive that finds a marking send already made at this
+/// instant does not fire redundantly (§16.5, ruling 174's last bullet).
+#[test]
+fn a_marking_send_in_the_same_evaluation_suppresses_the_keepalive() {
+    let mut solo = Solo::installed_at(origin());
+    let recv_at = origin() + Duration::from_millis(1);
+    let _ = solo.deliver(recv_at, &[constants::FRAME_PING as u8]);
+    let keepalive = solo
+        .conn
+        .timer(TimerKind::Keepalive)
+        .expect("§7.5 armed it");
+
+    // Application data queued for the same instant the keepalive is due.
+    // The pump seals it — a marking send — before the keepalive is reached.
+    let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
+    solo.conn.write(keepalive, r, &[9u8; 64]).expect("a write");
+    solo.conn.handle_timeout(keepalive);
+    let d = drain(&mut solo.conn);
+
+    let packets = solo.packets(&d);
+    assert!(!packets.is_empty(), "the data went out: {:?}", d.outs);
+    assert!(
+        packets.iter().all(|p| !p.is_empty()),
+        "and no empty-plaintext keepalive rode behind it: {packets:?}"
+    );
+    assert_eq!(
+        solo.conn.timer(TimerKind::Keepalive),
+        None,
+        "the marking send made `R > S` false, which is what the keepalive was for"
+    );
 }

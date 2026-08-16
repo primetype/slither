@@ -46,18 +46,73 @@
 //!
 //! 1. **Reconnecting is `close()` then dial, not `connect()` again.**
 //!    `connect()` to a static that already has a live connection returns
-//!    [`ConnectError::AlreadyConnected`]. "Call connect again" is the
-//!    natural guess and it is wrong.
+//!    [`ConnectError::AlreadyConnected`] — §16.1 admits one session per
+//!    peer static, and the *existing* connection is what holds it. "Call
+//!    connect again" is the natural guess and it is wrong: it does not
+//!    replace the old connection, it does not repair a wedged one, and it
+//!    leaves the first connection completely untouched.
+//!
+//!    An application that wants *reconnect now* releases the static first
+//!    and only then dials:
+//!
+//!    ```no_run
+//!    # use std::net::SocketAddr;
+//!    # async fn reconnect<I: slither::Identity>(
+//!    #     endpoint: &slither::Endpoint<I>,
+//!    #     stale: slither::Connection<I::Suite>,
+//!    #     peer: slither::PublicKeyOf<I>,
+//!    #     addr: SocketAddr,
+//!    # ) -> Result<slither::Connection<I::Suite>, slither::ConnectError> {
+//!    // Wrong: the static is still LIVE, so this is `AlreadyConnected`
+//!    // and the wedged connection is still there afterwards.
+//!    //
+//!    //     endpoint.connect(addr, peer)?.await
+//!
+//!    // Right: end the old one, wait for it to be gone, then dial.
+//!    stale.close(slither::constants::NO_ERROR, b"reconnecting").await;
+//!    stale.closed().await;
+//!    drop(stale);
+//!    endpoint.connect(addr, peer)?.await
+//!    # }
+//!    ```
+//!
+//!    The `closed().await` is not decoration: `close()` returns once the
+//!    CLOSE is sealed, and the static is released when the connection's
+//!    state is actually dropped (§16.4's `Retired`). Dialling before then
+//!    races the release.
 //! 2. **A *claimed* static is not an authenticated one.** The identity
 //!    `read_identity()` reveals during a staged accept is an
 //!    **unauthenticated assertion**, made before any DH proves possession.
 //!    Denylisting on it lets an attacker claim any public key in order to
 //!    get its owner banned. Authorise on it; do not punish on it.
-//! 3. **A connection with nothing to say dies.** An idle connection is
-//!    torn down after `DEAD_TIMEOUT` (25 s), so connecting ahead of need
-//!    does not keep a path warm. It is deliberate, and it is the single
-//!    most surprising behaviour for a new consumer; a connection that must
-//!    outlive its traffic needs a persistent keepalive.
+//! 3. **A connection with nothing to say dies — in 25 s, in silence.**
+//!    A connection that has received **no authenticated packet since it was
+//!    installed** transmits *nothing at all* and is torn down at
+//!    install + `DEAD_TIMEOUT` (25 s) with
+//!    [`ConnectionLost::TimedOut`]. **Connecting ahead of need does not
+//!    keep a path warm**, and this is the single most surprising behaviour
+//!    for a new consumer.
+//!
+//!    What keeps a connection alive is not a knob. §7.5's keepalive dance
+//!    is **automatic for any connection that has carried traffic**: one
+//!    application message, in **one** direction, puts the receiver into the
+//!    state that makes it answer every 10 s, which puts the sender into it,
+//!    and the pair then sustains itself indefinitely with no configuration
+//!    anywhere.
+//!
+//!    The knob is for the case that leaves out — a link that is **mutually
+//!    idle** and must nonetheless stay open, through a NAT binding or a
+//!    firewall's idle reaper.
+//!    [`Connection::set_persistent_keepalive`](shell::Connection::set_persistent_keepalive)
+//!    takes an interval in `[1 s, 25 s)` and rejects anything outside it
+//!    rather than clamping. Enabling it on **one** side is enough: the
+//!    beacon reaches the peer, and the peer's automatic half answers.
+//!
+//!    A beacon does not defer death, and is not meant to. Both keepalives
+//!    are *marking* sends, so they **arm** the death clock; a connection
+//!    whose beacons are never answered still ends 25 s after the last
+//!    authenticated packet it received. Two consecutive lost beacons at the
+//!    10 s default is what that costs.
 //! 4. **Teardown triggers on dropping every *handle*, not the endpoint.**
 //!    The connection lives as long as any handle to it does, and ends when
 //!    the last one is dropped — the opposite of the obvious guess, and

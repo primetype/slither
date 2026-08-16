@@ -2336,11 +2336,13 @@ fn accept_on_a_live_static_replaces_it_against_a_newer_basis() {
     );
 
     // … and, its timestamp being strictly newer than the basis, it replaces.
-    let (replacement, _core) = b
-        .ep
-        .accept(t, second)
-        .expect("§6.4: a strictly newer candidate against a Some(t) basis replaces");
-    assert_ne!(replacement, live, "a **fresh** connection, never the old one");
+    let (replacement, _core) =
+        b.ep.accept(t, second)
+            .expect("§6.4: a strictly newer candidate against a Some(t) basis replaces");
+    assert_ne!(
+        replacement, live,
+        "a **fresh** connection, never the old one"
+    );
 
     let d = b.drain();
     assert_eq!(
@@ -2382,11 +2384,7 @@ fn accept_on_a_live_static_replaces_it_against_a_newer_basis() {
     // And once it does arrive, the old route is gone — while the static
     // still names the replacement, which is what keeps §16.1's invariant
     // true at every instant rather than only at the ends.
-    b.ep.handle_connection_event(
-        t,
-        live,
-        ToEndpoint::Retired { our_index: ours },
-    );
+    b.ep.handle_connection_event(t, live, ToEndpoint::Retired { our_index: ours });
     let (disp, _d) = b.datagram(t, a.addr, &data_packet(ours, 2, 64));
     assert_eq!(disp, Disposition::Done, "the retired index routes nowhere");
     assert!(
