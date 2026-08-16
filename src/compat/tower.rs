@@ -208,6 +208,81 @@ impl<S: Handshake> Future for OpenBi<'_, S> {
     }
 }
 
+/// The dialling side on the **owned** handle — the form `UnsyncBoxService`
+/// and every other `'static` combinator require.
+///
+/// # Why both this and the `&Connection` impl exist
+///
+/// **[RATIFIED — ruling 239; this reverses ruling 236.]** `CONTRACT-8.md`
+/// §6.2 held that the owned form *"cannot be written"*, because
+/// [`Connection::open_bi`] takes `&self` and [`Service::call`] hands the body
+/// an anonymous lifetime that `type Future` cannot name. **The premise is
+/// sound and the conclusion does not follow**: the future does not have to
+/// borrow. It can *own* a second handle, and an in-crate `clone_handle`
+/// mints one with the same accounting `Drop` reverses, so nothing about
+/// §16.2's last-handle rule moves.
+///
+/// The reason it must exist is a bound neither §6.2 nor ruling 236 looked at:
+/// `UnsyncBoxService::new<S>` requires `S: Service<..> + 'static`, and
+/// `&'a Connection<S>` is not `'static`. **S33's acceptance clause — *"an
+/// `UnsyncBoxService` composes"* — is unsatisfiable on the borrowed form**,
+/// and a story is the acceptance criterion.
+///
+/// # The hazard, stated because it is silent
+///
+/// `ServiceExt::oneshot` takes `self` **by value**. On this impl
+/// `conn.oneshot(())` therefore **moves the connection into the combinator**,
+/// and dropping the resulting future runs §16.2's last-handle rule —
+/// `close(NO_ERROR, "")`. That is a closed connection from a call that looks
+/// like a request. Reach for `(&conn).oneshot(())`, which moves a `Copy`
+/// reference and leaves the handle where it is, or call
+/// `svc.call(())` directly.
+impl<S: Handshake + 'static> Service<()> for Connection<S> {
+    type Response = BiStream<S>;
+    type Error = ConnectionLost;
+    type Future = OpenBiOwned<S>;
+
+    /// Always ready — see the `&Connection` impl for why §10.4's stream
+    /// limit is not admission control.
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: ()) -> Self::Future {
+        let conn = Box::new(self.clone_handle());
+        let slot = conn.opener_slot_boxed(Dir::Bi);
+        OpenBiOwned { conn, slot }
+    }
+}
+
+/// The future [`Connection`]'s owned [`Service`] returns: one
+/// [`open_bi`](Connection::open_bi), over a handle the future owns.
+///
+/// Cancel-safe on `open_bi`'s terms, and handle-safe on §16.2's: the handle
+/// inside is accounted, so dropping this future decrements the count it
+/// incremented and never triggers the last-handle close while the caller
+/// still holds one.
+pub struct OpenBiOwned<S: Handshake> {
+    /// **Boxed deliberately.** `Pin::get_mut` in `poll` needs `Self: Unpin`,
+    /// and `Connection<S>` is `Unpin` only if `S`'s public-key type is —
+    /// which is an associated type with no such bound. `Box<T>` is `Unpin`
+    /// unconditionally, and this module is `#![forbid(unsafe_code)]`, so the
+    /// projection alternatives are closed. One allocation per `call()`,
+    /// against opening a stream.
+    conn: Box<Connection<S>>,
+    /// Held for the future's whole life and released on drop (ruling 228).
+    slot: WakerSlot<Box<dyn FnMut(u64)>>,
+}
+
+impl<S: Handshake> Future for OpenBiOwned<S> {
+    type Output = Result<BiStream<S>, ConnectionLost>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.conn.poll_open_bi(cx, this.slot.key())
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // The accepting side
 // ═══════════════════════════════════════════════════════════════════════

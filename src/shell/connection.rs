@@ -94,6 +94,32 @@ impl<S: Handshake> Connection<S> {
         }
     }
 
+    /// **[Integrator, ruling 239]** A second handle to this connection, with
+    /// the same accounting `new` performs.
+    ///
+    /// **Not `Clone`, and deliberately not public.** §16.2 ratified
+    /// `Connection` without a `Clone` impl and the last-handle drop rule
+    /// (`close(NO_ERROR, "")`) is load-bearing; publishing this would change
+    /// that surface, which slice 8 may not do.
+    ///
+    /// It exists so `compat::tower`'s owned `Service` impl can hand its
+    /// future a handle rather than a borrow — `Service::call` takes
+    /// `&mut self` and gives an anonymous lifetime that `type Future` cannot
+    /// name (`Service` has no GAT), so the *only* way to build an owned
+    /// future is for it to own something. This is that something, and it is
+    /// **accounted**: `shell.acquire()` plus `cell.handles += 1`, exactly
+    /// mirroring `Drop`, so the count is balanced and a future outliving its
+    /// caller's handle cannot make `handles` reach zero early or late.
+    pub(crate) fn clone_handle(&self) -> Self {
+        Self::new(
+            Rc::clone(&self.shell),
+            Rc::clone(&self.cell),
+            self.id,
+            self.remote_static.clone(),
+            self.session_id.clone(),
+        )
+    }
+
     // No `id()` accessor. §16.2's `Connection` surface is a list, and in
     // this project a list is read as exhaustive whether or not it says so
     // (CLAUDE.md working rule 8) — `ConnectionId` appears in §16.4's *core*

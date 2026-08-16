@@ -91,10 +91,10 @@ pub mod codec;
 pub mod tower;
 
 #[cfg(feature = "tower")]
-pub use self::tower::{Connect, OpenBi, serve};
+pub use self::tower::{Connect, OpenBi, OpenBiOwned, serve};
 
-// Slice 8. The integrator's to uncomment (working rules 6 and 15): the file
-// is the spec-test author's alone, and `mod tests;` naming a missing file is
-// a compile error on which no gate can run.
-// #[cfg(test)]
-// mod tests;
+// **[Integrator]** The implementer landed a commented-out `#[cfg(test)] mod
+// tests;` here for the spec-test author to claim (working rules 6 and 15).
+// That author reported it did **not** need an in-crate module — everything it
+// pins was reachable from `tests/spec_compat.rs` — so the declaration is
+// deleted rather than uncommented, and `src/compat/tests.rs` does not exist.

@@ -176,7 +176,7 @@ tower-service = { version = "0.3", optional = true }
 # NOT a new crate — `tokio` is already a dependency above. This dev-only entry adds
 # `test-util` (the PAUSED CLOCK the timer tests drive: every timer in SPEC.md
 # resolves in virtual time), plus `rt`/`macros` for `#[tokio::test]`.
-tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net", "sync"] }
+tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net", "sync", "io-util"] }
 
 # NOT a new crate either — `hiss` is already a dependency above, and this adds
 # no crate to the graph: `x25519-cryptoxide` is a feature of `hiss` that turns
@@ -198,6 +198,16 @@ hiss = { version = "0.3.2", features = ["x25519-cryptoxide"] }
 # buffered/spawn-ready layers, which are exactly what §16.11's `!Send`
 # paragraph says does **not** compose with a `!Send` driver.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+
+# Slice 8, the `Sink` half of the compat suites. **[ruling 235]** NOT a
+# duplicate of the `futures-sink` library dependency: `SinkExt::send` lives in
+# `futures-util`, and its `sink` module is **not in that crate's default
+# features** — a plain `futures-util = "0.3"` yields `stream::Stream` but not
+# `sink::Sink`, and rustc reports it as *"found an item that was configured
+# out"*, which reads like a version problem and is not. Both blind test
+# authors met this and neither could fix it: `Cargo.toml` is the integrator's
+# by working rule 15.
+futures-util = { version = "0.3", features = ["sink"] }
 # ── Integration test targets ──────────────────────────────────────────────
 # The three story/spec suites drive two endpoints over `slither::testutil`,
 # which lives behind `test-util`. Declared here rather than as an inner
@@ -265,3 +275,27 @@ required-features = ["test-util"]
 [[test]]
 name = "story_path"
 required-features = ["test-util"]
+
+# Slice 8 (`compat/`). Integrator-owned (working rule 15): each names a file
+# written by a blind agent that did not exist when the others' worktrees were
+# cut, and cargo **refuses to parse** a manifest naming a missing test file.
+#
+# **[ruling 194]** Not cosmetic. There is no `autotests = false`, so cargo
+# auto-discovers each of these *without* its `required-features`, and the
+# feature-less `cargo test` gate fails outright -- it does not degrade --
+# until every stanza lands. Both test authors flagged this independently.
+[[test]]
+name = "story_compat"
+required-features = ["test-util", "sink"]
+
+[[test]]
+name = "story_codec"
+required-features = ["test-util", "codec"]
+
+[[test]]
+name = "story_tower"
+required-features = ["test-util", "tower"]
+
+[[test]]
+name = "spec_compat"
+required-features = ["test-util", "sink"]

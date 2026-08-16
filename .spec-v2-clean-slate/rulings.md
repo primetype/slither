@@ -6841,3 +6841,91 @@ inverse case, a right conclusion on a wrong argument, and noted it is
 invisible to any review that checks conclusions. This one says the other
 half out loud: **checking the argument is how the conclusion gets a second
 look.**
+
+### 239 — **ruling 236 is reversed.** The `tower` face needs the **owned** receiver, and §6.2's impossibility argument does not hold
+
+Both blind test authors independently reported the §0.0-versus-§6.2 conflict
+on the `Service` receiver — the **second** independent convergence this
+project has seen. Agent A read ruling 225, found it silent, and implemented
+`&'a Connection<S>` per §6.2. Agent B wrote against §0.0's owned form and
+supplied the two facts that decide it. At integration the split produced
+exactly **four** compile errors, all in `story_tower.rs`, all this one
+disagreement; everything else — 44 new tests and the whole implementation —
+compiled together on the first attempt.
+
+**Ruling 236 was mine and it was wrong.** I settled it for §6.2 without
+checking either fact:
+
+1. **`UnsyncBoxService::new<S>` requires `S: Service<..> + 'static`**
+   (verified in `tower-0.5.3/src/util/boxed/unsync.rs:29-32`), and
+   `&'a Connection<S>` is not `'static`. **S33's acceptance clause — *"an
+   `UnsyncBoxService` composes"* — is unsatisfiable on the borrowed form.**
+   `CLAUDE.md` makes a story the acceptance criterion, so this is decisive
+   on its own.
+2. **§6.2's *"cannot be written"* is a sound premise with a false
+   conclusion.** `open_bi` takes `&self` and `Service::call` cannot name the
+   anonymous lifetime — both true — but the future does not have to
+   *borrow*. It can own a second handle. `Connection::drop` counts handles
+   in an explicit `cell.handles` field, **not** by `Rc::strong_count`
+   (`src/shell/connection.rs:1335`), so an accounted `clone_handle` —
+   `shell.acquire()` plus `handles += 1`, exactly mirroring `Drop` — hands
+   the future a handle without moving §16.2's last-handle rule at all.
+
+**Both impls ship.** The owned one is what `'static` combinators require;
+the borrowed one stays because it is the safe idiom for the hazard below.
+
+**The hazard, recorded rather than discovered later:** `ServiceExt::oneshot`
+takes `self` **by value**, so on the owned impl `conn.oneshot(())` moves the
+connection into the combinator and dropping the future runs
+`close(NO_ERROR, "")`. A request-shaped call that closes the connection.
+`(&conn).oneshot(())` moves a `Copy` reference instead. Agent B found this
+and kept `oneshot` out of its suite entirely; the rustdoc now says it.
+
+One implementation detail worth the line: `OpenBiOwned` **boxes** its
+handle, because `Pin::get_mut` needs `Self: Unpin` and `Connection<S>` is
+`Unpin` only if `S`'s public-key associated type is — which nothing bounds.
+`compat` is `#![forbid(unsafe_code)]`, so the projection alternatives are
+closed.
+
+**What this says about the process.** Ruling 236 praised Agent A for
+checking the ruling rather than the paraphrase — correctly — and then
+repeated A's error one level up: I checked *A's* argument and not the
+bound it never mentioned. **Working rule 12: a true lemma about the wrong
+state proves nothing.** §6.2's lemma was true about the *sketched* form and
+said nothing about every other owned form. It took the second blind agent,
+writing tests it could not compile, to produce the fact that settled it —
+which is the entire argument for two test authors.
+
+### 240 — dropping a read-only `BiStream` resets the peer's stream, and `shutdown()` fails on it
+
+`s31_shutdown_then_close_does_not_lose_the_tail` failed at integration with
+`shutdown: Custom { kind: ConnectionReset, error: Reset(0) }` — **after the
+payload had arrived whole.**
+
+`SendStream::drop` on a live local end calls
+`core.reset(now(), r, NO_ERROR)` (`src/shell/stream.rs:574`). A reader that
+takes a `BiStream`, reads to EOF and drops it therefore resets the send
+direction **it never used**, and that `RESET_STREAM` reaches the writer
+while it is still inside `AsyncWrite::shutdown` awaiting acknowledgement
+(ruling 57 makes shutdown `finish()` *and then* `acked()`). The writer's
+shutdown fails, reporting a reset for a transfer that completed.
+
+**This is not a slice-8 regression.** The drop rule is slice 4b's and is
+ratified; S28 tested the same guarantee at the *verb* level with the reader
+holding its handle. What slice 8 changed is who can see it: S31 exists
+precisely to reach *"S28's guarantee through the `AsyncWrite` surface by an
+application that never touches `acked()`"*, and the very first such
+application found this.
+
+**Not fixed here, deliberately** — the drop rule is ratified and slice 8
+may not move it, for the same reason ruling 231 declined to make
+`Connection: Clone`. The test holds the reader's handle across the join,
+which asserts the tail survives (S31's subject) instead of a teardown
+ordering no ruling has settled, and says so at the site.
+
+**Open for the maintainer, and it is a real question:** read-a-bi-stream-to-
+EOF-then-drop is the *canonical* client shape. Either the drop of a
+never-written send half should finish rather than reset it, or `poll_shutdown`
+should distinguish "reset after my data was acknowledged" from a reset that
+lost data, or the hazard is documented and accepted. All three are outside
+slice 8's mandate.
