@@ -5618,3 +5618,131 @@ the sender's sizing, not in the predicate.
 
 **Status: slice 7 is NOT closed.** 887 passing, **1 failing**, and the
 failure is a real protocol defect found by a blind story test.
+
+---
+
+## Round 33 — the API review gate, taken early (2026/08/16)
+
+### 204 — the public surface is ratified as reviewed. Ten open questions all resolve to *keep*.
+
+The review gate `PLAN.md` schedules after slice 8 was taken early, against
+the surface at `d2b2a45`, because two of its ten questions get more
+expensive once slice 8's adapters are built on top of them. The maintainer
+reviewed the surface and answered **"happy with the API"**.
+
+That is a ratification of the whole surface as it stands, and it resolves
+all ten questions in the *keep current behaviour* direction. Recorded
+individually so that reversing any one of them is a ruling rather than an
+excavation:
+
+1. **`core` stays `pub(crate)` through 0.2.** Promotion is additive and
+   remains available in 0.3; demotion would be breaking. The sans-io cores
+   ship unreachable.
+2. **The closed error taxonomy stands.** Nine of ten enums are
+   exhaustively matchable. `WriteError` alone carries `#[non_exhaustive]`
+   (ruling 61, reserving `Stopped`), and `Notification` carries it for a
+   later wire line. In particular **`ConnectionLost` is closed**: a new
+   death reason is a major bump, accepted knowingly.
+3. **0.2 ships without STOP_SENDING.** `FRAME_STOP_SENDING_RESERVED`
+   (`0x05`) stays claimed and never sent; §19's deferral stands. A reader
+   cannot cancel a stream, and the sender keeps buying credit for data
+   nobody will read. Additive on the wire when the round happens.
+4. **`EndpointBuilder::build()` keeps its panic** on a missing identity or
+   wire. It is the only panic on the public happy path, and it stays: a
+   builder used wrongly is a programming error, not a runtime condition.
+5. **`send_datagram` stays sync, `send_message` stays async.** The
+   asymmetry is the type system saying what it can — droppable into a
+   bounded queue versus backpressured — and no rename is owed.
+6. **`id() -> Option<StreamId>` stays `Option` on all three handles**,
+   including the accepted side where the id demonstrably already exists.
+   One shape beats two.
+7. **`remote_static()` keeps returning by value** while the staged types
+   return `&`. The reason is real (the connection holds its copy outside
+   the cell so it answers after §15.2's linger drops the session) and is
+   documented rather than engineered away.
+8. **The wire erasure point stays inside the driver.** `Endpoint<I>` does
+   not carry `W`; `Wire` stays dyn-incompatible.
+9. **`open_bi()` keeps returning `BiStream`** (ruling 96). See ruling 205
+   — the divergence to fix is in the spec's text, not in the code.
+10. **`testutil`'s attestation holds** as ruling 60 wrote it. See ruling
+    206 for what that implies about a change already made.
+
+**What this ratification does not cover.** It is a review of *signatures*,
+taken against a tree with one failing test. Ruling 203's defect is sender
+behaviour and moves nothing on this page; the ratification says nothing
+about it, and slice 7 still does not close until it is fixed. Slice 8's
+compatibility layer is **not** ratified here — it is unbuilt, and the
+question of whether its adapters read correctly is a question about code
+that does not exist yet.
+
+### 205 — §16.2 still writes the tuple ruling 96 replaced
+
+`open_bi()` and `accept_bi()` return `BiStream`, decided by ruling 96 and
+shipped in slice 4. §16.2's normative signature still writes the spec's
+original tuple.
+
+CLAUDE.md's hard rule is that **the code must match the spec, never the
+other way round** — but that rule governs *unratified* drift. Here a
+ruling already moved the decision and the spec's text simply did not
+follow it, which is a stale document rather than a code defect. Ruling 204
+question 9 confirms the shipped shape.
+
+**Ruling: amend §16.2 to write `BiStream`, citing ruling 96.** This is
+recording an existing decision, not making a new one. Working rule 4
+applies to the amendment: the surrounding prose is to be read for other
+clauses still arguing the tuple, not merely the signature line greped for.
+
+### 206 — `FlakyWire`'s field became a method mid-slice, and ruling 60 makes that breaking
+
+Ruling 60 puts `Network`, `FlakyWire` and `FlakyPolicy` under semver as
+**attested surface** — "renaming one of those three types is a protocol
+revision". Slice 7 (ruling 180's fixture work) moved `FlakyWire`'s `addr`
+from a public field to `addr()` plus `rebind()`, converting 99 call sites.
+
+Nobody checked ruling 60 at the time, including the maintainer. The
+question surfaced only while assembling the API review page, from the
+attestation's own text rather than from any test — no gate can see this,
+because the attestation is a promise about names and the compiler only
+sees the crate's own call sites.
+
+**Ruling: the attestation is about the three type names, not their
+members, and the change stands.** A fixture whose *fields* were frozen
+could not have gained `rebind()` at all, and ruling 180 needed it. But the
+scope was genuinely unstated — this is defect class 1 again, in ruling 60:
+**a stated construction with an unstated scope**, the most productive
+defect class in this project, now found in the attestation rule itself.
+
+Ruling 60's text is to gain the missing sentence: the attestation covers
+the three type names and the constructor spellings a downstream test
+writes, and does not freeze fields, inherent methods or internal
+behaviour.
+
+### 207 — ruling 203's fix goes out as its own blind pass, and here is what it may not do
+
+Ruling 203 states the fix — bound the packing target by the remaining
+budget, `min(MAX_DATAGRAM, room)` — and states that the integrator may not
+make it against a failing test at the end of a slice. Dispatching it,
+three constraints are worth fixing in the record first, because each is a
+way the fix could be built wrong while turning the test green:
+
+(a) **The budget predicate does not move.** `Amplification::admits` is
+correct as ruling 168 wrote it and ruling 203 re-confirmed. A fix that
+loosens `admits`, or that exempts the first post-roam packet from it,
+reopens the reflector §7.3 exists to close. The change is to what the pump
+*builds*, never to what the budget *permits*.
+
+(b) **A shrunken packet must still be able to elicit.** Validation
+arrives only on an ACK covering `validation_floor` (ruling 168), so a
+packet sized to fit the budget is useless if what fits is a bare ACK —
+non-ack-eliciting output cannot produce the ACK that validates, and the
+connection stalls exactly as it does today, one indirection later. Whether
+the pump owes a PING when the admitted room holds nothing ack-eliciting is
+a genuine question the pass must answer rather than assume.
+
+(c) **`MAX_PLAINTEXT` is not the only cap that moves.** `Packing::new`
+starts at `budget: MAX_PLAINTEXT` and the candidate's charged size is the
+full datagram (`DATA_HEADER_LEN + plaintext + AEAD_TAG_LEN`, ruling 136).
+A fix that caps the plaintext at the remaining *datagram* bytes overshoots
+by 30 and re-refuses its own packet. The two units differ by exactly the
+overhead, and ruling 201 already cost one round to a units error in this
+area.
