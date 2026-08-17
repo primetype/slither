@@ -614,9 +614,10 @@ fn drive_like_the_shell(s: &mut Solo, start: Instant, cap: usize) -> usize {
 /// The budget-refused hold, driven to a fixed point.
 ///
 /// Mutation caught: the spin, on the **first** step past the refusal
-/// (`next == now`). A build that suppresses correctly walks the PTO backoff
-/// and then dies of §7.4's liveness at `install + DEAD_TIMEOUT`, in a
-/// handful of steps.
+/// (`next == now`). A build that suppresses correctly announces no `Pto`
+/// at all while the budget is closed (§13.3, ruling 249 — before that
+/// ruling it walked the PTO backoff here) and dies of §7.4's liveness at
+/// `install + DEAD_TIMEOUT`, in a handful of steps.
 ///
 /// The cap is deliberately loose: the point is *bounded*, not *small*, and a
 /// tight cap would turn an unrelated recovery-timer change into a red here.

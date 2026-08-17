@@ -225,8 +225,16 @@ fn fire_pto(s: &mut Solo, what: &str) -> Instant {
 /// [`the_refund_re_announces_the_probe_deadline_and_fires_a_probe`] and
 /// would move §13.3's anchor, which is the quantity that test is about.
 fn roam_and_starve(s: &mut Solo, at: Instant) {
+    roam_and_starve_at(s, at, at);
+}
+
+/// The roam **receive** lands at `recv_at`; the budget-spending send at
+/// `send_at`. Separated instants are what let a test pin §7.4's anchor on
+/// the receive clock — a helper doing both at one instant makes
+/// receive-anchored and send-anchored the same number (working rule 9).
+fn roam_and_starve_at(s: &mut Solo, recv_at: Instant, send_at: Instant) {
     let before = s.conn.remote_address();
-    let d = s.deliver_from(at, c_addr(), &[]);
+    let d = s.deliver_from(recv_at, c_addr(), &[]);
     assert_eq!(
         s.conn.remote_address(),
         Some(c_addr()),
@@ -246,7 +254,7 @@ fn roam_and_starve(s: &mut Solo, at: Instant) {
         "fixture: the length varint above is one byte only below 64; got {payload}"
     );
     s.conn
-        .send_datagram(at, &ramp(0, payload as usize))
+        .send_datagram(send_at, &ramp(0, payload as usize))
         .expect("§11: a sub-maximum datagram is accepted");
     let d = drain(&mut s.conn);
     assert_eq!(
@@ -450,8 +458,14 @@ fn the_starved_connection_still_dies_at_the_dead_timeout() {
     let last = fire_pto(&mut s, "arming a backed-off train");
 
     let roam_at = last + Duration::from_millis(1);
-    // §7.4's anchor is the receive; the marking send is deliberately later.
-    roam_and_starve(&mut s, roam_at + Duration::from_millis(7));
+    // §7.4's anchor is the receive; the budget-spending send is
+    // deliberately 7 ms later, so a send-anchored build dies 7 ms late
+    // and goes red here. (The blind draft moved *both* instants 7 ms —
+    // the helper then took one timestamp — which anchored the receive at
+    // +7 ms too and read as an implementation defect; §7.4 and
+    // `Liveness::deadline()` were opened at integration and the code was
+    // right: receive-anchored. Corrected geometry, same pin.)
+    roam_and_starve_at(&mut s, roam_at, roam_at + Duration::from_millis(7));
     assert!(
         s.conn.bytes_in_flight() > 0,
         "fixture: the sent map is not empty"

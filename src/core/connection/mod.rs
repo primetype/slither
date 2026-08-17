@@ -127,6 +127,10 @@ mod tests_sizing;
 mod tests_livelock;
 #[cfg(test)]
 mod tests_path;
+// Slice R40-A's blind-author module (rulings 249/254) — declared by the
+// integrator, 2026/08/17, per working rules 6/15 and ruling 211.
+#[cfg(test)]
+mod tests_pto_gate;
 #[cfg(test)]
 mod tests_reassembly;
 //
