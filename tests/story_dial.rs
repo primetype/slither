@@ -472,6 +472,14 @@ async fn within<F: std::future::Future>(fut: F, budget: Duration, what: &str) ->
     }
 }
 
+/// Poll `fut` exactly once — the instrument for "**at this instant**", with
+/// no virtual time spent and so no timer given a chance to fire.
+async fn poll_once<F: std::future::Future>(
+    mut fut: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx))).await
+}
+
 /// Climb §6.2's staged ladder once — `accept()` → `read_identity()` →
 /// `authenticate()` → `accept()`, the 4 DH S34's `Cost:` line prices.
 ///
@@ -677,7 +685,12 @@ async fn s34_the_responder_never_retransmits_msg2() {
 /// Every clause of S34's first accept criterion, in order:
 ///
 /// 1. **exactly one msg2 dropped** — `drop_at([0])` on the responder's
-///    wire, with the identity of send #0 asserted (see the section header).
+///    wire, with the identity of send #0 asserted (see the section header)
+///    **and the drop itself observed**: after the first ladder and a
+///    `settle()`, one poll of the dial must still be `Pending`. Delete the
+///    `drop_at` and that is the line that goes red, by name — without it
+///    the failure lands on the second ladder's timeout instead, which
+///    reads like a harness fault rather than a vacuous test.
 /// 2. **the same `connect()`** — one `Connecting`, pinned before the first
 ///    ladder and still the same future when it resolves. There is no second
 ///    `connect()` call in this test, and a build that needed one could not
@@ -765,6 +778,19 @@ async fn s34_a_lost_msg2_is_recovered_by_the_next_accept() {
                 (b_sends[0].bytes.len(), b_sends[0].bytes[0]),
                 (RESP_PACKET_LEN, PKT_HANDSHAKE_RESP),
                 "§3.1: the dropped send #0 must be the 107-byte msg2"
+            );
+
+            // **The assertion that makes everything below it mean
+            // something.** `settle()` has given both drivers 64 turns at
+            // this instant, so a msg2 that arrived would already have
+            // resolved the dial. That it has not is the loss, observed
+            // directly and with no virtual time spent — remove the
+            // `drop_at` above and this is the line that goes red.
+            assert!(
+                poll_once(dial.as_mut()).await.is_pending(),
+                "the dial resolved although the responder's only msg2 was dropped: \
+                 `drop_at([0])` did not drop msg2, and every assertion below here \
+                 would be measuring an ordinary handshake"
             );
             assert_eq!(
                 pair.b.dhs.get(),
