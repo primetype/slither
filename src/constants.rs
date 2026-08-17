@@ -380,8 +380,21 @@ pub const K_GRANULARITY: Duration = Duration::from_millis(K_GRANULARITY_MS);
 /// The RTT assumed before any sample has been taken. §13.1.
 pub const K_INITIAL_RTT: Duration = Duration::from_millis(K_INITIAL_RTT_MS);
 
-/// The cap on the PTO backoff **multiplier**, `2⁶`. §13.3.
-pub const PTO_BACKOFF_CAP: u32 = 64;
+/// The cap on the PTO backoff **multiplier**, `2³`. §13.3.
+///
+/// **[RATIFIED 2026/08/17 — ruling 254]** 2⁶ until this ruling, inherited
+/// from RFC 9002 practice and never itself ratified. The cap is **sized to
+/// `DEAD_TIMEOUT`'s window, not to overflow**: at 2⁶ the later rungs could
+/// not fire inside 25 s at any warm RTT, so the probe train's tail turned
+/// from probing into waiting exactly when survival was the question —
+/// measured at 50 % sustained loss, transfers that timed out at 2⁶
+/// complete at 2³, at zero observed honest-path cost.
+///
+/// **The compile-time pins below are load-bearing at this value**, not
+/// belt-and-braces. At 64 the mis-transcribed idiom `1u32 << 64` was
+/// undefined behaviour and loud; at 8, `1u32 << 8` is a legal 256 and
+/// silently wrong — an eight-fold error in a timer with no red test.
+pub const PTO_BACKOFF_CAP: u32 = 8;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Congestion control (§14.2, §14.4)
@@ -604,7 +617,7 @@ const _: () = assert!(REPLAY_WINDOW.is_multiple_of(64)); // whole u64 words
 const _: () = assert!(MAX_EPOCH_JUMP == hiss::noise::datagram::MAX_EPOCH_JUMP);
 
 // ── Recovery and congestion (§13, §14) ────────────────────────────────
-const _: () = assert!(PTO_BACKOFF_CAP == 1 << 6); // the spec writes 2⁶
+const _: () = assert!(PTO_BACKOFF_CAP == 1 << 3); // the spec writes 2³ [ruling 254]
 const _: () = assert!(INITIAL_WINDOW == 10 * MAX_DATAGRAM as u64); // RFC 9002
 const _: () = assert!(MINIMUM_WINDOW == 2 * MAX_DATAGRAM as u64); // RFC 9002
 const _: () = assert!(MINIMUM_WINDOW < INITIAL_WINDOW);
@@ -618,10 +631,17 @@ const _: () = assert!(K_GRANULARITY_MS <= MAX_ACK_DELAY_MS);
 
 // ---------------------------------------------------------------------
 // Derivations the spec states in prose notation, added after slice 0's
-// fidelity review. Ruling 63 named the hazard: a value written "2⁶" or
+// fidelity review. Ruling 63 named the hazard: a value written "2³" or
 // "65 536 (2¹⁶)" is a judgement call an implementer can resolve wrongly
 // and *self-consistently*, so nothing turns red. `PTO_BACKOFF_CAP` was
 // already guarded; `REKEY_EPOCH_MSGS` is the identical shape and was not.
+//
+// **[ruling 254]** Ruling 63's example was `PTO_BACKOFF_CAP` at 2⁶, where
+// the wrong resolution — storing the *exponent* and shifting by it —
+// produced `1u32 << 64`, undefined behaviour that no build hides. At 2³ it
+// produces `1u32 << 8` = 256, a perfectly legal multiplier eight times too
+// large, on a timer whose only symptom is a probe train that thins. The
+// guard is what turns red now; nothing else would.
 const _: () = assert!(REKEY_EPOCH_MSGS == 1 << 16); // §7.7 "65 536 (2¹⁶)"
 
 // A close reply may not be rate-limited more slowly than the linger it

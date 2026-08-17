@@ -1290,7 +1290,14 @@ impl<C: Handshake> Connection<C> {
     /// * it does **not** clear the sent map — *"ACKs for packets in flight
     ///   to the old address still resolve"* — and does **not** reset
     ///   `bytes_in_flight`, `pto_count`, `loss_time` or `last_ack_eliciting`:
-    ///   loss detection and PTO *"continue undisturbed"*;
+    ///   loss detection continues undisturbed and PTO **state** *"carries
+    ///   across untouched"*. **[ruling 249]** §13.6's row is precise about
+    ///   which half that is: the `Pto` **announcement** is budget-gated
+    ///   (§13.3), and this function zeroes the budget four rows up, so the
+    ///   deadline is suppressed from the roam until the first qualifying
+    ///   receive re-admits a probe. Nothing here cancels or re-arms it —
+    ///   [`sync_recovery_timers`](Self::sync_recovery_timers) re-derives it
+    ///   from the state this roam left alone;
     /// * it does **not** clear `smoothed_rtt` or `rttvar` — the estimator is
     ///   *"suspect-but-kept"*. Only `min_rtt` is re-seeded, and the PTO floor
     ///   **may rise** as a result;
@@ -1483,19 +1490,88 @@ impl<C: Handshake> Connection<C> {
     /// Both are **functions of the map**, exactly as §7.4's `Liveness`
     /// deadline is a function of the receive clock, so they are
     /// re-synchronised after every change rather than armed at each site.
-    /// §13.3's precondition — *"armed only while at least one ack-eliciting
-    /// packet is in the sent map"* — is then true by construction: an empty
-    /// map yields `None`, so an idle connection cannot self-sustain a probe
-    /// train at ~20 packets/s against the 10 s keepalive cadence, which is
-    /// the failure §13.3 names.
+    /// §13.3's *first* precondition — *"armed only while at least one
+    /// ack-eliciting packet is in the sent map"* — is then true by
+    /// construction: an empty map yields `None`, so an idle connection
+    /// cannot self-sustain a probe train at ~20 packets/s against the 10 s
+    /// keepalive cadence, which is the failure §13.3 names.
+    ///
+    /// # §13.3's second precondition (**[RATIFIED 2026/08/17 — ruling 249]**)
+    ///
+    /// *"…**and while §7.3's amplification budget admits a probe
+    /// datagram**"*. The conjunct is applied **here**, at the one arming
+    /// site, because [`Recovery`] has no sight of the
+    /// budget — see [`probe_can_leave`](Self::probe_can_leave) for the size
+    /// it asks about.
+    ///
+    /// Without it a saturated backoff at a closed budget re-arms itself in
+    /// the past forever. `Recovery::pto_deadline` is `anchor + interval ×
+    /// 2^min(pto_count, PTO_MAX_EXPONENT)`; the anchor moves only at an
+    /// ack-eliciting send, the increment stops advancing once `pto_count`
+    /// saturates, and a firing that can emit nothing moves neither. The
+    /// single `!Send` driver **every** connection on the endpoint shares
+    /// then spins at 100 % of a core until `DEAD_TIMEOUT` reaps the session
+    /// — measured, silent in release, and reachable from any roam, which
+    /// zeroes the budget (§13.6).
+    ///
+    /// **The gate is on the announcement, not the state.** Sent map,
+    /// `pto_count` and anchor are untouched while the budget is closed; the
+    /// connection's `Timeout` falls to the next armed timer — `Liveness` at
+    /// the latest — and the session still dies at `DEAD_TIMEOUT`, which is
+    /// what §7.3 intends for an address that funds nothing.
+    ///
+    /// **Re-arming needs no machinery.** The budget grows only on an
+    /// authenticated, window-fresh receive (§7.2, §7.3, ruling 169), every
+    /// live receive path ends in [`pump`](Self::pump), and every pump ends
+    /// here — so the deadline is announced again on the one event that can
+    /// lift the hold. That is §16.4's `Contested` principle — a deadline is
+    /// never announced for output that cannot leave — and the same shape
+    /// slice 7b's F1 fix already gave both keepalives
+    /// ([`keepalive_can_leave`](Self::keepalive_can_leave)); ratified for
+    /// `Contested`, shipped for the keepalives, and absent only here.
     fn sync_recovery_timers(&mut self) {
         if !self.lifecycle.is_live() {
             return;
         }
-        self.timers
-            .set(TimerKind::Loss, self.recovery.loss_deadline());
-        self.timers
-            .set(TimerKind::Pto, self.recovery.pto_deadline());
+        let loss = self.recovery.loss_deadline();
+        // **[ruling 249]** The second conjunct. `filter` rather than a
+        // branch: the deadline the map permits is computed either way, and
+        // only the *announcement* is withheld.
+        let pto = self
+            .recovery
+            .pto_deadline()
+            .filter(|_| self.probe_can_leave());
+        self.timers.set(TimerKind::Loss, loss);
+        self.timers.set(TimerKind::Pto, pto);
+    }
+
+    /// Whether §7.3's budget admits §13.4's probe datagram right now
+    /// (**[RATIFIED 2026/08/17 — ruling 249]**).
+    ///
+    /// §13.4: *"while the budget has no room for the 39-byte challenge
+    /// datagram the `Pto` deadline is not announced at all"*. The 39 bytes
+    /// are §3.4's `DATA_HEADER_LEN`, `PATH_CHALLENGE`'s one-byte type, its
+    /// eight opaque bytes and the AEAD tag — **composed, never
+    /// transcribed**, which is the same arithmetic `constants.rs`'s
+    /// amplification-floor assertion writes.
+    ///
+    /// That is the right size to ask about because on an **unvalidated**
+    /// address the probe *is* the challenge: §8.7's standing obligation puts
+    /// `PATH_CHALLENGE` on the packet the PTO built, and it is ack-eliciting,
+    /// so no PING is owed beside it (ruling 221). On a **validated** address
+    /// [`Amplification::admits`](mobility::Amplification::admits) is
+    /// unconditionally true and this gate is vacuous — the state it exists
+    /// for is a fresh roam or an msg1 anchor whose remaining room cannot fit
+    /// the datagram §13.4 describes.
+    ///
+    /// It subsumes the other budget-shaped way a probe emits nothing:
+    /// [`pump_contested_probe`](Self::pump_contested_probe) stops the pump
+    /// dead when the budget refuses the contested probe's 31 bytes, and
+    /// `admits` is monotone in the length, so a budget refusing 31 refuses
+    /// 39 and the deadline is already withheld.
+    fn probe_can_leave(&self) -> bool {
+        let size = (constants::DATA_HEADER_LEN + 1 + 8 + constants::AEAD_TAG_LEN) as u64;
+        self.amplification.admits(size)
     }
 
     /// §18.1's cause, once the connection has died. The verbs surface it

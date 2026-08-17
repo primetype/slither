@@ -1083,14 +1083,33 @@ mod pto {
     /// §13.3: *"doubled per consecutive unanswered probe (`2^pto_count`)"*,
     /// with ruling 139's increment moment — **at the timer's firing**.
     ///
+    /// **[Re-derived 2026/08/17 — ruling 254.]** The ladder is unchanged;
+    /// what changed is where the cap sits relative to it. At
+    /// `PTO_BACKOFF_CAP` = 2⁶ the third sample (8×) had five rungs of
+    /// headroom, so it could only be explained by *"still doubling"*. At 2³
+    /// that same sample **is** the cap, and a build that stopped doubling
+    /// after 4× is indistinguishable from one that stopped because the cap
+    /// bound — the assertion stops separating the two hypotheses while
+    /// still passing, which is working rule 9's shape exactly.
+    ///
+    /// So the rungs are asserted as **two groups with different content**:
+    /// the ones strictly below the cap (2×, 4×), which only doubling
+    /// explains, and the pinned one (8×, and the firing after it still 8×),
+    /// which only the cap explains. Three samples in a row would have
+    /// asserted the first property twice and the second not at all.
+    ///
     /// Mutation caught: a build that increments when the probe is *sent*
     /// rather than when the timer fires. The two differ by exactly one
     /// interval, so the train runs `1×, 1×, 2×, 4×` and probes one extra
     /// time at the shortest interval — invisible on a healthy path,
-    /// visible as a doubled probe count on a black-holed one. Also caught:
-    /// a build that adds rather than doubles (`1×, 2×, 3×`), which agrees
-    /// with the correct one at the first two firings and diverges at the
-    /// third — which is why three firings are asserted, not one.
+    /// visible as a doubled probe count on a black-holed one.
+    ///
+    /// Mutation caught: a build that adds rather than doubles
+    /// (`1×, 2×, 3×`). It agrees at the first firing and diverges at the
+    /// second, which is why the 4× rung is asserted and not just the 2×.
+    ///
+    /// Mutation caught: **no cap at all** — 16× at the fourth firing, which
+    /// only the last assertion here separates from the conforming build.
     #[test]
     fn each_pto_firing_doubles_the_interval() {
         let t = t0();
@@ -1098,55 +1117,85 @@ mod pto {
         let mut rec = Recovery::new();
         rec.on_sent(sent(0, t, 1200, r));
 
+        // Strictly below the cap: doubling is the only explanation.
         rec.on_pto_timeout();
         assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 2), "2×");
         rec.on_pto_timeout();
         assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 4), "4×");
+
+        // The cap's own rung, and then the rung that is not there: a build
+        // still doubling reads 16× on the second of these.
         rec.on_pto_timeout();
-        assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 8), "8×");
+        assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 8), "8× — 2³");
+        rec.on_pto_timeout();
+        assert_eq!(
+            rec.pto_deadline(),
+            Some(t + INITIAL_PTO * 8),
+            "§13.3: the fourth firing is pinned, not 16×"
+        );
     }
 
-    /// §13.3's `PTO_BACKOFF_CAP` = 2⁶, **stored as the multiplier 64**.
+    /// §13.3's `PTO_BACKOFF_CAP` = 2³, **stored as the multiplier 8**
+    /// (**[RATIFIED 2026/08/17 — ruling 254]**; 2⁶ before it).
     ///
     /// `CONTRACT-5a.md` §4.3 names this *"the single most likely
     /// mechanical error in the whole slice"*: v0.1 writes
     /// `1u32 << self.pto_count.min(PTO_BACKOFF_CAP)` with its own
     /// `PTO_BACKOFF_CAP = 6`, and the same idiom with slither's constant
-    /// shifts by up to 64.
+    /// shifts by the **multiplier** instead of the exponent.
     ///
-    /// Mutation caught: exactly that transcription. A `u32` shifted by 64
-    /// panics in debug and is undefined in release; if the shift is done
-    /// on a `u64` it yields `2^64` and the `Instant` addition overflows
-    /// and panics. Six firings reach the cap, and the seventh and the
-    /// sixty-fourth must not move it — the sixty-fourth is the one that
-    /// detonates the bad idiom, so it is fired explicitly rather than
-    /// assumed.
+    /// # The hazard sharpened when the cap fell, and this test carries it
+    ///
+    /// At 2⁶ the bad idiom was `1u32 << 64`: a panic in debug, undefined in
+    /// release, and on `u64` an `Instant` addition that overflows. It could
+    /// not be missed, and this test's old body was really asserting that
+    /// *something detonated*.
+    ///
+    /// At 2³ it is `1u32 << 8` = **256** — a legal `u32`, no panic, no
+    /// overflow, and a probe train running at 32× the ratified cadence with
+    /// every packet still going out. Ruling 254 says so in terms: *"the
+    /// compile-time pins are now load-bearing, not belt-and-braces."* So
+    /// this test asserts the **value** rather than the survival, and does it
+    /// past the eighth firing, where the two readings first differ by
+    /// something an equality can see: 8× against 256×.
+    ///
+    /// Mutation caught (exponent read as multiplier): `INITIAL_PTO * 256`
+    /// at the last assertion — 4.4 minutes between probes on a 25 s death
+    /// clock, i.e. no probe train at all.
+    /// Mutation caught (no cap): 16× at the fourth firing.
+    /// Mutation caught (cap at the wrong rung, 2² or 2⁴): 4× or 16× at the
+    /// third firing, which is asserted separately from the pinned rungs.
     #[test]
-    fn the_pto_backoff_multiplier_caps_at_sixty_four() {
+    fn the_pto_backoff_multiplier_caps_at_eight() {
         let t = t0();
         let r = tag_ref();
         let mut rec = Recovery::new();
         rec.on_sent(sent(0, t, 1200, r));
 
-        for _ in 0..6 {
+        // §13.3's `2^pto_count`: three firings reach 2³, the cap.
+        for _ in 0..3 {
             rec.on_pto_timeout();
         }
-        assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 64), "2⁶");
+        assert_eq!(rec.pto_deadline(), Some(t + INITIAL_PTO * 8), "2³");
 
         rec.on_pto_timeout();
         assert_eq!(
             rec.pto_deadline(),
-            Some(t + INITIAL_PTO * 64),
-            "§13.3: the cap holds at the seventh firing"
+            Some(t + INITIAL_PTO * 8),
+            "§13.3: the cap holds at the fourth firing"
         );
 
-        for _ in 0..57 {
+        // Well past the cap — and, deliberately, past **eight** firings,
+        // because that is where a `pto_count` saturated at the multiplier
+        // rather than the exponent yields `1u32 << 8` = 256.
+        for _ in 0..60 {
             rec.on_pto_timeout();
         }
         assert_eq!(
             rec.pto_deadline(),
-            Some(t + INITIAL_PTO * 64),
-            "64 firings: the shift-by-pto_count idiom detonates here"
+            Some(t + INITIAL_PTO * 8),
+            "64 firings: pinned at 8×, and specifically not the 256× that \
+             `1u32 << pto_count` gives — legal, silent, and 32× too slow"
         );
     }
 
@@ -1294,10 +1343,14 @@ mod persistent_congestion {
     ///
     /// Mutation caught: a build using the backed-off interval. §14.4 says
     /// what happens in terms: *"with the backoff included, the threshold
-    /// would run up to 2⁶× too long and persistent congestion would never
-    /// trigger under exactly the sustained loss it exists to detect"*. At
-    /// `pto_count = 3` the period becomes `8 × 275 = 2200 ms`, the 1000 ms
-    /// spread no longer clears it, and the collapse never happens. Note
+    /// would run up to 2³× too long and persistent congestion would never
+    /// trigger under exactly the sustained loss it exists to detect"*
+    /// (**[ruling 254]** — "2⁶×" until `PTO_BACKOFF_CAP` fell to 2³; the
+    /// conclusion survives and the factor does not). At `pto_count = 3`,
+    /// which is now the cap itself and so the **worst** case rather than a
+    /// sample from the middle of the ladder, the period becomes
+    /// `8 × 275 = 2200 ms`, the 1000 ms spread no longer clears it, and the
+    /// collapse never happens. Note
     /// this test cannot fail a build that resets `pto_count` before
     /// computing the period, because such a build computes the correct
     /// period — an assertion a conforming build cannot fail.
