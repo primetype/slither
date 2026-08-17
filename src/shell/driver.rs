@@ -961,9 +961,31 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// no-op. An assertion is the thing that pays. A spin is invisible on
     /// the wire (ruling 141) and unreachable from `FlakyWire`, which models
     /// a network and not a CPU (working rule 13), so the one function every
-    /// drain passes through is where the whole class becomes a test failure
-    /// in every debug-mode run — including for the instances nobody has
-    /// found yet.
+    /// drain passes through is where the whole class becomes a loud failure
+    /// — including for the instances nobody has found yet.
+    ///
+    /// # It is an `assert!`, not a `debug_assert!` (**[RATIFIED 2026/08/17
+    /// — ruling 249(ii)]**)
+    ///
+    /// It shipped as a `debug_assert!`, which left the class **silent in
+    /// release** — precisely where it costs: this driver is §16.3's one
+    /// `!Send` actor serving *every* connection on the endpoint, so one
+    /// connection announcing a past deadline burns 100 % of a core for all
+    /// of them, with nothing red anywhere and nothing on the wire.
+    ///
+    /// The promotion is ordered **after** ruling 249(i), and the order is
+    /// load-bearing. 249(i) gates the `Pto` announcement on §7.3's budget;
+    /// before it landed, the one known-reachable member of this class was a
+    /// budget-suppressed saturated PTO, and promoting first would have
+    /// panicked release drivers in a state the protocol itself produced.
+    /// With (i) in, that state no longer announces, and its re-arm cannot
+    /// trip this either: the budget grows only on a *receive*, so the
+    /// re-armed deadline is always announced on a pass where `last_timeout`
+    /// is `None`.
+    ///
+    /// What remains trippable is an **unknown** member of ruling 141's spin
+    /// class, and there the alternative to a clean panic is the shared
+    /// driver spinning silently forever.
     ///
     /// **`CONTRACT-7b.md` §4.2 specifies that assertion as
     /// `debug_assert!(deadline >= now)`, and that predicate is too strong.**
@@ -1025,7 +1047,10 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             .chain(endpoint)
             .inspect(|announced| {
                 if let Some(fired_at) = self.last_timeout {
-                    debug_assert!(*announced > fired_at, "{PAST_DEADLINE}");
+                    // **[ruling 249(ii)]** `assert!`, not `debug_assert!` —
+                    // a release driver spinning silently is worse than a
+                    // panic that names the connection's core.
+                    assert!(*announced > fired_at, "{PAST_DEADLINE}");
                 }
             })
             .min()
@@ -1414,6 +1439,10 @@ fn session_id_of<S: Handshake>(cell: &Rc<RefCell<ConnCell<S>>>) -> Option<hiss::
 ///
 /// A `const` so the string is written once and so a test that provokes the
 /// class can name what it expects to see.
+///
+/// **[ruling 249(ii)]** The detector is an `assert!`, so this is a *release*
+/// panic message as well as a debug one — it is what an operator sees, not
+/// only what a test matches on.
 const PAST_DEADLINE: &str = "a core announced a deadline in the past — ruling 141's spin class: `sleep_until` \
      completes at once, `handle_timeout` re-fires, and the actor spins";
 
