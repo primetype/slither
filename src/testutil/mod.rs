@@ -1222,6 +1222,18 @@ impl Pair {
     /// concurrently with the dial so the paused clock advances. Nothing is
     /// hidden — [`Peer::dhs`] still shows what each stage cost.
     ///
+    /// **[Ruling 252]** The responder side is a **loop**, not one ladder:
+    /// §6.5's obligation is *"treat `accept()` as a loop for the lifetime
+    /// of the endpoint"*, and this fixture is where working rule 13 bit —
+    /// a single-accept `establish` cannot express a lost msg2 (msg2 is
+    /// never retransmitted, §5.5; the peer re-offers a fresh `Intro`, and
+    /// only the next `accept()` closes the gap as the §16.1 replacement).
+    /// The loop climbs a full ladder per admitted `Intro` until the dial
+    /// resolves; each admitted connection replaces its predecessor
+    /// (whose handle is dropped only after `Replaced` has fired at the
+    /// admitting `accept()`, §6.4). On a loss-free wire exactly one
+    /// ladder runs and the cost pins are unchanged.
+    ///
     /// # Panics
     ///
     /// If either side fails to establish.
@@ -1234,13 +1246,40 @@ impl Pair {
                 .await
                 .expect("the dial completed")
         };
-        let accept = async {
-            let intro = self.b.endpoint.accept().await.expect("an introduction");
-            let claimed = intro.read_identity().await.expect("read_identity");
-            let proven = claimed.authenticate().await.expect("authenticate");
-            proven.accept().await.expect("accept")
+        tokio::pin!(dial);
+        let mut accepted: Option<TestConnection> = None;
+        let a_conn = 'outer: loop {
+            // One ladder is pinned across `select!` polls and recreated
+            // only after it completes: dropping a ladder mid-flight would
+            // lose the handle to a connection the driver already
+            // installed — the dial can resolve one turn before the
+            // responder's `accept()` oneshot does, since msg2 is written
+            // by the same driver turn that will resolve it.
+            let ladder = async {
+                let intro = self.b.endpoint.accept().await.expect("an introduction");
+                let claimed = intro.read_identity().await.expect("read_identity");
+                let proven = claimed.authenticate().await.expect("authenticate");
+                proven.accept().await.expect("accept")
+            };
+            tokio::pin!(ladder);
+            tokio::select! {
+                biased;
+                conn = &mut ladder => {
+                    accepted = Some(conn);
+                }
+                conn = &mut dial => {
+                    if accepted.is_none() {
+                        // The in-flight ladder is the one whose
+                        // `accept()` wrote the msg2 the dial just
+                        // confirmed — finish it rather than drop it.
+                        accepted = Some(ladder.await);
+                    }
+                    break 'outer conn;
+                }
+            }
         };
-        tokio::join!(dial, accept)
+        let b_conn = accepted.expect("unreachable: set on both break paths");
+        (a_conn, b_conn)
     }
 }
 
