@@ -21,15 +21,23 @@
 //! ruling 208 exists to close. [`an_ack_covering_everything_validates_
 //! nothing`] and its siblings are what separate those two builds.
 //!
-//! # Two conflicts found while writing this, reported and not resolved
+//! # Two conflicts found while writing this — the first is now resolved
 //!
 //! Working rule 3. Both are stated at the tests that depend on them:
 //!
 //! 1. **The rank of the path frames against the contested probe.**
-//!    `SPEC.md` §7.3:2370-2374 ranks them *below* the probe and carries an
-//!    explicit `[FLAGGED FOR RULING]` block; **ruling 212(c) ranks them
-//!    above it**. See [`a_pending_contested_probe_does_not_block_the_
-//!    challenge`].
+//!    `SPEC.md` §7.3:2370-2374 ranked them *below* the probe and carried
+//!    an explicit `[FLAGGED FOR RULING]` block; **ruling 212(c) ranked
+//!    them above it**. **[RESOLVED — ruling 215 (2026/08/16), ruling 250
+//!    (2026/08/17).]** 215 reversed 212(c): §7.3's ranks *"stand exactly
+//!    as written"*, the probe at 2 and the path frames at 3 and 4, and the
+//!    defect was the send pump's early return rather than the order. 250
+//!    then carried that into the code and resolved the interaction by
+//!    **coalescing** — the probe and the owed path frames are one packet
+//!    when the remaining room admits it. Nothing in this file is written
+//!    to 212(c) any more. See
+//!    [`a_pending_contested_probe_does_not_block_the_challenge`] and
+//!    [`the_challenge_precedes_the_probes_ping_in_the_packet_carrying_both`].
 //! 2. **Whether the challenge rides a packet that already elicits.**
 //!    `CONTRACT-7b.md` §1.4 keeps the pump's `!elicits` guard; `SPEC.md`
 //!    §8.7 owes the challenge *"whenever §7.3's budget admits a packet and
@@ -113,6 +121,22 @@ fn highest_sealed(solo: &Solo) -> u64 {
          test's setup, not the core, is wrong",
     );
     next - 1
+}
+
+/// How many more bytes §7.3's budget will admit right now, or `None` on a
+/// validated address.
+///
+/// **[R40-B, ruling 250]** Needed because the interesting states are now
+/// *bands* of remaining room — below 31 the probe parks, 31 to 39 it
+/// leaves bare, 40 and up it carries the owed path frame — and 250(iii)
+/// says the check is against the **remaining** room at pump time, never
+/// against the arming floor.
+fn room(solo: &Solo) -> u64 {
+    let (sent, recv) = solo
+        .conn
+        .amplification_budget()
+        .expect("§7.3: the address is unvalidated, so a budget is armed");
+    (constants::AMPLIFICATION_FACTOR * recv).saturating_sub(sent)
 }
 
 /// Every `PATH_CHALLENGE` value in a frame list, in order.
@@ -904,6 +928,21 @@ fn a_live_connection_still_credits_the_address_it_roams_to() {
 /// `on_ack_coverage` entirely passes every path-validation test in this
 /// file — nothing on the wire changes — and silently turns ruling 176's
 /// clear-exit off.
+///
+/// # **[R40-B, 2026/08/17]** the name outlived the state, and the test
+/// did not
+///
+/// After ruling 250 the mark below lands `Armed`, not `Pending`: the roam
+/// leaves 49 bytes of room and the coalesced probe costs 40, so it goes
+/// out at the mark. The assertion is untouched because
+/// `Contested::floor()` is `Some` for **both** live states (`mobility.rs`)
+/// and §5.1 clears on a covering ACK from either — the property under test
+/// is the ACK's *clearing* role, which spans the pair. The name and the
+/// comment inside now say `Pending` about a state this fixture reaches
+/// only on the pre-250 build; they are left as they are rather than
+/// renamed, because the property is the same one either way and a rename
+/// would cost the git history of a test whose whole point is that it must
+/// not be deleted.
 #[test]
 fn an_ack_still_clears_a_pending_contested_mark() {
     let mut solo = Solo::installed_at(origin());
@@ -948,9 +987,36 @@ fn an_ack_still_clears_a_pending_contested_mark() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Ruling 212(c) — the rank, and the pump's early return
+// The rank, and the pump's early return
 //
 // ⚠ **CONFLICT, REPORTED AND NOT RESOLVED (working rule 3).**
+//
+// ✅ **RESOLVED 2026/08/16 by ruling 215 and 2026/08/17 by ruling 250 —
+// read this paragraph before the report below it.** [R40-B] The header
+// that follows is kept as written, because a conflict that vanishes when
+// it is answered teaches nothing; but on its own it left this file saying
+// both *"unresolved"* here and *"resolved, and this test does NOT invert"*
+// forty lines down, with no link between them, and a reader stopping at
+// the header took 212(c) for live law. The resolution, in order:
+//
+//   - **Ruling 215** closed §7.3's flag. It **reversed 212(c)**: the ranks
+//     *"stand exactly as written"* — 1 CLOSE, 2 contested probe, 3
+//     `PATH_RESPONSE`, 4 `PATH_CHALLENGE` — because lifting the challenge
+//     above the probe would demote a **liveness verdict** below a frame
+//     whose delay merely prolongs a cap. The defect is *"the send pump's
+//     early return"*, not the order, and *"the send pump may emit the
+//     probe and continue building on the same pass"*.
+//   - **Ruling 250** carried that into the code, which had gone on
+//     implementing 212(c)'s pre-pass for two slices — 215's own defect,
+//     *"closing a flag is not sweeping the spec"*, happening to 215 — and
+//     resolved the rank-2/rank-4 interaction by **coalescing**: one packet
+//     carrying the PING and the owed path frames when the remaining room
+//     at pump time admits it (40 B with one owed, 49 B with both), the
+//     bare 31 B PING otherwise.
+//
+// So the two tests below are written to **§7.3 as ratified plus ruling
+// 250**, not to 212(c). The prose under this line is the state of the
+// question in slice 7b, preserved.
 //
 // `SPEC.md` at this file's base commit `c131904` — the ruling-212 sweep
 // itself — ranks the path frames **below** the contested probe, in three
@@ -981,26 +1047,54 @@ fn an_ack_still_clears_a_pending_contested_mark() {
 //
 // The two tests are deliberately split by how much they depend on it:
 // [`a_pending_contested_probe_does_not_block_the_challenge`] asserts only
-// what **both** readings agree on, and [`the_challenge_outranks_the_
-// contested_probe`] asserts the disputed rank alone.
+// what **both** readings agree on, and the second asserts the disputed
+// rank alone.
+//
+// ── [R40-B, 2026/08/17] where that left the two tests ──────────────────
+//
+// The split held up, and the resolution did not invert either of them; it
+// **merged** them. Ruling 250 makes "the probe does not block the
+// challenge" and "the challenge precedes the PING" the same fact, because
+// there is one packet to be in. So both tests now assert over the packet
+// that carries the PING, and both are red on the pre-250 build for the
+// same reason: that packet is `[Ping]` and the path frames left in a
+// datagram of their own, above it.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// A pending contested probe must not prevent the challenge being built.
+/// A pending contested probe must not prevent the challenge being built —
+/// and after ruling 250 it **cannot**, because they are one packet.
 ///
-/// **Both readings of the conflict above agree on this**, which is why it
-/// is a separate test from the rank. §7.3's own flag block does the
-/// arithmetic: *"probe and challenge together cost 14 B of header + 1 B of
-/// PING + 9 B of challenge + a 16 B tag = **40 B**, inside the 90 B floor
-/// computed above"* — so rank 2 outranking rank 4 *"does not mean rank 4 is
-/// never built, only that it yields when the budget cannot hold both, and
-/// here the budget can."* Ruling 212(c) reaches the same operational
-/// conclusion from above.
+/// §7.3's own flag block did the arithmetic: *"probe and challenge
+/// together cost 14 B of header + 1 B of PING + 9 B of challenge + a 16 B
+/// tag = **40 B**"* — one header, one tag, one packet — so rank 2
+/// outranking rank 4 *"does not mean rank 4 is never built, only that it
+/// yields when the budget cannot hold both, and here the budget can."*
+/// Ruling 215 kept the ranks and blamed the pump's early return; ruling
+/// 250 made the *"can"* operational by coalescing, checked against the
+/// **remaining** room at pump time.
 ///
-/// **The degenerate build this catches is the one that exists today**: the
-/// pump returns early on a pending mark, so nothing ranked below it is
-/// built on that pass, and an address that is simultaneously unvalidated
-/// and holding a pending probe never emits its challenge — *"the two states
-/// co-occur by construction rather than by coincidence"*.
+/// # The state, built to the byte
+///
+/// The mark has to be genuinely `Pending`, and after ruling 250 that means
+/// room below **31**, not below 40 — a budget in the 31..40 band emits the
+/// bare PING and leaves the mark `Armed`. So the room the roam credits is
+/// spent down with stream bytes first, and the precondition is asserted
+/// rather than assumed. (Measured at `96f7ef0`: the roam leaves
+/// `budget = (44, 31)`, i.e. 49 bytes of room — enough for the coalesced
+/// probe, so without the spend-down this test's own precondition would
+/// fail against a correct build. The pre-250 build reaches `Pending` there
+/// only because its pre-pass has just spent 39 of the 49 on a dedicated
+/// challenge datagram, which is the defect.)
+///
+/// # What the broken build does (working rule 9)
+///
+/// The build shipped at this file's base returns early on a pending mark,
+/// so nothing ranked below it is built on that pass; its pre-pass then
+/// emits the challenge in a **dedicated** datagram *above* the probe. The
+/// packet carrying the PING is therefore `[Ping]`, and the assertion below
+/// names that. The two states co-occur by construction rather than by
+/// coincidence: §6.8's attacker roams the session to a fresh source *and*
+/// is the reason the mark was taken.
 #[test]
 fn a_pending_contested_probe_does_not_block_the_challenge() {
     let mut solo = Solo::installed_at(origin());
@@ -1011,6 +1105,20 @@ fn a_pending_contested_probe_does_not_block_the_challenge() {
     let issued = roam_and_collect(&mut solo, now, c_addr());
     assert_eq!(issued.len(), 1, "the arming's challenge");
 
+    // Spend the roam's credit down, so that the budget refuses even the
+    // bare 31-byte probe and the mark is `Pending` under **any** reading of
+    // §7.3's rank.
+    let now = now + Duration::from_millis(10);
+    let r = solo.conn.open(Dir::Uni).expect("a uni stream");
+    let _ = write_all(&mut solo.conn, now, r, &[0x5u8; 512]);
+    let _ = drain(&mut solo.conn);
+    assert!(
+        room(&solo) < 31,
+        "premise: §7.3 refuses even a bare PING, so the mark must park \
+         (room {})",
+        room(&solo),
+    );
+
     let now = now + Duration::from_millis(10);
     solo.conn.mark_contested(now);
     assert!(
@@ -1018,48 +1126,73 @@ fn a_pending_contested_probe_does_not_block_the_challenge() {
         "precondition: the mark is pending, not yet transmitted",
     );
 
-    // Drive one pump with the probe still pending.
+    // Drive one pump with the probe still pending. The peer's PING is
+    // 31 bytes and credits three times that, which admits the coalesced
+    // 40-byte probe with room to spare.
     let now = now + Duration::from_millis(10);
     let d = solo.deliver_from(now, c_addr(), &ping_frame());
-    let frames = solo.drain_frames(&d);
+    let packets = solo.packets(&d);
 
+    let probes: Vec<&Vec<Wire>> = packets
+        .iter()
+        .filter(|p| p.iter().any(|f| matches!(f, Wire::Ping)))
+        .collect();
+    assert_eq!(
+        probes.len(),
+        1,
+        "premise: the pending probe leaves here, exactly once. Packets: \
+         {packets:?}",
+    );
     assert!(
-        !challenges(&frames).is_empty(),
-        "**ruling 212(c)**: the pump's early return on a pending probe \"may \
-         not block the one frame that ends the state it is protecting\". \
-         Frames seen: {frames:?}",
+        probes[0]
+            .iter()
+            .any(|f| matches!(f, Wire::PathChallenge(v) if *v == issued[0])),
+        "**rulings 215 and 250**: the pump's early return *\"may not block \
+         the one frame that ends the state it is protecting\"*, and the \
+         resolution is that the probe **carries** it — same eight bytes, \
+         one packet, one header, one tag. On the pre-250 build this packet \
+         is `[Ping]` and the challenge left in a datagram above it. \
+         Packets: {packets:?}",
     );
 }
 
-/// The disputed half, on its own: the challenge is **packed first**.
+/// The other half, on its own: inside the packet that carries both, the
+/// challenge is **packed first**.
 ///
-/// Ruling 212(c)'s argument — *"everything else in the order competes for
-/// the budget; the challenge dissolves it. Ranking the output that removes
-/// the constraint above the outputs that consume it is not a preference, it
-/// is the only ordering that terminates."*
-///
-/// §8.5 says the same one layer down, and §8.5 **is** swept for 208:
+/// §8.5 is the section that rules on this, and §8.5 **is** swept for 208:
 /// *"`PATH_RESPONSE` and `PATH_CHALLENGE` **first among the control
-/// frames**"* — which is `CONTRACT-7b.md` §1.8's `Stage::Control`, ahead of
-/// `Stage::Fill`. So the packing-order half of this is unambiguous even
-/// though the §7.3 rank is not, and that is what this test asserts: the
-/// challenge precedes the probe's PING in the packet.
+/// frames**"* — `CONTRACT-7b.md` §1.8's `Stage::Control`, ahead of
+/// `Stage::Fill` — while PING is *"last among length-prefixed frames"*.
+/// §8.5 and §7.3 answer different questions and §8.5 says so in terms:
+/// §7.3's rank decides *what is built when the budget cannot hold
+/// everything*; §8.5 decides *where bytes go inside a packet that is being
+/// built*.
 ///
-/// **[Integrator, ruling 215 — resolved, and this test does NOT invert.]**
-/// The author flagged this as the line to flip if the rank went the other
-/// way, and it did: ruling 212(c) lifted the challenge above the probe and
-/// **ruling 215 reversed that**, restoring §7.3's ranks as written.
+/// # **[R40-B, 2026/08/17] the rename, and why the assertion gains force**
 ///
-/// The test still stands, because the author's own reasoning above is
-/// sharper than its hedge: the two are **different questions**, and
-/// `SPEC.md` §8.5 says so. §7.3's rank decides *what is built when the
-/// budget cannot hold everything*; §8.5 decides *where bytes go inside a
-/// packet that is being built*. Ruling 215 moved only the first. Under it
-/// the probe outranks the challenge for admission **and** the challenge
-/// still precedes the PING in the bytes — no contradiction, because a
-/// budget that admits either admits both (40 B against a 90 B floor).
+/// This test was called `the_challenge_outranks_the_contested_probe`,
+/// which states **ruling 212(c)'s reversed rank** — the rank ruling 215
+/// reversed and ruling 250 never restored. A name is prose (working rule
+/// 4), and this one contradicted the body: the body has always asserted
+/// §8.5's intra-packet precedence, which is not a rank at all. The name
+/// now says what the body pins.
+///
+/// The body gains force in the same move. It used to guard its assertion
+/// with `if let Some(ping_at)`, because under the pre-250 pre-pass the
+/// challenge and the PING were in **different packets** and the guard was
+/// vacuously satisfied — a bound the degenerate build met for free
+/// (working rule 9). Ruling 250 puts them in one packet by construction,
+/// so the PING's presence is now part of the claim and the `expect` below
+/// is the pin.
+///
+/// # What the broken build does (working rule 9)
+///
+/// The pre-250 build emits `[…, PathChallenge]` and then `[Ping]`: the
+/// packet carrying the PING has no challenge to be ahead of, and the
+/// `expect` fails naming it. A build that coalesces but packs PING first
+/// fails the ordering assertion instead.
 #[test]
-fn the_challenge_outranks_the_contested_probe() {
+fn the_challenge_precedes_the_probes_ping_in_the_packet_carrying_both() {
     let mut solo = Solo::installed_at(origin());
 
     let now = origin() + Duration::from_millis(10);
@@ -1076,23 +1209,32 @@ fn the_challenge_outranks_the_contested_probe() {
     let packets = solo.packets(&d);
     let carrying = packets
         .iter()
-        .find(|p| p.iter().any(|f| matches!(f, Wire::PathChallenge(_))))
-        .expect("some packet carries the challenge");
+        .find(|p| p.iter().any(|f| matches!(f, Wire::Ping)))
+        .expect("some packet carries the probe's PING");
 
+    let ping_at = carrying
+        .iter()
+        .position(|f| matches!(f, Wire::Ping))
+        .expect("just found it");
     let challenge_at = carrying
         .iter()
         .position(|f| matches!(f, Wire::PathChallenge(_)))
-        .expect("just found it");
+        .unwrap_or_else(|| {
+            panic!(
+                "ruling 250: the probe coalesces the owed `PATH_CHALLENGE`, \
+                 so the packet carrying the PING carries it too. The \
+                 pre-250 pre-pass sent it in a datagram of its own and this \
+                 packet is `[Ping]`. Packets: {packets:?}"
+            )
+        });
 
-    if let Some(ping_at) = carrying.iter().position(|f| matches!(f, Wire::Ping)) {
-        assert!(
-            challenge_at < ping_at,
-            "§8.5 (ruling 208, packing order — *not* §7.3's admission rank, \
-             which ruling 215 leaves with the probe above the challenge): \
-             the path frames are first among the control frames, ahead of \
-             the probe's PING. Packet: {carrying:?}",
-        );
-    }
+    assert!(
+        challenge_at < ping_at,
+        "§8.5 (ruling 208, packing order — *not* §7.3's admission rank, \
+         which rulings 215 and 250 leave with the probe above the \
+         challenge): the path frames are first among the control frames, \
+         ahead of the probe's PING. Packet: {carrying:?}",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
