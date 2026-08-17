@@ -1717,3 +1717,416 @@ async fn s28_connection_acked_terminates_while_a_bulk_stream_is_still_being_writ
     })
     .await;
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// E5a / E5b — Appendix B's ladder and survival obligations (ruling 254)
+// ══════════════════════════════════════════════════════════════════════
+//
+// > **The backoff ladder and the survival envelope** (§13.3, ruling 254):
+// > probe intervals under a black-holed path are **not all equal** and are
+// > **capped at 8 ×** the base PTO with the capped rung reached — both
+// > sides, so an always-at-base build and an uncapped build each fail; and
+// > at 50 % random loss a bounded transfer completes inside `DEAD_TIMEOUT`
+// > in ≥ 30 % of runs (the audit's E5a/E5b, discharged by the story
+// > suite).
+//
+// Written by round 40's blind test author from that obligation, §13.3 as
+// amended and rulings 249/254 — never from the implementation.
+//
+// **Why the departures are read off `blackholed` and not off the tap.**
+// A blackholed send is counted by `Network::sends()` and is *absent* from
+// the tap, so the difference is a **counter-proved** loss (this file's own
+// doctrine, §"working rule 9" in the header). It has a second virtue here:
+// under `block_path(a, b)` it counts **A's** datagrams only, so B's ACKs
+// and keepalives cannot be mistaken for probes. The tap cannot do that —
+// a blackholed datagram never reaches it, so `sent_from` sees nothing at
+// all on the blocked path.
+
+/// Sampling granularity for [`e5a_the_probe_ladder_backs_off_and_holds_at_eight_times_the_base`].
+///
+/// Every rung is measured to ±`LADDER_STEP`, and the base is one of the
+/// measurements, so the ratio of an 8 × rung to the base carries at most
+/// ~12 % of error — against a factor of two between adjacent rungs. The
+/// assertions round to the nearest integer multiplier, which is sound with
+/// that much margin and would not be at a coarser step.
+const LADDER_STEP: Duration = Duration::from_millis(2);
+
+/// How long the ladder is sampled for.
+///
+/// Long enough for **six rungs on either ladder**, which is what makes the
+/// red land on the assertion rather than on the sample size: six rungs of
+/// the ratified ladder (`1+2+4+8+8+8 = 31 ×` a ~77 ms base) take ≈ 2.4 s,
+/// six of the pre-254 one (`1+2+4+8+16+32 = 63 ×`) take ≈ 4.9 s. Six
+/// seconds covers both and is deliberately far inside `DEAD_TIMEOUT`, so
+/// nothing here observes a corpse.
+const LADDER_WINDOW: Duration = Duration::from_secs(6);
+
+/// Slack on the 8 × ceiling, for the sampling error alone.
+///
+/// A mark lands on the first step boundary at or after the true
+/// departure, so each rung carries up to ±`LADDER_STEP` and the base —
+/// itself a rung — carries the same. Comparing an 8 × rung against
+/// `8 × base` therefore accumulates up to `9 × LADDER_STEP` of error;
+/// twelve steps is that with margin, and it is 4 % of the 8 × → 16 × gap
+/// the assertion has to separate.
+const RUNG_TOLERANCE: Duration = Duration::from_millis(24);
+
+/// The multipliers §13.3 says the announced probe cadence walks:
+/// `2^pto_count` capped at `PTO_BACKOFF_CAP` = 2³.
+///
+/// Written out rather than derived from the constant. A test that imports
+/// `PTO_BACKOFF_CAP` and computes its expectation from it agrees with
+/// whatever the crate says and asserts nothing about the number;
+/// `tests/spec_constants.rs` pins the constant itself from outside.
+const LADDER: [u32; 6] = [1, 2, 4, 8, 8, 8];
+
+/// **E5a — the ladder shape, from the wire.**
+///
+/// One direction is black-holed and the departure instants of A's
+/// datagrams are sampled in virtual time. The first departure is the
+/// stream data; every one after it is a §13.3 probe, because nothing else
+/// A owes can fire inside the window (its passive keepalive is 10 s out,
+/// and B's traffic is on the unblocked direction and never counted here).
+///
+/// # BROKEN BUILD — both sides, because one side asserts nothing
+///
+/// * **A build that never backs off** announces the same interval for
+///   ever: `[1,1,1,1,1,1]`. Caught by the multiplier vector and, stated
+///   separately, by the *not all equal* assertion. This is the half a
+///   "no interval exceeds 8 ×" bound satisfies for free — working rule 9.
+/// * **A build with the pre-254 cap, or with no cap at all**, doubles past
+///   the ceiling: `[1,2,4,8,16,…]`. Caught by the multiplier vector and by
+///   the *no rung exceeds 8 × base* assertion.
+/// * **A build that caps too early** — say at 4 × — gives `[1,2,4,4,4,4]`
+///   and fails the vector at rung 3. The vector is asserted whole for this
+///   reason: a pair of inequalities admits every ladder between them.
+/// * **A build with no loss at all** — the working-rule-9 failure this
+///   file exists to avoid. Caught by the `blackholed` counter, which must
+///   have grown once per sampled rung: if the datagrams reached the fabric
+///   there was nothing to probe about.
+///
+/// The base is **measured, not assumed**: it is the first rung. §13.3's
+/// `PTO = srtt + max(4·rttvar, K_GRANULARITY) + MAX_ACK_DELAY` is pinned
+/// by exact equality in the core's own tests, and re-deriving it here
+/// would make this test fail for that arithmetic rather than for the shape
+/// it is about. What is asserted is the sequence of **ratios**, which is
+/// the whole of §13.3's `2^pto_count`-capped-at-`PTO_BACKOFF_CAP`.
+///
+/// The RTT is warmed first, with `Connection::acked()`, for the reason
+/// ruling 249 gives when it describes the same construction: a cold
+/// estimator puts the base at `K_INITIAL_RTT`-derived ~1 024 ms and the
+/// later rungs of *either* ladder outside any window that stays inside
+/// `DEAD_TIMEOUT`. It buys a second thing, and the assertion below names
+/// it: awaiting an acknowledgement advances virtual time through a full
+/// round trip, which **quiesces §7.3's path validation** before the window
+/// opens — ruling 223's confound, where B's standing `PATH_CHALLENGE`
+/// makes A emit a `PATH_RESPONSE` that this counter would read as a probe.
+#[tokio::test(start_paused = true)]
+async fn e5a_the_probe_ladder_backs_off_and_holds_at_eight_times_the_base() {
+    local(async {
+        let pair = Pair::seeded(0xE5A0_4001);
+        let (ca, cb) = pair.establish().await;
+
+        // A modest, jitter-free one-way delay: the RTT sample below is then
+        // a known quantity and the rung boundaries do not smear across the
+        // sampling step.
+        let delay = FlakyPolicy::perfect().with_delay(Duration::from_millis(10), Duration::ZERO);
+        pair.a.wire.set_policy(delay.clone());
+        pair.b.wire.set_policy(delay);
+
+        // ── warm the estimator ──────────────────────────────────────────
+        let mut send = within(ca.open_uni(), "open_uni").await.expect("open_uni");
+        write_all(&mut send, &payload(1024), "warm write").await;
+        let mut recv = within(cb.accept_uni(), "accept_uni")
+            .await
+            .expect("accept_uni");
+        assert_eq!(
+            within(ca.acked(), "warm acked").await,
+            Ok(()),
+            "fixture: the warm-up must be acknowledged, or §13.1 has no \
+             sample and the ladder below is drawn on `K_INITIAL_RTT`"
+        );
+        let mut buf = vec![0u8; 4096];
+        let _ = within(recv.read(&mut buf), "warm read").await;
+        settle().await;
+
+        // ── black-hole A → B and put one packet in flight ───────────────
+        let before = blackholed(&pair);
+        pair.net.block_path(pair.a.addr(), pair.b.addr());
+        write_all(&mut send, &payload(1024), "blackholed write").await;
+        // The driver must run *inside* the blackhole window, or the sealed
+        // datagram leaves after the block and there is nothing to probe for.
+        settle().await;
+        assert!(
+            blackholed(&pair) > before,
+            "the blackhole destroyed nothing: `Network::sends()` and the tap \
+             moved together, so the write reached the fabric and no probe \
+             train can start"
+        );
+
+        // ── sample every departure in virtual time ──────────────────────
+        let start = tokio::time::Instant::now();
+        let mut marks: Vec<Duration> = Vec::new();
+        let mut last = blackholed(&pair);
+        while tokio::time::Instant::now() - start < LADDER_WINDOW {
+            tokio::time::advance(LADDER_STEP).await;
+            settle().await;
+            let n = blackholed(&pair);
+            if n > last {
+                marks.push(tokio::time::Instant::now() - start);
+                last = n;
+            }
+        }
+
+        // Rungs: the gap from the anchoring send to the first probe, then
+        // probe to probe. `start` is the anchor — the write above settled
+        // at it.
+        let mut rungs: Vec<Duration> = Vec::new();
+        let mut prev = Duration::ZERO;
+        for m in &marks {
+            rungs.push(*m - prev);
+            prev = *m;
+        }
+
+        assert!(
+            rungs.len() >= LADDER.len(),
+            "fixture: only {} rung(s) were sampled in {LADDER_WINDOW:?} — \
+             {rungs:?}. Fewer than {} cannot separate a capped ladder from \
+             an uncapped one",
+            rungs.len(),
+            LADDER.len()
+        );
+        let base = rungs[0];
+        assert!(
+            rungs.iter().all(|r| *r > Duration::ZERO),
+            "**ruling 223's confound.** Two departures on one instant read \
+             out as a 0 ns rung, and the usual cause is §7.3's path \
+             validation leaking into the window: B's standing \
+             `PATH_CHALLENGE` (ruling 208) obliges A to emit a \
+             `PATH_RESPONSE`, which this counter cannot tell from a probe. \
+             The warm-up above quiesces that exchange by advancing virtual \
+             time through a full acknowledged round trip — the same repair \
+             `s12_the_probe_train_backs_off_…` makes explicitly. If this \
+             fires, something A owes that is not a probe is being counted \
+             as one. Rungs {rungs:?}"
+        );
+
+        // Round each rung to the nearest multiple of the base. With a
+        // factor of two between adjacent rungs and ~12 % of measurement
+        // error at the 8 × rung, the rounding is unambiguous.
+        let multipliers: Vec<u32> = rungs
+            .iter()
+            .map(|r| {
+                u32::try_from((r.as_nanos() * 2 + base.as_nanos()) / (base.as_nanos() * 2))
+                    .expect("a multiplier fits in u32")
+            })
+            .collect();
+
+        assert_eq!(
+            multipliers[..LADDER.len()],
+            LADDER,
+            "§13.3: the probe interval is `2^pto_count` capped at \
+             `PTO_BACKOFF_CAP` = 2³. Base {base:?}, rungs {rungs:?}"
+        );
+
+        // The two halves stated on their own, because the vector above is
+        // one assertion and Appendix B asks for both sides by name.
+        assert!(
+            rungs[..LADDER.len()].iter().any(|r| *r != base),
+            "§13.3: *not all equal* — a build that never backs off announces \
+             the base interval for ever and probes a dead path ~13 times a \
+             second. Rungs {rungs:?}"
+        );
+        let ceiling = base * 8 + RUNG_TOLERANCE;
+        assert!(
+            rungs.iter().all(|r| *r <= ceiling),
+            "§13.3's envelope: *the probe cadence never thins beyond 8 × \
+             PTO*. Base {base:?}, ceiling {ceiling:?}, rungs {rungs:?} — at \
+             the inherited 2⁶ the later rungs could not fire inside 25 s at \
+             any warm RTT, which is what ruling 254 measured"
+        );
+        assert_eq!(
+            (multipliers[LADDER.len() - 1], multipliers[LADDER.len() - 2]),
+            (8, 8),
+            "the capped rung is **reached and held**: a ladder still \
+             climbing at the end of the window has not shown its ceiling, \
+             and a ladder that never left the base has no ceiling to show. \
+             Rungs {rungs:?}"
+        );
+
+        // Working rule 9's other half for this file: the loss is *shown*.
+        assert!(
+            blackholed(&pair) >= before + 1 + marks.len(),
+            "every rung above must correspond to a datagram the fabric \
+             destroyed; the counter says otherwise"
+        );
+    })
+    .await;
+}
+
+/// How many independent runs [`e5b_a_transfer_at_fifty_per_cent_loss_completes_in_most_runs`]
+/// makes, and the floor it holds them to.
+///
+/// Twenty runs, six completions. §13.3's obligation is *"≥ 30 % of runs"*,
+/// and 6/20 is the smallest integer count that clears it. Twenty is chosen
+/// to make the bound *meaningful in both directions*: ruling 254 measured
+/// **8/8** completions at the ratified cap, so a conforming build clears
+/// six with an enormous margin and this test is not a coin flip; while the
+/// pre-254 build it measured *timed out* at this loss rate, and would have
+/// to get six of twenty seeds unusually right to survive. Each run is a
+/// few seconds of **virtual** time on a paused clock.
+const E5B_RUNS: usize = 20;
+const E5B_FLOOR: usize = 6;
+
+/// The transfer each E5b run makes: bounded, and sized so that its
+/// completion is about **loss recovery** rather than about bandwidth.
+///
+/// 32 KiB is ~28 datagrams and is far below `INITIAL_MAX_STREAM_DATA`, so
+/// nothing here stalls on credit — S17 owns flow control and a test that
+/// mixed them could not say which failed.
+///
+/// The size is calibrated, not picked: measured on the pre-254 build at
+/// this loss rate and delay, 16 KiB completes 13/20 (a floor of 30 % it
+/// passes, so it pins nothing) and 64 KiB completes 0/20 but with the
+/// failing runs having delivered a *median 38 %* of their bytes — bytes,
+/// not stalls, are the binding constraint there, and a bound no build can
+/// clear is as empty as one every build clears. At 32 KiB the pre-254
+/// build completes **3/20** with the failing runs at a median 45 % and a
+/// long tail at 77–95 %: the runs are stalled, not starved, which is the
+/// regime §13.3's envelope is a statement about.
+const E5B_LEN: usize = 32 * 1024;
+
+/// One-way path delay for E5b: 100 ms RTT, so §13.3's base PTO is ≈ 325 ms.
+///
+/// This is the quantity that makes the cap operational rather than an
+/// overflow guard, and it is why the constant's magnitude is a *tuning*
+/// decision (ruling 254 corrects §13.3's *"the cap is an overflow guard,
+/// not a death sentence"* for exactly this reason). At 2⁶ the ladder
+/// spends its last three rungs at 5.2 s, 10.4 s and 20.8 s — 36 s of
+/// waiting inside a 25 s death window, so one deep stall ends the
+/// transfer. At 2³ the same three rungs are 2.6 s each.
+const E5B_ONE_WAY: Duration = Duration::from_millis(50);
+
+/// One E5b run. Returns whether the transfer completed, **byte-exact,
+/// inside `DEAD_TIMEOUT`**, and how many bytes reached the reader — and
+/// never panics on failure, because failing is a legitimate outcome that
+/// the caller counts, and the byte count is what says *why* it failed.
+async fn transfer_at_half_loss(seed: u64) -> (bool, usize) {
+    let pair = Pair::seeded(seed);
+    let (ca, cb) = pair.establish().await;
+
+    // The loss is installed **after** establishment on purpose: a handshake
+    // that has to survive 50 % loss is slice 2's story, and folding it in
+    // would make an E5b red ambiguous between two slices.
+    let policy = FlakyPolicy::lossy(0.5).with_delay(E5B_ONE_WAY, Duration::ZERO);
+    pair.a.wire.set_policy(policy.clone());
+    pair.b.wire.set_policy(policy);
+
+    let want = payload(E5B_LEN);
+    let Ok(Ok(mut send)) = tokio::time::timeout(DEAD_TIMEOUT, ca.open_uni()).await else {
+        return (false, 0);
+    };
+
+    // The reader's running total, so a failed run can say whether it was
+    // *stalled* or *starved* — the difference between the regime §13.3's
+    // envelope is about and a bound no cap could clear.
+    let delivered = Rc::new(Cell::new(0usize));
+    let counter = Rc::clone(&delivered);
+
+    let writer = async {
+        let mut done = 0usize;
+        while done < want.len() {
+            match send.write(&want[done..]).await {
+                Ok(n) => done += n,
+                Err(_) => return false,
+            }
+        }
+        send.finish().await.is_ok()
+    };
+    let reader = async {
+        let mut recv = cb.accept_uni().await.ok()?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    out.extend_from_slice(&buf[..n]);
+                    counter.set(out.len());
+                }
+                Ok(None) => return Some(out),
+                Err(_) => return None,
+            }
+        }
+    };
+
+    let done =
+        match tokio::time::timeout(DEAD_TIMEOUT, async { tokio::join!(writer, reader) }).await {
+            Ok((true, Some(got))) => got == want,
+            _ => false,
+        };
+    (done, delivered.get())
+}
+
+/// **E5b — the survival envelope.**
+///
+/// > under sustained random loss the probe cadence never thins beyond
+/// > 8 × PTO, so completion degrades gracefully toward the `DEAD_TIMEOUT`
+/// > verdict rather than cliffing — an Appendix B obligation pins … a
+/// > ≥ 30 % completion floor at 50 % loss.
+///
+/// Twenty seeded runs at 50 % loss in **both** directions; at least six
+/// must deliver all 16 KiB byte-exact inside `DEAD_TIMEOUT`.
+///
+/// # BROKEN BUILD
+///
+/// * **The pre-254 cap (2⁶).** This is the measurement that produced
+///   ruling 254: *"at ≥ 50 % sustained loss the sender reaps `TimedOut` at
+///   ~33 s — the 64 × cap walks the probe interval past `DEAD_TIMEOUT`'s
+///   useful window, so the train stops probing at a survivable cadence
+///   exactly when survival is the question."* The ladder walks out of the
+///   window rather than out of the connection: by the sixth rung the
+///   sender is waiting tens of seconds between probes on a path whose
+///   death clock is 25 s, so most runs die with the transfer unfinished
+///   and the count falls far below six.
+/// * **A build with no backoff at all** passes this floor and fails E5a —
+///   which is why the two obligations are separate tests and neither is
+///   sufficient alone.
+/// * **A build that reports success without delivering the bytes.** Each
+///   run compares the payload, which is offset-derived, so a truncated or
+///   misassembled transfer counts as a failure rather than as a pass.
+///
+/// The count is asserted, not merely `> 0`: *some* run completing is true
+/// of almost any build, and a floor is the only shape that separates
+/// graceful degradation from a cliff.
+#[tokio::test(start_paused = true)]
+async fn e5b_a_transfer_at_fifty_per_cent_loss_completes_in_most_runs() {
+    local(async {
+        let mut completed = 0usize;
+        let mut outcomes: Vec<String> = Vec::with_capacity(E5B_RUNS);
+        for i in 0..E5B_RUNS {
+            let (ok, got) = transfer_at_half_loss(0xE5B0_0000 + i as u64).await;
+            completed += usize::from(ok);
+            outcomes.push(if ok {
+                "ok".to_owned()
+            } else {
+                format!("{}%", got * 100 / E5B_LEN)
+            });
+        }
+        assert!(
+            completed >= E5B_FLOOR,
+            "§13.3's survival envelope: {completed} of {E5B_RUNS} bounded \
+             transfers completed inside `DEAD_TIMEOUT` at 50 % loss, and the \
+             Appendix B floor is {E5B_FLOOR} (≥ 30 %). Per-run outcome — \
+             `ok`, or the share of the payload that had reached the reader \
+             when the window closed: {outcomes:?}. Ruling 254 measured this \
+             exact shape: the 2⁶ cap *walks the probe interval past \
+             `DEAD_TIMEOUT`'s useful window, so the train stops probing at a \
+             survivable cadence exactly when survival is the question*. A row \
+             of high percentages is that failure — transfers stalled a few \
+             packets from the end, waiting out a 10 s or 20 s rung. A row of \
+             low ones would mean something else entirely and this bound \
+             would be the wrong instrument."
+        );
+    })
+    .await;
+}
