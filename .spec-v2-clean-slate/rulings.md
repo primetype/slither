@@ -7431,8 +7431,16 @@ separate constant test pins the value — independently, which is the
 stronger arrangement"* — stands; the sweep found it half-built: `with_epoch_size`
 (`config.rs:183`) is exercised by exactly one setter unit test, and no
 test anywhere configures a small epoch and crosses a boundary **[S-98]**.
-251 builds the missing half. The separating assertion is the **e−2
-straggler refusal**: a build that never rekeys opens it happily, where
+251 builds the missing half. **[Corrected at slice R40-C, 2026/08/17.]**
+The sweep's sentence carried here — "no test anywhere configures a small
+epoch and crosses a boundary" — named a wider absence than exists: the
+slice-3a core tests (`tests.rs`'s `mod ratchet`) cross boundaries at
+epochs 4 and 8, building sessions by hand with an explicit `NonZeroU64`.
+They bypass `Config`/`with_epoch_size`/the endpoint entirely, which is
+exactly why the never-rekey mutation leaves them green — the substance
+of the finding stands; its scope is the config-to-endpoint path. Found
+by the slice's author under rule 11. The separating assertion is the
+**e−2 straggler refusal**: a build that never rekeys opens it happily, where
 boundary-invisibility alone is rule 9's trap twice over — satisfied for
 free by the build in which nothing happens, and green in any both-sides
 round-trip under a consistent schedule mutation.

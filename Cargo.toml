@@ -173,6 +173,14 @@ tokio-util = { version = "0.7", default-features = false, features = ["codec"], 
 tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
+# NOT a new crate — `cryptoxide` is already a dependency above (mac1's keyed
+# BLAKE2b). This dev-only entry makes `chacha`/`poly1305` an explicit
+# requirement for `tests/spec_rekey.rs`'s `REKEY(0³²)` vector pin (ruling
+# 251): today those features reach the build only by unification from hiss's
+# own list, and a hiss feature change would otherwise break the pin with a
+# "configured out" error that reads like a version problem.
+cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = ["chacha", "poly1305"] }
+
 # NOT a new crate — `tokio` is already a dependency above. This dev-only entry adds
 # `test-util` (the PAUSED CLOCK the timer tests drive: every timer in SPEC.md
 # resolves in virtual time), plus `rt`/`macros` for `#[tokio::test]`.
@@ -274,6 +282,16 @@ required-features = ["test-util"]
 # gate can run at all (working rule 15).
 [[test]]
 name = "story_path"
+required-features = ["test-util"]
+
+# Slice R40-C (ruling 251's rekey obligations). Integrator-owned (working
+# rule 15), same reasoning as every stanza above.
+[[test]]
+name = "spec_rekey"
+required-features = ["test-util"]
+
+[[test]]
+name = "story_rekey"
 required-features = ["test-util"]
 
 # Slice 8 (`compat/`). Integrator-owned (working rule 15): each names a file
