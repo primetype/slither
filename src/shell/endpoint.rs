@@ -65,6 +65,34 @@ impl<I: Identity> Endpoint<I> {
     /// nothing more. The ladder starts at
     /// [`Intro::read_identity`](super::staged::Intro::read_identity).
     ///
+    /// # Keep calling it — documentation obligation #6
+    ///
+    /// **This is a loop for the lifetime of the endpoint, not one call per
+    /// connection.** §6.5: *"Every application SHOULD treat `accept()` as a
+    /// loop for the lifetime of its endpoint — diallers and responders
+    /// alike."* Two conditions are visible only as a later [`Intro`], and
+    /// nothing else repairs them.
+    ///
+    /// A **lost msg2**. msg2 is never retransmitted — every retransmit is a
+    /// completely fresh initiation (§5.5) — so one dropped msg2 leaves this
+    /// endpoint holding a live, never-confirmed connection while the peer
+    /// re-offers a fresh introduction every `RETRANSMIT_BASE` (~5 s) until
+    /// `HANDSHAKE_GIVEUP` (90 s). **No error announces it**: this call
+    /// *succeeded*, and the connection it produced simply never carries
+    /// anything. A **restarted peer** (§6.8) is the same shape against a
+    /// zombie connection that keeps running untouched.
+    ///
+    /// Admitting the fresh introduction **is** the replacement (§5.4),
+    /// under §6.4's §16.1 guard. Against a connection this endpoint
+    /// **accepted** — replacement basis `Some(t)`, the new initiation's
+    /// timestamp strictly greater — the old connection's handle sees
+    /// [`ConnectionLost::Replaced`](crate::error::ConnectionLost::Replaced)
+    /// and the new chain completes. Against one it **dialled** the basis is
+    /// `None`, so no initiation can replace it:
+    /// [`AcceptError::Stale`](crate::error::AcceptError::Stale) comes back
+    /// and the live connection is untouched. Documentation obligation #6 in
+    /// the [crate docs](crate) states both halves.
+    ///
     /// # Cancel-safety
     ///
     /// Dropping the future before it resolves takes nothing: the
