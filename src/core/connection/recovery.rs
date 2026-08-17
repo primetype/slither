@@ -359,11 +359,24 @@ impl Recovery {
     /// exponent whose multiplier is `PTO_BACKOFF_CAP`, and returns nothing:
     /// the **caller** builds the probe from §13.4's rule.
     ///
-    /// **[ruling 139(a)]** The increment is at the *firing*, before the
-    /// probe is built — RFC 9002's point, and the one that stays right in
+    /// **[ruling 139(a), re-founded 2026/08/17 by ruling 249]** The
+    /// increment is at the *firing*, before the probe is built. The
+    /// conclusion is 139(a)'s and is unchanged; its **footing** is now RFC
+    /// 9002's ordering point **alone**.
+    ///
+    /// 139(a) also argued that the firing-time increment *"stays right in
     /// slice 7, where §7.3's anti-amplification budget can stop a probe
-    /// leaving and an increment tied to transmission would stall the
-    /// backoff at an unvalidated address.
+    /// leaving and an increment tied to transmission would stall the backoff
+    /// at an unvalidated address"*. Ruling 249 removes that firing: §13.3
+    /// does not announce a `Pto` deadline while the budget admits no probe
+    /// datagram, so a budget-suppressed firing no longer exists and cannot
+    /// justify anything. Said out loud rather than quietly dropped, because
+    /// a ruling that re-founds another inherits the duty to address its
+    /// reasoning (rulings 175/188).
+    ///
+    /// The behavioural consequence is **ruled, not accidental**: the backoff
+    /// does not climb through a blockade. `pto_count` freezes while the
+    /// budget is closed and resumes at the first *admitted* firing.
     pub(crate) fn on_pto_timeout(&mut self) {
         self.pto_count = self.pto_count.saturating_add(1).min(PTO_MAX_EXPONENT);
     }
@@ -373,13 +386,29 @@ impl Recovery {
         self.loss_time
     }
 
-    /// The `Pto` deadline.
+    /// The `Pto` deadline **the sent map permits** — §13.3's *first*
+    /// precondition, and only that one.
     ///
-    /// `None` iff the sent map is empty — §13.3's precondition, *"the `Pto`
-    /// timer is armed only while at least one ack-eliciting packet is in the
-    /// sent map"*. Without it an idle connection self-sustains a probe train
-    /// at ~20 packets/s against the 10 s keepalive cadence, which §13.3
-    /// names as the failure the precondition exists to prevent.
+    /// `None` when the sent map is empty: *"the `Pto` timer is armed only
+    /// while at least one ack-eliciting packet is in the sent map"*. Without
+    /// it an idle connection self-sustains a probe train at ~20 packets/s
+    /// against the 10 s keepalive cadence, which §13.3 names as the failure
+    /// the precondition exists to prevent.
+    ///
+    /// # Not an iff (**[RATIFIED 2026/08/17 — ruling 249]**)
+    ///
+    /// This doc read *"`None` **iff** the sent map is empty"*, and that
+    /// reading is what shipped ruling 249's measured livelock. §13.3 has a
+    /// **second** precondition — *"and while §7.3's amplification budget
+    /// admits a probe datagram"* — so a `Some` here is a deadline the map
+    /// permits, **not** one the connection announces.
+    ///
+    /// The second conjunct cannot live here: [`Recovery`] has no sight of
+    /// §7.3's budget, by design. It is applied at the one arming site,
+    /// `Connection::sync_recovery_timers`, which is also where the
+    /// announcement is assembled. The defect this replaces is working rule
+    /// 8's shape in a doc comment — a necessary condition, written with its
+    /// disarm clause beside it, read as the complete rule.
     pub(crate) fn pto_deadline(&self) -> Option<Instant> {
         if self.sent.is_empty() {
             return None;
