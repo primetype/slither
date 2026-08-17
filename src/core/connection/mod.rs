@@ -1573,6 +1573,12 @@ impl<C: Handshake> Connection<C> {
     /// dead when the budget refuses the contested probe's 31 bytes, and
     /// `admits` is monotone in the length, so a budget refusing 31 refuses
     /// 39 and the deadline is already withheld.
+    ///
+    /// **[ruling 250]** The contested probe's packet may now be 40 or 49
+    /// bytes rather than 31 — but the **hold** threshold is unchanged, and
+    /// this sentence still holds: the coalesced size is taken only when the
+    /// room already admits it, and the bare 31-byte PING is what the pump
+    /// falls back to, so 31 is still the length a hold refuses.
     fn probe_can_leave(&self) -> bool {
         let size = (constants::DATA_HEADER_LEN + 1 + 8 + constants::AEAD_TAG_LEN) as u64;
         self.amplification.admits(size)
@@ -2133,37 +2139,40 @@ impl<C: Handshake> Connection<C> {
             return;
         }
 
-        // **[ruling 212(c)]** §7.3's ranks 2 and 3 — `PATH_RESPONSE` and
-        // `PATH_CHALLENGE`, immediately after CLOSE and **above** the
-        // contested probe. *"Everything else in the order competes for the
-        // budget; the challenge dissolves it. Ranking the output that
-        // removes the constraint above the outputs that consume it is not a
-        // preference, it is the only ordering that terminates."*
+        // §7.3's one-per-pump bound on the `PATH_CHALLENGE` offer, hoisted
+        // above the probe because the probe is now the packet that may
+        // carry it (**[RATIFIED 2026/08/17 — ruling 250]**).
         //
-        // **This pre-pass exists because the probe's early return below
-        // would otherwise deny them**, which ruling 212(c) names as wrong
-        // as written: *"it may not block the one frame that ends the state
-        // it is protecting."* It runs **only** while a mark is pending —
-        // when none is, the loop below packs the same frames into the packet
-        // it is already building, which is what §8.5 prefers and what keeps
-        // a challenge from costing a datagram of its own.
-        //
-        // Worth stating because it bounds how much this can matter: the
-        // early return fires only when the budget refuses the probe's 31
-        // bytes, and a challenge datagram is 39, so in the *blocked* state
-        // neither could have left. What this reordering changes is the case
-        // where the budget admits both but not both at once — there the
-        // probe's spend used to deny the challenge, inverting the rank.
+        // **The 212(c) pre-pass that stood here is gone.** It emitted the
+        // path frames in a datagram of their own, *above* the contested
+        // probe, under a comment citing ruling 212(c) as live law — and
+        // ruling 215 **reversed 212(c) in exactly that half**: §7.3's ranks
+        // are 1 CLOSE · 2 contested probe · 3 `PATH_RESPONSE` · 4
+        // `PATH_CHALLENGE`, and they *"stand exactly as written"*. (212(c)'s
+        // other half — that the early return below is wrong **as written** —
+        // 215 kept, and ruling 250 is what finally spends it. 212(d), cited
+        // elsewhere in this file, is a different sub-ruling and is live.)
+        // Ruling 250 measured what the survival cost: the contested verdict
+        // delayed ~10 s against a talking peer and ~15 s against an
+        // abandoned one — a delay rather than a kill, which is how it passed
+        // a full suite for two rounds.
         let mut owe_challenge = true;
-        if self.contested.is_pending() && self.pump_path_frames(now) {
-            owe_challenge = false;
-        }
 
-        // **[ruling 171]** Rank 4. A pending probe the budget cannot admit
-        // stops everything **below** it: anything sent underneath would
-        // spend budget the probe is waiting for, and the probe's deadline
-        // does not exist until it leaves.
-        if !self.pump_contested_probe(now) {
+        // **[ruling 171]** Rank 2, immediately under CLOSE. A pending probe
+        // the budget cannot admit stops everything **below** it: anything
+        // sent underneath would spend budget the probe is waiting for, and
+        // the probe's deadline does not exist until it leaves.
+        //
+        // **[ruling 215]** That is the whole of the early return, and it is
+        // the surviving half. An **admitted** probe does not stop the pump:
+        // *"the send pump may emit the probe and continue building on the
+        // same pass"*. The label on this comment read "Rank 4" until ruling
+        // 250 — 212(c)'s rank for a frame this pre-pass no longer emits.
+        //
+        // **[ruling 250]** `owe_challenge` is threaded in because the
+        // probe's own packet may carry the challenge: the pump must not
+        // then offer a second one in the same pass.
+        if !self.pump_contested_probe(now, &mut owe_challenge) {
             return;
         }
 
@@ -2193,6 +2202,17 @@ impl<C: Handshake> Connection<C> {
             // (`owe_challenge`), and only while something is actually owed
             // to the address. A pending contested probe counts as owed —
             // it is output waiting on exactly this budget.
+            //
+            // **[ruling 250]** `contested.is_pending()` below is that
+            // sentence, and it is **unreachable here** — reported rather
+            // than deleted. `pump_contested_probe` runs above and leaves
+            // `Pending` in no case: it returns early when there is no mark,
+            // transitions to `Armed` when it sends, and returns from the
+            // whole pump when the budget holds it. The disjunct was already
+            // unreachable before 250 (the 212(c) pre-pass ran first, the
+            // probe second), so the pre-pass's deletion did not create this.
+            // The state it names is real and is now served where it is
+            // reachable — the probe's own packet coalesces the challenge.
             // **[ruling 217]** `self.ack.is_owed()` belongs in this
             // disjunction and its absence was the defect. §8.7 owes the
             // challenge *"whenever §7.3's budget admits **a packet**"* — an
@@ -2357,6 +2377,15 @@ impl<C: Handshake> Connection<C> {
             //    packs stage 2 like any other packet, so the escape survives
             //    a full window.
             //
+            //    **[ruling 250]** One qualification, and it is about the
+            //    *carrier*, not about the frame: a challenge riding the
+            //    **contested probe's** packet is exempt, because §14.5's
+            //    exemption now covers *"the probe's packet as built"* —
+            //    *"gating the merged packet would starve the challenge at
+            //    collapsed cwnd exactly where a roam makes it owed."* The
+            //    challenge has still won no exemption of its own; it has
+            //    boarded one, exactly as it does on the PTO probe.
+            //
             //    **[ruling 221]** This sentence was written as a statement
             //    of fact and was **not one until ruling 221**: the PTO
             //    packed stage 2 with `offer` false, so the probe carried a
@@ -2426,8 +2455,11 @@ impl<C: Handshake> Connection<C> {
             // §14.5's admission gate. **Exemptions, exhaustively**: PTO
             // probes (§13.4 — a black-holed path with a full window must
             // stay probeable); the contested-connection probe (§7.5, sent
-            // above); and non-ack-eliciting control packets, which are never
-            // tracked in flight and never gated.
+            // above) — **[ruling 250]** *"the exemption covers the probe's
+            // packet **as built**"*, so the path frames it coalesces are
+            // exempt too, and no packet built *here* inherits that; and
+            // non-ack-eliciting control packets, which are never tracked in
+            // flight and never gated.
             //
             // The exemption is from **admission only** — the probe is still
             // recorded below and still counts in `bytes_in_flight` (ruling
@@ -2626,8 +2658,17 @@ impl<C: Handshake> Connection<C> {
         let mut packed = PathPacked::default();
         // Answering an obligation before raising one — §7.3: *"between
         // themselves the order is free"*, and this is the conventional
-        // reading. They never contend: 14 B of header + 18 B of frames + a
-        // 16 B tag = 48 B, inside the 90 B floor the smallest arming funds.
+        // reading.
+        //
+        // **[ruling 250]** The sentence that stood here — *"they never
+        // contend: 14 B of header + 18 B of frames + a 16 B tag = 48 B,
+        // inside the 90 B floor the smallest arming funds"* — is a universal
+        // over **armed** budgets, and by the time this runs the budget has
+        // been spent down by whatever left since. It is not a licence to
+        // skip the room check, and none is skipped: each verb below refuses
+        // its frame when nine bytes do not remain, and the caller keeps
+        // owing what it could not pack. §7.3 now states the guarantee
+        // against the **remaining** room at pump time.
         if let Some(value) = self.owed_path_response
             && packing.path_response(value)
         {
@@ -2643,33 +2684,49 @@ impl<C: Handshake> Connection<C> {
     }
 
     /// One packet carrying nothing but §7.3's path frames, for the one state
-    /// in which the pump's loop cannot carry them: a **pending** contested
-    /// probe (**[ruling 212(c)]**).
+    /// left in which the pump's loop cannot carry them: an owed
+    /// `PATH_RESPONSE` the loop planned and a gate then refused
+    /// (**[ruling 217]**, and the call at the end of
+    /// [`pump_packets`](Self::pump_packets) is the only one). The loop's own
+    /// packet may be large enough for §14.5's window to refuse it while
+    /// admitting these 39 bytes; a *response* we owe is manufactured, a
+    /// *challenge* is not.
     ///
-    /// Returns whether a challenge went out, which is what stops the loop
-    /// re-offering the same one in the same pump.
+    /// **[RATIFIED 2026/08/17 — ruling 250]** The **other** call site is
+    /// gone. It was ruling 212(c)'s pre-pass — a dedicated datagram emitted
+    /// *above* a pending contested probe — and ruling 215 reversed 212(c) in
+    /// that half. The frames it carried now ride the probe's own packet
+    /// ([`pump_contested_probe`](Self::pump_contested_probe)): one packet,
+    /// one counter, one sent-map entry.
+    ///
+    /// Returns nothing. It reported *"whether a challenge went out"* so the
+    /// deleted pre-pass could clear the pump's one-per-pump bound before the
+    /// loop ran; the surviving call site runs **after** the loop, so there is
+    /// nothing left to tell, and a return value no caller can act on is a
+    /// mechanism that reads as live and is not.
     ///
     /// Sealed `seal_quiet` and **counted** in the sent map: the frames are
     /// ack-eliciting (§8.3) and §14.5's exemption list — PTO probes, the
-    /// contested probe, non-ack-eliciting control packets — does not name
-    /// them, so unlike the probe beside it this packet is gated by the
-    /// congestion window as well as by the budget.
-    fn pump_path_frames(&mut self, now: Instant) -> bool {
+    /// contested probe *and the packet it builds* (ruling 250),
+    /// non-ack-eliciting control packets — does not name a path-frame packet
+    /// of its own, so this one is gated by the congestion window as well as
+    /// by the budget.
+    fn pump_path_frames(&mut self, now: Instant) {
         let mut packing = self.packing();
         let packed = self.pack_path_frames(&mut packing, true);
         if packed.response.is_none() && !packed.challenge {
-            return false;
+            return;
         }
         let plaintext = packing.into_plaintext();
         let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
         if !self.amplification.admits(size) || !self.admits(size) {
             // Held, not dropped: both obligations still stand and the next
             // pump re-offers them.
-            return false;
+            return;
         }
 
         let Some(session) = self.session.as_mut() else {
-            return false;
+            return;
         };
         // §7.4's quiet set: a challenge is not fresh application intent, so
         // it neither moves `last_send` nor suppresses a keepalive. It **is**
@@ -2678,7 +2735,7 @@ impl<C: Handshake> Connection<C> {
             Ok(sealed) => sealed,
             Err(_) => {
                 self.die(ConnectionLost::NonceExhausted);
-                return false;
+                return;
             }
         };
         let to = session.established().anchor;
@@ -2703,7 +2760,6 @@ impl<C: Handshake> Connection<C> {
         if packed.response.is_some() {
             self.owed_path_response = None;
         }
-        packed.challenge
     }
 
     /// §8.5 stage 1 — the owed ACK, derived from §7.2's window (§12.2).
@@ -3058,10 +3114,11 @@ impl<C: Handshake> Connection<C> {
     /// §7.5's contested probe: the transmission, and the four things pinned
     /// to that one instant.
     ///
-    /// §15.4: the PING goes out *"at the first instant §7.3's budget admits
-    /// it, **which is also when the deadline arms and when `Contested` is
-    /// emitted**"*. So this sends the PING, arms `TimerKind::Contested`,
-    /// queues `ConnEvent::Contested` and traces — as one step, never four.
+    /// §15.4: the probe's packet goes out *"at the first instant §7.3's
+    /// budget admits it, **which is also when the deadline arms and when
+    /// `Contested` is emitted**"*. So this sends the packet, arms
+    /// `TimerKind::Contested`, queues `ConnEvent::Contested` and traces — as
+    /// one step, never four.
     ///
     /// Returns `false` iff a mark is pending and the budget would not admit
     /// the probe. **[ruling 171]** A pending probe *"takes priority over all
@@ -3071,17 +3128,107 @@ impl<C: Handshake> Connection<C> {
     /// the probe is waiting for. §7.5's congestion-gate argument transfers
     /// verbatim, and the budget cannot be waived, so priority is the only
     /// lever: a probe the budget could delay past its own deadline *"would
-    /// silently convert congestion into a liveness verdict"*.
-    fn pump_contested_probe(&mut self, now: Instant) -> bool {
+    /// silently convert congestion into a liveness verdict"*. **[ruling
+    /// 215]** `true` does **not** mean "nothing was sent": an admitted probe
+    /// returns `true` and the pump keeps building on the same pass.
+    ///
+    /// # One packet (**[RATIFIED 2026/08/17 — ruling 250]**)
+    ///
+    /// §7.3: *"The pump prefers **one packet**: the probe coalesces the owed
+    /// path frames when the remaining room at pump time admits the coalesced
+    /// size — 40 B with one 9 B path frame owed …, 49 B with both, which a
+    /// roam constructs (§13.6 keeps the owed `PATH_RESPONSE` and re-draws
+    /// the challenge at one instant) — and emits the bare 31 B PING
+    /// otherwise, the path frames following at their rank when room next
+    /// admits them; when room admits neither, nothing is emitted and no
+    /// `Pto` deadline is announced (§13.3, ruling 249)."*
+    ///
+    /// That is **one** counter, **one** sent-map entry and one charge
+    /// against the budget. Ruling 221's deletion of ruling 217's
+    /// `dedicated_sent` machinery is not resurrected: this rides the
+    /// ordinary seal path and the probe takes the floor counter again.
+    ///
+    /// `owe_challenge` is the pump's one-per-pump bound, read **and**
+    /// written: a challenge this packet carries is not offered again below.
+    ///
+    /// ## Pump time, not arming time (working rule 8)
+    ///
+    /// §7.3's *"the budget holds both and always does: 40 B against a 90 B
+    /// floor"* is a universal over **armed** budgets and says nothing about
+    /// **remaining** ones — by the time this runs the budget has been spent
+    /// down by whatever left since. The coalesced size is therefore checked
+    /// against [`packing`](Self::packing)'s room (ruling 207(c)'s seam,
+    /// which already sizes every packet to what the budget will admit),
+    /// never asserted from the arming-instant floor.
+    ///
+    /// The arithmetic is **composed, never transcribed**, in the style
+    /// [`probe_can_leave`](Self::probe_can_leave) uses: one PING byte plus
+    /// nine per owed path frame, in *plaintext* units, because that is what
+    /// `Packing` budgets in (ruling 207(c)'s trap — [`Amplification::room`]
+    /// is in **datagram** bytes and the two differ by 30).
+    ///
+    /// ## §14.5's exemption covers the packet as built
+    ///
+    /// *"[AMENDED 2026/08/17 — ruling 250] The exemption covers the probe's
+    /// packet **as built**: a probe that coalesces the owed
+    /// `PATH_RESPONSE`/`PATH_CHALLENGE` (§7.3) remains exempt — the packet
+    /// exists because the probe demanded it, the piggyback adds at most 18 B
+    /// of frames, and gating the merged packet would starve the challenge at
+    /// collapsed cwnd exactly where a roam makes it owed."* So this path
+    /// consults [`Amplification::admits`] and **not** [`admits`](Self::admits)
+    /// — which is what it did before the path frames joined, and the
+    /// dedicated packet they arrive from was cwnd-gated and is gone.
+    fn pump_contested_probe(&mut self, now: Instant, owe_challenge: &mut bool) -> bool {
         let Contested::Pending { floor } = self.contested else {
             return true;
         };
 
-        let mut packing = Packing::new();
-        let fits = packing.ping();
-        debug_assert!(fits, "a PING is one byte and MAX_PLAINTEXT is 1170");
+        // **[ruling 203/207(c)]** Sized to §7.3's *remaining* room, like
+        // every other packet the pump builds. Before ruling 250 this was
+        // `Packing::new()` — full size — which was harmless only because the
+        // plan was a single byte.
+        let mut packing = self.packing();
+        // Which path frames are owed **now**. The challenge is owed on
+        // exactly the terms the loop below states: the one-per-pump bound,
+        // and an arming that has not been disarmed. There is no §8.7
+        // *"something else is owed"* disjunct to check here, because a
+        // pending contested probe **is** that something — the loop's `offer`
+        // names the state literally, as `contested.is_pending()`.
+        //
+        // Worth stating, because that disjunct now reads as the live site
+        // and is not: the loop cannot observe `Pending` at all. This
+        // function either finds no mark and returns `true`, or sends and
+        // leaves `Armed`, or holds and returns `false`, which returns from
+        // the pump. It was equally unreachable before ruling 250 (the 212(c)
+        // pre-pass ran first, this ran second), so nothing about the deletion
+        // created it — reported rather than removed, since removing a
+        // disjunct is a behaviour change and this one is `SPEC.md` §8.7's
+        // condition written out.
+        let response_owed = self.owed_path_response.is_some();
+        let challenge_owed = *owe_challenge && self.amplification.outstanding_challenge().is_some();
+        let owed = usize::from(response_owed) + usize::from(challenge_owed);
+        const PATH_FRAME_LEN: usize = 1 + frame::PATH_CHALLENGE_LEN;
+        let coalesced = 1 + owed * PATH_FRAME_LEN;
+        // All or nothing over the **owed set**, which is what §7.3 prices:
+        // 40 B with one owed, 49 B with both. A room that admits only part
+        // of the set leaves the whole of it to ranks 3 and 4, where it is
+        // offered again the moment room next admits it.
+        let path = if owed > 0 && packing.room() >= coalesced {
+            self.pack_path_frames(&mut packing, challenge_owed)
+        } else {
+            PathPacked::default()
+        };
+        // Not a `debug_assert`: the plan is bounded by the remaining room
+        // now, so a room below the PING's own datagram is reachable — and
+        // an empty plaintext is §3.4's keepalive, not a probe. §7.3's
+        // *"when room admits neither, nothing is emitted"*.
+        if !packing.ping() {
+            return false;
+        }
         let plaintext = packing.into_plaintext();
         let size = (constants::DATA_HEADER_LEN + plaintext.len() + constants::AEAD_TAG_LEN) as u64;
+        // **[ruling 207(a)]** The predicate does not move. Sizing to the
+        // room only means the answer is now normally *yes*.
         if !self.amplification.admits(size) {
             return false;
         }
@@ -3110,16 +3257,37 @@ impl<C: Handshake> Connection<C> {
         // **[ruling 43]** The probe is exempt from §14.5's admission gate and
         // is nonetheless **counted in the sent map and in
         // `bytes_in_flight`** — or loss recovery would hold a packet in
-        // flight it could not see.
+        // flight it could not see. **[ruling 250]** **One** entry, for the
+        // coalesced packet as a whole.
         self.recovery.on_sent(SentPacket {
             counter: sealed.counter,
             time_sent: now,
             size,
             app_limited: false,
             path_gen: self.recovery.path_gen(),
+            // §8.7: neither path frame is ever re-queued by loss detection,
+            // and a PING is not retransmittable either — so a coalesced
+            // packet carries no retransmittable frames and this stays empty.
+            // The challenge's reliability is §8.7's standing obligation, the
+            // response's is the peer's standing challenge, and the probe's
+            // is `Contested`'s own deadline.
             frames: Vec::new(),
         });
         self.congestion.on_sent(now, size);
+
+        // **[ruling 208]** Discharged on the **send**, never on the plan:
+        // every early return above leaves both obligations owed.
+        //
+        // The response is discharged by one emission (§8.7); the challenge
+        // is **not** — it stands for as long as the arming does. What clears
+        // is the pump's one-per-pump bound, which is why this is the pump's
+        // local and not a field.
+        if path.response.is_some() {
+            self.owed_path_response = None;
+        }
+        if path.challenge {
+            *owe_challenge = false;
+        }
 
         let deadline = now + constants::KEEPALIVE_TIMEOUT;
         self.contested = Contested::Armed {
