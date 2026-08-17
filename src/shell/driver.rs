@@ -181,6 +181,14 @@ pub(crate) struct Driver<I: Identity, W: Wire> {
     /// See [`deadline`](Self::deadline) for why the difference is the whole
     /// of ruling 141's class.
     last_timeout: Option<std::time::Instant>,
+    /// **[ruling 255]** Consecutive turns whose previous event was a timer
+    /// firing and whose announced min deadline was at or before that
+    /// firing's instant. One such turn is ordinary (a firing can shrink a
+    /// *different* timer's deadline into the past — a lost datagram
+    /// retransmits nothing while an ACK reset shrinks the PTO interval);
+    /// a genuine spin re-fires immediately forever. `Cell` because
+    /// [`deadline`](Self::deadline) takes `&self`.
+    overdue_streak: std::cell::Cell<u32>,
 }
 
 impl<I: Identity + 'static, W: Wire> Driver<I, W> {
@@ -195,6 +203,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             shell,
             commands,
             last_timeout: None,
+            overdue_streak: std::cell::Cell::new(0),
             conns: BTreeMap::new(),
             ready: VecDeque::new(),
             waiting: VecDeque::new(),
@@ -271,6 +280,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
 
             if !matches!(event, Event::Timeout) {
                 self.last_timeout = None;
+                self.overdue_streak.set(0);
             }
 
             match event {
@@ -1045,15 +1055,35 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                 }
             })
             .chain(endpoint)
+            .min()
             .inspect(|announced| {
+                // **[ruling 255, amending 249(ii)]** Still an `assert!` — a
+                // release driver spinning silently is worse than a panic
+                // that names the connection's core — but it trips on the
+                // **third consecutive** overdue announce, not the first.
+                // Measured (slice R40-C's finding, reproduced at
+                // integration): a `Loss` firing that marks a lost DATAGRAM
+                // retransmits nothing, while the ACK that revealed the gap
+                // has already reset `pto_count` and shrunk the `Pto`
+                // deadline ~4 ms into the past — the next firing sends the
+                // probe and the deadline advances. One overdue step with
+                // progress behind it is the "overdue is not spinning" case
+                // the doc above always named; 249(ii) asserted the
+                // converse one level up. A genuine spin re-fires
+                // immediately and forever, so the streak reaches 3 in
+                // virtual-zero time; every benign chain measured or
+                // constructed is length ≤ 2. If a legitimate 3-chain ever
+                // appears, the threshold moves, not the mechanism.
                 if let Some(fired_at) = self.last_timeout {
-                    // **[ruling 249(ii)]** `assert!`, not `debug_assert!` —
-                    // a release driver spinning silently is worse than a
-                    // panic that names the connection's core.
-                    assert!(*announced > fired_at, "{PAST_DEADLINE}");
+                    if *announced <= fired_at {
+                        let streak = self.overdue_streak.get() + 1;
+                        self.overdue_streak.set(streak);
+                        assert!(streak < 3, "{PAST_DEADLINE}");
+                    } else {
+                        self.overdue_streak.set(0);
+                    }
                 }
             })
-            .min()
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1440,9 +1470,10 @@ fn session_id_of<S: Handshake>(cell: &Rc<RefCell<ConnCell<S>>>) -> Option<hiss::
 /// A `const` so the string is written once and so a test that provokes the
 /// class can name what it expects to see.
 ///
-/// **[ruling 249(ii)]** The detector is an `assert!`, so this is a *release*
-/// panic message as well as a debug one — it is what an operator sees, not
-/// only what a test matches on.
+/// **[ruling 249(ii), threshold by ruling 255]** The detector is an
+/// `assert!` tripping on the third consecutive overdue announce, so this is
+/// a *release* panic message as well as a debug one — it is what an
+/// operator sees, not only what a test matches on.
 const PAST_DEADLINE: &str = "a core announced a deadline in the past — ruling 141's spin class: `sleep_until` \
      completes at once, `handle_timeout` re-fires, and the actor spins";
 

@@ -7643,3 +7643,60 @@ ship in one slice, 249's fix first.
 
 Amended: §13.3 (formula, rationale-with-envelope, table), §14.4, the two
 consolidated constants tables, the worked-example passage.
+
+### 255 — the past-deadline guard counts a streak: one overdue announce is not a spin
+
+**Ruling: the driver's past-deadline detector keeps ruling 249(ii)'s
+`assert!` — release-mode, because a shared driver spinning silently is
+worse than a panic — but it trips on the third consecutive turn whose
+previous event was a timer firing and whose announced minimum deadline is
+at or before that firing's instant. A single such turn is ordinary; the
+streak resets on any turn that advances, and on every non-timeout event.**
+
+The finding is slice R40-C's author's, made while sweeping for something
+else, and it was reproduced and instrumented at integration before this
+ruling was drafted (measure before ruling): one dropped datagram plus
+ordinary sends between 30 ms clock advances kills a healthy connection —
+the driver panics at the promoted assert and the application sees
+`ConnectionLost(EndpointDropped)`. The instrumented chain: a `Loss`
+firing at `t` marks the lost datagram, which retransmits **nothing**
+(§13.5, §11.1 — datagrams never re-enter the pump), while the ACK that
+revealed the gap has already reset `pto_count` and shrunk the `Pto`
+deadline to `t − 4 ms`; the announced minimum is past, and the very next
+firing sends the probe and advances the deadline. Overdue with progress
+one turn away — the exact *"overdue is not spinning"* case the driver's
+own doc has named since `CONTRACT-7b.md` §4.2's predicate was rejected.
+
+**Rule 4(b), against 249(ii)'s reasoning.** 249(ii)'s soundness argument
+enumerated the states in which a firing leaves the announced deadline at
+or before its instant, and every state it checked was the fired timer's
+**own**: the budget-closed probe (removed by 249(i)) and the
+re-fire-with-no-advance. It never considered a firing that shrinks a
+**different** timer's deadline into the past — `Loss` fires, `Pto` is
+overdue — which is rule 12's shape one level up: a true lemma (*the
+firing that changed nothing observable is one step of a spin*) applied to
+the wrong state (*the observed overdue deadline was not the fired
+timer's, and the firing changed plenty*). The false positive was latent
+in the `debug_assert!` era too — no test combined a dropped datagram with
+sends between advances (`sd6` advances without sending; rule 13's
+fixture-bounds-the-coverage, again) — so demotion alone would have left
+debug runs broken and the release detector gone; the streak repairs
+both.
+
+**Why three.** A genuine spin re-fires immediately and forever: the
+streak reaches three in virtual-zero time, and the livelock 249 removed
+would have been caught on its third turn. Every benign chain measured is
+length one; a length-two chain is constructible in principle (a loss
+walk re-arming inside a sub-millisecond `srtt` window while a `Pto`
+shrink lands); three carries one step of headroom. If a legitimate
+three-chain ever appears, the threshold moves, not the mechanism.
+
+Code: `driver.rs` — `overdue_streak: Cell<u32>` beside `last_timeout`,
+reset on every non-timeout event and every advancing announce; the guard
+moved from per-core `inspect` to the announced minimum (equivalent for
+spin detection: the min is what the driver sleeps on). Regression:
+`story_datagram.rs`'s `sd12_a_dropped_datagram_then_ordinary_traffic_
+does_not_kill_the_driver`, the reproducer verbatim — red on the
+first-strike build, green on this one. No spec text moves: the guard was
+never ratified prose; ruling 249's amendment-table row ("the driver's
+past-deadline guard goes release-mode") remains true.

@@ -1124,3 +1124,42 @@ async fn sd11_a_zero_length_datagram_is_a_datagram() {
     })
     .await;
 }
+
+/// **[ruling 255]** One dropped datagram plus ordinary traffic between
+/// clock advances must not kill the driver.
+///
+/// The regression slice R40-C's author found: ruling 249(ii)'s release
+/// `assert!` fired on a *healthy* connection. The chain — a `Loss` firing
+/// marks the lost datagram, which retransmits **nothing** (§13.5, §11.1),
+/// while the ACK that revealed the gap has already reset `pto_count` and
+/// shrunk the `Pto` deadline into the past. One overdue announce, then the
+/// probe fires and the deadline advances: overdue, not spinning. Ruling
+/// 255's streak counter (3 consecutive) keeps the spin detector while
+/// letting this chain through.
+///
+/// The broken build (the pre-255 first-strike assert) panics the driver at
+/// the first advance past the loss window and every send after that
+/// surfaces `ConnectionLost(EndpointDropped)`.
+#[tokio::test(start_paused = true)]
+async fn sd12_a_dropped_datagram_then_ordinary_traffic_does_not_kill_the_driver() {
+    local(async {
+        let pair = Pair::seeded_with(1, slither::Config::new());
+        let (ca, _cb) = pair.establish().await;
+        settle().await;
+
+        let base = pair.net.tap().len();
+        pair.a.wire.set_policy(FlakyPolicy::drop_at(base..base + 1));
+        ca.send_datagram(&[1u8; 64]).expect("send");
+        settle().await;
+        pair.a.wire.set_policy(FlakyPolicy::perfect());
+
+        for i in 0..5u8 {
+            ca.send_datagram(&[i; 64])
+                .expect("§11: the driver is alive and the queue has room");
+            settle().await;
+            tokio::time::advance(std::time::Duration::from_millis(30)).await;
+            settle().await;
+        }
+    })
+    .await;
+}
