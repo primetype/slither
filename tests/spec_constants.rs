@@ -575,14 +575,18 @@ fn k_granularity() {
 
 #[test]
 fn k_initial_rtt() {
-    // SPEC.md §13.1 / Named constants: K_INITIAL_RTT / PTO_BACKOFF_CAP = 333 ms / 2^6.
+    // SPEC.md §13.1 / Named constants: K_INITIAL_RTT / PTO_BACKOFF_CAP = 333 ms / 2^3.
     assert_eq!(K_INITIAL_RTT, Duration::from_millis(333));
 }
 
 #[test]
 fn pto_backoff_cap() {
-    // SPEC.md §13.3 / Named constants: K_INITIAL_RTT / PTO_BACKOFF_CAP = 333 ms / 2^6.
-    assert_eq!(PTO_BACKOFF_CAP, 64);
+    // SPEC.md §13.3 / Named constants: K_INITIAL_RTT / PTO_BACKOFF_CAP = 333 ms / 2^3.
+    // [RATIFIED 2026/08/17 — ruling 254] 2^6 until this ruling.
+    // The constant is the **multiplier**, not the exponent: a build storing
+    // 3 here and shifting by it is the transcription ruling 254 says is now
+    // silent (`1u32 << 8` = 256 is legal), so the value is asserted whole.
+    assert_eq!(PTO_BACKOFF_CAP, 8);
 }
 
 // ---------------------------------------------------------------------

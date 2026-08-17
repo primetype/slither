@@ -175,14 +175,22 @@ pub(crate) struct CongestionEvent {
 /// The largest exponent `2^n` may take before `PTO_BACKOFF_CAP` binds.
 ///
 /// **Derived from the constant, never transcribed.** `PTO_BACKOFF_CAP` is
-/// **64 — the multiplier, not the exponent** (`constants.rs`, and SPEC's
-/// table writes it "2⁶"). v0.1 wrote `1u32 << pto_count.min(PTO_BACKOFF_CAP)`
+/// **8 — the multiplier, not the exponent** (`constants.rs`, and SPEC's
+/// table writes it "2³"). v0.1 wrote `1u32 << pto_count.min(PTO_BACKOFF_CAP)`
 /// with its own `PTO_BACKOFF_CAP = 6`; copying that idiom with slither's
-/// constant shifts by up to 64, which is undefined behaviour on `u32`.
+/// constant shifts by the multiplier instead of the exponent.
+///
+/// **[RATIFIED 2026/08/17 — ruling 254]** The derivation below is unchanged;
+/// only the constant it reads moved, 2⁶ → 2³. What moved with it is the
+/// **cost** of the mis-transcription: at 64 the wrong idiom was
+/// `1u32 << 64`, undefined behaviour on `u32` and loud; at 8 it is
+/// `1u32 << 8` = 256, legal, silent, and eight times the ratified
+/// multiplier. That is why `trailing_zeros()` and the two pins below are
+/// the mechanism rather than a comment.
 const PTO_MAX_EXPONENT: u32 = constants::PTO_BACKOFF_CAP.trailing_zeros();
 
 const _: () = assert!(constants::PTO_BACKOFF_CAP.is_power_of_two());
-const _: () = assert!(PTO_MAX_EXPONENT == 6);
+const _: () = assert!(PTO_MAX_EXPONENT == 3);
 
 impl Recovery {
     /// Nothing in flight, no samples, no backoff.
@@ -584,9 +592,16 @@ impl Recovery {
     /// `persistent_period` evaluates §13.3's formula with **`pto_count =
     /// 0`**: §14.4 says the backoff is deliberately excluded *"so the period
     /// is a property of the path, not of the probe count — with the backoff
-    /// included, the threshold would run up to 2⁶× too long and persistent
+    /// included, the threshold would run up to 2³× too long and persistent
     /// congestion would never trigger under exactly the sustained loss it
     /// exists to detect."*
+    ///
+    /// **[ruling 254]** That magnitude was "2⁶×" until `PTO_BACKOFF_CAP`
+    /// fell to 2³, and §14.4 is the one place the spec derives arithmetic
+    /// from the cap. The **conclusion** is untouched — 8× too long is still
+    /// too long, and the exclusion still stands — but the argument's force
+    /// is now a factor of eight smaller, which is said here rather than
+    /// left as a stale digit.
     ///
     /// The `has_sample` guard is §14.4's own — *"the pre-sample
     /// `K_INITIAL_RTT` phase never triggers it"* — and without it a
