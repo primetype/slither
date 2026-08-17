@@ -22,6 +22,12 @@
 > | 232 | Appendix B | the composability obligations, which two documents had claimed were already there |
 > | 238 | §16.11.1 | the `WriteError` match is exhaustive; the fallback arm hid the future rather than guarding it |
 > | 241 | §9.8, §9.9 | the peer-reset latch is scoped to unidirectional streams |
+> | 249 | §13.3, §13.4, §13.6, §16.5 | the `Pto` deadline is announced only while §7.3's budget admits a probe — the livelock the roam seam could construct; the driver's past-deadline guard goes release-mode |
+> | 250 | §7.3, §14.5, §15.4 | the probe coalesces the owed path frames, and §7.3's arithmetic holds at pump time, not the arming instant; two dead flag references swept |
+> | 251 | §7.7, Appendix B | §7.7's obligations exist: the boundary, the straggler window, S23 — and the `REKEY(0³²)` vector pin has a named home |
+> | 252 | §6.4, §6.5, §6.8 | drain `accept()` is every application's obligation, not the dialler's — a lost msg2 is only closed by the next accept (S34) |
+> | 253 | §10.6 | coalesce-on-insert gains its work bound, O(credit · log credit), and capacity stays the arrived span |
+> | 254 | §13.3, §14.4, the constants tables | `PTO_BACKOFF_CAP` 2⁶ → 2³: the ladder fits inside `DEAD_TIMEOUT`'s window; survival envelope stated |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -503,8 +509,11 @@ from the send pass suppresses every rank below it, including the
 `PATH_CHALLENGE` that would end the scarcity. **Ruling 215 resolved it in
 favour of the third available resolution: the ranks were right and the
 send pump's early return was the defect** — it emits the probe and
-continues building on the same pass, since probe plus challenge is 40 B
-against a 90 B floor. An earlier ruling (212(c)) lifted the challenge
+continues building on the same pass — and, since ruling 250, prefers one
+packet: the probe coalesces the owed path frames when pump-time room
+admits the coalesced size, the probe-plus-challenge arithmetic re-checked
+against the **remaining** room rather than the arming-instant 90 B
+floor. An earlier ruling (212(c)) lifted the challenge
 above the probe instead and was reversed, because §7.5 proves a delayed
 probe *"would silently convert congestion into a liveness verdict"* while
 a delayed challenge only prolongs a cap.
@@ -1611,7 +1620,9 @@ human-in-the-loop accept decision. The rule:
   4. the static is PENDING and we are the tie-break winner.
 
   The application SHOULD
-  re-accept when the peer's next initiation surfaces as a new `Intro`. On
+  re-accept when the peer's next initiation surfaces as a new `Intro` —
+  the error-prompted case of §6.5's loop obligation (ruling 252), which
+  also covers the lost-msg2 case in which no error ever prompts it. On
   the tie-break-winner case there is nothing to re-accept: our own
   outbound is completing that connection, and its `Connecting` resolves
   in the ordinary way. Only case (3) can touch a live connection
@@ -1672,8 +1683,20 @@ backstop, and it is application-driven: two peers that dial
 simultaneously, are both NAT-port-rewritten, and never probe inbound
 intros will both fail at `HANDSHAKE_GIVEUP` and must retry. The failure
 is self-limiting in practice, because the two retries are scheduled by
-the applications and so de-synchronise. **Applications that dial SHOULD
-also drain `accept()`.**
+the applications and so de-synchronise. **Every application SHOULD treat
+`accept()` as a loop for the lifetime of its endpoint — diallers and
+responders alike.** **[AMENDED 2026/08/17 — ruling 252; this sentence
+read "applications that dial", a scope narrower than the hazard.]** For a
+dialler the reason is the paragraph above. For a responder it is the lost
+msg2: msg2 is never retransmitted (§5.5 — every retransmit is a fresh
+initiation), so one lost msg2 leaves this side holding a LIVE,
+never-confirmed connection while the peer re-offers a fresh `Intro` every
+~5 s until `HANDSHAKE_GIVEUP`; no error ever prompts a retry — the first
+`accept()` **succeeded** — and only the next `accept()` closes the gap,
+as the §16.1 replacement (§6.4): the unconfirmed connection dies
+`Replaced` and the new chain completes. The same loop is what makes
+§6.8's *"restart needs no machinery of its own"* true — the machinery it
+does need is the application still listening (S34).
 
 **The membership-timing oracle, restated.** **[RATIFIED 2026/08/14, in
 reduced form.]** The probed set is the **pending-outbound-remote set
@@ -1855,7 +1878,8 @@ fixed by this outcome at establishment and never changes thereafter.
 
 ### 6.8 Restart handling, summarised
 
-Restart needs no machinery of its own (§5.4): a restarted *peer*
+Restart needs no machinery of its own (§5.4) — beyond an application
+still draining `accept()` (§6.5, ruling 252): a restarted *peer*
 reconnects, its initiation parks as an ordinary `Intro` at our LIVE
 static, the live (now-zombie) connection keeps running untouched, and the
 `Replaced` teardown fires only at the replacing `accept()` (§6.4); a
@@ -2419,8 +2443,12 @@ free: each costs 9 bytes of frame, so a packet carrying **both** costs
 14 B of header + 18 B of frames + a 16 B tag = 48 B, and the smallest
 budget any arming can produce is 3 × the 30-byte keepalive that armed it =
 90 B (§7.5, ruling 203's arithmetic). They therefore never contend with
-one another under any budget this protocol can construct, and
-`PATH_RESPONSE` is listed first only because answering an obligation
+one another **at the arming instant** — **[AMENDED 2026/08/17 — ruling
+250]** the floor is a property of the budget when it is armed, and by pump
+time the budget may have been spent down by whatever left since, so the
+guarantee the pump keeps is checked against the **remaining** room when
+the packet is built (ruling 207(c)'s seam), never asserted from the floor
+— and `PATH_RESPONSE` is listed first only because answering an obligation
 before raising one is the conventional reading.
 
 **[RATIFIED 2026/08/16 — ruling 215, closing this section's one open
@@ -2447,7 +2475,9 @@ pump's realisation of that rank, and it is a strictly stronger reading —
 rank 2 outranking rank 4 does not mean rank 4 is never built, only that it
 yields when the budget cannot hold both, and here the budget can: probe
 and challenge together cost 14 B of header + 1 B of PING + 9 B of
-challenge + a 16 B tag = **40 B**, inside the 90 B floor computed above.
+challenge + a 16 B tag = **40 B** — one coalesced packet, one header, one
+tag — inside the 90 B floor at arming, and checked against the remaining
+room at pump time (ruling 250).
 Three resolutions were available — coalesce the challenge into the probe's
 own packet, lift the challenge above the probe, or hold that the priority
 order was never an early return and the pump is simply wrong.
@@ -2459,8 +2489,21 @@ while §7.5 proves the probe's own delay *"would silently convert
 congestion into a liveness verdict"* — an argument that transfers verbatim
 to the budget, and which nothing in the challenge's case answers. The
 ranks above therefore stand exactly as written, and **the send pump may
-emit the probe and continue building on the same pass**, because the
-budget holds both and always does: 40 B against a 90 B floor.
+emit the probe and continue building on the same pass**. **[AMENDED
+2026/08/17 — ruling 250]** The pump prefers **one packet**: the probe
+coalesces the owed path frames when the remaining room at pump time admits
+the coalesced size — 40 B with one 9 B path frame owed (the packet this
+section's own arithmetic has priced all along), 49 B with both, which a
+roam constructs (§13.6 keeps the owed `PATH_RESPONSE` and re-draws the
+challenge at one instant) — and emits the bare 31 B PING otherwise, the
+path frames
+following at their rank when room next admits them; when room admits
+neither, nothing is emitted and no `Pto` deadline is announced (§13.3,
+ruling 249). One packet, one counter, one sent-map entry — ruling 221's
+deletion of the dedicated-packet machinery is not resurrected. "The budget
+holds both and always does" was a universal over **armed** budgets with an
+unstated scope; the pump-time room check is the guarantee the
+implementation can keep.
 
 The probe's place is the load-bearing one, and §7.5 already makes the
 argument exactly once, for the congestion gate: *"a probe the gate could
@@ -2479,9 +2522,10 @@ address unvalidated for free; the priority rule stands anyway, because an
 attacker who *can* keep an address unvalidated must still not be able to
 starve the verdict — and ruling 208 widens that residual class rather than
 narrowing it, because an on-path relay **can** keep answering. Note also
-that the engine's defusal is a claim about this attacker only: the flagged
-rank-2/rank-4 interaction above is a way the verdict can be starved with
-**no attacker at all**, and it is not closed by anything in this
+that the engine's defusal is a claim about this attacker only: the
+once-flagged rank-2/rank-4 interaction above was a way the verdict could
+be starved with **no attacker at all** — closed by ruling 215 and
+resolved into coalescing by ruling 250, not by anything in this
 paragraph.
 
 **Why CLOSE outranks even the probe. [RATIFIED 2026/08/16 — ruling
@@ -3134,7 +3178,11 @@ each direction ratchets independently; the counter is **never reset** by
 the ratchet; `2⁶⁴ − 1` is reserved for the `Rekey()` transform. Epoch `e`'s
 key is Noise §11.3 `Rekey()` applied `e` times:
 `Rekey(k) = ENCRYPT(k, 2⁶⁴ − 1, empty, zeros[32])[0..32]`. The
-ChaCha20-Poly1305 vector, pinned by test:
+ChaCha20-Poly1305 vector, pinned by a test-only computation in slither's
+own suite **[AMENDED 2026/08/17 — ruling 251]** (via `cryptoxide`, the
+golden-wire philosophy: a fixed vector over constants is not session
+cryptography — and a both-sides-hiss boundary test cannot pin it, because
+a wrong `Rekey()` agrees with itself):
 `REKEY(0³²) = 25ce5d37df19f3783185f2ffd5ab17fa3397c212f02d62fb1733e0b875b74c58`.
 The receiver retains the current and immediately preceding epoch keys
 (straggler tolerance: one epoch back); anything older is refused, its key
@@ -4228,6 +4276,21 @@ defragment-plus-hard-fail shape). The ceiling value ships
 ratified-but-revisitable, gated on the Appendix B
 defragmentation/throughput check.
 
+**[AMENDED 2026/08/17 — ruling 253]** **The mandate above bounds state;
+this clause bounds work.** Coalesce-on-insert's total copy work per
+stream MUST be O(that stream's advertised credit · log credit) — every
+stored byte is
+copied O(log) times across its lifetime (the small-to-large discipline),
+never once per bridging frame. Without the work bound a peer alternating
+bridging inserts buys receiver work three orders of magnitude past its
+wire bytes while staying inside flow credit — the lever lives exactly in
+the gap between a state bound and a work bound, and the state mandate
+alone says nothing about it. The evidence is an adversarial
+alternating-bridging workload asserted from the separating side — the
+pre-253 whole-span merge fails it (an Appendix B obligation) — with the
+throughput gate guarding the honest path; the gate alone is not the
+evidence, because the whole-span merge passes it.
+
 | Constant | Value |
 |---|---|
 | `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream |
@@ -4244,7 +4307,12 @@ exactly the class this section exists to close, produced by following
 this section's own admissible option.
 
 Both bounds are real and they are reconciled by never allocating ahead of
-arrival. The connection-level credit is what protects memory; the
+arrival — within ruling 253's accounting bound, stated for option (b):
+allocated **capacity** stays ≈ the arrived span, its per-stream ceiling
+≈ the advertised credit; shrink-at-quiescence and capped growth both
+qualify (the ruling's admissible mechanisms), a bare doubling policy
+holding ~1.5 × credit does not, and the capacity observable below is
+what enforces this. The connection-level credit is what protects memory; the
 per-stream bound is what keeps any one stream's metadata proportional.
 Buffering only what has arrived makes total buffered bytes across **all**
 streams bounded by the advertised connection credit, and (b)'s
@@ -4513,12 +4581,23 @@ PTO = smoothed_rtt + max(4 · rttvar, K_GRANULARITY) + MAX_ACK_DELAY
 ```
 
 anchored at the last ack-eliciting send, doubled per consecutive
-unanswered probe (`2^pto_count`), capped at `PTO_BACKOFF_CAP` = 2⁶.
+unanswered probe (`2^pto_count`), capped at `PTO_BACKOFF_CAP` = 2³
+**[AMENDED 2026/08/17 — ruling 254]**.
 `pto_count` resets to 0 whenever any packet is newly acknowledged. The
 probe train is ended by liveness (`DEAD_TIMEOUT` — under symmetric loss
 and, since the anchor is the receive clock, under asymmetric loss too,
-§7.4) — the cap is an overflow
-guard, not a death sentence. The ending is unconditional, and that is
+§7.4) — and the cap is sized to that window, not to overflow
+**[AMENDED 2026/08/17 — ruling 254]**: at the inherited 2⁶ the later
+rungs could not fire inside 25 s at any warm RTT, silently converting the
+train's tail from probing into waiting — measured at 50 % sustained loss,
+transfers timed out at 2⁶ that complete at 2³, at zero observed
+honest-path cost (every virtual-time budget in the suite sits at ≤ 3
+doublings). At 2³ the whole ladder fits inside `DEAD_TIMEOUT` and
+liveness still decides. The survival envelope this buys, stated: under
+sustained random loss the probe cadence never thins beyond 8 × PTO, so
+completion degrades gracefully toward the `DEAD_TIMEOUT` verdict rather
+than cliffing — an Appendix B obligation pins the ladder shape and a
+≥ 30 % completion floor at 50 % loss (the audit's E5a/E5b). The ending is unconditional, and that is
 ruling 33's doing: a probe is ack-eliciting, so the *first* probe arms the
 death deadline even when the connection has marked nothing since its last
 receive, and no later probe re-arms it. A probe train therefore always
@@ -4526,18 +4605,34 @@ terminates within `DEAD_TIMEOUT` of the last authenticated receive; it can
 neither defer death nor run in a black hole unobserved.
 
 **The `Pto` timer is armed only while at least one ack-eliciting packet
-is in the sent map** (RFC 9002 §6.2.1); when the map empties it is
-disarmed, and when the `Loss` timer is armed it takes precedence (§16.5).
-Without the precondition an idle connection self-sustains a probe train —
-PTO fires, the bare PING is ack-eliciting, the peer ACKs, `pto_count`
-resets, the timer re-arms — at ~20 packets/s against the 10 s keepalive
-cadence, defeating §16.5's timer economy.
+is in the sent map** (RFC 9002 §6.2.1) **and while §7.3's amplification
+budget admits a probe datagram** **[AMENDED 2026/08/17 — ruling 249]**;
+when the map empties it is disarmed, and when the `Loss` timer is armed it
+takes precedence (§16.5).
+Without the first precondition an idle connection self-sustains a probe
+train — PTO fires, the bare PING is ack-eliciting, the peer ACKs,
+`pto_count` resets, the timer re-arms — at ~20 packets/s against the 10 s
+keepalive cadence, defeating §16.5's timer economy. Without the second, a
+saturated backoff at a closed budget re-arms itself in the past forever:
+the anchor moves only at an ack-eliciting send, the increment advances the
+deadline only until `pto_count` saturates, and a firing that can emit
+nothing changes neither — so the one driver every connection shares spins
+until `DEAD_TIMEOUT` (ruling 249's measured livelock, reachable from any
+roam, which zeroes the budget, §13.6). The second precondition gates the
+**announcement**, not the state: sent map, `pto_count` and anchor are
+untouched while the budget is closed, the connection's `Timeout` falls to
+the next armed timer — `Liveness` at the latest — and the deadline is
+announced again at the authenticated, window-fresh receive that refunds
+the budget (§7.2, §7.3; every receive recomputes the `Timeout`, so no
+dedicated re-arm machinery exists). This is §16.4's `Contested` principle
+— a deadline is never announced for output that cannot leave — applied to
+`Pto`.
 
 | Constant | Value |
 |---|---|
 | `K_PACKET_THRESHOLD` | 3 |
 | time threshold | 9⁄8 |
-| `PTO_BACKOFF_CAP` | 2⁶ |
+| `PTO_BACKOFF_CAP` | 2³ |
 
 ### 13.4 Probe content
 
@@ -4559,8 +4654,10 @@ frames out of loss recovery, so on a connection with nothing else to say
 the PTO is the sole timer that can re-ask, and without it §8.7's
 *"sent once and lost forever"* is what the implementation does. The probe
 remains subject to §7.3's budget (below), which is what bounds the
-re-offer: a budget with no room for a 39-byte challenge datagram emits
-nothing, and the session dies at `DEAD_TIMEOUT` as §7.3 intends.
+re-offer: while the budget has no room for the 39-byte challenge datagram
+the `Pto` deadline is not announced at all **[AMENDED 2026/08/17 — ruling
+249]** (§13.3) — nothing fires and nothing is emitted, and the session
+still dies at `DEAD_TIMEOUT` as §7.3 intends.
 
 Probes are sealed
 `seal_quiet` (liveness-neutral, §7.4) **and** exempt from the congestion
@@ -4586,7 +4683,10 @@ connection's one session lives as long as the connection (§7.8).
 
 **Roaming** (§7.3): the sent map is **kept** — ACKs for packets in flight
 to the old address still resolve, and `bytes_in_flight` remains consistent
-with the retained map; loss detection and PTO continue undisturbed. The
+with the retained map; loss detection continues undisturbed, and PTO
+**state** carries across untouched — though its deadline is announced
+again only once the zeroed budget re-admits a probe (§13.3, ruling 249).
+The
 congestion controller resets with the **pre-roam flight fenced off**
 (§14.6): packets sent before the roam still resolve for loss and
 retransmission, but feed no congestion event, no persistent-congestion
@@ -4605,8 +4705,11 @@ estimator is treated as suspect-but-kept, with
 (Consequence: immediately after a roam,
 `bytes_in_flight` may exceed the fresh initial window; the admission gate
 then blocks new sends until old-path packets are acknowledged or declared
-lost — a bounded stall of at most one loss-detection/PTO cycle, kept
-probeable by the PTO exemption within §7.3's budget.)
+lost — a bounded stall of at most one loss-detection/PTO cycle once §7.3's
+budget re-admits a probe, which the first authenticated receive at the new
+address funds; until then the `Pto` deadline is suppressed (§13.3, ruling
+249), and the path stays probeable by the PTO exemption within that
+budget.)
 
 **Every per-connection reset on this seam, in one list.**
 **[RATIFIED 2026/08/16 — ruling 173]** This section's title claims a
@@ -4630,7 +4733,7 @@ builds against it, so the list is the thing that has to exist.
 | the outstanding **challenge** | **re-drawn** at the roam — eight fresh bytes from the connection's §16.6 sub-seed; any earlier challenge is discarded and a `PATH_RESPONSE` echoing it validates nothing thereafter | §7.3, §16.6, rulings 208, 210(b) |
 | an outstanding **`PATH_RESPONSE` obligation** (one we owe the peer) | **kept** — it answers the peer's question about *its* path, which our endpoint moving does not change; like all output it is sent to the new endpoint, and it is capped by the re-armed budget like everything else | §7.3, §8.4, ruling 208 |
 | sent-packet map | **kept** — in-flight ACKs still resolve, `bytes_in_flight` stays consistent | §13.5, above |
-| PTO / loss detection | **undisturbed** — timers continue, no re-arm, no cancel | §13.3, §13.4 |
+| PTO / loss detection | **state undisturbed** — sent map, `pto_count`, anchor and `loss_time` carry across, nothing is reset; the `Pto` **announcement** is budget-gated (§13.3, ruling 249), so it is suppressed from the roam — which zeroes the budget, four rows up — until the first qualifying receive | §13.3, §13.4 |
 | RTT estimator | **kept as a prior** (suspect-but-kept); `min_rtt` re-seeded from the first post-roam sample | §13.1 |
 | pending contested mark and its `probe_floor` | **kept intact, floor unchanged** — a roam changes the pending probe's budget prospects, not the question it asks | §7.5, ruling 176 |
 | `Contested` deadline, once armed | **undisturbed** — it is armed at the probe's transmission and disarmed only by an ACK covering `probe_floor` | §16.5, §7.5 |
@@ -4699,7 +4802,7 @@ the controller collapses: `cwnd = MINIMUM_WINDOW`, slow start effectively
 restarts. `persistent_period` evaluates the §13.3 PTO formula **with
 `pto_count = 0`** (RFC 9002 §7.6.1): the backoff is deliberately excluded
 so the period is a property of the path, not of the probe count — with
-the backoff included, the threshold would run up to 2⁶× too long and
+the backoff included, the threshold would run up to 2³× too long and
 persistent congestion would never trigger under exactly the sustained
 loss it exists to detect. Packets sent before a roam are excluded from
 the walk (§13.6, §14.6).
@@ -4730,7 +4833,14 @@ send permitted  iff  bytes_in_flight + candidate_size ≤ cwnd
   it in the sent map and its bytes count in `bytes_in_flight` like any
   other tracked packet (ruling 43). Exempting it from the gate without
   counting it would have put a packet in flight that loss recovery could
-  not see and §17.5's cwnd bound did not cover.
+  not see and §17.5's cwnd bound did not cover. **[AMENDED 2026/08/17 —
+  ruling 250]** The exemption covers the probe's packet **as built**: a
+  probe that coalesces the owed `PATH_RESPONSE`/`PATH_CHALLENGE` (§7.3)
+  remains exempt — the packet exists because the probe demanded it, the
+  piggyback adds at most 18 B of frames, and gating the merged packet
+  would starve the challenge at collapsed cwnd exactly where a roam makes
+  it owed. (The dedicated path-frame packet the coalescing replaces was
+  cwnd-gated; its work now rides the exempt probe.)
 - **Non-ack-eliciting control packets** — pure ACKs, CLOSE, keepalives —
   are never tracked in flight and never gated.
 
@@ -4756,8 +4866,10 @@ is the normative one), because a probe the budget could delay past its own
 deadline would convert a scarce budget into a liveness verdict, which is
 the same argument that earns it the cwnd exemption above. `PATH_RESPONSE`
 and `PATH_CHALLENGE` rank immediately below the probe and above the pure
-ACK, and §7.3 carries a flagged, unresolved interaction between the probe's
-rank and the challenge's — read the order there, not here.
+ACK; the once-flagged interaction between the probe's rank and the
+challenge's was closed by ruling 215 and resolved into coalescing by
+ruling 250 — the probe carries the owed path frames when room admits —
+read the order in §7.3, not here.
 
 **`app_limited`** (quinn's mechanism, pinned): the send path maintains an
 application-limited flag — set when the sender runs out of queued data
@@ -4950,7 +5062,7 @@ what each side observes:
 | Cause | Transmitted | Local surface | Peer's view |
 |---|---|---|---|
 | liveness — 25 s without an authenticated fresh receive (§7.5) | nothing | `ConnectionLost::TimedOut` | its own liveness fires ≈ symmetrically |
-| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's one PING, at the mark — or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output but CLOSE** to that address (§7.3, rulings 171 and 186 — this cell read "all other output" and did not carry ruling 186's amendment across; §7.3's list is the normative one, and §7.3 also carries a flagged, unresolved interaction between this rank and ruling 208's `PATH_CHALLENGE`); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
+| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's packet — the PING, plus the owed path frames when room admits (ruling 250) — at the mark, or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output but CLOSE** to that address (§7.3, rulings 171 and 186 — this cell read "all other output" and did not carry ruling 186's amendment across; §7.3's list is the normative one, and the once-flagged interaction with ruling 208's `PATH_CHALLENGE` was closed by ruling 215 and resolved into coalescing by ruling 250: the probe carries the owed path frames when room admits); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
 | nonce exhaustion (§7.9) | nothing | `ConnectionLost::NonceExhausted` | liveness |
 | local `close(code, reason)` / last-handle drop (§16.2) | CLOSE, then ≤ 1 reply/s for 5 s | `ConnectionLost::LocallyClosed` | `PeerClosed { code, reason }` |
 | peer's CLOSE received | nothing (drain only) | `ConnectionLost::PeerClosed { code, reason }` | (it closed) |
@@ -5973,9 +6085,12 @@ enum ToEndpoint {
   never armed for it (ruling 176) — which matters here because the
   disarm rule above keys on an ACK covering the floor, and a floor
   already satisfied cannot disarm a deadline armed after it. `Pto` is armed only while an
-  ack-eliciting packet is in the sent map (§13.3) — the probe is
-  ack-eliciting and is in that map (§13.5), so `Pto` and `Contested` can
-  be armed together and are independent; `Liveness` is armed by the first
+  ack-eliciting packet is in the sent map **and §7.3's budget admits a
+  probe** (§13.3, ruling 249) — the probe is ack-eliciting and is in that
+  map (§13.5), so `Pto` and `Contested` can be armed together; they are
+  not independent in one respect: both wait on the same budget predicate,
+  `Contested` at the probe's transmission (§16.4) and `Pto` at the
+  announcement; `Liveness` is armed by the first
   **marking or ack-eliciting** send after an authenticated, window-fresh
   receive, is not re-armed by later sends of either kind, and is disarmed
   and re-anchored by every such receive (§7.4). The endpoint core's
@@ -7105,6 +7220,11 @@ clock (§16.10); no test sleeps.
   even-offsets flood stays O(credit) or dies at `REASSEMBLY_CHUNKS_MAX`
   with `PROTOCOL_VIOLATION`; the defragmentation cost is measured by the
   throughput gate below.
+- **The reassembly work bound** (§10.6, ruling 253): an alternating
+  bridging workload's total copy work stays O(credit · log credit),
+  asserted from the separating side — the pre-253 whole-span merge fails
+  it while passing the throughput gate, which is why the gate alone is
+  not the evidence.
 - MAX_STREAMS replenishment (batching at 8, low-allowance emission,
   peer-opened streams only) and
   `STREAM_LIMIT_ERROR` (§10.4).
@@ -7140,9 +7260,21 @@ clock (§16.10); no test sleeps.
   above-highest-sealed ⇒ frame ignored whole (§7.2, §12).
 - Loss/PTO staircase on the paused clock (packet threshold, time
   threshold, PTO doubling and cap, reset-on-ack) (§13).
-- **PTO-disarm** (§13.3): an idle connection with an empty sent map arms
-  no `Pto` — no self-sustaining PING train; the timer re-arms with the
-  next ack-eliciting send.
+- **PTO-disarm** (§13.3, amended by ruling 249): an idle connection with
+  an empty sent map arms no `Pto` — no self-sustaining PING train — and a
+  **non-empty** map under a closed §7.3 budget announces no `Pto` either:
+  the announced `Timeout` falls to the next armed timer, `Liveness` at
+  the latest (the livelock separation — the pre-249 build announces a
+  past deadline and spins the shared driver), re-announcing at the
+  receive that refunds the budget. The timer re-arms with the next
+  ack-eliciting send **the budget admits**.
+- **The backoff ladder and the survival envelope** (§13.3, ruling 254):
+  probe intervals under a black-holed path are **not all equal** and are
+  **capped at 8 ×** the base PTO with the capped rung reached — both
+  sides, so an always-at-base build and an uncapped build each fail; and
+  at 50 % random loss a bounded transfer completes inside `DEAD_TIMEOUT`
+  in ≥ 30 % of runs (the audit's E5a/E5b, discharged by the story
+  suite).
 - NewReno: slow start, congestion avoidance (ABC), recovery-period
   one-cut, **no cwnd growth from ACKs of pre-recovery-period packets**
   (§14.3), persistent congestion (3× the un-backed-off PTO —
@@ -7150,6 +7282,22 @@ clock (§16.10); no test sleeps.
   (§14.2–14.4).
 - The cwnd admission gate incl. the PTO-probe exemption and
   non-ack-eliciting exemption (§14.5).
+- **The epoch ratchet** (§7.7, ruling 251): seals cross the epoch
+  boundary invisibly — a stream is byte-exact across it, with no
+  handshake, no round trip and no application-visible event (S23); each
+  direction ratchets independently; the counter is never reset. Pinned at
+  **both triggers**: the config-supplied epoch (ruling 82's knob)
+  crossing several boundaries on the paused clock, and the production
+  constant (`REKEY_EPOCH_MSGS` = 65 536) crossing once — in the release
+  run if debug-slow.
+- **Straggler tolerance** (§7.7): a packet from the immediately preceding
+  epoch opens after the receiver commits to the new one; a packet from
+  **two** epochs back is refused without key derivation. The refusal is
+  the separating assertion — a build that never rekeys opens the e−2
+  straggler happily, where boundary-invisibility alone is satisfied for
+  free by the build in which nothing ever happens.
+- The `REKEY(0³²)` vector (§7.7), pinned test-only in slither via
+  `cryptoxide` (ruling 251).
 - **One session per connection** (§7.8): a completed replacement
   handshake installs a fresh connection carrying nothing — fresh
   streams, credit, recovery, counters — and the old connection dies
@@ -7537,7 +7685,7 @@ rulings).**
 | ACK policy | every 2nd ack-eliciting, `MAX_ACK_DELAY` cap, immediate on gap | §12.4 |
 | `MAX_ACK_DELAY` | 25 ms | §12.4 / §13.3 |
 | `K_PACKET_THRESHOLD` / time threshold / `K_GRANULARITY` | 3 / 9⁄8 / 1 ms | §13.2 |
-| `K_INITIAL_RTT` / `PTO_BACKOFF_CAP` | 333 ms / 2⁶ | §13.1 / §13.3 |
+| `K_INITIAL_RTT` / `PTO_BACKOFF_CAP` | 333 ms / 2³ | §13.1 / §13.3 |
 | `INITIAL_WINDOW` / `MINIMUM_WINDOW` | 12 000 / 2 400 B | §14.2 |
 | `LOSS_REDUCTION_FACTOR` / `PERSISTENT_CONGESTION_THRESHOLD` | 0.5 / 3 | §14.2 / §14.4 |
 | `RETRANSMIT_BASE` / `RETRANSMIT_JITTER_MAX` | 5 s / 333 ms | §5.5 |
@@ -7573,7 +7721,7 @@ already fixes**. Nothing here changes a value, a byte, or a behaviour.
 | `CREDIT_REGRANT_DIVISOR` | 2 | §10.3 | "credit re-grant threshold … ½ window consumed" |
 | `ACK_ELICITING_PER_ACK` | 2 | §12.4 | "every 2nd ack-eliciting" |
 | `K_TIME_THRESHOLD_NUM` / `_DEN` | 9 / 8 | §13.2 | "time threshold … 9⁄8" |
-| `PTO_BACKOFF_CAP` | **64** | §13.3 | written "2⁶" |
+| `PTO_BACKOFF_CAP` | **8** | §13.3 | written "2³" |
 | `CLOSE_REPLY_MIN_INTERVAL` | 1 s | §15.1 | "close-reply rate … ≤ 1 per s" |
 | `SHELL_LATENESS_BOUND` | 250 ms | §16.5 | the spec calls it `L` |
 | `PERSISTENT_KEEPALIVE_DEFAULT` / `_MIN` | 10 s / 1 s | §7.5 | one bare `PERSISTENT_KEEPALIVE`, range in prose |
@@ -7584,11 +7732,15 @@ entries.** Both are ways a specification can be complete and still
 unimplementable without a guess.
 
 1. **A ratio or rate stated in prose** — `½ window`, `every 2nd`, `9⁄8`,
-   `≤ 1 per s`, `2⁶` — needs an identifier **and a stated unit**.
-   `PTO_BACKOFF_CAP` proves the point: "2⁶" is a multiplier (64) in
-   §13.3's sentence and reads as an exponent (6) in the table, and an
-   implementer who guessed wrong would back off 64× too little with
-   nothing red to show for it.
+   `≤ 1 per s`, `2³` — needs an identifier **and a stated unit**.
+   `PTO_BACKOFF_CAP` proves the point: "2³" is a multiplier (8) in
+   §13.3's sentence and reads as an exponent (3) in the table, and an
+   implementer who guessed wrong would back off 8× too little with
+   nothing red to show for it — more silently since ruling 254 lowered
+   the cap from the inherited 2⁶: `1u32 << 8` is a legal 256 where
+   `1u32 << 64` was undefined, so the compile-time pins
+   (`PTO_BACKOFF_CAP == 1 << 3`, `PTO_MAX_EXPONENT == 3`) are
+   load-bearing rather than belt-and-braces.
 2. **A range stated in prose against one named constant** — the
    admissible `[1 s, DEAD_TIMEOUT)` for `PERSISTENT_KEEPALIVE` — becomes
    two or three identifiers in code. Name the **default** and the

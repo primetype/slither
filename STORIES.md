@@ -1,10 +1,14 @@
 # slither — capability stories
 
-> **COMPLETE AND APPROVED 2026/08/14 — 30 stories.** S1–S26 were walked
+> **COMPLETE AND APPROVED 2026/08/14 — 34 stories.** S1–S26 were walked
 > one at a time first; S27–S28 followed from rulings 46–47; S29–S30 were
 > walked last, after a re-read found the "still open" list entirely
 > stale (both items had been ruled in round 8 with no story testing
-> them). **This set is the acceptance criteria for `PLAN.md`.**
+> them); S31–S33 were approved by ruling 209 (2026/08/16) and S34 by
+> ruling 252 (2026/08/17). *(This banner read "30" until 2026/08/17 —
+> stale since ruling 209, the 2026/08/17 survey's finding #1; rule 4's
+> shape, in the acceptance-criteria document itself.)* **This set is the
+> acceptance criteria for `PLAN.md`.**
 >
 > **APPROVED 2026/08/14.** All 26 stories were walked one at a time and
 > approved by the maintainer. **Twenty-five stand as drafted; S11 was
@@ -600,6 +604,33 @@ The service shape, typed honestly rather than aspirationally.
   out of v0.2 scope — it re-crosses the core→shell seam with channels,
   which is exactly where round 7's five defects lived.
 - **Anchor:** §3.4 of `PLAN.md`, §16.3, S21. **Paused clock:** yes.
+
+## J. Liveness of the accept loop *(APPROVED 2026/08/17 — ruling 252)*
+
+The 2026/08/17 audit's C1: one lost msg2 against a one-accept responder
+fails the dial outright — measured 1 in 12 at 10 % loss. The design is
+confirmed (msg2 is never retransmitted; the peer re-offers fresh
+initiations, §5.5); what was missing was any statement of the
+application's obligation to keep accepting, and a harness that could
+express the case — every `accept()` site in `tests/` accepted exactly
+once (working rule 13).
+
+### S34 — a responder that keeps accepting survives a lost msg2
+
+The application obligation §6.5 now states, exercised end to end.
+
+- **Accepts:** drop exactly one msg2 with `FlakyWire`; the initiator's
+  same `connect()` resolves within §5.5's retransmit schedule — no new
+  dial, no application retry. The responder's accept loop admits the
+  peer's fresh initiation; its first, never-confirmed connection
+  surfaces `ConnectionLost::Replaced`; the replacement carries the
+  traffic.
+- **Accepts:** the dial story under loss — at 10 % random loss, 12 of 12
+  establishments complete against a looping responder (the measured
+  1-in-12 failure of a one-accept responder goes to 0).
+- **Cost:** 4 DH per completed `accept()` ladder — the recovery pays the
+  ladder twice at the responder, once per admitted initiation (§6.1).
+- **Anchor:** §5.5, §6.4, §6.5, ruling 252. **Paused clock:** yes.
 
 ---
 

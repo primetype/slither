@@ -7193,3 +7193,445 @@ Not decided here. Each needs a call the reviewers correctly declined to make.
 8. **Window auto-tuning**, per 247(a). Today's constants cap a single stream
    at `256 KiB / RTT` — about 2.5 MiB/s at 100 ms — with no way for a
    consumer to raise them. `Config` exposes no flow-control knob.
+
+## Round 40 — the measured audit's six items, ratified (2026/08/17)
+
+> **Resuming?** The round's inputs are `DECISIONS-round40.md` (the nine
+> maintainer decisions, taken one by one) and `SWEEP-round40.md` (the
+> rule-4 sweep over every artefact the six changes touch: 68 non-benign
+> hits, six conflicts C1–C6). Sweep hits are cited below as **[S-nn]**.
+> Line references are at `6448e6f`, the pre-amendment base.
+
+A seven-agent measured audit at `6448e6f` (all gates green, ~5 M fuzz
+iterations panic-free, DoS/replay/amplification posture held under
+measurement, mutation score 79 % of viable) surfaced six items worth a
+ruling. Every finding below was **measured before ruling** — driven in a
+worktree harness, not argued from reading — and the sweep then verified
+every citation in these rulings against the artefact it is about (rule
+11), which corrected several of this round's own draft claims before they
+shipped. The slices: 249+254 ship together (249's fix first — both levers
+are red on the livelock test without it), then 250, 251, 252, 253.
+
+### 249 — the `Pto` deadline is announced only while §7.3's budget admits a probe; the driver's past-deadline guard becomes `assert!`
+
+**Ruling: (i) a `Pto` deadline is announced to the shell only while
+§7.3's amplification budget admits a probe datagram. While the budget
+admits none, the connection's announced `Timeout` falls to the next armed
+timer — `Liveness` at the latest — and the recovery state (sent map,
+`pto_count`, anchor) is untouched: the gate is on the announcement, not
+the timer state. Re-arming needs no machinery: the budget grows only on
+an authenticated, window-fresh receive, and every receive already
+recomputes the `Timeout`. (ii) The driver's past-deadline guard
+(`driver.rs:1028`) is promoted from `debug_assert!` to `assert!` — after
+(i) has landed, and not before.**
+
+The finding, measured and reproduced at shipped constants: a
+budget-suppressed, saturated PTO announces a deadline ≤ `now`, and the
+single shared driver — §16.3's one `!Send` actor serving every connection
+on the endpoint — spins at 100 % of a core for ~21 s until `DEAD_TIMEOUT`
+reaps the session (receive-anchored, §7.4, so it does fire).
+`pto_deadline()` returns `anchor + interval × 2^min(pto_count,
+PTO_MAX_EXPONENT)` (`recovery.rs:383–396`); the anchor moves only in
+`on_sent` (`recovery.rs:218`); the firing-time increment advances the
+deadline only `PTO_MAX_EXPONENT` times and then freezes it — rule 8's
+shape in arithmetic: the mechanism's unstated scope is saturation, and
+past it the firing re-arms itself in the past forever. Peer-triggerable:
+an authenticated peer warms the RTT estimator, roams, goes silent; §13.6
+keeps the estimator, the roam zeroes the budget, and with `srtt` warm the
+whole 64× ladder fits far inside 25 s. In release the spin is silent.
+
+§13.4 already stated the intended outcome — *"a budget with no
+room for a 39-byte challenge datagram emits nothing, and the session dies
+at `DEAD_TIMEOUT` as §7.3 intends"* — with §13.3 carrying the
+ending-by-liveness half, and the code did not implement it;
+one clause was never written. The code read §13.3's arming rule as an iff
+(`recovery.rs:376–382`, `None` **iff** the map is empty) **[S-32]**, and
+rule 8 applies to the spec sentence itself: "armed only while X" is a
+necessary condition whose disarm clause beside it reads as the complete
+rule without saying so **[S-21]**. The ruling adds the second conjunct.
+
+The precedent is already ratified, for the other timer: §16.4 refuses to
+arm `Contested` for output the budget will not admit — *"an event fired
+at the mark would announce a countdown that is not running"*
+(`SPEC.md:5849–5862`) **[S-27]**. And the code already went further
+than the ratified text: slice 7b's F1 fix gates **both keepalive**
+announcements on the same budget predicate (`keepalive_can_leave()`,
+`mod.rs:2804–2807`, pinned in `tests_livelock.rs`) — ratified for
+`Contested`, shipped for the keepalives, absent only for `Pto`; this
+ruling ends the asymmetry. The roam-seam conflict
+predates the ruling and is why it exists (sweep conflict C4): §13.6's
+table said *"undisturbed — timers continue, no re-arm, no cancel"* four
+lines under the row that zeroes the budget, while §13.4 admitted the
+firing emits nothing **[S-24]**. The announce-gate resolves it without
+touching ruling 173's table structure — recovery **state** is undisturbed
+exactly as the row said; the row is reworded in place, none added, so the
+exhaustive table stays exhaustive.
+
+**Ruling 139(a) is re-founded, not reversed (rule 4(b)).** Its conclusion
+stands — the increment stays at the firing — but its slither-specific
+rationale (*"stays right in slice 7 where §7.3's budget can prevent a
+probe leaving"*, carried, reworded, into `recovery.rs:359–366`) describes
+exactly the firing this ruling removes: under 249 a budget-suppressed
+firing never happens, so the increment's justification is RFC 9002's
+ordering point alone **[S-29]**. Ruling 175/188's defect — correcting a
+conclusion while orphaning the reasoning — is avoided by saying this out
+loud. The behavioural consequence, stated: the backoff no longer climbs
+through a blockade; `pto_count` freezes and resumes at the first admitted
+firing. Combined with 254 the post-roam cadence changes twice this round;
+E5a's ladder obligation is written against both.
+
+**Layering:** `Recovery` has no sight of the budget; the gate lands where
+the connection assembles its `Timeout` — the one arming site,
+`mod.rs:1496–1498` **[S-33]**. Whether the predicate is threaded into
+`pto_deadline()` or applied at the `.set()` is the implementer's; the
+iff-doc is rewritten either way.
+
+**(ii), argued from the guard that exists.** The guard is
+`debug_assert!(*announced > fired_at)` keyed on `last_timeout` — set in
+`handle_timeout` (`driver.rs:936`), cleared on every non-`Timeout` event
+(`:273`). It is **not** `CONTRACT-7b.md` §4.2's `deadline >= now`, which
+the driver rejected as too strong (a deadline computed after the clock
+advanced while parked is correctly overdue and fires once —
+`driver.rs:968–969`, the `sd6` case). What the shipped guard fires on is
+precisely a firing that changed nothing: timer fired at `t`, cores
+mutated and pumped, freshly announced deadline still ≤ `t`. Post-249 the
+one known-reachable such state no longer announces, and the re-arm cannot
+trip it: the budget grows only on a receive, so the re-armed deadline is
+always announced on a pass where `last_timeout` is `None` — verified by
+reading `driver.rs:255–297, 929–945, 1013–1031`, not inferred **[S-B7]**.
+What remains trippable is an unknown member of ruling 141's spin class on
+the shared driver, where the alternative to a clean panic is 100 % CPU
+for every co-hosted connection with nothing red anywhere. **Order is
+load-bearing:** promoted before (i), the assert panics release drivers in
+the known-reachable state; the slice lands (i), proves it, then (ii).
+
+**Scope guard:** this rules `Pto`, the measured case. The keepalive was
+checked and is already safe: slice 7b's F1 fix gates both keepalive
+announcements on the budget (`keepalive_can_leave()`,
+`mod.rs:2804–2807`) and `tests_livelock.rs` pins that no beacon deadline
+is armed at zero room — F1's spin is unreachable rather than survivable.
+The residual gap is documentary and is recorded here, deferred: the spec
+is silent about the keepalive announce-gate the code implements (a grep
+for a keepalive-budget clause in `SPEC.md` finds only §7.3's 90 B
+arithmetic) — round-41 material, not a spin.
+
+Amended: §13.3 (the arming conjunct and the announce-gate paragraph),
+§13.4 (the mechanism sentence — "fires and emits nothing" became "does
+not fire"), §13.6 (the roam row, its prose restatement, and the
+post-roam-stall parenthetical), §16.5 (the arming restatement; the word
+"independent" — `Pto` and `Contested` now wait on the same budget
+predicate, one at transmission, one at announcement).
+
+### 250 — the pump implements ruling 215; the probe coalesces the owed path frames; §7.3's arithmetic moves to pump time
+
+**Ruling: (i) `pump_packets`' 212(c) pre-pass is deleted — the contested
+probe is built first, at rank 2, and the pump continues on the same
+pass, exactly as ratified §7.3 orders. (ii) The probe coalesces: one
+packet carrying the PING and the owed `PATH_RESPONSE`/`PATH_CHALLENGE`
+when the budget's remaining room admits the coalesced size — 40 B with
+one path frame owed, 49 B with both; a bare 31 B PING otherwise, the
+path frames following at their rank. One packet, one
+counter, one sent-map entry. (iii) §7.3's contention arithmetic is
+restated at pump time: checked against the remaining room when the
+packet is built, never asserted from the arming-instant floor. (iv) The
+coalesced packet keeps the probe's §14.5 cwnd exemption.**
+
+The finding (sweep conflict C3): the code contradicts the ratified spec
+**today**. `mod.rs:2055–2069` still implements ruling 212(c) — a
+pre-pass emitting the path frames in a dedicated datagram *above* the
+contested probe, under a comment citing 212(c) as live law — while
+ratified §7.3 ranks 1 CLOSE · 2 probe · 3 `PATH_RESPONSE` · 4
+`PATH_CHALLENGE` and ruling 215 says those ranks *"stand exactly as
+written"* **[S-48]**. Measured cost: the contested verdict delayed ~10 s
+against a talking peer, ~15 s against an abandoned one — a delay, not a
+kill, which is how it survived the full suite. The citation pattern is the
+diagnosis: every `212(c)` site in `SPEC.md` and `rulings.md` says
+"reversed"; not one of the `src/` citations does — 15 lines across four
+files (`grep -rn '212(c)' src/`; the sweep's B7 table undercounts its
+own listing, so grep, do not count from it) **[S-B7]**.
+Ruling 215 named this exact process defect — *"closing a flag is not
+sweeping the spec"* — and then left the code behind: 215's own defect,
+happening to 215.
+
+**Coalescing, stated honestly against 215's record (rule 4(b)).** 215
+listed three resolutions and took the third (`rulings.md:6232–6237`)
+**[S-44]** — but its justifying arithmetic priced the **first**: *"probe
+and challenge together cost 14 B of header + 1 B of PING + 9 B of
+challenge + a 16 B tag = 40 B"* is one header and one tag, a single
+coalesced packet, while the shipped two-packet shape pays both twice. 215
+declined resolution 1 without argument; 250 adopts it because a pump-time
+budget makes two packets a contention 215's arming-instant floor assumed
+away — and because it makes 215's own numbers true. Ruling 221's deletion
+of 217's `dedicated_sent` machinery is not resurrected: the coalesced
+probe rides the ordinary pump, and the probe takes the floor counter
+again **[S-55]**.
+
+**Pump time, not arming time (rule 8).** §7.3's *"never contend … under
+any budget this protocol can construct"* and *"the budget holds both and
+always does: 40 B against a 90 B floor"* are universals over **armed**
+budgets, silent about **remaining** ones — by pump time the budget has
+been spent down by whatever left since **[S-37, S-39]**. The mechanism
+for the restatement exists and was opened (rule 11): ruling 207(c)'s
+`Amplification::room`/`Packing` seam already sizes each packet to the
+remaining room (`mod.rs:2010–2046`) **[S-52]**.
+
+**The congestion gate (iv), the sweep's unanswered question [S-50].** The
+probe is cwnd-exempt; the dedicated path-frame packet it absorbs was
+cwnd-gated and said so (`mod.rs:2565–2578`). The merged packet keeps the
+exemption: it exists because the probe demanded it, the piggyback adds at
+most 18 B, and gating it would starve the challenge at collapsed cwnd
+exactly where a roam makes it owed. §14.5's exhaustive exemption list
+carries the clause.
+
+**The flag-reference sweep (conflict C2).** §14.5 and §15.4 still sent
+the reader to *"a flagged, unresolved interaction"* that §1.3 and §7.3
+say ruling 215 closed **[S-41, S-42]** — 215 wrote *"§14.5 needs no
+change, because the ranks it describes were right all along"*; the ranks
+were, the flag reference in the same sentence was not (rule 4(a)). Both
+sites are rewritten.
+
+Amended: §7.3 (the three arithmetic sites), §14.5 (the dead flag
+reference; the exemption clause), §15.4 (the contested row's flag
+reference). Code, for the slice: the pre-pass deleted, the rank label at
+`mod.rs:2071–2085` corrected (ruling 171's refused-probe early return is
+the surviving half and stays), `pack_path_frames`' arming-time universal,
+the dedicated packet absorbed, and every `212(c)` citation in `src/`
+updated — 15 lines across four files; the implementer greps rather than
+trusting any stated count **[S-109–115]**. Tests, for the blind author: `tests_contested.rs:684`
+asserts two transmits and goes red (becomes one); `:1092`'s comment is
+false while its assertion survives; `tests_path.rs:1062`'s **name** still
+states 212(c)'s rank (a name is prose, rule 4); `tests_path.rs:951`'s
+reported-conflict header gains a cross-reference to its resolution
+(conflict C5: one file, two verdicts, no link).
+
+### 251 — §7.7 gains its Appendix B obligation; the epoch boundary gets behavioural tests at both triggers
+
+**Ruling: Appendix B gains a §7.7 obligation block — the invisible
+boundary crossing (S23), the straggler window as the separating
+assertion, and the `REKEY(0³²)` vector — and slice R40-C discharges it
+with behavioural tests at both triggers: ruling 82's config knob crossing
+several boundaries on the paused clock, and the production constant
+crossing once (release run if debug-slow). No `#[cfg(test)]` epoch
+accessor. The vector is pinned test-only in slither via `cryptoxide`.**
+
+The finding, measured: hard-wiring the epoch schedule to never-rekey
+leaves **all 1041 tests green**; the control (epoch size 1) breaks 14 —
+the suite is sensitive to a too-small epoch's side effects and pins
+nowhere that rekeying happens at all. The soak saw 21 genuine rollovers:
+the ratchet works; nothing observes it. Appendix B contains zero
+occurrences of "rekey", "epoch" or "ratchet" (measured over
+`SPEC.md:6967–7505`) — §7.7 is the only numbered subsection of §7 with no
+obligation **[S-93]** — and S23 is an approved story with no test behind
+it, against `CLAUDE.md`'s *"a slice is done when its stories are
+paused-clock tests that pass"* **[S-99]**.
+
+**Ruling 82 is extended, not reversed (rule 4(b)).** Its arrangement —
+*"a configurable epoch therefore pins the boundary behaviour and a
+separate constant test pins the value — independently, which is the
+stronger arrangement"* — stands; the sweep found it half-built: `with_epoch_size`
+(`config.rs:183`) is exercised by exactly one setter unit test, and no
+test anywhere configures a small epoch and crosses a boundary **[S-98]**.
+251 builds the missing half. The separating assertion is the **e−2
+straggler refusal**: a build that never rekeys opens it happily, where
+boundary-invisibility alone is rule 9's trap twice over — satisfied for
+free by the build in which nothing happens, and green in any both-sides
+round-trip under a consistent schedule mutation.
+
+**The vector (sweep conflict C6).** §7.7 asserted the `REKEY(0³²)` vector
+*"pinned by test"* and `grep -rn "25ce5d37" src tests` returns nothing —
+a claim about an artefact, refuted by opening it **[S-95]**. A
+both-sides-hiss boundary test cannot pin it (a wrong `Rekey()` agrees
+with itself — ruling 82's own argument), so the pin is a test-only
+`cryptoxide` computation in slither's suite, the golden-wire philosophy:
+a fixed vector over constants is not session cryptography. This is a
+deliberate maintainer's reading of the raw-primitive rule, whose stated
+scope was mac1's keyed BLAKE2b; the production invariant — every session
+Noise/curve/AEAD operation flows through hiss — is untouched.
+
+Rule 15, for the slice: `tests/spec_rekey.rs` and `tests/story_rekey.rs`
+are both free; `Cargo.toml` has no `autotests = false`, so each file's
+`[[test]]` stanza with `required-features` is mandatory and
+integrator-owned — the manifest's own comment states the hazard
+**[S-102]**.
+
+Amended: Appendix B (the three bullets, slotted in document order before
+§7.8's "One session per connection"), §7.7 (the vector sentence names its
+home).
+
+### 252 — keep accepting: the obligation is stated where applications form their model, and the harness learns to express a lost msg2
+
+**Ruling: the ratified design is confirmed — no protocol change. (i)
+§6.5's drain-`accept()` obligation is widened from dialling applications
+to every application, with the lost-msg2 responder and the restarted peer
+named as the reasons the dial-scoped sentence did not reach. (ii)
+Documentation obligation #6, at the call sites: `lib.rs` and
+`Endpoint::accept`'s rustdoc. (iii) The "unconfirmed handshake" accessor
+is a separate follow-on API-shape ruling and blocks nothing. (iv)
+`Pair::establish` keeps accepting (the integrator's file, rule 15), and
+the acceptance story is S34, approved into `STORIES.md` §J.**
+
+The finding, verified against §5.5/§6.4 rather than assumed: the
+responder never retransmits msg2 — every retransmit is a completely fresh
+initiation (§5.5), and a msg2 answering a superseded initiation is
+ignored — so one lost msg2 leaves the responder holding a LIVE,
+never-confirmed connection while the initiator re-offers a fresh `Intro`
+every ~5 s until `HANDSHAKE_GIVEUP` (90 s). Only a second `accept()`
+closes the gap, and by §6.4's §16.1 guard that accept **is** the
+replacement — basis `Some(t)` because we accepted, strictly-greater
+timestamp — firing `ConnectionLost::Replaced` on the unconfirmed
+connection. Every mechanism in that chain exists and is ratified (rule
+11: §6.4 and §6.8 were opened). What did not exist is any statement that
+an application must call `accept()` again. Measured: 1 in 12 dials at
+10 % loss fail against a one-accept responder.
+
+Three rule-8 findings make it a documentation defect, not a design one
+**[S-82, S-83, S-84]**: §6.5's SHOULD was scoped to *dialling*
+applications (the NAT'd simultaneous open), a scope narrower than the
+hazard; §6.4's re-accept SHOULD is conditioned on receiving `Stale`,
+and in the lost-msg2 case the first accept **succeeded** — no error ever
+prompts the retry; and §6.8's *"restart needs no machinery of its own"*
+was load-bearing on an unstated application obligation. One widened
+sentence and two cross-references make all three honest.
+
+The harness is working rule 13 in its exact form **[S-89]**:
+`Pair::establish` accepts exactly once, and so does every `accept()`
+site in `tests/` — 31 across five files (`grep -rn '\.accept()'
+tests/*.rs`; the sweep's "74" was wrong, a hit-index carried over as a
+count) — drop msg2 under `FlakyPolicy` and the fixture panics at
+`expect("the dial completed")`, which reads as a fixture bug rather than
+the application obligation it is. No amount of test-writing against it
+would have found this. S34's acceptance: one dropped msg2, the same dial
+completes within §5.5's schedule, the first connection dies `Replaced`,
+and 10 %-loss establishment goes 12/12. (S1 was left untouched
+deliberately: its 4 DH cost pin is the clean path's, and a re-accept
+costs the ladder twice.)
+
+Amended: §6.5 (the widened SHOULD, both reasons named), §6.4 (the
+cross-reference), §6.8 (the one clause), `STORIES.md` (§J, S34, and the
+banner — which read "30", stale since ruling 209, the survey's finding
+#1, and now reads 34 with its history), `CLAUDE.md` (33 → 34). Docs and
+fixture, for the slice: `lib.rs`, `endpoint.rs`, `testutil/mod.rs`.
+
+### 253 — the reassembly merge goes small-to-large; the §10.6 ceiling stays ~credit; the cost bound is stated
+
+**Ruling: (i) `Reassembly::insert`'s merge is rewritten so total copy
+work per stream is O(credit · log credit) — every stored byte copied
+O(log) times across its lifetime, never once per bridging frame. (ii)
+The capacity observable stays ≈ the arrived span: ruling 94's "allocating
+only on arrival" is preserved within the stated bound — capacity ≈ the
+arrived span, per-stream ceiling ≈ the advertised credit;
+shrink-at-quiescence and capped growth both qualify (the decision's
+mechanisms), a bare doubling policy holding ~1.5 × credit does not; the
+ceiling is not relaxed to the measured 1.49 × credit. (iii) §10.6 states the work bound its mandate lacked.
+(iv) Per-turn driver fairness is deferred, recorded as an open §16
+design question.**
+
+The finding, measured: a peer alternating bridging inserts sustains
+**~916× receiver work per wire byte** at shipped constants (205 MB copied
+for 224 KB of wire), post-authentication, on the shared driver; the
+pre-ruling prototype's controlled run put the same class at 1006×, and
+its small-to-large merge takes that to **3.18×**, total copy work
+≤ 0.95 · credit · log₂(credit) — `DECISIONS-round40.md` records the
+prototype pair, this entry the sustained audit number. The case was known and
+accepted: the code's F3 block says the bridging copy *"makes progress, is
+bounded by credit, and is left alone"* (`recv.rs:469–489` — the sentence
+is the **code's**, not ruling 213's) **[S-70]**, and ruling 213(c) states
+the contract side: `CONTRACT-7b.md` §5's *"bounded by bytes that are new
+to the buffer"* corrected to *"bounded by the existence of a new byte …
+not linear in them"*. The number is what is new — an amplification lever
+on the one driver every co-hosted connection shares.
+
+Rule 4(b), three inherited duties. **Ruling 94**: *"allocating only on
+arrival"* is what a growth-amortised `Vec` bends — headroom is allocation
+ahead of arrival — and §10.6's own instrument enforces the reconciliation:
+the normative observable is **capacity**, and `Reassembly::capacity()`
+sums `Vec` capacity, so the accounting tightening is required, not
+optional **[S-63, S-64, S-73]**. **Ruling 213(c)**: its characterisation
+is **superseded, not improved** — it is cited as defect-class-1's worked
+example, and a reader must not take the example as still live; after 253
+the work is near-linear in new bytes up to the log factor **[S-69b]**.
+**Ruling 103**: `REASSEMBLY_CHUNKS_MAX` is externally observable, so
+*when* 1024 is reached is wire-visible; the merge change does not move it
+— the check stays on `chunks.len()` after coalescing, verified by reading
+`recv.rs:584–588` **[S-69]**.
+
+What the rewrite must preserve, and where it is stated (only in the
+code): F3's early return stays — and its **separator is re-verified, not
+assumed**: `tests_reassembly.rs:38–61`'s separating argument ("capacity
+collapses to the span") is a property of `vec![0u8; span]`, the exact
+code being replaced, so ruling 213(b)/214's independently-derived
+separator must be re-derived against the new merge **[S-77]**. The
+overlap policy — `recv.rs:566` claims *"stored bytes win"* — is relaxed
+to §9.5's "either" (small-to-large can invert which copy survives;
+`tests_reassembly.rs:191–196` already uses equal bytes so as not to
+lean on it) **[S-71]**. And `recv.rs:702`'s `assert_eq!(half.capacity(), 2_000)`
+goes red under any growth-amortised merge: it is **re-derived** under the
+new accounting, never relaxed to an inequality — an upper bound the
+degenerate build satisfies for free is rule 9's trap, and this is the one
+test that catches an accounting regression **[S-74]**.
+
+Amended: §10.6 (the work-bound clause; the accounting scope on "never
+allocating ahead of arrival"); Appendix B (a work-bound obligation,
+asserted from the separating side — the pre-253 merge **passes** the
+throughput gate, which is why the gate alone was never the evidence; the
+gate still guards the honest path, `benches/throughput.rs` the
+instrument) **[S-67, S-81]**.
+
+### 254 — `PTO_BACKOFF_CAP` falls to 2³
+
+**Ruling: `PTO_BACKOFF_CAP` = 2³ (the multiplier 8). The compile-time
+pins move with it: `assert!(PTO_BACKOFF_CAP == 1 << 3)` in
+`constants.rs`, `PTO_MAX_EXPONENT == 3` in `recovery.rs` (the
+`trailing_zeros()` derivation itself is untouched). E5a (the ladder
+shape) and E5b (completion under 50 % loss) become Appendix B
+obligations discharged by slice R40-A's story tests, and §13.3 states
+the survival envelope.**
+
+Provenance: **this is the first ratification decision about the
+magnitude.** No ruling chose 2⁶ — it was inherited from RFC 9002
+practice, and the record only ever settled its **reading** (multiplier,
+not exponent) in the unnumbered slice-0 block. Recorded here because the
+sweep dated it (conflict C1): that block cites *"§13.5 says '2⁶× too
+long'"* and the sentence has been **§14.4's** since the original
+ratification commit `2274981` — the citation never resolved. The block is
+history and stands; its miscitation is corrected by this note (rule 11: a
+citation is a claim about the cited text — in the very passage ruling 63
+built on).
+
+The finding, measured: at ≥ 50 % sustained loss the sender reaps
+`TimedOut` at ~33 s (RTT-dependent) — the 64× cap walks the probe
+interval past `DEAD_TIMEOUT`'s useful window, so the train stops probing
+at a survivable cadence exactly when survival is the question. At 2³ the
+measured configuration completes 8/8 transfers at 50 % loss, with zero
+honest-path cost observed — the sweep checked the only three virtual-time
+budgets in the suite sized off the doubling; all sit at ≤ 3 doublings,
+unaffected **[S-19]**.
+
+The prose that argued for a large cap is rewritten, not just the digit
+(rule 4): §13.3's *"the cap is an overflow guard, not a death sentence"*
+was the only sentence in the spec arguing the cap needs no operational
+tuning **[S-2]** — half right (liveness does end the train), and blind to
+the cap changing what the train *does* before death. §14.4's derived
+magnitude becomes "2³× too long": the conclusion survives — 8× is still
+too long — and the argument's force weakens by a factor of 8, said here
+because §14.4 is the one place the spec derives arithmetic from the cap
+**[S-4]**. And the hazard **sharpens** at the new value: at 64 the
+mis-transcribed idiom `1u32 << 64` was undefined and loud; at 8,
+`1u32 << 8` is a legal 256 and silently wrong — the compile-time pins are
+now load-bearing, not belt-and-braces; the consolidated table's worked
+example says so **[S-7, S-14]**.
+
+For the slice: `constants.rs:383–384, :607, :621–624`;
+`recovery.rs:175–185`; `tests/spec_constants.rs:584` and the stale
+comment at `:578` (on the *k_initial_rtt* test — the site a grep for the
+assert would miss) **[S-17]**; `tests_recovery.rs:1108–1145` renamed
+(`…caps_at_sixty_four` → `…caps_at_eight`) and re-derived — and the
+preceding 2×/4×/8× test re-derived too: at cap 8 its last sample **is**
+the cap, so as written it stops separating "backs off" from "pinned at
+the cap" (rule 9) **[S-16]**. Interaction with 249, stated: 249 freezes
+the count during blockades, 254 shortens the ladder — the post-roam
+cadence changes twice in one round, and E5a is written against both. They
+ship in one slice, 249's fix first.
+
+Amended: §13.3 (formula, rationale-with-envelope, table), §14.4, the two
+consolidated constants tables, the worked-example passage.
