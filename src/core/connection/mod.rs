@@ -1290,7 +1290,14 @@ impl<C: Handshake> Connection<C> {
     /// * it does **not** clear the sent map — *"ACKs for packets in flight
     ///   to the old address still resolve"* — and does **not** reset
     ///   `bytes_in_flight`, `pto_count`, `loss_time` or `last_ack_eliciting`:
-    ///   loss detection and PTO *"continue undisturbed"*;
+    ///   loss detection continues undisturbed and PTO **state** *"carries
+    ///   across untouched"*. **[ruling 249]** §13.6's row is precise about
+    ///   which half that is: the `Pto` **announcement** is budget-gated
+    ///   (§13.3), and this function zeroes the budget four rows up, so the
+    ///   deadline is suppressed from the roam until the first qualifying
+    ///   receive re-admits a probe. Nothing here cancels or re-arms it —
+    ///   [`sync_recovery_timers`](Self::sync_recovery_timers) re-derives it
+    ///   from the state this roam left alone;
     /// * it does **not** clear `smoothed_rtt` or `rttvar` — the estimator is
     ///   *"suspect-but-kept"*. Only `min_rtt` is re-seeded, and the PTO floor
     ///   **may rise** as a result;
