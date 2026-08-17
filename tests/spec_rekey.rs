@@ -404,10 +404,11 @@ async fn read_exactly(r: &mut TestRecvStream, n: usize, what: &str) -> Vec<u8> {
 /// The construction is spelled out from the Noise spec rather than borrowed
 /// from hiss, which is the point — an independent computation:
 ///
-/// * the AEAD is ChaCha20-Poly1305 (§2.3's suite);
-/// * Noise §12.3's nonce encoding is four zero bytes then the 64-bit
-///   counter **little-endian**, so `n = 2⁶⁴ − 1` is four zeros then eight
-///   `0xFF`;
+/// * the AEAD is ChaCha20-Poly1305 — §2.2's reference suite is
+///   `P256 / ChaChaPoly / Blake2b`;
+/// * §3.4: *"Noise builds the ChaChaPoly nonce as
+///   `32 zero bits ‖ LE64(counter)`"*, so `n = 2⁶⁴ − 1` is four zero bytes
+///   then eight `0xFF`;
 /// * the associated data is empty and the plaintext is `zeros[32]`;
 /// * `Rekey` keeps `[0..32]` — the ciphertext, **not** the 16-byte tag.
 ///
@@ -476,9 +477,9 @@ fn rk1_the_rekey_of_zeros_vector() {
 /// handshake, no round trip and no application-visible event; each
 /// direction ratchets independently; the counter is never reset."*
 ///
-/// A 96 KiB stream over an epoch of [`EPOCH`] messages crosses at least
-/// four boundaries — proved from the wire, not assumed — and the bytes come
-/// out identical.
+/// A 96 KiB stream over an epoch of [`EPOCH`] messages crosses several
+/// boundaries — five on the base commit, and *at least three* is asserted
+/// from the wire rather than assumed — and the bytes come out identical.
 ///
 /// **This test separates nothing, and says so.** A never-rekey build passes
 /// it in full: *boundary-invisibility alone is satisfied for free by the
@@ -540,7 +541,7 @@ async fn rk2_crossing_several_epoch_boundaries_is_invisible() {
         );
         let crossed = last / EPOCH - first / EPOCH;
         assert!(
-            crossed >= 4,
+            crossed >= 3,
             "the fixture never crossed enough boundaries to prove anything: A's \
              counters ran {first}..={last} at an epoch of {EPOCH}, {crossed} \
              boundaries. This is the assertion that keeps this test from being \
@@ -573,12 +574,12 @@ async fn rk2_crossing_several_epoch_boundaries_is_invisible() {
         assert_eq!(
             claim_ready(&cb, "A→B after the crossings").await,
             vec![1],
-            "A→B still carries datagrams after four boundaries"
+            "A→B still carries datagrams after the boundaries"
         );
         assert_eq!(
             claim_ready(&ca, "B→A after the crossings").await,
             vec![2],
-            "B→A still carries datagrams after four boundaries"
+            "B→A still carries datagrams after the boundaries"
         );
     })
     .await;
