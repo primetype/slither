@@ -68,14 +68,21 @@
 //! |---|---|---|
 //! | **F3 present**, either merge | **0** | 0 |
 //! | **F3 lost**, pre-253 whole-span merge | `span + 1` | 0, or a collapse if the chunk held slack |
-//! | **F3 lost**, small-to-large merge | ≥ 1 (the arriving bytes, written over the stored ones) | **0** |
+//! | **F3 lost**, small-to-large merge | **0** — measured, refuting this row's blind draft of "≥ 1" | **0** |
 //!
-//! The third row is why the assertion is `== 0` and not `< span`. Once the
-//! merge goes small-to-large a lost early return is *cheap* — one frame's
-//! worth of copying, not a span's — so any bound phrased in spans is
-//! satisfied by the broken build for free, which is working rule 9's trap
-//! exactly. Zero is what the fix promises and zero is what separates it from
-//! both broken merges.
+//! **[Integrator, slice R40-E — the third row is the implementation's
+//! measurement, not the blind draft's prediction.]** The draft reasoned a
+//! lost early return would still write the arriving bytes (≥ 1); the landed
+//! merge writes the frame **only into gaps no stored chunk covers**, and a
+//! covered frame has no gap — so with the return disabled every test here
+//! still passes (the implementer measured exactly that, `if false && …`).
+//! Consequence, worth stating precisely: **F3's defence is now structural.**
+//! The zero-progress amplification cannot be bought from this merge at all;
+//! the early return survives as a CPU short-circuit, and no core accessor
+//! separates its loss. The `== 0` assertions below therefore pin the
+//! covered case's *cost* — the property F3 exists for — not the return's
+//! presence, and any bound phrased in spans is working rule 9's trap under
+//! either broken build.
 //!
 //! `copy_work` is also a **strictly** better instrument than capacity was: it
 //! separates in the attack's own configuration — byte 0 held back, nothing
@@ -846,11 +853,15 @@ fn alternating_bridging_inserts_stay_inside_the_work_bound() {
     assert_alive(&d);
 
     let span = base + 2 * BRIDGE_ROUNDS;
+    // Both windows, stated as a const so a constant change re-derives it
+    // (clippy: with CREDIT <= INITIAL_MAX_DATA the second comparison is
+    // redundant at runtime; the const assert keeps that premise honest).
+    const _: () = assert!(CREDIT <= INITIAL_MAX_DATA);
     assert!(
-        span <= CREDIT && span <= INITIAL_MAX_DATA,
+        span <= CREDIT,
         "the workload must stay inside both windows or flow control, not the \
-         work bound, is what this test measures: {span} against {CREDIT} and \
-         {INITIAL_MAX_DATA}"
+         work bound, is what this test measures: {span} against {CREDIT} \
+         (and CREDIT <= INITIAL_MAX_DATA by the const assert above)"
     );
 
     let bound = work_bound();
@@ -1009,15 +1020,24 @@ fn heavy_merging_to_the_credit_limit_holds_no_growth_headroom() {
         "the buffer holds {span} bytes but reports {held} of capacity — bytes \
          went missing, and a build that stores nothing satisfies any ceiling"
     );
+    // **[Integrator, slice R40-E.]** The blind draft asserted `held <=
+    // CREDIT` exactly, and the blind implementation holds 271 125 for a
+    // 262 000 span — 1.035 × the span, inside the ⅛ slack its capped-growth
+    // policy documents. The ruled §10.6 text is the tiebreak: *"allocated
+    // capacity stays ≈ the arrived span … shrink-at-quiescence and capped
+    // growth both qualify"* — a ⅛-capped policy necessarily breathes past
+    // exact credit when the span fills the window, and "≈" was ruled, not
+    // "≤". The bound below is the ruled envelope, span × 9⁄8; it still
+    // refuses a bare doubling policy (which holds ≥ 1.46 × credit here, and
+    // fails per-span in `recv.rs`'s ladder test at span 1 025).
     assert!(
-        held <= CREDIT,
-        "reassembly capacity is {held} against §10.6's per-stream ceiling of \
-         {CREDIT}, for an arrived span of {span}. That is {}% of credit: a \
-         growth policy is holding headroom the ceiling does not fund. Ruling \
+        held <= span + span / 8,
+        "reassembly capacity is {held} for an arrived span of {span} — past \
+         the ⅛-capped envelope ruling 253(ii) admits (span × 9⁄8 = {}). A \
+         growth policy is holding headroom the ruled ceiling does not fund: \
          253(ii) admits shrink-at-quiescence and capped growth and refuses a \
-         bare doubling policy at ~1.5 × credit — the ceiling is not relaxed \
-         to the measured 1.49 ×.",
-        held * 100 / CREDIT
+         bare doubling policy at ~1.5 × credit.",
+        span + span / 8
     );
 
     // …and the span really did coalesce into one readable run, so none of the

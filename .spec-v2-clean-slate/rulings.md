@@ -7568,7 +7568,15 @@ code): F3's early return stays — and its **separator is re-verified, not
 assumed**: `tests_reassembly.rs:38–61`'s separating argument ("capacity
 collapses to the span") is a property of `vec![0u8; span]`, the exact
 code being replaced, so ruling 213(b)/214's independently-derived
-separator must be re-derived against the new merge **[S-77]**. The
+separator must be re-derived against the new merge **[S-77]**.
+**[Discharged at slice R40-E, 2026/08/17, with a stronger answer than
+the obligation asked for: the landed merge writes the arriving frame
+only into gaps no stored chunk covers, and a covered frame has no gap —
+the zero-progress case costs nothing by construction on both paths (the
+implementer disabled the early return and measured every test still
+green). F3's defence is structural; the return survives as a CPU
+short-circuit, and the re-derived `== 0` copy-work assertions pin the
+covered case's cost, not the return's presence.]** The
 overlap policy — `recv.rs:566` claims *"stored bytes win"* — is relaxed
 to §9.5's "either" (small-to-large can invert which copy survives;
 `tests_reassembly.rs:191–196` already uses equal bytes so as not to

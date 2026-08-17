@@ -959,7 +959,6 @@ impl<C: Handshake> Connection<C> {
     // `expect` rather than `allow` on purpose: the moment the author's file
     // lands, `unfulfilled_lint_expectations` turns this into an error under
     // `-D warnings`, so it cannot go the way ruling 222's blanket allow went.
-    #[expect(dead_code, reason = "caller is the blind author's tests_reassembly.rs")]
     pub(crate) fn reassembly_copy_work(&self) -> u64 {
         self.streams.reassembly_copy_work()
     }
