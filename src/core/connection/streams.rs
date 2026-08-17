@@ -361,6 +361,21 @@ impl Streams {
             .sum()
     }
 
+    /// Ruling 253's accounting, summed across every live receive half.
+    ///
+    /// Unlike [`Streams::reassembly_capacity`] this is a **work** meter, not
+    /// a state one, so freeing a half takes its total with it: the sum is
+    /// over the halves that still exist, which is the same shape ruling 94's
+    /// accessor has and the same caveat — a workload that abandons streams
+    /// measures only the ones it kept.
+    pub(crate) fn reassembly_copy_work(&self) -> u64 {
+        self.entries
+            .values()
+            .filter_map(|s| s.recv.as_ref())
+            .map(RecvHalf::copy_work)
+            .sum()
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // §16.4's verbs
     // ═══════════════════════════════════════════════════════════════════

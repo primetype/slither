@@ -947,6 +947,23 @@ impl<C: Handshake> Connection<C> {
         self.streams.reassembly_capacity()
     }
 
+    /// **Ruling 253.** Total bytes ever written into reassembly storage
+    /// across every live receive half — §10.6's work bound made
+    /// test-visible, mirroring `reassembly_capacity` for its memory bound.
+    /// Monotone per half; see `Reassembly::copy_work`.
+    // **Working rule 15 — the integrator removes this attribute.** This
+    // accessor's caller is slice R40-E's blind author's work-bound test in
+    // `tests_reassembly.rs`, which does not exist on the implementer's tree;
+    // ruling 222 makes the `dead_code` lint live in the test build, and it
+    // is right, because on this tree the item genuinely has no caller.
+    // `expect` rather than `allow` on purpose: the moment the author's file
+    // lands, `unfulfilled_lint_expectations` turns this into an error under
+    // `-D warnings`, so it cannot go the way ruling 222's blanket allow went.
+    #[expect(dead_code, reason = "caller is the blind author's tests_reassembly.rs")]
+    pub(crate) fn reassembly_copy_work(&self) -> u64 {
+        self.streams.reassembly_copy_work()
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // §9.8's messages and §11's datagrams — §16.4's four sugar verbs
     // ═══════════════════════════════════════════════════════════════════
