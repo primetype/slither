@@ -796,6 +796,27 @@ async fn rk4_a_packet_two_epochs_back_does_not_open() {
 /// *everything* old — and fails here. A real network reorders, and a
 /// straggler from the last epoch is the ordinary case, not the exotic one:
 /// this test is the difference between rotation and data loss.
+///
+/// # Why this lives at the knob and cannot be repeated at 65 536
+///
+/// §7.2's replay window binds first. Measured on this fixture at the
+/// production epoch, with the held packet and the receiver's commit inside
+/// **one** epoch throughout — so the epoch cannot be what refuses:
+///
+/// | counters back | same epoch | opens |
+/// |---|---|---|
+/// | 1 000 | yes | yes |
+/// | 3 000 | yes | **no** |
+/// | 5 000 | yes | **no** |
+///
+/// `REPLAY_WINDOW` is 2 048 and one production epoch is 65 536, so *"one
+/// epoch back"* is never reachable at the ratified constant: the retained
+/// previous-epoch key is used only for packets within `REPLAY_WINDOW`
+/// counters of a boundary. That is exactly what it is for, and exactly what
+/// this test constructs — at an epoch of [`EPOCH`], where the two limits do
+/// not overlap. `story_rekey.rs` records the same measurement at the point
+/// where a reader would otherwise ask why the straggler is not asserted
+/// there.
 #[tokio::test(start_paused = true)]
 async fn rk5_a_packet_one_epoch_back_still_opens() {
     local(async {

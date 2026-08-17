@@ -18,24 +18,35 @@
 //! endpoint on `Config::new()` — **no knob**. `spec_rekey.rs` carries the
 //! epoch-distance separators at ruling 82's knob, and the `Rekey()` vector.
 //!
-//! The two are complementary and neither subsumes the other. A build whose
-//! constant was 1 024 instead of 65 536 would satisfy every test in
-//! `spec_rekey.rs` — they all configure their own epoch — and fails
-//! [`rekey`](s23_a_long_lived_connection_rekeys_itself_without_the_user_noticing)
-//! here, whose whole content is *the production endpoint's boundary is
-//! where §7.7 says it is*.
+//! The two are complementary and neither subsumes the other: every test in
+//! `spec_rekey.rs` configures its own epoch and so says nothing about the
+//! one a production endpoint uses, which is all this file is about.
 //!
 //! # Working rule 9 — what this test does and does not separate
 //!
-//! It **catches**: a wrong `REKEY_EPOCH_MSGS`; a boundary that costs a
+//! It **catches**: a boundary at the ratified constant that costs a
 //! handshake, a DH, a lost byte or a stalled stream; a counter that resets
-//! with the epoch. It does **not** catch the never-rekey build — crossing a
-//! boundary invisibly is satisfied for free by a build in which nothing
-//! happens (ruling 251), and the assertion that fails that build is
-//! `spec_rekey.rs`'s `rk4_a_packet_two_epochs_back_does_not_open`. Splitting
-//! them is deliberate: the separating assertion needs a packet held two
-//! epochs back, which at the production constant would cost 131 072 seals
-//! to construct.
+//! with the epoch; a receiver that stops opening packets once the sender
+//! has crossed.
+//!
+//! It does **not** catch two things, and neither is an oversight:
+//!
+//! * **The never-rekey build.** Crossing a boundary invisibly is satisfied
+//!   for free by a build in which nothing happens (ruling 251). The
+//!   assertion that fails it is `spec_rekey.rs`'s
+//!   `rk4_a_packet_two_epochs_back_does_not_open`, and it cannot be made
+//!   here: a packet two epochs back costs 131 072 seals to construct at
+//!   this constant.
+//! * **A wrong value for `REKEY_EPOCH_MSGS` itself.** This test reads the
+//!   constant, so it moves with it — but nothing is lost, because the value
+//!   is pinned where a value belongs: `constants.rs` carries
+//!   `const _: () = assert!(REKEY_EPOCH_MSGS == 1 << 16)`, which fails the
+//!   **build**, and `config.rs`'s `the_default_epoch_size_is_rekey_epoch_msgs`
+//!   ties `Config::new()` to it. Ruling 82's *"a separate constant test pins
+//!   the value"* is those two, not this one. What this test adds is the only
+//!   thing they cannot show: that the boundary at that value is **reached
+//!   and crossed** by an endpoint on `Config::new()`, with the whole stack
+//!   underneath it.
 //!
 //! # Cost, and why it is gated into the release run
 //!
@@ -178,10 +189,15 @@ async fn round_trip(from: &TestConnection, to: &TestConnection, payload: &[u8], 
 ///
 /// The four obligations, each with the build it catches:
 ///
-/// * **The boundary is at 65 536.** A's counters are observed to run from
-///   below `REKEY_EPOCH_MSGS` to above it, and the transfer keeps working
-///   across it. BROKEN BUILD: a constant of 1 024 or 2¹⁵ — invisible to
-///   every test in `spec_rekey.rs`, which configures its own epoch.
+/// * **The boundary at `REKEY_EPOCH_MSGS` is reached and crossed.** A's
+///   counters are observed to run from below it to above it, one boundary
+///   and no more, with 65 536 packets actually sealed to get there. BROKEN
+///   BUILD: one where the crossing never happens — a `Config::new()` whose
+///   epoch is `u64::MAX`, a counter that stalls, or a fixture that thinks
+///   it crossed on 300 packets. Every count here is read off the wire so
+///   that "it crossed" is a measurement rather than an assumption. Note
+///   what this does *not* pin: the **value** 65 536, which is a compile-time
+///   assertion in `constants.rs` (see the module docs).
 /// * **No handshake, no DH.** Not one handshake packet on the fabric after
 ///   establishment, and neither peer's cumulative DH count moves. BROKEN
 ///   BUILD: WireGuard's periodic re-handshake, which §5.4 and §7.7 override
@@ -364,6 +380,29 @@ async fn s23_a_long_lived_connection_rekeys_itself_without_the_user_noticing() {
              only, so a single charged DH across 65 537 messages is the \
              WireGuard design §7.7 overrides"
         );
+
+        // ── Why §7.7's straggler tolerance is **not** asserted here, and
+        // is asserted in `spec_rekey.rs` instead.
+        //
+        // *"The receiver retains the current and immediately preceding epoch
+        // keys (straggler tolerance: one epoch back)"* cannot be observed at
+        // this epoch size, and the reason is §7.2, not §7.7: one production
+        // epoch back is 65 536 counters back, and `REPLAY_WINDOW` is 2 048.
+        // Measured on this fixture at the production epoch, holding a
+        // datagram and posting it late with the packet and the receiver's
+        // commit inside **one** epoch throughout:
+        //
+        // | distance | same epoch | opens |
+        // |---|---|---|
+        // | 1 000 | yes | yes |
+        // | 3 000 | yes | **no** |
+        // | 5 000 | yes | **no** |
+        //
+        // So the retained previous-epoch key is reachable only for packets
+        // within `REPLAY_WINDOW` counters of a boundary — which is what it is
+        // for, and is exactly the case `spec_rekey.rs`'s `rk5` constructs at
+        // an epoch of 16. An assertion here would be red on a conforming
+        // build, which is a flake and not a pin.
 
         // ── And the connection is ordinary afterwards, in both directions.
         // A's next seal is in epoch 1; B's is still in epoch 0, and each
