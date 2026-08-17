@@ -23,12 +23,33 @@
 //! and a test that asserted *bytes received* would pass an eager allocator
 //! for free.
 //!
+//! # Reassembly merges small into large
+//!
+//! **[RATIFIED 2026/08/17 — ruling 253]** §10.6's mandate above bounds
+//! *state*; its work clause bounds *work*. Coalescing on insert by
+//! allocating the merged span and copying everything into it is O(span) per
+//! frame, so a peer alternating **bridging** inserts — one new byte joining
+//! two stored ranges, over and over — sustained a measured 916× receiver
+//! work per wire byte while staying inside flow credit. [`Reassembly::insert`]
+//! extends the larger buffer and copies the smaller side instead, which puts
+//! total copy work per stream at O(credit · log credit), and
+//! [`Reassembly::copy_work`] is the accounting that makes the bound
+//! test-visible the way [`Reassembly::capacity`] makes ruling 94's bound
+//! test-visible.
+//!
 //! # Overlap
 //!
 //! §9.5: *"a byte received twice with differing values is undefined
-//! behaviour of the sender … and the receiver may keep either."* This keeps
-//! the **first** copy: a merge writes the arriving data into the span first
-//! and then copies the already-stored chunks over it.
+//! behaviour of the sender … and the receiver may keep either."*
+//!
+//! **[ruling 253]** Which copy survives is **not a promise this module
+//! makes**. §9.5's "either" is the whole rule, and a merge that is free to
+//! keep whichever side is cheaper to keep is exactly what the small-to-large
+//! discipline needs. As it happens this build keeps the **stored** copy —
+//! the merge writes the arriving frame only where no stored chunk already
+//! holds the byte, which is both the first-copy-wins answer and the cheap
+//! one — but nothing may depend on that, and a merge that reversed it would
+//! still be conformant.
 
 use std::collections::VecDeque;
 
@@ -122,6 +143,13 @@ impl RecvHalf {
     /// allocated for this half.
     pub(crate) fn capacity(&self) -> u64 {
         self.reassembly.capacity()
+    }
+
+    /// Ruling 253's accounting: bytes this half has ever written into
+    /// reassembly storage — see [`Reassembly::copy_work`]. Monotone, and a
+    /// reset does not return it.
+    pub(crate) fn copy_work(&self) -> u64 {
+        self.reassembly.copy_work()
     }
 
     /// Whether a `read()` would return anything other than "no data".
@@ -418,14 +446,145 @@ impl RecvTombstone {
 // §10.6's reassembler
 // ═══════════════════════════════════════════════════════════════════════
 
+/// One coalesced range of received bytes.
+///
+/// `data[head..]` is the range and `offset` is the stream offset of
+/// `data[head]`; `data[..head]` is a **head gap** and
+/// `data.capacity() - data.len()` is a tail gap.
+///
+/// **[ruling 253(i)]** The head gap is what makes the small-to-large merge
+/// implementable at *both* ends. Extending the larger buffer is cheap on the
+/// right for free — that is what spare `Vec` capacity is — and a peer that
+/// bridges **downwards**, one byte at a time just below a large stored
+/// chunk, would otherwise pay a shift of the whole buffer per frame: the
+/// same amplification 253 closes, mirrored onto the front.
 struct Chunk {
+    /// Stream offset of the first live byte.
     offset: u64,
     data: Vec<u8>,
+    head: usize,
 }
 
+/// **[ruling 253(ii)] Capped growth.** A reallocating chunk takes an eighth
+/// of itself as slack, so allocated capacity stays within 1.125× the arrived
+/// span and §10.6's per-stream ceiling stays ≈ the advertised credit.
+///
+/// The two ends of the knob are both refused. A bare doubling policy holds
+/// ~1.5 × credit, which ruling 253 declines; an exact allocation holds 1.0 ×
+/// and reallocates on **every** merge, which is the whole-span copy 253(i)
+/// removes. At an eighth the copying spent growing one chunk to `n` bytes is
+/// geometric and sums to ≤ 9 `n` — a constant factor *inside* the
+/// O(credit · log credit) bound rather than a term added to it.
+const REASSEMBLY_SLACK_SHIFT: u32 = 3;
+
 impl Chunk {
+    /// An arriving frame, allocated **exactly**: ruling 94's lazy allocation
+    /// is the disjoint case, and 253 does not touch it.
+    fn from_frame(offset: u64, data: &[u8]) -> Self {
+        Self {
+            offset,
+            data: data.to_vec(),
+            head: 0,
+        }
+    }
+
+    /// The placeholder a merge parks at the base's index while it owns the
+    /// base. It holds no allocation, it is overwritten before `insert`
+    /// returns, and nothing outside `insert` can observe it.
+    fn vacant() -> Self {
+        Self {
+            offset: 0,
+            data: Vec::new(),
+            head: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() - self.head
+    }
+
     fn end(&self) -> u64 {
-        self.offset + self.data.len() as u64
+        self.offset + self.len() as u64
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.data[self.head..]
+    }
+
+    /// The `n` bytes at stream offset `at`, writable.
+    fn at_mut(&mut self, at: u64, n: usize) -> &mut [u8] {
+        let from = self.head + (at - self.offset) as usize;
+        &mut self.data[from..from + n]
+    }
+
+    /// Copy `[from, to)` of an arriving frame in. The interval is inside the
+    /// frame by the coverage lemma in [`Reassembly::insert`]'s doc.
+    fn write_frame(&mut self, from: u64, to: u64, frame_at: u64, frame: &[u8]) -> u64 {
+        debug_assert!(from >= frame_at && to <= frame_at + frame.len() as u64);
+        let src = &frame[(from - frame_at) as usize..(to - frame_at) as usize];
+        self.at_mut(from, src.len()).copy_from_slice(src);
+        src.len() as u64
+    }
+
+    /// Copy a stored chunk in, at its own offset. Chunks are pairwise
+    /// disjoint, so this never lands on bytes this chunk already holds.
+    fn write_chunk(&mut self, other: &Chunk) -> u64 {
+        let n = other.len();
+        self.at_mut(other.offset, n).copy_from_slice(other.bytes());
+        n as u64
+    }
+
+    /// Grow so the range spans `[start, stop)`, leaving the two new regions
+    /// zeroed for the caller to fill.
+    ///
+    /// Returns the number of **stored** bytes moved — zero whenever the
+    /// slack already paid for covers both ends, which is the entire point of
+    /// holding slack. A merge that finds room is O(the bytes it adds).
+    fn reserve_span(&mut self, start: u64, stop: u64) -> u64 {
+        debug_assert!(start <= self.offset && stop >= self.end());
+        let front = (self.offset - start) as usize;
+        let back = (stop - self.end()) as usize;
+
+        if front <= self.head && back <= self.data.capacity() - self.data.len() {
+            self.head -= front;
+            // The head gap holds bytes this chunk already delivered or never
+            // owned. The caller covers every byte of both new regions (the
+            // coverage lemma), but zeroing keeps a coverage bug a zero byte
+            // rather than a stale one.
+            self.data[self.head..self.head + front].fill(0);
+            self.data.resize(self.data.len() + back, 0);
+            self.offset = start;
+            return 0;
+        }
+
+        let held = self.len();
+        let need = front + held + back;
+        let slack = need >> REASSEMBLY_SLACK_SHIFT;
+        // Slack goes to the end that just grew: a range being extended in
+        // one direction is overwhelmingly likely to be extended in it again,
+        // and slack on the other side is capacity §10.6 counts and nothing
+        // spends.
+        let (gap_front, gap_back) = match (front > 0, back > 0) {
+            (true, true) => (slack / 2, slack - slack / 2),
+            (true, false) => (slack, 0),
+            // `(false, false)` cannot reach here: it needs nothing, so the
+            // fast path above always takes it.
+            _ => (0, slack),
+        };
+        let mut fresh = Vec::with_capacity(gap_front + need + gap_back);
+        fresh.resize(gap_front + front, 0);
+        fresh.extend_from_slice(self.bytes());
+        fresh.resize(gap_front + need, 0);
+        self.data = fresh;
+        self.head = gap_front;
+        self.offset = start;
+        held as u64
+    }
+
+    /// Hand `n` bytes off the front to the application.
+    fn advance(&mut self, n: usize) {
+        self.head += n;
+        self.offset += n as u64;
     }
 }
 
@@ -434,6 +593,8 @@ impl Chunk {
 struct Reassembly {
     /// Disjoint, non-adjacent, ascending by offset.
     chunks: VecDeque<Chunk>,
+    /// Ruling 253's accounting — see [`Reassembly::copy_work`].
+    copy_work: u64,
 }
 
 impl Reassembly {
@@ -442,6 +603,7 @@ impl Reassembly {
         // the line that would turn 128 peer-opened streams into 32 MiB.
         Self {
             chunks: VecDeque::new(),
+            copy_work: 0,
         }
     }
 
@@ -450,44 +612,110 @@ impl Reassembly {
         self.chunks.iter().map(|c| c.data.capacity() as u64).sum()
     }
 
+    /// Total bytes ever written into chunk storage by [`Reassembly::insert`]:
+    /// the arriving frame's bytes on store, plus every stored byte re-copied
+    /// by a merge — a chunk folded into the base, or the base's own bytes
+    /// moved by a reallocation.
+    ///
+    /// **[ruling 253]** This is to §10.6's *work* bound what
+    /// [`Reassembly::capacity`] is to ruling 94's *memory* bound. The clause
+    /// is otherwise an untestable MUST: no behavioural assertion separates a
+    /// small-to-large merge from the whole-span copy it replaces, because
+    /// both deliver exactly the same bytes, and the throughput gate passes
+    /// on both.
+    ///
+    /// **Monotone, and never reset** — in particular not by
+    /// [`Reassembly::discard`]. The quantity under test is what a peer
+    /// *spent*; a reset that zeroed the meter would hand it back, and
+    /// §9.6's reset is a frame the peer chooses to send.
+    fn copy_work(&self) -> u64 {
+        self.copy_work
+    }
+
     /// How many contiguous bytes are available starting at `at`.
     fn contiguous_at(&self, at: u64) -> u64 {
         match self.chunks.front() {
-            Some(c) if c.offset == at => c.data.len() as u64,
+            Some(c) if c.offset == at => c.len() as u64,
             _ => 0,
         }
     }
 
     fn discard(&mut self) {
+        // `copy_work` deliberately survives: see its doc.
         self.chunks = VecDeque::new();
     }
 
     /// Insert a received range, coalescing with everything it overlaps or
     /// touches.
     ///
+    /// # The merge is small-to-large
+    ///
+    /// **[RATIFIED 2026/08/17 — ruling 253(i)]** §10.6: *"total copy work
+    /// per stream MUST be O(that stream's advertised credit · log credit) —
+    /// every stored byte is copied O(log) times across its lifetime … never
+    /// once per bridging frame."* The merge this replaced allocated the
+    /// merged span and copied everything into it, so a peer alternating
+    /// **bridging** inserts — one new byte joining two stored ranges — bought
+    /// a span-sized copy per frame and sustained a measured **916×** receiver
+    /// work per wire byte, inside flow credit, on the driver every co-hosted
+    /// connection shares.
+    ///
+    /// The discipline, and why it bounds the work:
+    ///
+    /// - The **base** is the largest stored chunk in the merge. Its bytes
+    ///   never move within the merged range, and its allocation is the one
+    ///   the merged chunk keeps.
+    /// - Every other stored chunk is copied into the base. Stored chunks are
+    ///   pairwise disjoint, so the merged range contains the base *and* the
+    ///   copied chunk side by side: a chunk of `s` bytes is only ever copied
+    ///   into a range of at least `2s`. A stored byte therefore at least
+    ///   **doubles the range it lives in each time it is copied**, so it is
+    ///   copied at most log₂(credit) times in its life — never once per
+    ///   bridging frame.
+    /// - The arriving frame is written **only where no stored chunk holds
+    ///   the byte**, so a retransmission that merely bridges pays for its new
+    ///   bytes and not for the span it lands in. New bytes are bounded by
+    ///   flow credit and each offset is new at most once, so that term is
+    ///   linear in credit.
+    /// - Reallocation inside a chunk is geometric, at
+    ///   [`REASSEMBLY_SLACK_SHIFT`]'s eighth, and sums to a constant factor
+    ///   on the same total.
+    ///
+    /// Total: O(credit · log credit) per stream, which is §10.6's bound.
+    ///
+    /// # Coverage lemma
+    ///
+    /// Chunks `lo..hi` are exactly those that overlap **or touch** the
+    /// arriving range, so `[start, stop)` is covered contiguously by the
+    /// frame together with those chunks, and every point of it outside a
+    /// stored chunk lies inside the frame. That is what lets the two fill
+    /// loops below write a gap straight out of the frame without checking:
+    /// a gap between two consecutive participants is, by construction, frame
+    /// bytes. It is also why the merged chunk stays non-adjacent to its new
+    /// neighbours — `chunks[lo - 1].end() < start` and
+    /// `chunks[hi].offset > stop` both follow from the same two scans.
+    ///
     /// # A frame that adds no byte does no work
     ///
-    /// **[F3]** The merge below allocates and copies the whole merged span,
-    /// and the span is the *stored* chunk's, not the arriving frame's. A
-    /// frame lying **wholly inside** already-received offset space would
-    /// therefore pay a span-sized allocation to reproduce bytes that are
-    /// already there — and it is free to the peer twice over: `check_stream`
-    /// accepts it (`end <= high_water` violates nothing) and it charges
-    /// `delta = 0` flow credit, so neither §10's ledger nor §17.5's memory
-    /// bound sees it. One 1-byte frame at offset 5, against a 256 KiB chunk
-    /// at offset 1 whose byte 0 never arrives — so nothing is ever readable
-    /// and `read_offset` stays 0 — costs ~512 KiB of memory traffic per
-    /// ~40-byte datagram, at a rate the peer picks.
+    /// **[F3]** A frame lying **wholly inside** already-received offset space
+    /// is free to the peer twice over: `check_stream` accepts it
+    /// (`end <= high_water` violates nothing) and it charges `delta = 0` flow
+    /// credit, so neither §10's ledger nor §17.5's memory bound sees it. It
+    /// stays **legal** — it is ordinary retransmission, and rejecting it as a
+    /// violation would kill connections over routine loss recovery — so only
+    /// the work is refused, never the packet.
     ///
-    /// The covered case returns early, and what that buys is stated
-    /// precisely: **every allocation this function performs is now paid for
-    /// by at least one byte that is new to the buffer.** New bytes are
-    /// bounded by flow credit, so the peer can no longer buy reassembly work
-    /// at zero credit or at an unbounded rate. It is *not* the claim that
-    /// the work is linear in the new bytes — a frame that bridges two stored
-    /// chunks still copies the merged span for one new byte. That case makes
-    /// progress, is bounded by credit, and is left alone; F3 is exactly the
-    /// **zero**-progress case.
+    /// **What this early return is worth has changed, and the doc says so
+    /// rather than inheriting the old claim** (working rule 4). Against the
+    /// whole-span merge it was load-bearing: the covered frame paid a
+    /// span-sized allocation and copy for zero new bytes, and the guarantee
+    /// it bought was *every allocation is paid for by at least one byte that
+    /// is new to the buffer*. Against the small-to-large merge the covered
+    /// case already costs nothing — `lo` is the base, `start == base.offset`
+    /// and `stop == base.end()`, so `reserve_span` finds both ends satisfied
+    /// and the fill loops have no gap to write. What survives is the cheaper
+    /// half: the `max_by_key` scan and the chunk-list churn are skipped, and
+    /// the invariant is now structural rather than defended by this branch.
     ///
     /// **One stored chunk is the whole test, and that is the load-bearing
     /// lemma.** Chunks are pairwise disjoint *and* non-adjacent (this
@@ -496,10 +724,6 @@ impl Reassembly {
     /// which the invariant forbids — so covered-by-the-union **is**
     /// covered-by-one-chunk, and the one chunk it can be is the first with
     /// `end() >= offset`, which the `lo` scan already finds.
-    ///
-    /// The frame stays **legal**: it is ordinary retransmission, and
-    /// rejecting it as a violation would kill connections over routine loss
-    /// recovery. Only the work is refused, never the packet.
     fn insert(
         &mut self,
         mut offset: u64,
@@ -531,8 +755,8 @@ impl Reassembly {
             lo += 1;
         }
 
-        // **[F3]** Nothing new: return before allocating anything. See the
-        // lemma in this function's doc comment for why `lo` is the only
+        // **[F3]** Nothing new: return before touching the chunk list. See
+        // the lemma in this function's doc comment for why `lo` is the only
         // chunk that can cover the range.
         if self
             .chunks
@@ -550,35 +774,62 @@ impl Reassembly {
         if lo == hi {
             // Disjoint: one exact-capacity allocation for the arriving
             // bytes and nothing more.
-            self.chunks.insert(
-                lo,
-                Chunk {
-                    offset,
-                    data: data.to_vec(),
-                },
-            );
+            self.chunks.insert(lo, Chunk::from_frame(offset, data));
+            self.copy_work += data.len() as u64;
         } else {
             let start = self.chunks[lo].offset.min(offset);
             let stop = self.chunks[hi - 1].end().max(end);
-            let mut merged = vec![0u8; (stop - start) as usize];
-            let at = |o: u64| (o - start) as usize;
-            merged[at(offset)..at(end)].copy_from_slice(data);
-            // Stored bytes win on overlap — §9.5 lets the receiver keep
-            // either, and keeping the first is the cheaper invariant to
-            // reason about.
-            for c in self.chunks.range(lo..hi) {
-                merged[at(c.offset)..at(c.end())].copy_from_slice(&c.data);
+
+            // Small-to-large: the largest stored chunk keeps its bytes and
+            // its allocation; everything else moves into it.
+            let base_at = (lo..hi)
+                .max_by_key(|&k| self.chunks[k].len())
+                .expect("lo < hi");
+            let mut base = std::mem::replace(&mut self.chunks[base_at], Chunk::vacant());
+            let (base_off, base_end) = (base.offset, base.end());
+            let mut work = base.reserve_span(start, stop);
+
+            // Fill the prefix region `[start, base_off)`, ascending: each
+            // stored chunk onto its own bytes, each gap between them out of
+            // the frame.
+            let mut cur = start;
+            for c in self.chunks.range(lo..base_at) {
+                if cur < c.offset {
+                    work += base.write_frame(cur, c.offset, offset, data);
+                }
+                work += base.write_chunk(c);
+                cur = c.end();
             }
-            for _ in lo..hi {
+            if cur < base_off {
+                work += base.write_frame(cur, base_off, offset, data);
+            }
+
+            // And the suffix region `[base_end, stop)`, the same way.
+            let mut cur = base_end;
+            for c in self.chunks.range(base_at + 1..hi) {
+                if cur < c.offset {
+                    work += base.write_frame(cur, c.offset, offset, data);
+                }
+                work += base.write_chunk(c);
+                cur = c.end();
+            }
+            if cur < stop {
+                work += base.write_frame(cur, stop, offset, data);
+            }
+            self.copy_work += work;
+
+            // Put the base back where it stood and drop the chunks it
+            // swallowed. Removing the ones below it slides it to `lo`, which
+            // is where a range starting at `start` belongs — and when the
+            // base is already `lo` and nothing else merged (the ordinary
+            // in-order append) this is zero deque work.
+            self.chunks[base_at] = base;
+            for _ in lo..base_at {
                 self.chunks.remove(lo);
             }
-            self.chunks.insert(
-                lo,
-                Chunk {
-                    offset: start,
-                    data: merged,
-                },
-            );
+            for _ in base_at + 1..hi {
+                self.chunks.remove(lo + 1);
+            }
         }
 
         // §10.6: *"would exceed `REASSEMBLY_CHUNKS_MAX` (= 1024) **after
@@ -590,6 +841,12 @@ impl Reassembly {
     }
 
     /// Drain the contiguous prefix starting at `at`.
+    ///
+    /// The head gap [`Chunk`] carries for the merge pays a second time here:
+    /// handing bytes to the application advances `head` instead of shifting
+    /// the tail down, so a large chunk read out in small reads is linear
+    /// rather than quadratic. Emptying the chunk drops it, which is what
+    /// returns its capacity to ruling 94's accounting.
     fn read(&mut self, at: u64, buf: &mut [u8]) -> usize {
         let Some(front) = self.chunks.front_mut() else {
             return 0;
@@ -597,11 +854,10 @@ impl Reassembly {
         if front.offset != at {
             return 0;
         }
-        let n = buf.len().min(front.data.len());
-        buf[..n].copy_from_slice(&front.data[..n]);
-        front.data.drain(..n);
-        front.offset += n as u64;
-        if front.data.is_empty() {
+        let n = buf.len().min(front.len());
+        buf[..n].copy_from_slice(&front.bytes()[..n]);
+        front.advance(n);
+        if front.len() == 0 {
             self.chunks.pop_front();
         }
         n
@@ -692,6 +948,17 @@ mod tests {
 
     /// Coalescing is what keeps the count down: 2000 adjacent ranges are one
     /// chunk, not 2000.
+    ///
+    /// **[ruling 253(ii)] The capacity is re-derived, not relaxed.** It read
+    /// `2_000` — an exact number, and a property of the whole-span
+    /// `vec![0u8; span]` this merge replaces: that merge reallocated to the
+    /// exact span on every one of the 2 000 inserts, which is precisely the
+    /// per-frame copy 253(i) removes. Under [`REASSEMBLY_SLACK_SHIFT`]'s
+    /// capped growth the ladder is deterministic and lands at **2 104**: the
+    /// chunk reallocates only when its eighth of slack is spent, to
+    /// `need + need/8` each time. Relaxing this to `<=` would be rule 9's
+    /// trap — every degenerate build satisfies an upper bound for free, and
+    /// this is the one assertion that catches an accounting regression.
     #[test]
     fn adjacent_ranges_coalesce_rather_than_accumulate() {
         let mut half = RecvHalf::new();
@@ -699,7 +966,124 @@ mod tests {
             half.apply_stream(i, b"x", false)
                 .expect("adjacent ranges coalesce into one");
         }
-        assert_eq!(half.capacity(), 2_000);
+        assert_eq!(half.capacity(), 2_104);
+    }
+
+    /// **[ruling 253(ii)]** §10.6's ceiling, held at every span rather than
+    /// at one lucky point: allocated capacity never exceeds the arrived span
+    /// by more than an eighth.
+    ///
+    /// Separating, which is the whole reason it is an invariant over the
+    /// ladder and not a single `assert_eq!`. A bare doubling policy — the
+    /// one ruling 253 declines, at ~1.5 × credit — passes at span 2 000
+    /// (it holds 2 048, under 2 250) and fails here at span 1 025, where it
+    /// holds 2 048 against a limit of 1 153.
+    #[test]
+    fn capped_growth_holds_capacity_within_an_eighth_of_the_span() {
+        let mut half = RecvHalf::new();
+        for i in 0..3_000u64 {
+            half.apply_stream(i, b"x", false)
+                .expect("inside the window");
+            let span = i + 1;
+            assert!(
+                half.capacity() <= span + span / 8,
+                "capacity {} exceeds an eighth over the {span}-byte span",
+                half.capacity(),
+            );
+        }
+    }
+
+    /// **[ruling 253(i)]** The bridging case, from the separating side: a
+    /// frame that extends a large stored range pays for **its own bytes**,
+    /// not for the range it lands in.
+    ///
+    /// Derived rather than observed. The 1 000-byte range costs 1 000 to
+    /// store. The first append finds no tail slack, so it reallocates —
+    /// 1 000 stored bytes moved plus the 1 new byte — and takes
+    /// `1001 / 8 = 125` bytes of slack with it. The next 99 appends fit in
+    /// that slack and cost 1 byte each. Total **2 100**; capacity **1 126**.
+    ///
+    /// The merge this replaced copied the whole merged span every time:
+    /// `1000 + sum(1000 + i for i in 1..=100)` = **106 050**, fifty times
+    /// more, for the same hundred bytes of wire. That is the shape of the
+    /// measured 916×.
+    #[test]
+    fn an_appending_bridge_copies_the_new_byte_and_not_the_range_it_extends() {
+        let mut half = RecvHalf::new();
+        half.apply_stream(0, &[7u8; 1_000], false).unwrap();
+        assert_eq!(half.copy_work(), 1_000, "the arriving bytes, once");
+        for i in 0..100u64 {
+            half.apply_stream(1_000 + i, b"x", false).unwrap();
+        }
+        assert_eq!(half.copy_work(), 2_100);
+        assert_eq!(half.capacity(), 1_126);
+        assert_eq!(drain(&mut half).len(), 1_100, "and the bytes are all there");
+    }
+
+    /// **[ruling 253(i)]** The same bridge from **below**, which is the head
+    /// gap's whole reason to exist: without it, prepending one byte to a
+    /// large range shifts the range, and the amplification comes back
+    /// mirrored onto the front.
+    ///
+    /// The arithmetic is the append case's mirror image — one reallocation
+    /// moving 1 000 bytes, then 99 prepends into the 125 bytes of head slack
+    /// it took — so the total is the same **2 100**. A merge that prepended
+    /// by shifting would pay ~1 000 per frame and land near 101 000.
+    #[test]
+    fn a_prepending_bridge_copies_the_new_byte_too() {
+        let mut half = RecvHalf::new();
+        half.apply_stream(1_000, &[7u8; 1_000], false).unwrap();
+        for i in 1..=100u64 {
+            half.apply_stream(1_000 - i, b"x", false).unwrap();
+        }
+        assert_eq!(half.copy_work(), 2_100);
+        assert_eq!(half.capacity(), 1_126);
+        assert_eq!(
+            drain(&mut half).len(),
+            0,
+            "byte 0 never arrived, so nothing is contiguous — which is what \
+             makes this the attack and not a transfer"
+        );
+    }
+
+    /// **[ruling 253]** The meter is what the peer **spent**, so a reset
+    /// does not hand it back. Ruling 94's `capacity` is a state accessor and
+    /// goes to zero; `copy_work` is a work accessor and does not.
+    #[test]
+    fn a_reset_returns_the_capacity_and_not_the_copy_work() {
+        let mut half = RecvHalf::new();
+        half.apply_stream(0, &[7u8; 200], false).unwrap();
+        assert_eq!(half.capacity(), 200);
+        assert_eq!(half.copy_work(), 200);
+        half.apply_reset(500, 42);
+        assert_eq!(half.capacity(), 0, "§12.7: the discard is the first moment");
+        assert_eq!(
+            half.copy_work(),
+            200,
+            "a peer that resets has still spent the work"
+        );
+    }
+
+    /// **[F3]** A frame wholly inside already-received space writes nothing
+    /// and allocates nothing.
+    ///
+    /// Stated as the property rather than as a test of the early return,
+    /// because under ruling 253's merge the two are no longer the same
+    /// thing: the covered frame reaches `reserve_span` with both ends
+    /// already satisfied and both fill loops with no gap, so it costs
+    /// nothing on either path. The early return is now the cheap
+    /// short-circuit rather than the defence — see `insert`'s doc.
+    #[test]
+    fn a_covered_frame_writes_nothing() {
+        let mut half = RecvHalf::new();
+        half.apply_stream(0, b"abcdef", false).unwrap();
+        let (cap, work) = (half.capacity(), half.copy_work());
+        half.apply_stream(2, b"cd", false).unwrap();
+        half.apply_stream(0, b"abcdef", false).unwrap();
+        half.apply_stream(5, b"f", false).unwrap();
+        assert_eq!(half.capacity(), cap, "no allocation");
+        assert_eq!(half.copy_work(), work, "and no copy");
+        assert_eq!(drain(&mut half), b"abcdef");
     }
 
     /// §9.5's three `FINAL_SIZE_ERROR` cases.
