@@ -7021,6 +7021,11 @@ the top of it.
 
 ## Round 39 — the post-slice review: API surface, coverage, throughput
 
+> **Resuming?** Start at `round39-worklist.md`, not here. It carries the
+> ranked work items, the eight open decisions below in table form, and the
+> commands. The three agent reports are `review-api-opus-r39.md`,
+> `review-api-sonnet-r39.md` and `review-coverage-r39.md`.
+
 Two API reviewers (Opus, Sonnet) ran blind to each other over `cd12ed7`, a
 third measured coverage, and the maintainer built the throughput benchmark.
 Rulings 243–247 are the findings that needed no new decision — the spec or an
