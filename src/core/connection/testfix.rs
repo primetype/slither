@@ -791,8 +791,10 @@ impl Pair {
     /// packing order are statements about **one pass** of the send pump: a
     /// fixture that runs the pump to a fixed point observes the union of
     /// every pass and can no longer see which output a scarce budget
-    /// admitted *first*. Ruling 212(c) is exactly such a statement, and it
-    /// is unassertable through `pump_from`.
+    /// admitted *first*. Ruling 212(c) was exactly such a statement (its
+    /// rank half reversed by ruling 215; ruling 250's coalescing is
+    /// per-pass in the same way), and none of them is assertable through
+    /// `pump_from`.
     ///
     /// Returns `(A's outputs, B's outputs)` from the single round.
     pub(crate) fn step_from(
