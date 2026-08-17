@@ -8,7 +8,10 @@
 //! sealed plaintext with flow control, RFC 9002 loss recovery and
 //! congestion control. Connections roam across address changes, rekey by
 //! ratchet, and are accepted in *stages*, so an application can inspect a
-//! peer's claimed identity before spending a second DH on it.
+//! peer's claimed identity before spending a second DH on it — a ladder
+//! climbed **in a loop**, not once per connection: `accept()` is drained
+//! for the lifetime of the endpoint, by diallers and responders alike
+//! (§6.5, documentation obligation #6).
 //!
 //! **`SPEC.md` is the authority.** Every constant, header layout, frame
 //! type and timer in this crate is ratified there, and where the code and
@@ -39,9 +42,9 @@
 //! endpoints over the in-memory `testutil` fabric on tokio's paused clock,
 //! with every timer resolving in virtual time.
 //!
-//! # The five documentation obligations
+//! # The six documentation obligations
 //!
-//! Five hazards have no code fix. A consumer meets each one by getting it
+//! Six hazards have no code fix. A consumer meets each one by getting it
 //! wrong, so each is stated here as well as at its call site.
 //!
 //! 1. **Reconnecting is `close()` then dial, not `connect()` again.**
@@ -143,6 +146,37 @@
 //!    programming error with a defined, loud failure. The safe and unsafe
 //!    shapes look alike at the call site, which is exactly why it is
 //!    written down.
+//! 6. **`accept()` is a loop for the lifetime of the endpoint, not one
+//!    call per connection.** §6.5 puts it as a SHOULD: *"Every application
+//!    SHOULD treat `accept()` as a loop for the lifetime of its endpoint —
+//!    diallers and responders alike."* Accepting once and moving on is the
+//!    natural shape, and it strands the two cases the protocol expects the
+//!    *next* `accept()` to repair.
+//!
+//!    - **A lost msg2 leaves a responder holding a connection the peer
+//!      knows nothing about.** msg2 is never retransmitted — every
+//!      retransmit is a *completely fresh initiation* (§5.5) — so one
+//!      dropped msg2 leaves this side with a live, never-confirmed
+//!      connection while the peer re-offers a fresh [`Intro`] every
+//!      `RETRANSMIT_BASE` (~5 s) until it gives up at `HANDSHAKE_GIVEUP`
+//!      (90 s). **No error ever prompts the retry**: the first `accept()`
+//!      *succeeded*. Only the next one closes the gap.
+//!    - **A restarted peer is the same shape (§6.8).** Its reconnection
+//!      parks as an ordinary `Intro` against our still-live static, the
+//!      now-zombie connection keeps running untouched, and nothing tears
+//!      it down until the replacing `accept()`. *"Restart needs no
+//!      machinery of its own"* is true only because the application is
+//!      still listening.
+//!
+//!    Admitting that fresh `Intro` **is** the replacement, by §6.4's §16.1
+//!    guard. Where the connection it displaces is one we **accepted** —
+//!    replacement basis `Some(t)`, and the new initiation's timestamp
+//!    strictly greater — the install fires [`ConnectionLost::Replaced`] on
+//!    the old connection and the new chain completes. Where it is one we
+//!    **dialled**, the basis is `None`, no initiation can replace it,
+//!    [`AcceptError::Stale`] comes back and §6.8's restart instead resolves
+//!    at liveness, at most `DEAD_TIMEOUT` later. Either way the application
+//!    side of it is the one instruction: keep accepting.
 //!
 //! # Modules
 //!
