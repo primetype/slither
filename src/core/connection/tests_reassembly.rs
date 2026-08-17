@@ -117,6 +117,26 @@
 //! asserts that the fix does not pay for it with headroom the §10.6 ceiling
 //! forbids.
 //!
+//! # What was measured rather than reasoned about
+//!
+//! `reassembly_copy_work()` does not exist on the base this file was written
+//! against, so every number here would otherwise have been a derivation about
+//! a state machine — which this project has lost to the build repeatedly. The
+//! contract's accounting was therefore added to the **pre-253** merge in a
+//! throwaway build, the file run against it, and the instrumentation reverted
+//! before anything was committed. What that run established:
+//!
+//! * §6's pre-253 total is **548 750 144 B**, agreeing with the
+//!   hand-derivation to the byte, and §6 is the *only* test that fails on the
+//!   old merge — which is what it means for the other twelve to be pins on
+//!   behaviour that already ships rather than new-behaviour reds.
+//! * §7 **passes** on the pre-253 merge at exactly 262 000 bytes of capacity,
+//!   as it must: `vec![0u8; span]` allocates the arrived span and nothing
+//!   more. §7 is aimed at the fix, not at the defect.
+//! * Both new workloads stay inside flow control and inside
+//!   `REASSEMBLY_CHUNKS_MAX`, and both read back every byte they sent — so
+//!   nothing in either is measuring an accident.
+//!
 //! # No clock, so no runtime
 //!
 //! Sans-io core tests: `now: Instant` is an argument and nothing here reads a
@@ -174,6 +194,16 @@ fn cap(s: &Solo) -> u64 {
 /// chunk storage by `insert` — the arriving frame's bytes on store, plus
 /// every stored byte re-copied during a merge. Never reset, so every
 /// assertion here is over a *delta* or over a fresh core's total.
+///
+/// **A scope question the contract leaves open, reported rather than
+/// assumed.** `reassembly_capacity()` sums over the *live* receive halves,
+/// which is right for capacity — an abandoned half's allocation really is
+/// gone. Summed the same way, copy **work** is not monotone: retiring a half
+/// would subtract its history, and a peer could reset the accounting by
+/// opening and abandoning streams. Nothing here depends on the answer (no
+/// test in this file abandons or resets a half while measuring), so the tests
+/// hold either way — but "never reset" and "sum the live halves" cannot both
+/// be true, and the integrator picks one.
 fn work(s: &Solo) -> u64 {
     s.conn.reassembly_copy_work()
 }
@@ -759,13 +789,21 @@ fn work_bound() -> u64 {
 ///
 /// # What each broken build does
 ///
-/// * **Pre-253 whole-span merge.** Building the run costs
-///   `Σ 1024·(j+1)` ≈ 8.45 MB, because `deliver_stream_bytes` arrives in
-///   1 KiB frames and each one rebuilds the whole run so far — the bound is
-///   already blown before a single bridging round. Then each round rebuilds
-///   the run again for its 2 wire bytes: `Σ (131 072 + 2k + 2)` ≈ 540 MB.
-///   Total ≈ **549 MB for 139 KB of wire** — 122× this bound, ~3 900× per
-///   wire byte, the same lever the audit measured at 916× sustained.
+/// * **Pre-253 whole-span merge — measured, not estimated.** Building the run
+///   costs `Σ 1024·(j+1)` = 8 454 144 B, because `deliver_stream_bytes`
+///   arrives in 1 KiB frames and each one rebuilds the whole run so far: the
+///   bound is already blown by 1.9× before a single bridging round. Then each
+///   round rebuilds the run again for its 2 wire bytes,
+///   `Σ (131 072 + 2k + 2)` = 540 292 000 B, plus 4 000 for parking the
+///   bytes. **Total 548 750 144 B for 139 072 B of wire** — 122× this bound
+///   and ~3 946× per wire byte, the same lever the audit measured at 916×
+///   sustained.
+///
+///   That figure is this test's own output, not arithmetic: the pre-253
+///   merge was instrumented with the contract's accounting in a throwaway
+///   build, run, and reverted before committing. It agreed with the
+///   hand-derivation to the byte, which is the only reason the derivation
+///   above is quoted at all.
 /// * **Small-to-large merge (the fix).** The arriving side of every merge is
 ///   1 byte and the parked chunk is 1 byte, so a round copies ~3 bytes.
 ///   Total ≈ the arrived bytes plus whatever the growth policy re-copies as
@@ -909,8 +947,9 @@ const GROW_BLOCKS: usize = 262;
 ///   sits at the window from the first byte. The two snapshots before the
 ///   merging phase catch it: one chunk after one block, 131 after 131.
 /// * **The pre-253 whole-span merge** passes this test, and is meant to —
-///   `vec![0u8; span]` is exactly the arrived span. §7 is not aimed at it;
-///   §7 is aimed at what §6 tempts a fix into doing.
+///   `vec![0u8; span]` is exactly the arrived span, and it was measured here
+///   at exactly 262 000. §7 is not aimed at it; §7 is aimed at what §6 tempts
+///   a fix into doing.
 #[test]
 fn heavy_merging_to_the_credit_limit_holds_no_growth_headroom() {
     let t = t0();
