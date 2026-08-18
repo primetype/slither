@@ -68,6 +68,32 @@
      Rule 13 squarely: FlakyWire cannot express a saturated socket.
      **The slice must resolve this before any representation change
      lands.**
+
+   **Phase 1 verdict (2026/08/18, `round42-C`): PRE-EXISTING — and not
+   a stall, a KILL.** The 8 MiB/100 ms cell dies at
+   `recv.rs:882`: §10.6's flat `REASSEMBLY_CHUNKS_MAX = 1024` against
+   8 MiB of advertised credit (≈6 990 packets). A conforming sender
+   inside its credit, under one transient mass-loss event (measured:
+   all 10 018 lost datagrams die in the receiving endpoint's own UDP
+   socket buffer — 786 896 B ≈ 655 datagrams, `SO_RCVBUF` never set;
+   the relay lost zero), exceeds the hole ceiling while obeying the
+   credit and is closed with `PROTOCOL_VIOLATION`. Separated three
+   ways: identical death with `send.rs` reverted verbatim to
+   `d8bb652`; deterministic virtual-time reproducer on FlakyWire +
+   paused clock, seed 0x4200_0001, with a rule-9 control that
+   survives; the mutant's own invariant verified clean. Steady loss
+   cannot reach it (NewReno collapses cwnd first) — it needs
+   zero-loss-then-burst, exactly a socket buffer overflowing.
+   Reachability is linear in the window: 83 / 267 / 946 / 1025 chunks
+   at 256 Ki / 1 Mi / 4 Mi / 8 Mi; crossing ≈ 4.5 MiB; the ratified
+   default has 12× margin. §10.6 shipped the ceiling
+   *ratified-but-revisitable* gated on the Appendix B check whose "no
+   stall" clause phase 1 has now run red at 8 MiB; ruling 269's own
+   sizing advice (≈ 2×RTT×rate) steers operators past the crossing
+   once the drain fix lands. Ruling 270 material; two bench-harness
+   defects also recorded (probe task never joins a dead cell;
+   `finish()` emits `n<5` instead of failing).
+
    - The real fix wants a ring buffer or an explicit slack bound, not
      the mutant's compact-at-half (peak buffer doubles; ruling 94
      makes per-stream allocation a budget).
