@@ -86,8 +86,9 @@ release gates today — all nine are green at `65af633`.
 
 13. Ruling 248's eight API/doc decisions (round 39) — untouched.
     **[RESOLVED 2026/08/18 — ruling 259: all eight disposed; items
-    (i)–(vii) landed at `99cdc56`/`f148140`; (viii)'s Config knob ships
-    in its own slice.]**
+    (i)–(vii) landed at `99cdc56`/`f148140`; (viii)'s Config knob landed
+    2026/08/18 at `2c93102` + `bb32603` (fold + rename) with §10.2's
+    clause; `round41-M-flow-knob.md`.]**
 14. The 2026-08-17 survey's doc-staleness items not consumed by round 40:
     README/CHANGELOG/SECURITY/TODO predate the rewrite;
     `core/endpoint/mod.rs:34–41` (+3 files) claim the proven-LIVE branch

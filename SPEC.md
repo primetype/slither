@@ -30,7 +30,7 @@
 > | 254 | §13.3, §14.4, the constants tables | `PTO_BACKOFF_CAP` 2⁶ → 2³: the ladder fits inside `DEAD_TIMEOUT`'s window; survival envelope stated |
 > | 256 | §7.7, Appendix B | retention is not reach: the previous-epoch key delivers only within `REPLAY_WINDOW` counters of the boundary — one part in 32 — and the straggler pins must be built below it |
 > | 258 | §7.3, §8.5, §12.4, §14.5 | what rides the contested probe's packet: coalescing is all-or-nothing over the owed set; the owed ACK rides behind, not aboard; no fill — the 18 B bound is the exemption's proof; §8.5's collision sentence scoped to the PTO probe |
-> | 259 | §16.2, §16.4, §16.11 | ruling 248's listings: `SendCreditAvailable` enters both `ConnEvent` lists with the counting rule; `join` is fallible in §16.11 as ruling 120 ratified |
+> | 259 | §10.2, §16.2, §16.4, §16.11 | ruling 248's listings: `SendCreditAvailable` enters both `ConnEvent` lists with the counting rule; `join` is fallible in §16.11 as ruling 120 ratified; (viii)'s config-raisable receive windows enter §10.2 (2026/08/18) |
 > | 260 | Appendix B | O53a discharged by measurement (spurious ≤ 1.55 %, envelope 2.5 %); O53b's quinn bar ruled untestable, the no-stall clause pinned in virtual time |
 > | 261 | §6.3, §18.1, §18.2 | `IntroError::Evicted` splits cap-pressure from TTL; the eviction events enter `slither::policy` |
 > | 262 | §16.4 | the cores expose `next_deadline(&self)`: the deadline is read, never popped — the driver's destroy-arms disappear (a reentrant inline-executor consumer could reach them and silently lose a datagram in release) |
@@ -4165,11 +4165,50 @@ one receiver's ceiling is killed and past another's is not (§10.5). The
 values and their locations do not move — that would be wire-pin churn for
 nothing — but the code and `spec_constants.rs` mark which kind each is.
 
+**The two receive windows are config-raisable; the constants are the
+defaults.** **[AMENDED 2026/08/18 — ruling 259(viii)]** A receiver may
+advertise *more* than `INITIAL_MAX_DATA` / `INITIAL_MAX_STREAM_DATA`,
+and an endpoint config may say so once, statically, for every connection
+it mints. Ruling 247(a) is what this answers: the ratified pair caps one
+stream at `INITIAL_MAX_STREAM_DATA / RTT` — about 2.5 MiB/s at 100 ms —
+and before this a consumer had no way to buy more.
+
+**Nothing on the wire changes shape.** The knob is not negotiation and
+is not a sixth row in the table above: the *initial* values are still
+protocol constants, still unnegotiated, still identical in both
+directions, and still what a peer assumes before any credit frame
+arrives. A raise is therefore **said**, not assumed — carried by the
+MAX_DATA and MAX_STREAM_DATA frames §10.3 already emits, at values §8.4
+already admits. A receiver that widens its own ledger without emitting
+one has changed nothing its peer can observe.
+
+Three bounds, and they are the whole of the validation: **it raises
+only** — a configured window below its ratified constant is refused
+rather than clamped, because lowering re-opens §17.5's memory ceiling,
+§9.8's message bound, and the assumption a peer makes before the first
+credit frame; **`stream ≤ connection`**, the relation the constants
+already hold; and **both ≤ 2⁶² − 1**, the largest absolute offset a
+§8.1 varint carries.
+
+**`MESSAGE_RECV_MAX` does not move with it.** §9.8's bound is checked on
+the **send** side, and a sender cannot know what its receiver
+configured; a locally raised message bound would emit a payload that a
+default peer resets with `MESSAGE_OVERFLOW`. It stays equal to
+`INITIAL_MAX_STREAM_DATA` — the constant, not the configured window —
+so §9.8's bound (*messages bounded by the initial stream window*) is
+true of every conforming sender against every receiver, whatever either
+has configured.
+
+The memory consequence is the operator's, knowingly: §17.5's
+per-connection receive commitment is the **connection** window, so
+raising the pair multiplies that term.
+
 ### 10.3 Advancing credit
 
 The re-grant rule, concrete (RFC 9000 §4.2's shape): with `WINDOW` the
-level's window (`INITIAL_MAX_STREAM_DATA` for a stream,
-`INITIAL_MAX_DATA` for the connection), the **prospective limit** is
+level's window (the advertised stream or connection window — the
+ratified constant by default, ruling 259(viii)'s configured raise
+otherwise), the **prospective limit** is
 `bytes_read + WINDOW`, and the receiver emits MAX_STREAM_DATA or MAX_DATA
 when `prospective_limit − last_advertised ≥ WINDOW/2` — that is, when the
 read offset has advanced at least half a window since the last
@@ -4224,8 +4263,9 @@ at §9.2's watermark, trued up in the same step — rather than arming a
 retirement for a FIN or reset that a stalled sender has no reason to
 send. Its final size is unknown and unknowable, so the value is the
 **highest stream-level limit this endpoint ever advertised** for that
-half: seeded to `INITIAL_MAX_STREAM_DATA` (§10.2) and grown by the
-re-grant above, never the constant as a fixed value. That is the least
+half: seeded to the advertised stream window (§10.2 —
+`INITIAL_MAX_STREAM_DATA` unless config raised it, ruling 259(viii))
+and grown by the re-grant above, never the constant as a fixed value. That is the least
 upper bound on what the peer could have sent without a
 `FLOW_CONTROL_ERROR`, and it is ≥ the highest received offset, so the
 bring-to-final stays monotone.
@@ -6883,7 +6923,7 @@ policy:
 | stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 220 B raw bytes each, ≈ 225 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
-| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ `INITIAL_MAX_DATA` (1 MiB) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
+| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
 
 **The caveat on the sent map, stated because ruling 43 changed what it
 covers.** "Bounded by cwnd" is exact for congestion-controlled output

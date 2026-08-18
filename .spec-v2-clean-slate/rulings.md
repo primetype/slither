@@ -8363,6 +8363,37 @@ precedent. The 18 `Debug` impls are all manual: `WakerSlot` holds a
 that silently vanishes, and `CountingProvider`/`CountingIdentity` wrap
 key material that must not print.
 
+**Addendum (2026/08/18, at the (viii) landing —
+`round41-M-flow-knob.md`).** The knob landed in its own slice as
+ratified (`2c93102`; integration follow-ups `bb32603`): one atomic
+`Config::with_flow_windows(stream, connection)` rather than two
+builders, because the pair carries an ordering invariant
+(`stream ≤ connection`) and two consumed builders make its validation
+order-dependent. Three bounds are the whole of the validation:
+raise-only (below the ratified default is **refused, not clamped**),
+`stream ≤ connection`, both ≤ 2⁶² − 1. Two findings from the landing,
+both in §10.2's clause: *(a)* a raise stored but never said is
+invisible — the initial windows are never on the wire and `take_grant()`
+fires only on consumption — so `CreditWindow` gained a one-shot
+`pending_announce`: MAX_DATA owed at `connecting()`, MAX_STREAM_DATA
+owed on the **peer's first STREAM frame**, not at open (`pack_control`
+runs before the STREAM fill, so a grant owed at open leaves ahead of
+the frame that names the stream and §8.4 drops it as inert). *(b)*
+`MESSAGE_RECV_MAX` does not move with the knob: §9.8's bound is checked
+on the **send** side and a sender cannot know what its receiver
+configured (`the_message_bound_does_not_move_with_the_window`).
+Red-on-default evidence per rule 9: three mutants — knob ignored,
+ledger widened but never announced, announce at open instead of on the
+peer's first frame — each caught, the third by exactly one test, which
+isolates the claim its rustdoc makes. At integration the refusal
+variants folded into `error::ConfigError` (`WindowTooSmall` /
+`WindowTooLarge` / `StreamWindowAboveConnection`; one configuration
+error type is the crate's stated design, and a second would have been
+"ratify the split"), `spec_errors.rs`'s exhaustiveness fence was
+extended deliberately as its own doc requires, and `draw_sub_seed`
+became `mint_conn_seed` — `ConnSeed` is minted at the one place both
+birth paths pass through, so the two cannot advertise different policy.
+
 ### 260 — O53a and O53b, discharged by measurement
 
 **Ruling: Appendix B's two stranded pre-ratification gates are re-scoped
