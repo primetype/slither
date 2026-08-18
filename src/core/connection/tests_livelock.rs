@@ -568,6 +568,46 @@ fn one_more_byte_of_room_releases_the_probe_and_the_isolation_with_it() {
 // 4. Termination — the driver loop, run at the core
 // ═══════════════════════════════════════════════════════════════════════
 
+/// The step cap [`drive_like_the_shell`] is given, and the separation it buys.
+///
+/// **[round 41 item 11 — 2026/08/18]** Both call sites passed a literal `64`,
+/// under a comment calling it *"deliberately loose: the point is bounded, not
+/// small, and a tight cap would turn an unrelated recovery-timer change into a
+/// red here"*. Loose to the point of **vacuous** — working rule 9: *a bound is
+/// only a test if the degenerate case violates it*, and nothing violated 64.
+/// The three quantities, measured at this commit rather than argued:
+///
+/// * the shipped build reaches `Timeout(None)` in **1** step. The budget
+///   admits no probe, so ruling 249 announces no `Pto` at all; the only timer
+///   left is §7.4's liveness, one sleep to `install + DEAD_TIMEOUT`.
+/// * the build this loop's own assertion message names — *"a held keepalive
+///   re-offered without bound"* — scores `DEAD_TIMEOUT / BEACON` = **25**.
+///   Measured, not assumed: driving an **un**held beacon on a validated
+///   address is exactly that behaviour, and it takes 25 steps to die. 25 < 64,
+///   so the old cap could not fail the one build it was written against.
+/// * a build that walked §13.3's ladder here instead (ruling 249's defect, in
+///   the variant whose anchor advances, so the retrospection assert above does
+///   not catch it) reaches `DEAD_TIMEOUT` in **6** firings at ruling 254's 2³
+///   — arithmetic, not measured: a ~1.02 s first interval doubling to 8× sums
+///   1, 3, 7, 15, 23, 31 intervals, and 25 s falls between the fifth and the
+///   sixth. At the old 2⁶ it was **5**, a longer ladder having fewer rungs
+///   inside the same 25 s — so tightening here is not a consequence of 254 so
+///   much as something 254 made worth doing properly.
+///
+/// The separating band is therefore `1 ≤ cap < 25`, and every shape above
+/// sits outside it. 4 keeps a three-step margin for exactly the unrelated
+/// recovery-timer change the old comment was protecting, and still fails the
+/// 25-step build by a factor of six.
+const FIXED_POINT_CAP: usize = 4;
+
+/// The upper end of that band, pinned to the constants it is derived from
+/// rather than transcribed: a cap at or above a beacon re-offered every
+/// interval until §7.4 reaps the session asserts nothing at all.
+const _: () = assert!(
+    (FIXED_POINT_CAP as u64) < DEAD_TIMEOUT.as_secs() / BEACON.as_secs(),
+    "a cap at or above DEAD_TIMEOUT / BEACON separates no build at all"
+);
+
 /// Simulate `Driver::run`'s steps 4 and 5 against the core alone: sleep to
 /// whatever deadline was announced, hand it back, repeat.
 ///
@@ -619,8 +659,9 @@ fn drive_like_the_shell(s: &mut Solo, start: Instant, cap: usize) -> usize {
 /// ruling it walked the PTO backoff here) and dies of §7.4's liveness at
 /// `install + DEAD_TIMEOUT`, in a handful of steps.
 ///
-/// The cap is deliberately loose: the point is *bounded*, not *small*, and a
-/// tight cap would turn an unrelated recovery-timer change into a red here.
+/// The cap read `64` until round 41 item 11 measured what it was separating:
+/// nothing. See [`FIXED_POINT_CAP`] — this build takes **1** step, and the
+/// re-offering build the assertion names takes 25.
 #[test]
 fn a_connection_holding_its_beacon_still_reaches_a_fixed_point() {
     let start = t0();
@@ -631,7 +672,7 @@ fn a_connection_holding_its_beacon_still_reaches_a_fixed_point() {
         .expect("§7.5's floor");
     let _ = drain(&mut s.conn);
 
-    let steps = drive_like_the_shell(&mut s, start, 64);
+    let steps = drive_like_the_shell(&mut s, start, FIXED_POINT_CAP);
 
     // The loop ends only at `Timeout(None)`, and §15.4's liveness row is the
     // only thing that produces it here — so the connection must be dead, and
@@ -663,7 +704,7 @@ fn a_connection_holding_its_beacon_behind_a_mark_still_reaches_a_fixed_point() {
         .expect("§7.5's floor");
     let _ = drain(&mut s.conn);
 
-    let steps = drive_like_the_shell(&mut s, start, 64);
+    let steps = drive_like_the_shell(&mut s, start, FIXED_POINT_CAP);
     assert!(steps > 0, "the loop must actually have run");
 }
 

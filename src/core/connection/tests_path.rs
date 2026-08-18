@@ -1242,6 +1242,32 @@ fn the_challenge_precedes_the_probes_ping_in_the_packet_carrying_both() {
 //
 // ⚠ **SECOND CONFLICT, REPORTED AND NOT RESOLVED (working rule 3).**
 //
+// ✅ **RESOLVED 2026/08/18 [round 41 item 6] — the code follows §8.7, and
+// the three tests below are green on it.** The report is kept as written,
+// for the same reason the first header keeps its own: a conflict that
+// vanishes when it is answered teaches nothing. The resolution, in order:
+//
+//   - **Ruling 217** added `ack.is_owed()` to the pump's challenge offer —
+//     exactly the case `!elicits` refused — and **ruling 224** put the
+//     reversal in the record rather than only in the code: *"§8.7 outranks
+//     the comment"*, boundary 2 struck through in place with the half of
+//     its objection that survived. **Ruling 221** then added the PTO's
+//     `probe`, the retransmission half of the same standing obligation.
+//   - The shipped predicate carries no `!elicits` term at all:
+//     `offer = owe_challenge && (owes_output() || ack.is_owed() || probe)`
+//     (`mod.rs:2289`). The one surviving `!elicits` in the pump is §13.4's
+//     bare-PING rule (`mod.rs:2447-2448`), which decides whether a **PTO
+//     probe** needs a PING — not whether a packet carries a challenge.
+//   - So `CONTRACT-7b.md` §1.4's *"unchanged in force"* did not survive
+//     contact with §8.7. Boundary 1 survives only as the ban on
+//     **manufacture**, which is what
+//     [`an_idle_unvalidated_connection_owing_nothing_emits_no_challenge`]
+//     below still pins, and it is why the shipped rule is a disjunct rather
+//     than an unconditional offer.
+//
+// The author's closing line — *"this author believes that build is wrong —
+// but the call is the maintainer's"* — was upheld by the call.
+//
 // `CONTRACT-7b.md` §1.4 converts the pump's existing `validate` branch from
 // `packing.ping()` to a `PathChallenge` and says all four of its documented
 // boundaries *"carry over **unchanged in force**"*. Two of those boundaries

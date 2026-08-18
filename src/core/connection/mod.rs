@@ -2216,19 +2216,38 @@ impl<C: Handshake> Connection<C> {
             // The challenge's two gates are §7.3's boundaries, unchanged in
             // force from the PING they replace: one offer per pump
             // (`owe_challenge`), and only while something is actually owed
-            // to the address. A pending contested probe counts as owed —
-            // it is output waiting on exactly this budget.
+            // to the address.
             //
-            // **[ruling 250]** `contested.is_pending()` below is that
-            // sentence, and it is **unreachable here** — reported rather
-            // than deleted. `pump_contested_probe` runs above and leaves
-            // `Pending` in no case: it returns early when there is no mark,
-            // transitions to `Armed` when it sends, and returns from the
-            // whole pump when the budget holds it. The disjunct was already
-            // unreachable before 250 (the 212(c) pre-pass ran first, the
-            // probe second), so the pre-pass's deletion did not create this.
-            // The state it names is real and is now served where it is
-            // reachable — the probe's own packet coalesces the challenge.
+            // **[round 41 item 8 — 2026/08/18]** A `contested.is_pending()`
+            // disjunct stood here, on the sentence *"a pending contested
+            // probe counts as owed — it is output waiting on exactly this
+            // budget"*, reported unreachable at the R40-B merge and left in
+            // place. It is now **deleted**, because this loop cannot observe
+            // that state at all. `pump_contested_probe` runs above it and
+            // leaves `Pending` in no case: it returns early when there is no
+            // mark, assigns `Armed` when it sends, and returns from the
+            // **whole pump** when anything refuses the send. `Pending` has
+            // one writer — `mark_contested` — and nothing under the pump
+            // calls it, so the state cannot appear mid-loop either.
+            //
+            // Measured as well as argued, since a green suite that misses a
+            // line proves little (rule 13): an assertion on this line over
+            // the full suite saw `Armed` 55 times and `Pending` **0** times
+            // across >37 000 iterations, while `pump_contested_probe`
+            // entered on a mark 49 times and left by exactly those two
+            // exits — 17 refused, 32 sent. The deletion is therefore
+            // behaviour-preserving, not the behaviour change the report
+            // feared. It was already unreachable before ruling 250 (the
+            // 212(c) pre-pass ran first, the probe second), so neither the
+            // pre-pass's deletion nor its replacement created it.
+            //
+            // The state that disjunct named is real, and **ruling 250 is
+            // where it is served**: the probe's own packet coalesces the
+            // owed path frames (`pump_contested_probe` → `pack_path_frames`,
+            // 40 B with one owed, 49 B with both), and `owe_challenge` is
+            // threaded through that call so this loop does not then offer a
+            // second challenge on the same pass.
+            //
             // **[ruling 217]** `self.ack.is_owed()` belongs in this
             // disjunction and its absence was the defect. §8.7 owes the
             // challenge *"whenever §7.3's budget admits **a packet**"* — an
@@ -2245,8 +2264,12 @@ impl<C: Handshake> Connection<C> {
             // and the reason this is a disjunct rather than an unconditional
             // `owe_challenge`.
             //
-            // **[RATIFIED — ruling 221]** `probe` is the fourth disjunct, and
-            // its absence was the defect §8.7 names by its own words: without
+            // **[RATIFIED — ruling 221]** `probe` is a disjunct of `offer`,
+            // and its absence was the defect §8.7 names by its own words:
+            // ruling 221 calls it *"the fourth"*, which it was until round
+            // 41 item 8 deleted the dead `contested.is_pending()` above it —
+            // it is now the third of three, and the ruling's ordinal is left
+            // quoted rather than silently renumbered. Without
             // it a **lost** challenge is never re-emitted. §13.4 arms the PTO
             // on the challenge packet (it is ack-eliciting), the probe finds
             // nothing else owed, `packing.ping()` below builds a bare PING,
@@ -2268,11 +2291,7 @@ impl<C: Handshake> Connection<C> {
             // It is not the manufacture ruling 217's first draft attempted —
             // the packet exists because the PTO fired, not because the
             // challenge wanted one.
-            let offer = owe_challenge
-                && (self.owes_output()
-                    || self.contested.is_pending()
-                    || self.ack.is_owed()
-                    || probe);
+            let offer = owe_challenge && (self.owes_output() || self.ack.is_owed() || probe);
             let path = self.pack_path_frames(&mut packing, offer);
             // Stages 2 and 3 — credit grants and RESET_STREAM, then the
             // STREAM and DATAGRAM fill.
@@ -3208,18 +3227,19 @@ impl<C: Handshake> Connection<C> {
         // exactly the terms the loop below states: the one-per-pump bound,
         // and an arming that has not been disarmed. There is no §8.7
         // *"something else is owed"* disjunct to check here, because a
-        // pending contested probe **is** that something — the loop's `offer`
-        // names the state literally, as `contested.is_pending()`.
+        // pending contested probe **is** that something — this packet is
+        // output waiting on exactly this budget.
         //
-        // Worth stating, because that disjunct now reads as the live site
-        // and is not: the loop cannot observe `Pending` at all. This
+        // **[round 41 item 8 — 2026/08/18]** The loop's `offer` used to name
+        // that state literally, as `contested.is_pending()`. That disjunct
+        // is deleted: the loop cannot observe `Pending` at all, because this
         // function either finds no mark and returns `true`, or sends and
-        // leaves `Armed`, or holds and returns `false`, which returns from
+        // leaves `Armed`, or holds and returns `false` — which returns from
         // the pump. It was equally unreachable before ruling 250 (the 212(c)
-        // pre-pass ran first, this ran second), so nothing about the deletion
-        // created it — reported rather than removed, since removing a
-        // disjunct is a behaviour change and this one is `SPEC.md` §8.7's
-        // condition written out.
+        // pre-pass ran first, this ran second), so nothing about the
+        // deletion created it. **This** is the site where §8.7's condition
+        // is discharged for a connection carrying a mark, and the coalescing
+        // below is how.
         let response_owed = self.owed_path_response.is_some();
         let challenge_owed = *owe_challenge && self.amplification.outstanding_challenge().is_some();
         let owed = usize::from(response_owed) + usize::from(challenge_owed);
