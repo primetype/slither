@@ -8,8 +8,24 @@ integration `069d7a0`, review carry-alongs `de50def`; verification in
 findings landed); records in rulings 270 + the 269 addendum. Bench
 after: ladder 83/80/97/97/95 MiB/s (was 12.3× spread), 100 ms column
 monotone to 17.66 MiB/s, the kill cell completes. Carried onward, NOT
-closed: the syscall/async-datapath bucket (~50 % of CPU, 7.8 vs 2.3 µs
-floor) — the next attribution when throughput work resumes.]**
+closed: the syscall/async-datapath bucket — ATTRIBUTED 2026/08/18
+(`round42-G`, branch `datapath/attribution`): retry-storm REFUTED
+(attempts/ok ≈ 1.0000 over ~2M calls); platform batching NOT
+gap-differentiating (quinn pays the same no-GSO macOS floor; the honest
+async floor is tok-oneway 3.12 µs/dg unconnected, and the old "2.3 µs"
+anchor was a mislabelled connected-drain figure); TWO measured levers —
+(i) ACK cadence: slither ACKs 1-per-2 data datagrams (33.6 % of all
+datagrams) vs quinn's 1-per-58.6 (1.68 %), a 30× difference, ratified
+§12.4 territory, floor-only lower bound ≈1.53 µs/data-dg; (ii)
+connect()-per-peer addressing: 30.1 % per-call floor saving, ≈1.41
+µs/data-dg, shell-internal but multi-peer/roaming design questions.
+Combined model ≈ +2.94 µs → ~88 → ~113 MiB/s. A ≈6 µs residual is
+UNATTRIBUTED (protocol/userspace processing — needs userspace CPU
+profiling, a fifth bucket the syscall instrumentation cannot see). Two
+rule-12 flags left open: the profile's sendto/recvfrom asymmetry does
+not reproduce in isolation, and the two sessions' conditions may not be
+comparable. Maintainer decision pending on which lever, if any, to
+pursue.]**
 
 1. **The O(window) ack-path drain** (ruling 269(iii), deferred by
    decision). `SendHalf`'s send buffer is a contiguous `Vec<u8>`;
