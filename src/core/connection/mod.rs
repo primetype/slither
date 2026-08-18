@@ -793,6 +793,32 @@ impl<C: Handshake> Connection<C> {
             .unwrap_or_else(|| ConnOutput::Timeout(self.timers.next()))
     }
 
+    /// The next deadline, read **without** popping (**[RATIFIED 2026/08/18
+    /// — ruling 262]**).
+    ///
+    /// The same value [`poll_output`](Self::poll_output)'s terminal
+    /// `Timeout` announces, computed the same way — `Timers::next` is
+    /// already a `&self` read, so this adds no state and costs nothing.
+    ///
+    /// # Why the announcement is separable from the drain sentinel
+    ///
+    /// §16.4 makes the terminal `Timeout` *"simultaneously the drain
+    /// sentinel and the next-deadline announcement"*, and a caller that
+    /// needs the **sentinel** must still use `poll_output`. A caller that
+    /// needs only the **value** was, until ruling 262, obliged to obtain it
+    /// through a verb that *pops* — so on a non-empty queue it destroyed an
+    /// output to learn a number. `Timers::next` is that number, and it does
+    /// not depend on the queue being empty: §16.7 puts sealing inside the
+    /// mutating call that triggers it, so every verb that queues an output
+    /// re-derives the timers in the same call, and the value is correct
+    /// whether or not the drain has run.
+    ///
+    /// The shell's driver is that caller — see `shell::driver::Driver`'s
+    /// `deadline`, which is where ruling 262's construction was found.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.timers.next()
+    }
+
     /// T7's seal-failure injection: the next seal fails as §7.9's
     /// exhausted counter would.
     #[cfg(test)]

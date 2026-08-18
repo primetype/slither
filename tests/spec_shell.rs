@@ -1068,9 +1068,19 @@ async fn cancelled_dial_leaves_the_peer_a_silent_half_open_session() {
 /// §16.4: `poll_output()`'s terminal `Timeout` "is simultaneously the drain
 /// sentinel and the next-deadline announcement", and the core's
 /// `poll_output` **pops** — for `core::Connection` it is
-/// `self.outputs.pop_front().unwrap_or_else(…)`. So reading the deadline is
-/// only a pure read while the queue is provably empty, and the only thing
-/// that establishes that is a drain with **no intervening yield**.
+/// `self.outputs.pop_front().unwrap_or_else(…)`. When this test was written
+/// the driver collected deadlines with `poll_output`, so reading one was a
+/// pure read only while the queue was provably empty, and the only thing
+/// that established that was a drain with **no intervening yield**.
+///
+/// **[ruling 262]** The driver now collects with `next_deadline`, which
+/// reads without popping, so the destruction this test was written against
+/// is gone at the root. The obligation it pins is unchanged and is the one
+/// that actually matters to a peer: **a CLOSE sealed while `send_to` is
+/// suspended still reaches the wire.** That is a statement about the drain
+/// contract, not about where the deadline is read, and it would still fail
+/// on a driver that dropped the handle-side mutation on the floor for any
+/// other reason.
 ///
 /// # The mutation this catches
 ///
@@ -1086,15 +1096,20 @@ async fn cancelled_dial_leaves_the_peer_a_silent_half_open_session() {
 /// that lands while the driver is suspended inside `send_to` queues
 /// `Transmit(CLOSE)` on a core the driver is about to call `poll_output()`
 /// on outside a drain — and `deadline()` popped it and threw it away. In
-/// release that is a silently lost CLOSE and 25 s of `DEAD_TIMEOUT` for the
+/// release that was a silently lost CLOSE and 25 s of `DEAD_TIMEOUT` for the
 /// peer, which is precisely the cost §15.1 says CLOSE exists to avoid; in
 /// debug the `debug_assert!` beside it panicked the driver instead.
 ///
-/// The fix is to read the deadline **before** the yield, where the drain
-/// has just finished and `deadline()`'s own doc comment already claimed it
-/// was — every handle-side mutation sends a command, and the command arm is
-/// `biased` first, so a deadline made stale during the yield is recomputed
-/// on the very next iteration rather than obeyed.
+/// The first fix was to read the deadline **before** the yield, where the
+/// drain has just finished and `deadline()`'s own doc comment already
+/// claimed it was — every handle-side mutation sends a command, and the
+/// command arm is `biased` first, so a deadline made stale during the yield
+/// is recomputed on the very next iteration rather than obeyed. **Ruling 262
+/// then removed the destructive read itself**, after measuring that position
+/// alone was never sufficient: `serve()`'s own post-drain tail calls into
+/// consumer code, so "no yield since the drain" did not imply "no mutation
+/// since the drain". The deadline is still read here, and now nothing is
+/// riding on that.
 ///
 /// # Why the assertion separates them
 ///
@@ -1164,9 +1179,10 @@ async fn a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer() {
                 .await
                 .expect(
                     "§16.4: a CLOSE sealed while the wire was suspended must still be \
-                     drained and sent. A driver that reads its deadline out of \
-                     poll_output() *after* a yield pops this datagram and discards it, \
-                     and the peer then waits out DEAD_TIMEOUT for nothing",
+                     drained and sent. A driver that loses this datagram — by reading \
+                     its deadline out of poll_output() after a yield, which pops and \
+                     discards it (the pre-ruling-262 shape), or by any other route — \
+                     leaves the peer waiting out DEAD_TIMEOUT for nothing",
                 );
             assert_eq!(
                 peer_c,

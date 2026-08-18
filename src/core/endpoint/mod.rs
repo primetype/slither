@@ -279,6 +279,19 @@ impl<I: Identity> Endpoint<I> {
         }
     }
 
+    /// The next deadline, read **without** popping (**[RATIFIED 2026/08/18
+    /// — ruling 262]**).
+    ///
+    /// The connection core's twin, on the same argument: this is exactly the
+    /// value [`poll_output`](Self::poll_output)'s terminal `Timeout` carries,
+    /// and [`deadline`](Self::deadline) is already a `&self` scan over
+    /// §16.5's three timer families. Reading it here costs a caller nothing
+    /// and, unlike `poll_output`, cannot consume an output the caller was
+    /// not asked to handle.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.deadline()
+    }
+
     /// §16.5, verbatim: *"The endpoint core's deadline is the min over its
     /// pendings' retransmit/give-up deadlines, the parked intros'
     /// expiries, and the timestamp-guard orphan aging (§17.1)."*

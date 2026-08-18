@@ -1407,4 +1407,186 @@ mod tests {
         })
         .await;
     }
+    // ══════════════════════════════════════════════════════════════════
+    // Ruling 262 — the driver reads deadlines without popping
+    // ══════════════════════════════════════════════════════════════════
+
+    thread_local! {
+        /// The live send half the reentrant consumer writes on. Parked here
+        /// rather than captured by the waker's closure on purpose: dropping
+        /// a `SendStream` sends RESET_STREAM (§9.6), and an earlier draft of
+        /// this test failed with `Reset(0)` for that reason rather than for
+        /// the one it exists to catch.
+        static REENTRANT_STREAM: std::cell::RefCell<Option<crate::testutil::TestSendStream>> =
+            const { std::cell::RefCell::new(None) };
+        static REENTRANT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static REENTRANT_FIRED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A consumer executor that polls a ready task **inline** instead of
+    /// queueing it.
+    ///
+    /// Not exotic, and not this test's invention: [`Driver::latch`],
+    /// [`resolve_slot`](shared::resolve_slot) and
+    /// `Connection::poll_recv_message` each name this executor in their doc
+    /// comments and each end their cell borrow before waking *because* of
+    /// it. Those three defences are what make the reentrant call **succeed**
+    /// rather than abort with `already mutably borrowed` — which is exactly
+    /// why the window below is reachable.
+    struct InlinePoller;
+
+    impl std::task::Wake for InlinePoller {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            if !REENTRANT_ARMED.with(std::cell::Cell::get) {
+                return;
+            }
+            REENTRANT_ARMED.with(|c| c.set(false));
+            REENTRANT_FIRED.with(|c| c.set(c.get() + 1));
+            REENTRANT_STREAM.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let send = slot.as_mut().expect("the stream is parked here");
+                let waker = std::task::Waker::noop().clone();
+                let mut cx = std::task::Context::from_waker(&waker);
+                let wrote = std::pin::Pin::new(send).poll_write(&mut cx, b"reentrant-write");
+                assert!(
+                    matches!(wrote, std::task::Poll::Ready(Ok(15))),
+                    "the reentrant write must be accepted by the core, or this test \
+                     asserts nothing about what happens to it afterwards: {wrote:?}"
+                );
+            });
+        }
+    }
+
+    /// **[RATIFIED 2026/08/18 — ruling 262]** A consumer that mutates a core
+    /// from inside `serve()`'s post-drain tail does not lose its datagram.
+    ///
+    /// # The window
+    ///
+    /// `Driver::run` step 1 is `serve()` and step 2 is `deadline()`, with no
+    /// `.await` between them — which is what the old code relied on. But
+    /// `serve()`'s **tail** runs *after* its last `dirty` scan and calls into
+    /// consumer code with no yield involved: `dispatch_intros` sends an
+    /// `Intro` down a `oneshot`, and `release_dead` resolves a `Connecting`
+    /// slot and drops a `PublicKeyOf<I>`. An inline-polling consumer woken
+    /// there re-enters the data path, and the `Transmit` it queues is
+    /// scanned for by nobody before `deadline()` runs.
+    ///
+    /// So the old precondition — *"no yield since the drain"* — was true and
+    /// insufficient. The one that matters is *"no consumer code since the
+    /// last `dirty` scan"*, and `serve()` violated it itself.
+    ///
+    /// # Why the assertion separates the builds (working rule 9)
+    ///
+    /// The pin is delivery **with no advance of virtual time**. That clause
+    /// is load-bearing rather than decorative: the core records the popped
+    /// packet as *sent*, so loss recovery would retransmit it and a test that
+    /// merely awaited the bytes would pass over real data loss. `settle()`
+    /// only yields — `SETTLE_YIELDS` × `yield_now` — so no `Loss` or `Pto`
+    /// timer can fire inside it, and a destroyed datagram is simply absent.
+    ///
+    /// Measured on the parent commit, where `deadline()` collected with
+    /// `poll_output`:
+    ///
+    /// * **debug** — the driver's own `debug_assert!(false, "a connection
+    ///   core queued an output outside a drain")` fired *and* the read below
+    ///   timed out;
+    /// * **release** — no panic at all, and the read below still timed out.
+    ///
+    /// The release row is the finding: no panic, no log, nothing red, and
+    /// the application's accepted bytes gone. Note also that the debug panic
+    /// did **not** fail the test — it happened on the `spawn_local` task
+    /// whose `JoinHandle` the shell drops — so the arm was never the
+    /// debug-build detector its comment claimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_reentrant_consumer_write_in_the_post_drain_tail_is_not_destroyed() {
+        local(async {
+            let pair = Pair::seeded(0x262_0001);
+            let (a, b) = pair.establish().await;
+            settle().await;
+
+            // B has a live connection and a stream it can write on.
+            let (send, _recv) = b.open_bi().await.expect("open_bi").split();
+            settle().await;
+
+            // A third endpoint: §16.1's LIVE test refuses a second dial from
+            // A's static, so the fresh introduction must carry a static this
+            // endpoint has never seen.
+            let third: crate::testutil::TestIdentity =
+                crate::testutil::CountingIdentity::seeded([0x5C; 32]);
+            let third = super::Endpoint::builder()
+                .identity(third)
+                .wire(pair.net.endpoint(crate::testutil::addr_c()))
+                .config(crate::config::Config::new())
+                .rng_seed([0x5D; 32])
+                .build();
+
+            REENTRANT_STREAM.with(|slot| *slot.borrow_mut() = Some(send));
+            REENTRANT_ARMED.with(|c| c.set(true));
+
+            // Park an `accept()` on B under the inline-polling waker, so the
+            // `oneshot` `dispatch_intros` will send on registers *our* waker.
+            let mut accepting = Box::pin(pair.b.endpoint.accept());
+            let waker = std::task::Waker::from(std::sync::Arc::new(InlinePoller));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(
+                std::future::Future::poll(accepting.as_mut(), &mut cx).is_pending(),
+                "accept() must park, or the waker is never registered and this test \
+                 exercises nothing"
+            );
+            settle().await;
+
+            // The third endpoint dials B. B's driver drains, `IntroReady`
+            // lands in `ready`, the drain settles — and then `dispatch_intros`
+            // hands the `Intro` over, waking us inline, after the last `dirty`
+            // scan and before `deadline()`.
+            let _dialling = third
+                .connect(pair.b.addr(), pair.b.public_static)
+                .expect("the third endpoint dials");
+            settle().await;
+            settle().await;
+
+            assert_eq!(
+                REENTRANT_FIRED.with(std::cell::Cell::get),
+                1,
+                "the inline waker must have fired from serve()'s tail, or the window \
+                 this test exists for was never entered"
+            );
+
+            // The pin. No clock advance: `settle()` yields and never sleeps,
+            // so nothing here can be covered for by a retransmission.
+            let accepted = tokio::time::timeout(Duration::from_millis(1), a.accept_bi())
+                .await
+                .expect(
+                    "ruling 262: the reentrant write's datagram must reach the peer. A \
+                     driver that collects deadlines with poll_output() pops it and \
+                     discards it, and nothing retransmits within zero virtual time",
+                )
+                .expect("accept_bi");
+            let mut reading = accepted.split().1;
+            let mut got = vec![0u8; 64];
+            // The crate's own `read`, not `AsyncReadExt`'s: `Ok(None)` is end
+            // of stream and `Ok(Some(0))` never appears from an `await`ed
+            // read. A destroyed datagram would surface as neither — the
+            // `accept_bi` above times out first.
+            let n = reading
+                .read(&mut got)
+                .await
+                .expect("read")
+                .expect("bytes, not end of stream");
+            assert_eq!(
+                &got[..n],
+                b"reentrant-write",
+                "the bytes the core accepted must be the bytes the peer receives"
+            );
+
+            // Leave the thread-local empty: a `SendStream` outliving the
+            // runtime would be dropped on a dead shell.
+            REENTRANT_STREAM.with(|slot| slot.borrow_mut().take());
+        })
+        .await;
+    }
 }

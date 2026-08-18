@@ -222,22 +222,22 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             // 2. The next deadline, read **here** — after the drain and
             //    before the first yield of the iteration.
             //
-            //    §16.4 makes `poll_output()`'s terminal `Timeout`
-            //    "simultaneously the drain sentinel and the next-deadline
-            //    announcement", and `poll_output` **pops**. So reading a
-            //    deadline is a pure read only while the queue is provably
-            //    empty, and the only thing that establishes that is a drain
-            //    with no yield after it. `transmit()` below is a yield —
-            //    `Wire::send_to` is an application-supplied `async fn`, and
-            //    a real socket returns `Pending` whenever its send buffer
-            //    is full — and §16.3 (ruling 53) puts `close()` on the
-            //    *handle* side of the seam, so a `close()` landing during
-            //    that yield queues a `Transmit` on a core the driver has
-            //    already drained. Reading the deadline after the yield
-            //    popped that datagram and discarded it: a silently lost
-            //    CLOSE and 25 s of `DEAD_TIMEOUT` for the peer.
+            //    **[ruling 262]** This is a *pure read*: `deadline` collects
+            //    through `next_deadline`, not `poll_output`, so it consumes
+            //    nothing and the position is no longer load-bearing for
+            //    correctness. It used to be: `poll_output` **pops**, so a
+            //    `close()` landing during `transmit()`'s yield — §16.3
+            //    (ruling 53) puts `close()` on the *handle* side of the seam,
+            //    and `Wire::send_to` is an application-supplied `async fn`
+            //    that a real socket leaves `Pending` on a full send buffer —
+            //    queued a `Transmit` on an already-drained core, which a
+            //    deadline read after the yield then destroyed: a silently
+            //    lost CLOSE and 25 s of `DEAD_TIMEOUT` for the peer. Ruling
+            //    262 removed the destruction rather than the discipline; see
+            //    `deadline` for why the discipline alone was never enough.
             //
-            //    Reading it here cannot go stale in a way that matters:
+            //    It stays here because the value is freshest here, and
+            //    reading it here cannot go stale in a way that matters:
             //    **every** handle-side core mutation ends by sending a
             //    command (`Connection::close_now` → `Command::Dirty`,
             //    `Connecting::drop` → `Cancel`, `Endpoint::connect` →
@@ -328,11 +328,14 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// through silently, which is the one asymmetry of the three. It is
     /// not benign: falling through means proceeding to `release_dead`,
     /// `prune_ready` and then [`deadline`](Self::deadline) with connection
-    /// cores still dirty and the endpoint core undrained — and `deadline`
-    /// **pops**, so an undrained `Transmit` sitting there is destroyed
-    /// rather than sent. A silent exhaustion therefore degrades to a lost
-    /// CLOSE and 25 s of `DEAD_TIMEOUT` for the peer, which is exactly the
-    /// failure the `deadline` docs describe.
+    /// cores still dirty and the endpoint core undrained, so whatever they
+    /// queued is **not collected by this pass** and `transmit` never sees
+    /// it. Since ruling 262 `deadline` no longer *destroys* it — it reads
+    /// rather than pops — but nothing here posts a `Command::Dirty` either,
+    /// so an undrained `Transmit` is held until some unrelated event wakes
+    /// the driver. A silent exhaustion therefore still degrades to a CLOSE
+    /// the peer may wait out `DEAD_TIMEOUT` for; the loss became a stall,
+    /// which is not an improvement worth being quiet about.
     ///
     /// Panicking is now also *cheaper* than it was when this loop was
     /// written: [`Driver`]'s `Drop` runs [`stop`](Self::stop) on an unwind,
@@ -1022,38 +1025,50 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// is still announcing a deadline at or before `t`. No threshold, no
     /// tolerance, and no false positive from an overdue timer.
     ///
-    /// # It must be called with no yield since the drain
+    /// # It reads, and does not pop (**[RATIFIED 2026/08/18 — ruling 262]**)
     ///
-    /// `poll_output()` **pops**, so the `_` arms below do not merely
-    /// mis-report a deadline — they *destroy* whatever the core queued,
-    /// which for a connection core is a datagram. This function has no way
-    /// to establish that the queues are empty; only its **caller's
-    /// position** does, and [`run`](Self::run) step 2 is that position and
-    /// says why. Moving this call after `transmit().await` is what the
-    /// regression test
+    /// This used to collect deadlines with `poll_output()`, whose terminal
+    /// `Timeout` is §16.4's announcement — but `poll_output()` **pops**, so
+    /// the two `_` arms it needed did not merely mis-report a deadline, they
+    /// *destroyed* whatever the core had queued, which for a connection core
+    /// is a datagram. They were `debug_assert!(false)` plus `None`: silent in
+    /// release, and in debug a panic on the `spawn_local` task whose
+    /// `JoinHandle` the shell drops — so **neither profile went red**, and
+    /// the arms were a data-loss site rather than the guard they read as.
+    ///
+    /// The precondition was documented as *"no yield since the drain"*, and
+    /// that is not the invariant. [`serve`](Self::serve)'s **post-drain
+    /// tail** — `release_dead`, `prune_ready`, `prune_waiting`,
+    /// `dispatch_intros` — runs after the last `dirty` scan and calls into
+    /// **consumer** code with no yield at all: `dispatch_intros` sends an
+    /// `Intro` down a `oneshot`, `release_dead` resolves a `Connecting` slot
+    /// and drops a `PublicKeyOf<I>`. A consumer whose executor polls inline
+    /// rather than queueing — the case [`latch`](Self::latch),
+    /// [`resolve_slot`](super::shared::resolve_slot) and `poll_recv_message`
+    /// each name, and each release their borrow for, which is exactly what
+    /// lets the reentrant call *succeed* — re-enters the data path there and
+    /// queues output that nothing drains before this runs. The regression
+    /// test is `reentrant_consumer_write_in_the_post_drain_tail_is_not_destroyed`
+    /// in this file's test module; it was red in **both** profiles.
+    ///
+    /// So the collection is a **pure read**: `next_deadline` announces the
+    /// same value without consuming anything, and there is no `_` arm left
+    /// to assert about. A core holding an undrained output announces its
+    /// correct next deadline and *keeps* the output, which the
+    /// `Command::Dirty` its mutator sent brings the driver back for on the
+    /// very next turn — the `biased` command arm of step 4's `select!`.
+    ///
+    /// The call **stays** at [`run`](Self::run) step 2 even though it no
+    /// longer has to: before the send is still the freshest value, and the
+    /// discipline now costs nothing. `spec_shell.rs`'s
     /// `a_close_sealed_while_the_wire_is_suspended_still_reaches_its_peer`
-    /// (`tests/spec_shell.rs`) exists to catch.
+    /// no longer depends on the position.
     fn deadline(&self) -> Option<std::time::Instant> {
-        let endpoint = match self.shell.state.borrow_mut().endpoint.poll_output() {
-            EndpointOutput::Timeout(deadline) => deadline,
-            _ => {
-                debug_assert!(false, "the endpoint core queued an output outside a drain");
-                None
-            }
-        };
+        let endpoint = self.shell.state.borrow().endpoint.next_deadline();
 
         self.conns
             .values()
-            .filter_map(|record| {
-                let mut cell = record.cell.borrow_mut();
-                match cell.core.as_mut()?.poll_output() {
-                    ConnOutput::Timeout(deadline) => deadline,
-                    _ => {
-                        debug_assert!(false, "a connection core queued an output outside a drain");
-                        None
-                    }
-                }
-            })
+            .filter_map(|record| record.cell.borrow().core.as_ref()?.next_deadline())
             .chain(endpoint)
             .min()
             .inspect(|announced| {
