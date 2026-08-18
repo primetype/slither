@@ -215,9 +215,12 @@ impl Config {
     /// (256 KiB) and
     /// [`DEFAULT_CONNECTION_WINDOW`](Self::DEFAULT_CONNECTION_WINDOW)
     /// (1 MiB), which are §10.2's ratified constants and what a `Config`
-    /// nobody configured advertises. Ruling 247(a) measured what they cost:
-    /// one stream is capped at `stream_window / RTT`, about 2.5 MiB/s at
-    /// 100 ms, and before this knob a consumer had no way to buy more.
+    /// nobody configured advertises. What they cost, measured (ruling 269 —
+    /// this doc once credited the figure to ruling 247(a) as *measured*; it
+    /// was derived, and derived with the wrong rule): one stream is capped
+    /// at ≈ `stream_window / (2 × RTT)` — §10.3 re-grants at half the
+    /// window consumed — about 1.4 MiB/s at 100 ms, and before this knob a
+    /// consumer had no way to buy more.
     ///
     /// # What changes, and what does not
     ///
@@ -267,8 +270,10 @@ impl Config {
     /// ```
     /// use slither::Config;
     ///
-    /// // 2 MiB per stream, 8 MiB per connection: ~20 MiB/s on one stream
-    /// // at a 100 ms RTT.
+    /// // 2 MiB per stream, 8 MiB per connection: ~9 MiB/s measured on one
+    /// // stream at a 100 ms RTT (ruling 269). Size ≈ 2 × RTT × target
+    /// // rate, and not larger — past the optimum a bigger window buys
+    /// // ack-path work, not throughput.
     /// let config = Config::new()
     ///     .with_flow_windows(2 * 1024 * 1024, 8 * 1024 * 1024)
     ///     .expect("a raise within the varint bound");

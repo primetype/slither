@@ -295,6 +295,16 @@ payload. Setting `440·W / BW = b·W` gives **`BW ≈ 23.3 GB/s`** — a plausib
 single-core memmove rate on this host, and it agrees with the 8 MiB row's
 implied rate directly.
 
+> **Review correction (F1, 2026/08/18, adversarial review at
+> integration).** The release count is per acked STREAM **frame**, not per
+> ACK datagram: `apply_ack_outcome` iterates one acked stream frame per
+> newly-acked packet into `on_ack_range` → `release()`, so 1 MiB of
+> payload is ≈ 880–930 releases, not ~440, and the implied single-core
+> memmove rate is **≈ 46 GB/s**, not 23.3 — still plausible on this host.
+> The mechanism, the linear fit, and the O(W)-per-release claim are
+> unaffected; "agrees with the 8 MiB row's implied rate directly"
+> overstated precision by exactly this factor 2.
+
 **Attribution status.** The mechanism is present, is on the hot path, has the
 measured shape, and has the right magnitude. It is **not profiler-confirmed** —
 no profiler and no new dependency were in scope. Two alternative `O(window)`

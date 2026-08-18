@@ -38,6 +38,7 @@
 > | 265 | §7.5, §13.6, §16.5, Appendix B | neither keepalive deadline is announced while §7.3's budget or a pending mark holds it, and a vetoed keepalive announces the death clock — the measured immortal-park ends in death or recovery; §16.5's "both wait" was two timers and is four |
 > | 267 | §6.1 | `authenticate()` is idempotent on a `Proven` chain — same peer, same timestamp, 0 DH; the symmetric clause `read_identity()` already had |
 > | 268 | Appendix B | O13's flush parenthetical becomes admission-driven — the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
+> | 269 | §10.2 | the window-limited cap is ≈ window/(2 × RTT) — §10.3's half-window re-grant is the factor; the 259(viii) clause read window/RTT until the benchmark measured it (`bench-vs-tcp-2026-08.md`) |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -4179,8 +4180,13 @@ defaults.** **[AMENDED 2026/08/18 — ruling 259(viii)]** A receiver may
 advertise *more* than `INITIAL_MAX_DATA` / `INITIAL_MAX_STREAM_DATA`,
 and an endpoint config may say so once, statically, for every connection
 it mints. Ruling 247(a) is what this answers: the ratified pair caps one
-stream at `INITIAL_MAX_STREAM_DATA / RTT` — about 2.5 MiB/s at 100 ms —
-and before this a consumer had no way to buy more.
+stream at ≈ `INITIAL_MAX_STREAM_DATA / (2 × RTT)` **[AMENDED 2026/08/18
+— ruling 269]** — measured 1.4 MiB/s at 100 ms, 0.44–0.57 × `W/RTT`
+across 20–100 ms; the factor is §10.3's half-window re-grant (a
+window-limited sender spends `W/2`, then waits a round trip), and this
+sentence read `/ RTT` until the benchmark measured it
+(`bench-vs-tcp-2026-08.md`) — and before this a consumer had no way to
+buy more.
 
 **Nothing on the wire changes shape.** The knob is not negotiation and
 is not a sixth row in the table above: the *initial* values are still

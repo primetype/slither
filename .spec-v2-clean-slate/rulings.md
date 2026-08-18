@@ -8697,3 +8697,56 @@ was right and the illustration was wrong. B's demotion-timing note
 (C2) was reviewed and closed no-change: `age_deadline` is
 max(orphan TTL, exemption) — no fresh 15 s window exists, and the test
 pins re-admission at 90 s + ε.
+
+### 269 — the benchmark, the corrected sizing rule, and the drain the knob uncovered
+
+**Ruling: (i) the comparative benchmark lands as a committed example
+(`examples/bench_vs_tcp.rs`) with its measured report
+(`bench-vs-tcp-2026-08.md`) — a measurement, never a gate. (ii) The
+window-limited throughput rule is ≈ `window / (2 × RTT)` — the factor
+is §10.3's half-window re-grant (`take_grant()` at
+`CREDIT_REGRANT_DIVISOR` = 2) — and the three sites carrying `window /
+RTT` are swept together under rule 4: the §10.2 clause ruling 259(viii)
+landed, `config.rs`'s knob doc (which also credited the figure to
+ruling 247(a) as *measured* when it was derived), and the knob's
+rustdoc example ("~20 MiB/s"; measured 9.01). Stated as ≈, not a law:
+round 39's measured 8.4 MiB/s at 20 ms sits above `W/(2·RTT)` = 6.25 —
+the factor is ack-timing dependent, 0.44–0.57 × `W/RTT` on this
+harness. (iii) The O(window) ack-path drain is recorded as a known
+cost and deferred to its own measured slice (`round42-material.md`),
+not patched here.**
+
+The honest headlines, none of them the expected one. On a clean
+loopback, raw kernel TCP wins bulk by ≈150× (10 979 vs 73 MiB/s) —
+segment size (16 KiB loopback MTU vs our 1 192 B mean datagram),
+double in-process AEAD, userspace acks/recovery, and both endpoints on
+one thread; only the sum is measured. slither ties TCP where the
+protocol design speaks: establishment at 2 RTT each (after correcting
+the harness's proxy-terminated TCP relay, whose delayed TCP columns
+are invalid and flagged in the data — the report is explicit that this
+bias ran *against* slither in one scenario and *for* TCP in another),
+round-trip latency at 20 ms RTT indistinguishable (0.5 % apart), and
+sixteen multiplexed streams cost nothing at the default windows. The
+TLS arithmetic is stated, not measured: IK's 2 RTT beats TCP+TLS 1.3
+by one round trip and TLS 1.2 by two; it does not beat raw TCP, and no
+0-RTT path exists.
+
+The finding: **raising the windows is monotonically slower on a fast
+path** — 12× across the ladder at zero measured loss and flat
+amplification, linear in the window (`T ≈ a + b·w`, slopes constant to
+~8 %). Mechanism, cited and review-confirmed at the code:
+`SendHalf::release()` (`send.rs:581–595`) is `Vec::drain(..drop)` — a
+memmove of the ≈window-sized remainder — invoked per acked STREAM
+frame (`on_ack_range`, one per newly-acked packet), ≈ 880–930 times
+per MiB at the observed MTU (the review corrected the report's ~440,
+which counted ACK datagrams; the implied single-core rate is ≈ 46 GB/s,
+not 23.3 — plausible either way). Both O(window) alternatives were
+checked and dismissed at the code (`RangeSet` coalesces to ~1 range in
+order; recovery's ack path is O(newly acked) by its own comment). Not
+profiler-confirmed — a profile or a VecDeque mutant settles it, and
+that is the dedicated slice's first task. Even the ratified default
+pays ~35 % of its per-byte cost here. The measured 100 ms optimum,
+2 MiB / 8 MiB at 9.01 MiB/s (6.3× default), moves with the host's
+memmove rate and is recorded as measured-on-this-host, **not** a
+recommended constant; the guidance that survives the host is *size ≈
+2 × RTT × target rate, and not larger*.
