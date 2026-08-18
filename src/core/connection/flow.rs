@@ -87,7 +87,9 @@ pub(crate) enum Violation {
     #[error("final size: the frame contradicts a pinned final size")]
     FinalSize,
     /// §10.6's reassembly-fragment ceiling — ruling 104's third member.
-    #[error("protocol violation: reassembly ranges exceed REASSEMBLY_CHUNKS_MAX")]
+    #[error(
+        "protocol violation: reassembly ranges exceed the credit-derived ceiling (floor REASSEMBLY_CHUNKS_MAX)"
+    )]
     Reassembly,
 }
 

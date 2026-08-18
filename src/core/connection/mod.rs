@@ -133,6 +133,8 @@ mod tests_path;
 mod tests_pto_gate;
 #[cfg(test)]
 mod tests_reassembly;
+#[cfg(test)]
+mod tests_reassembly_credit;
 // Ruling 265's core regression — the vetoed keepalive and the death clock.
 #[cfg(test)]
 mod tests_park;

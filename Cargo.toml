@@ -372,5 +372,9 @@ required-features = ["test-util"]
 # birth paths, and §9.8's message bound held still while they move.
 # Drives two endpoints over `testutil`, so `test-util` like its neighbours.
 [[test]]
+name = "story_reassembly"
+required-features = ["test-util"]
+
+[[test]]
 name = "story_flow"
 required-features = ["test-util"]
