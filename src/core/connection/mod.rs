@@ -1314,6 +1314,12 @@ impl<C: Handshake> Connection<C> {
     /// attacker one extra ACK per replayed packet: free reverse-path
     /// amplification, and invisible to every test that does not count ACKs.
     ///
+    /// **[ruling 271]** That is now *cheaper* to attack and no easier to
+    /// reach. Coalescing means a burst of genuine packets buys one ACK, so a
+    /// replay that advanced the counter would be worth proportionally more —
+    /// the guard is unchanged and load-bearing, which is why this paragraph
+    /// stays rather than being softened alongside the cadence.
+    ///
     /// Skipped once the connection is dying: §15.2's closing state emits
     /// only CLOSE, and arming `AckDelay` there would announce a deadline
     /// that fires with nothing to pack.
@@ -1345,7 +1351,22 @@ impl<C: Handshake> Connection<C> {
         {
             AckAction::None => {}
             AckAction::Now => self.timers.disarm(TimerKind::AckDelay),
-            AckAction::Arm(at) => self.timers.arm(TimerKind::AckDelay, at),
+            // **[ruling 271]** An arming never pushes an existing one
+            // **later**. Before 271 this could not arise — the sequence was
+            // `Arm`, then `Now`, and `Now` disarms — so an unconditional
+            // overwrite was the same function. Under coalescing every packet
+            // of a burst arms, each at its own `now`, and a plain overwrite
+            // would walk the deadline forward one packet at a time: the
+            // drain-end flush would then be scheduled at the *last* packet's
+            // instant rather than the first's, and on a real clock a long
+            // enough burst would keep outrunning it.
+            AckAction::Arm(at) => {
+                let at = self
+                    .timers
+                    .get(TimerKind::AckDelay)
+                    .map_or(at, |armed| armed.min(at));
+                self.timers.arm(TimerKind::AckDelay, at);
+            }
         }
     }
 
@@ -2514,6 +2535,41 @@ impl<C: Handshake> Connection<C> {
                 break;
             }
 
+            // **[RATIFIED 2026/08/18 — ruling 271]** A *pending* ACK rides a
+            // packet; it never builds one. Every stage above has now run, so
+            // "the ACK is the only frame here" is exactly `len() == 1` with
+            // `ack_packed` — and it is the state in which this iteration
+            // would otherwise put an ACK-only datagram on the wire.
+            //
+            // Breaking here is what makes the coalescing real. The ACK stays
+            // pending, `AckDelay` stays armed at the instant
+            // `fold_ack_policy` gave it — already due — and the driver fires
+            // it the moment its `select!` finds the socket empty: one ACK per
+            // receive drain instead of one per two datagrams.
+            //
+            // **Nothing needs restoring.** `len() == 1` means stage 2 packed
+            // no control frame and stage 3 packed neither a STREAM nor a
+            // DATAGRAM frame, so `packed` is empty and `sent_datagram` is
+            // `None` — a DATAGRAM would itself be a second frame. The
+            // `debug_assert!`s state that rather than leaving it to be
+            // re-derived, because the two restore paths below are what a
+            // future stage-3 change would have to remember here.
+            //
+            // `is_owed()` is the escape: a gap ACK, an `ACK_COALESCE_MAX`
+            // flush and a fired `AckDelay` all set `owed`, and all three send
+            // this packet exactly as they did before 271.
+            if ack_packed && !self.ack.is_owed() && packing.frames().len() == 1 {
+                debug_assert!(
+                    sent_datagram.is_none(),
+                    "ruling 271: a packed DATAGRAM is a second frame"
+                );
+                debug_assert!(
+                    packed.is_empty(),
+                    "ruling 271: a packed STREAM or control frame is a second frame"
+                );
+                break;
+            }
+
             let ack_eliciting = frame::packet_is_ack_eliciting(packing.frames());
             let frames = packed.sent_frames();
             let plaintext = packing.into_plaintext();
@@ -2855,11 +2911,17 @@ impl<C: Handshake> Connection<C> {
 
     /// §8.5 stage 1 — the owed ACK, derived from §7.2's window (§12.2).
     ///
-    /// `false` when none is owed, when nothing has been received, or when
-    /// not even the first block fits the packet — in which case the ACK
-    /// **stays owed** and rides the next one.
+    /// `false` when none is **due** — **[ruling 271]** owed *or* pending —
+    /// when nothing has been received, or when not even the first block fits
+    /// the packet, in which case the ACK **stays due** and rides the next one.
     fn pack_ack(&mut self, now: Instant, packing: &mut Packing) -> bool {
-        if !self.ack.is_owed() {
+        // **[ruling 271]** `is_ready`, not `is_owed`: a *pending* ACK rides
+        // this packet if one is being built. §12.4's *"an owed ACK rides the
+        // next outgoing packet"* is the cheapest ACK there is, and coalescing
+        // must not cost a piggyback. Whether a packet that would carry
+        // **only** this ACK is allowed to exist is decided in
+        // [`pump_packets`](Self::pump_packets), not here.
+        if !self.ack.is_ready() {
             return false;
         }
         let ack_delay_us = self.ack.ack_delay_us(now);

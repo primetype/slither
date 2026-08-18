@@ -389,8 +389,39 @@ pub const CLOSE_REPLY_MIN_INTERVAL: Duration = Duration::from_millis(CLOSE_REPLY
 /// The most ranges one ACK frame will carry. §12.2.
 pub const MAX_ACK_RANGES: usize = 64;
 
-/// Send an ACK immediately on every Nth ack-eliciting packet. §12.4.
+/// An ACK becomes due on every Nth unacknowledged ack-eliciting packet.
+/// §12.4.
+///
+/// **[AMENDED 2026/08/18 — ruling 271]** The value is unchanged and the
+/// trigger is unchanged; only what it triggers moved. This used to read
+/// *"send an ACK immediately"*, and until ruling 271 it did: the ACK was
+/// built inside the receive that crossed the threshold, which — because the
+/// driver delivers one datagram per loop turn — put exactly one ACK-only
+/// datagram on the wire for every two data datagrams. It now marks the ACK
+/// **pending**, to be coalesced into one emission per receive drain. See
+/// [`ACK_COALESCE_MAX`].
 pub const ACK_ELICITING_PER_ACK: u64 = 2;
+
+/// The most unacknowledged ack-eliciting packets §12.4's coalescing will
+/// hold before it emits regardless. §12.4.
+///
+/// **[NEW 2026/08/18 — ruling 271]** The safety valve on per-drain
+/// coalescing, and the *only* new constant the ruling adds.
+///
+/// Coalescing defers the ACK until the driver's receive drain ends. That
+/// boundary is reached by any peer obeying a congestion window — it must
+/// eventually stop sending and wait — so the deferral is self-limiting even
+/// without a bound. But it is self-limiting *by way of a sender stall*,
+/// which is a throughput hazard rather than a safety property, and a
+/// scheduler that keeps a receiver's socket non-empty holds the reverse path
+/// silent for as long as it does so.
+///
+/// 32 caps that silence at 32 data packets — ~38 kB at [`MAX_DATAGRAM`],
+/// one order below any plausible congestion window, and the same batch depth
+/// every GSO/GRO-capable stack drains a socket in. It also floors the
+/// ACK-only share of wire traffic at 1/32 ≈ 3.1 %, against the 33.6 %
+/// measured before ruling 271.
+pub const ACK_COALESCE_MAX: u64 = 32;
 
 /// The longest an ACK may be deferred. §12.4, §13.3.
 pub const MAX_ACK_DELAY: Duration = Duration::from_millis(MAX_ACK_DELAY_MS);
@@ -705,6 +736,11 @@ const _: () = assert!(RETRANSMIT_BASE_MS + RETRANSMIT_JITTER_MAX_MS < HANDSHAKE_
 const _: () = assert!(INTRO_TTL_MS < HANDSHAKE_GIVEUP_MS);
 const _: () = assert!(PERSISTENT_KEEPALIVE_MIN_MS <= PERSISTENT_KEEPALIVE_DEFAULT_MS);
 const _: () = assert!(PERSISTENT_KEEPALIVE_DEFAULT_MS < DEAD_TIMEOUT_MS); // ruling 40's ceiling
+// **[ruling 271]** The valve sits at or above the trigger, or coalescing
+// never happens: `since_ack` reaches both thresholds on the same packet and
+// the pending state is unreachable — the pre-271 cadence, restored silently
+// and invisibly to everything but a datagram census.
+const _: () = assert!(ACK_ELICITING_PER_ACK <= ACK_COALESCE_MAX);
 
 #[cfg(test)]
 mod tests {

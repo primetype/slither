@@ -210,6 +210,22 @@ struct TakenChunk {
 }
 
 impl Packed {
+    /// **[ruling 271]** Nothing was taken from the stream layer for this
+    /// packet plan, so abandoning the plan needs no
+    /// [`restore`](Streams::restore).
+    ///
+    /// Written for the pump's coalescing break, which abandons a plan whose
+    /// only frame is a pending ACK and must be able to say *why* it restores
+    /// nothing rather than leaving that to be re-derived by whoever adds the
+    /// next stage-3 contributor.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.max_data
+            && self.max_streams == [false; 2]
+            && self.max_stream_data.is_empty()
+            && self.resets.is_empty()
+            && self.chunks.is_empty()
+    }
+
     /// Forget everything: the packet was sealed and committed.
     pub(crate) fn clear(&mut self) {
         self.max_data = false;

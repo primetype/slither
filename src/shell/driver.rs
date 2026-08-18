@@ -268,6 +268,26 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
 
             // 4. Nothing left to do: wait for the next thing that could
             //    change that.
+            //
+            //    **[RATIFIED 2026/08/18 — ruling 271] `biased`, and the
+            //    order of the last two arms, is now protocol.** §12.4's
+            //    coalesced ACK is armed at `now` — already due — and the
+            //    core has no notion of a "receive drain": this `select!` is
+            //    where that notion lives. `recv_from` sits **above**
+            //    `sleep_until`, so an already-due deadline loses to every
+            //    datagram still on the socket and wins the instant the
+            //    socket empties. That is exactly *"the end of the receive
+            //    drain"*, and it is why per-drain coalescing needed no new
+            //    core API.
+            //
+            //    Swapping these two arms, or dropping `biased`, does not
+            //    break anything visibly: it silently returns the ACK cadence
+            //    to one per received datagram — **worse** than the every-2nd
+            //    policy 271 replaced — with every test still green and
+            //    nothing on the wire to say so but a datagram census.
+            //    Measured at the cadence this ordering does produce:
+            //    ACK-only datagrams fell from 33.6 % of wire traffic to
+            //    3.4 %, and `bulk` throughput rose 85 → 111 MiB/s.
             let event = {
                 let Self { wire, commands, .. } = &mut self;
                 tokio::select! {

@@ -8,13 +8,28 @@
 //! no second tracker."* [`derive`] therefore reads
 //! [`ReplayWindow`](super::session::ReplayWindow) and nothing else.
 //!
-//! What [`AckState`] holds beside it is **four scalars**, not a record:
+//! What [`AckState`] holds beside it is **five scalars**, not a record:
 //! §12.3 needs the arrival instant of the packet bearing the window's
 //! largest and whether that packet was frame-bearing; §12.4 needs a count
-//! of ack-eliciting packets since the last ACK and an owed flag. None of
+//! of ack-eliciting packets since the last ACK, an owed flag, and — since
+//! **[ruling 271]** — a pending flag. None of
 //! them scales with packets received, so §12.2's sentence is true as
 //! written — but it reads as forbidding these, which is why the boundary is
 //! stated here rather than left to be re-derived.
+//!
+//! # The cadence is per **receive drain**, not per two packets
+//!
+//! **[RATIFIED 2026/08/18 — ruling 271]** §12.4's *"every 2nd ack-eliciting
+//! packet"* is now the instant at which an ACK becomes **pending**, not the
+//! instant it is emitted. It is emitted at the end of the driver's receive
+//! drain, or on any packet built for another reason, or at
+//! `MAX_ACK_DELAY` — whichever comes first.
+//!
+//! The measurement that forced it (`round42-G`, `round42-H`): slither was
+//! emitting one ACK-only datagram per two data datagrams — **33.6 % of all
+//! wire traffic**, against quinn's 1.68 % for the same workload — costing
+//! ≈3.69 µs of a 14.11 µs per-data-datagram budget on both sides combined.
+//! Nothing about the *frame* was wrong; the **emission point** was.
 //!
 //! # Only window-fresh packets fold in
 //!
@@ -36,7 +51,9 @@ use super::session::ReplayWindow;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AckState {
     /// Ack-eliciting packets received since the last ACK we packed. §12.4's
-    /// "every 2nd" counter. Reset to 0 when an ACK is packed.
+    /// "every 2nd" counter, and — **[ruling 271]** — also the counter
+    /// [`ACK_COALESCE_MAX`](crate::constants::ACK_COALESCE_MAX) bounds. Reset
+    /// to 0 when an ACK is packed.
     since_ack: u64,
     /// Arrival instant of the packet bearing the window's **current**
     /// greatest. `None` before the first authenticated, window-fresh
@@ -45,8 +62,19 @@ pub(crate) struct AckState {
     /// Whether that packet was frame-bearing. §12.3: a keepalive's counter
     /// yields `ack_delay = 0`.
     largest_frame_seen: bool,
-    /// An ACK is owed and not yet packed.
+    /// An ACK is owed and not yet packed, and the pump must **build a packet
+    /// for it** if nothing else is pending.
     owed: bool,
+    /// **[ruling 271]** An ACK is due and **rides** the next outgoing packet
+    /// (§12.4), but does not build one of its own — it waits for the end of
+    /// the current receive drain, which reaches it as the `AckDelay` timer
+    /// armed *due-immediately* by [`AckAction::Arm`].
+    ///
+    /// The two flags are not redundant. `owed` is what makes the pump
+    /// manufacture a datagram; `pending` is what makes an ACK *coalesce*.
+    /// Collapsing them restores the pre-271 one-ACK-per-two-packets cadence
+    /// exactly.
+    pending: bool,
 }
 
 /// What receiving one authenticated, window-fresh packet does to §12.4's
@@ -61,9 +89,25 @@ pub(crate) enum AckAction {
     /// and that earlier arming must survive — §12.4 arms on *"the first
     /// unacknowledged ack-eliciting packet"*, and a keepalive is neither.
     None,
-    /// An ACK is owed now (2nd ack-eliciting, or out-of-order arrival).
+    /// An ACK is owed now, and the pump builds a packet for it if nothing
+    /// else is pending.
+    ///
+    /// **[ruling 271]** Out-of-order arrival, or
+    /// [`ACK_COALESCE_MAX`](crate::constants::ACK_COALESCE_MAX)
+    /// unacknowledged ack-eliciting packets — **no longer** the plain 2nd
+    /// ack-eliciting packet, which now returns [`Arm`](Self::Arm) at `now`.
     Now,
-    /// Arm `AckDelay` at this instant (`now + MAX_ACK_DELAY`).
+    /// Arm `AckDelay` at this instant.
+    ///
+    /// Two instants reach this, and the second is the whole of ruling 271's
+    /// change:
+    ///
+    /// * `now + MAX_ACK_DELAY` — §12.4's first unacknowledged ack-eliciting
+    ///   packet, unchanged.
+    /// * **`now` itself** — the coalescing arm. A deadline already due fires
+    ///   the moment the driver has nothing else ready, which is exactly the
+    ///   end of the receive drain; until then every further packet of the
+    ///   burst folds into the same ACK.
     Arm(Instant),
 }
 
@@ -84,6 +128,15 @@ impl AckState {
     /// Read afterwards it already includes this packet, §12.4's
     /// out-of-order test is always false, and the only §12.4 trigger left is
     /// the every-2nd counter — which no completion test can see.
+    ///
+    /// **[ruling 271] That hazard got worse, not better.** Before 271 the
+    /// surviving every-2nd trigger still emitted an ACK inside the receive,
+    /// so a `prev_greatest` read on the wrong side of the mark cost only the
+    /// *promptness* of the gap ACK. It now costs the gap signal **entirely**:
+    /// the every-2nd trigger defers to the drain boundary, so with the
+    /// out-of-order test dead there is nothing left that reacts to
+    /// reordering at all, and the peer's loss detection loses its input with
+    /// nothing red anywhere.
     pub(crate) fn on_recv(
         &mut self,
         now: Instant,
@@ -115,34 +168,99 @@ impl AckState {
         // greater than the window's previous greatest"*. `None` — the first
         // ack-eliciting packet of a session — satisfies it vacuously, and
         // SPEC.md:3615–3618 calls the resulting immediate ACK harmless.
+        //
+        // **[ruling 271]** This test is taken **first** and is deliberately
+        // untouched: immediate-on-gap still emits inside the receive that saw
+        // the gap, ahead of the drain boundary. It is the signal the peer's
+        // loss detection reads, and coalescing it would be paying for
+        // throughput with recovery latency on exactly the path that cannot
+        // afford it.
         let in_order =
             prev_greatest.is_some_and(|greatest| greatest.checked_add(1) == Some(counter));
-        if !in_order || self.since_ack >= 2 {
+        if !in_order {
             self.owed = true;
             return AckAction::Now;
+        }
+
+        // **[ruling 271]** §12.4's every-2nd trigger no longer *emits*; it
+        // *arms*, at `now`. The ACK is pending — it rides any packet the pump
+        // builds for another reason — and the due-immediately timer flushes
+        // it the instant the driver has nothing else ready, which is the end
+        // of the receive drain. Every further packet of a burst folds into
+        // the same ACK, because `pending` is a flag and [`derive`] reads the
+        // whole replay window.
+        //
+        // The threshold keeps its ratified value and its ratified job: a
+        // **single** isolated ack-eliciting packet still waits
+        // `MAX_ACK_DELAY` for a carrier, which is what lets a low-rate
+        // bidirectional flow piggyback rather than emit. This is also the
+        // first use of `ACK_ELICITING_PER_ACK` — the threshold was a bare
+        // literal `2` here since slice 5, and the constant it names went
+        // unread.
+        if self.since_ack >= constants::ACK_ELICITING_PER_ACK {
+            // The safety valve. Without it the deferral is bounded only by
+            // the sender exhausting its congestion window — self-limiting,
+            // but by way of a sender stall rather than by a property, and a
+            // scheduler that keeps this receiver's socket non-empty holds the
+            // reverse path silent for as long as it does so.
+            if self.since_ack >= constants::ACK_COALESCE_MAX {
+                self.owed = true;
+                return AckAction::Now;
+            }
+            self.pending = true;
+            return AckAction::Arm(now);
         }
 
         AckAction::Arm(now + constants::MAX_ACK_DELAY)
     }
 
-    /// `true` iff an ACK is owed. Does not clear.
+    /// `true` iff an ACK is owed **and the pump must build a packet for it**.
+    /// Does not clear.
+    ///
+    /// **[ruling 271]** This is the narrow question, and every pre-271 caller
+    /// keeps it: ruling 217's `PATH_CHALLENGE` offer rides a packet an owed
+    /// ACK *creates*, ruling 203's refusal path emits a standalone ACK, and
+    /// the pump's loop exit asks whether anything is left to build. A merely
+    /// **pending** ACK answers `false` to all three — it is not, by itself, a
+    /// reason to put a datagram on the wire.
     pub(crate) fn is_owed(&self) -> bool {
         self.owed
     }
 
+    /// `true` iff an ACK should be **packed into a packet already being
+    /// built** — §12.4's *"an owed ACK rides the next outgoing packet"*.
+    ///
+    /// **[ruling 271]** Strictly weaker than [`is_owed`](Self::is_owed): this
+    /// is the question [`pack_ack`](super::Connection::pack_ack) asks, and it
+    /// takes the pending ACK too. Piggybacking is the cheapest ACK there is,
+    /// so a coalescing ACK must never miss a carrier that already exists.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.owed || self.pending
+    }
+
     /// §12.4's `AckDelay` firing: the ACK becomes owed now.
+    ///
+    /// **[ruling 271]** This is where a *pending* ACK is promoted, and the
+    /// promotion needs no branch of its own: `owed` supersedes `pending`, and
+    /// [`on_ack_packed`](Self::on_ack_packed) clears both.
     pub(crate) fn on_delay_expired(&mut self) {
         self.owed = true;
     }
 
-    /// Called when an ACK has been packed into a packet: clears `owed` and
-    /// resets `since_ack`. **The caller disarms `AckDelay`.**
+    /// Called when an ACK has been packed into a packet: clears `owed`,
+    /// **[ruling 271]** clears `pending`, and resets `since_ack`. **The
+    /// caller disarms `AckDelay`.**
+    ///
+    /// All three, not two: a `pending` left set here would make the next
+    /// packet built for any reason carry a redundant ACK for ever, and
+    /// `ACK_COALESCE_MAX` would then be measured from the wrong origin.
     ///
     /// The counter resets because §12.4 arms on the first **unacknowledged**
     /// ack-eliciting packet, and packing an ACK makes every packet received
     /// so far acknowledged.
     pub(crate) fn on_ack_packed(&mut self) {
         self.owed = false;
+        self.pending = false;
         self.since_ack = 0;
     }
 
