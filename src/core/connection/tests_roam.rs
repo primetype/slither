@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use crate::constants;
 use crate::core::connection::mobility::Contested;
-use crate::core::connection::testfix::{Pair, Solo, Wire, a_addr, b_addr, drain, put, t0, v4};
+use crate::core::connection::testfix::{
+    Pair, Solo, Wire, a_addr, b_addr, drain, put, t0, v4, write_all,
+};
 use crate::core::connection::timers::TimerKind;
 use crate::core::connection::{ConnEvent, ConnOutput};
 use crate::error::{ConfigError, ConnectionLost};
@@ -45,6 +47,24 @@ fn ack_frame(largest: u64) -> Vec<u8> {
     put(&mut out, 0); // ack_delay
     put(&mut out, 0); // range_count
     put(&mut out, 0); // first_range
+    out
+}
+
+/// §8.4's ACK over a **contiguous run** — `largest` and the `first_range`
+/// counters below it.
+///
+/// **[R41-T item 1]** Needed beside [`ack_frame`] because a single-counter
+/// ACK for a multi-packet burst is also a **loss** report: §13.2's packet
+/// threshold declares everything at least `K_PACKET_THRESHOLD` counters
+/// behind `largest` lost, and the congestion event that follows halves the
+/// very window the test is trying to observe being reset.
+fn ack_range_frame(largest: u64, first_range: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put(&mut out, constants::FRAME_ACK);
+    put(&mut out, largest);
+    put(&mut out, 0); // ack_delay
+    put(&mut out, 0); // range_count
+    put(&mut out, first_range);
     out
 }
 
@@ -731,19 +751,91 @@ fn a_re_mark_after_a_clear_records_a_strictly_greater_floor() {
 
 /// A roam resets the controller and **keeps** the sent map and
 /// `bytes_in_flight` — §13.6's list, on both sides.
+///
+/// # **[R41-T item 1]** This test used to assert nothing about the reset
+///
+/// It wrote 800 bytes, roamed, and asserted `cwnd == INITIAL_WINDOW`. But
+/// `Controller::on_ack` is the **only** path that moves `cwnd` upward and
+/// the fixture never delivered an ACK, so `cwnd` had never left
+/// `INITIAL_WINDOW` and the assertion was satisfied by a `NewReno::reset`
+/// with an **empty body** — working rule 9's "a bound the collapsed
+/// implementation satisfies for free", measured. The same was true of the
+/// `min_rtt` assertion below: with no ACK there is no RTT sample, so
+/// `min_rtt` was already `None` before the roam.
+///
+/// The fixture now drives a real ACK cycle first, so both are preconditions
+/// that a no-op reset violates. Two details of that cycle are load-bearing:
+///
+/// * **The burst must be more than one packet.** §14.5's `app_limited` is
+///   stamped at seal time on the packet that empties the send queue while
+///   headroom remains, and `on_ack` returns without growing on an
+///   app-limited packet. A single-packet write grows `cwnd` by nothing.
+/// * **The ACK must cover the whole burst.** §13.2's packet threshold
+///   declares everything three or more counters behind `largest` lost, and
+///   the resulting congestion event would *halve* `cwnd` — which is why
+///   `ack_range_frame` exists beside `ack_frame`.
+///
+/// Mutation caught: `NewReno::reset`'s body emptied — `cwnd` stays at its
+/// grown value and `min_rtt` keeps the old path's floor. The companion
+/// [`a_roam_lifts_the_slow_start_threshold_back_to_u64_max`] covers the
+/// other half of §14.6's initial state, which a `reset` that assigns only
+/// `cwnd` still passes here.
 #[test]
 fn a_roam_resets_the_controller_and_keeps_the_flight() {
     let mut solo = Solo::installed_at(origin());
     let now = origin() + Duration::from_millis(10);
 
+    // A burst of several packets: every one but the last is sealed while
+    // the send queue is non-empty, so every one but the last is **not**
+    // app-limited and its acknowledgement grows the window (§14.5).
     let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
-    solo.conn.write(now, r, &[7u8; 800]).expect("a write");
-    solo.conn.flush(now);
+    let _ = write_all(&mut solo.conn, now, r, &[7u8; 4096]);
+    let d = drain(&mut solo.conn);
+    let burst = d.transmits().len() as u64;
+    assert!(
+        burst >= 2,
+        "premise: more than one packet, so at least one is not app-limited \
+         and §14.2's slow start has something to grow on (burst {burst})",
+    );
+    let sealed = solo.conn.next_counter().expect("established") - 1;
+
+    // The whole burst, in one range: `first_range` counts the counters
+    // below `largest` the first block also covers.
+    let ack_at = now + Duration::from_millis(20);
+    let _ = solo.deliver(ack_at, &ack_range_frame(sealed, burst - 1));
+    assert_eq!(
+        solo.conn.bytes_in_flight(),
+        0,
+        "premise: the ACK covered the whole burst, so no packet was left \
+         behind to be declared lost and halve the window",
+    );
+
+    // A second burst, so §13.6's *"the sent map is kept"* has something to
+    // be true of at the roam.
+    let resend_at = ack_at + Duration::from_millis(10);
+    let _ = write_all(&mut solo.conn, resend_at, r, &[7u8; 2048]);
     let _ = drain(&mut solo.conn);
     let in_flight = solo.conn.bytes_in_flight();
     assert!(in_flight > 0, "something is in flight");
 
-    let roam_at = now + Duration::from_millis(30);
+    // ── the two preconditions this test's own validity rests on ──────
+    let grown = solo.conn.congestion_window();
+    assert!(
+        grown > constants::INITIAL_WINDOW,
+        "**precondition, and it guards this test's own validity**: slow \
+         start has moved cwnd off its initial value ({grown} vs \
+         {}). Without this the assertion below is satisfied by a `reset` \
+         with an empty body.",
+        constants::INITIAL_WINDOW,
+    );
+    assert!(
+        solo.conn.recovery().rtt().min_rtt().is_some(),
+        "**precondition**: the first burst's ACK took an RTT sample, so \
+         `min_rtt` has a floor for the roam to re-seed — otherwise the \
+         `min_rtt` assertion below is vacuous too",
+    );
+
+    let roam_at = resend_at + Duration::from_millis(30);
     let _ = solo.deliver_from(roam_at, c_addr(), &[]);
 
     assert_eq!(
@@ -761,6 +853,80 @@ fn a_roam_resets_the_controller_and_keeps_the_flight() {
         solo.conn.recovery().rtt().min_rtt(),
         None,
         "§13.1: min_rtt is re-seeded so it may rise"
+    );
+}
+
+/// §14.6's other half: the roam puts `ssthresh` **back at `u64::MAX`**, so
+/// the new path starts in slow start rather than inheriting the old path's
+/// congestion-avoidance threshold.
+///
+/// **[R41-T item 1]** `cwnd` and `ssthresh` are separate assignments in
+/// `NewReno::reset`, and the sibling test above is passed by a `reset` that
+/// makes only the first. §13.6's roam table names both in one row —
+/// *"**reset** to `INITIAL_WINDOW` / `ssthresh = u64::MAX`"* — so both are
+/// asserted, and the precondition here is what makes the second one a test:
+/// `ssthresh` starts at `u64::MAX`, so without a loss episode first the
+/// assertion holds for a `reset` that never touches it.
+///
+/// Mutation caught: the `self.ssthresh = u64::MAX;` line dropped from
+/// `NewReno::reset`. That build carries the old path's threshold across,
+/// which ends slow start on the new path at a value derived from a network
+/// the connection has left — and no other test in the suite sees it.
+///
+/// The read goes through the private `congestion` field rather than a
+/// `Connection` accessor: `NewReno::ssthresh()` is `#[cfg(test)]` for
+/// exactly this, and this module is a descendant of the one that owns the
+/// field. No production change is needed to observe it.
+#[test]
+fn a_roam_lifts_the_slow_start_threshold_back_to_u64_max() {
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
+
+    assert_eq!(
+        solo.conn.congestion.ssthresh(),
+        u64::MAX,
+        "§14.2: ssthresh starts at u64::MAX, which is why a loss episode \
+         has to come before the roam for this test to assert anything",
+    );
+
+    // A long burst, acknowledged **only at its head**: §13.2's packet
+    // threshold (K_PACKET_THRESHOLD) then declares everything three or more
+    // counters behind `largest` lost, and §14.3 turns the whole scan into
+    // one congestion event.
+    let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
+    let _ = write_all(&mut solo.conn, now, r, &[7u8; 8192]);
+    let d = drain(&mut solo.conn);
+    let burst = d.transmits().len() as u64;
+    assert!(
+        burst > constants::K_PACKET_THRESHOLD + 1,
+        "premise: the burst is long enough for a head-only ACK to leave \
+         packets past the threshold (burst {burst}, threshold {})",
+        constants::K_PACKET_THRESHOLD,
+    );
+    let sealed = solo.conn.next_counter().expect("established") - 1;
+
+    let ack_at = now + Duration::from_millis(20);
+    let _ = solo.deliver(ack_at, &ack_frame(sealed));
+
+    let cut = solo.conn.congestion.ssthresh();
+    assert!(
+        cut < u64::MAX,
+        "**precondition, and it guards this test's own validity**: §14.3's \
+         congestion event cut ssthresh to the halved window ({cut}). \
+         Without it the assertion below is satisfied by a `reset` that \
+         never assigns ssthresh at all.",
+    );
+
+    let roam_at = ack_at + Duration::from_millis(30);
+    let _ = solo.deliver_from(roam_at, c_addr(), &[]);
+    assert_eq!(solo.conn.path_generation(), 1, "the roam did happen");
+
+    assert_eq!(
+        solo.conn.congestion.ssthresh(),
+        u64::MAX,
+        "§14.6 / §13.6: the controller resets to **initial state** on the \
+         roam seam, and ssthresh = u64::MAX is half of that state — a new \
+         path carries no continuity evidence, including no threshold",
     );
 }
 

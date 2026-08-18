@@ -2916,3 +2916,106 @@ mod slice_boundary {
         assert_violation(&d, &frames, PROTOCOL_VIOLATION);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// §8.4's `offset + length` ceiling — the one structural bound with no test
+// ═══════════════════════════════════════════════════════════════════════
+//
+// **[R41-T item 6]** `SPEC.md` §8.4 lists *"`offset + length` exceeding
+// 2⁶² − 1"* among STREAM's structural errors, and §8.2 puts the whole
+// structural class on CLOSE(`PROTOCOL_VIOLATION`). The guard is
+// `frame.rs`'s single `checked_add(...).filter(|end| *end <=
+// VarInt::MAX_VALUE).ok_or(Structural::StreamOffsetOverflow)?` —
+// constructed at exactly one site and, until this module, asserted nowhere.
+//
+// # Why the *accept* side asserts `FLOW_CONTROL_ERROR`
+//
+// A frame ending exactly at 2⁶² − 1 is structurally legal and semantically
+// hopeless: 2⁶² − 1 is astronomically past `INITIAL_MAX_STREAM_DATA`, so
+// §10.5 kills the connection whatever the decoder does. The two
+// dispositions are still **distinguishable**, and that is the whole point.
+// `Connection::handle_datagram` matches `Received::Structural` and CLOSEs
+// *before* `Received::Frames` is applied at all, so the semantic checks are
+// only ever reached by a frame the decoder passed. The code on the CLOSE is
+// therefore a direct readout of **which layer refused it**:
+//
+//   `PROTOCOL_VIOLATION` ⇒ the decoder refused it (structural);
+//   `FLOW_CONTROL_ERROR` ⇒ the decoder passed it and §10 refused it.
+//
+// "Structurally accepted" has no other observable at this seam — the frame
+// cannot be made both legal at the ceiling and inside a 256 KiB window —
+// and asserting mere *survival* instead would be a bound the degenerate
+// build satisfies for free (working rule 9). Asserting the **code** is not:
+// each of the two mutants below moves exactly one of these two tests from
+// one code to the other.
+
+mod offset_ceiling {
+    use super::*;
+
+    /// §8.4's ceiling is **inclusive**: `offset + length == 2⁶² − 1`
+    /// exactly clears the structural guard, and §10 is what refuses it.
+    ///
+    /// Mutation caught: `<=` tightened to `<` in the guard's
+    /// `.filter(|end| *end <= VarInt::MAX_VALUE)`. That build refuses the
+    /// last legal end offset in the *decoder*, so the CLOSE carries
+    /// `PROTOCOL_VIOLATION` instead of `FLOW_CONTROL_ERROR` and this test
+    /// goes red. Nothing else in the suite separates the two: every other
+    /// ceiling test — `reset::a_reset_final_size_at_the_varint_ceiling_
+    /// is_rejected_without_wrapping` here, and
+    /// `a_close_code_at_the_varint_maximum_round_trips` in `tests.rs` —
+    /// exercises a *different* field's ceiling and never reaches this
+    /// `checked_add`.
+    ///
+    /// The one-byte payload is deliberate. With an empty payload the
+    /// addition is a no-op and the assertion would hold for a build with
+    /// no addition in it at all — working rule 9's "satisfied for free".
+    #[test]
+    fn a_stream_frame_ending_exactly_at_the_varint_ceiling_clears_the_structural_guard() {
+        let t = t0();
+        let mut s = Solo::installed_at(t);
+        let id = Solo::peer_uni(0);
+
+        // offset + length == (2⁶² − 2) + 1 == 2⁶² − 1: the last legal end.
+        let offset = VarInt::MAX_VALUE - 1;
+        assert_eq!(
+            offset + 1,
+            VarInt::MAX_VALUE,
+            "precondition: this frame ends *at* §8.4's ceiling, not below it",
+        );
+        assert!(
+            offset > INITIAL_MAX_STREAM_DATA,
+            "precondition: it is also far outside §10's window, so \
+             FLOW_CONTROL_ERROR is the disposition a decoder that passed it \
+             must produce",
+        );
+
+        let d = s.deliver(t, &stream_frame(id, offset, &[0xab], false));
+        let frames = s.drain_frames(&d);
+        assert_violation(&d, &frames, FLOW_CONTROL_ERROR);
+    }
+
+    /// One byte past it — `offset + length == 2⁶²` — is the structural
+    /// error §8.4 names, and §8.2's CLOSE carries `PROTOCOL_VIOLATION`.
+    ///
+    /// Mutation caught: the `.filter(|end| *end <= VarInt::MAX_VALUE)`
+    /// clause dropped, leaving the bare `checked_add`. `2⁶²` does not
+    /// overflow a `u64`, so `checked_add` alone returns `Some`, the frame
+    /// reaches §10, and the connection dies with `FLOW_CONTROL_ERROR`
+    /// instead — the peer's operator reads the wrong cause, and every
+    /// downstream §9/§10 comparison has silently left the varint domain.
+    /// This test is the only thing in the suite that goes red for it.
+    ///
+    /// Its partner above is what stops *this* one being passed by a build
+    /// that refuses every large offset structurally.
+    #[test]
+    fn a_stream_frame_ending_one_byte_past_the_varint_ceiling_is_a_structural_error() {
+        let t = t0();
+        let mut s = Solo::installed_at(t);
+        let id = Solo::peer_uni(0);
+
+        // offset + length == (2⁶² − 1) + 1 == 2⁶².
+        let d = s.deliver(t, &stream_frame(id, VarInt::MAX_VALUE, &[0xab], false));
+        let frames = s.drain_frames(&d);
+        assert_violation(&d, &frames, PROTOCOL_VIOLATION);
+    }
+}

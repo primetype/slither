@@ -1749,3 +1749,189 @@ fn a_pto_probe_to_an_unvalidated_address_carries_the_challenge() {
          beside it. Frames: {frames:?}",
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Appendix B, O43e — "Per session (ruling 170)"
+// ═══════════════════════════════════════════════════════════════════════
+//
+// **[R41-T item 3]** Appendix B's obligation: *"**Per session** (ruling
+// 170). Two connections anchored to the same peer address hold two
+// independent budgets: exhausting one must not throttle the other, and
+// funding one must not credit the other."* §7.3's normative text says the
+// same and states the residual rather than leaving it to inference: *"`N`
+// sessions anchored or roamed to the **same** address carry `N` independent
+// budgets, so a peer holding `N` sessions against one victim address
+// multiplies the reflector by `N`."*
+//
+// # Why this needs a test at all, given the field is per-connection
+//
+// `Amplification` is a plain `Copy` field on `Connection`, so independence
+// looks true by construction — and every budget test written before this
+// one drives **one** connection, so the whole suite is satisfied by a build
+// whose counters live anywhere at all: a `static`, a thread-local, an
+// endpoint-side per-address table. That is the shape §7.3 explicitly
+// forbids (*"there is no endpoint-side per-address table"*), it is the
+// natural "optimisation" for anyone who reads the residual above as a
+// defect to be fixed, and **nothing in the suite goes red for it**. Working
+// rule 9: the assertion has to be one that a shared counter violates, which
+// means it has to involve two connections at one address.
+
+/// **O43e.** Two sessions at one peer address, both halves of the
+/// obligation.
+///
+/// Mutation caught: **any build in which the two connections share budget
+/// state** — a `static`/thread-local counter pair, or the endpoint-side
+/// per-address table §7.3 forbids.
+///
+/// Measured against such a build (a thread-local counter pair seeded by the
+/// first arming): it fails at **three independent points**, each one
+/// reached by deleting the one before it. A's spending shows up in B's
+/// counters (`Some((588, 196))` where B's own are `Some((214, 196))`); B's
+/// own small write is then refused outright, because A has already spent
+/// the shared cap; and the credit later delivered to B is immediately spent
+/// paying for the write B was refused earlier. A build sharing only `recv`
+/// or only `sent` reaches a different one of the three, which is why they
+/// are all kept.
+///
+/// The two halves are not redundant. A build sharing only `sent` passes the
+/// funding half; a build sharing only `recv` passes the spending half.
+#[test]
+fn two_sessions_at_one_peer_address_hold_two_independent_budgets() {
+    let mut a = Solo::installed_from_msg1_at(origin());
+    let mut b = Solo::installed_from_msg1_at(origin());
+
+    // ── preconditions ────────────────────────────────────────────────
+    //
+    // Both cores are msg1-anchored (ruling 200), so both begin unvalidated
+    // with a budget armed, and both anchor on the **same** address — which
+    // is what makes this ruling 170's scenario rather than two unrelated
+    // connections.
+    let armed_a = a.conn.amplification_budget().expect("A is unvalidated");
+    let armed_b = b.conn.amplification_budget().expect("B is unvalidated");
+    assert_eq!(
+        armed_a, armed_b,
+        "precondition: two identically armed budgets, so any later \
+         difference is something one of them did",
+    );
+    let (spent, credit) = armed_a;
+    assert!(
+        credit > 0,
+        "precondition: the msg1 anchor funded each budget, so each has a \
+         non-zero cap of its own to be independent *of*",
+    );
+    let cap = constants::AMPLIFICATION_FACTOR * credit;
+    assert!(
+        spent < cap,
+        "precondition: each has spent only its own response packet \
+         ({spent} of {cap}) and has room left to be exhausted",
+    );
+
+    let now = origin() + Duration::from_millis(10);
+    let ra = a.conn.open(Dir::Uni).expect("a uni stream");
+    let rb = b.conn.open(Dir::Uni).expect("a uni stream");
+    let _ = write_all(&mut a.conn, now, ra, &[0x5u8; 4096]);
+    let da = drain(&mut a.conn);
+    assert!(
+        !da.transmits().is_empty(),
+        "premise: A's own budget admitted something",
+    );
+    for t in da.transmits() {
+        assert_eq!(
+            t.to,
+            a_addr(),
+            "precondition: A is anchored at the address B is anchored at",
+        );
+    }
+
+    // ── half 1: exhausting A must not throttle B ─────────────────────
+    assert!(
+        room(&a) < 31,
+        "premise: A has spent its whole 3× cap and now refuses even a bare \
+         31-byte PING datagram (room {}, cap {cap})",
+        room(&a),
+    );
+    assert_eq!(
+        b.conn.amplification_budget(),
+        Some(armed_b),
+        "§7.3: B's counters are its own. A shared counter shows A's spending \
+         here, and this is the only assertion in the suite that sees it.",
+    );
+
+    // B writes a **small** payload — one packet's worth, comfortably inside
+    // its own untouched cap. Small on purpose: it drains B's send queue
+    // completely, which is the state half 2 needs, and it is still the
+    // whole of half 1's claim, because under a shared counter A has already
+    // spent the shared cap and *nothing* leaves B here.
+    let _ = write_all(&mut b.conn, now, rb, &[0x5u8; 200]);
+    let db = drain(&mut b.conn);
+    assert!(
+        !db.transmits().is_empty(),
+        "§7.3, Appendix B O43e: *exhausting one must not throttle the \
+         other*. B has spent nothing of its own and must still be \
+         admitted: {:?}",
+        db.outs,
+    );
+    for t in db.transmits() {
+        assert_eq!(t.to, a_addr(), "and B's packets go to the same address");
+    }
+    let (b_spent, b_recv) = b.conn.amplification_budget().expect("still unvalidated");
+    assert_eq!(b_recv, credit, "B's received side never moved");
+    assert!(
+        b_spent > spent && b_spent <= cap,
+        "B spent inside **its own** cap: {b_spent} of {cap}",
+    );
+
+    // ── half 2: funding one must not credit the other ────────────────
+    //
+    // **The direction is chosen, not incidental (working rule 9).** The
+    // obligation is symmetric and the two cores are constructed
+    // identically, so either may be the funded one — but the *exhausted*
+    // core still holds thousands of unsent bytes, and funding **it** would
+    // have its own pump consume the whole credit before any assertion runs.
+    // A shared counter would then look identical to a private one on the
+    // behavioural half. Funding the core with an **empty** send queue is
+    // what leaves the credit sitting there to be wrongly spent.
+    //
+    // 600 bytes of PADDING is authenticated and window-fresh, so ruling 169
+    // lets it fund B; PADDING is not ack-eliciting, so B owes nothing back
+    // and spends none of it.
+    let before_a = a.conn.amplification_budget().expect("still unvalidated");
+    let later = now + Duration::from_millis(10);
+    let db = b.deliver(later, &[constants::FRAME_PADDING as u8; 600]);
+    let (_, b_recv) = b.conn.amplification_budget().expect("still unvalidated");
+    assert!(
+        b_recv >= credit + 600,
+        "premise: the receive really did fund **B** — its received counter \
+         moved from {credit} to {b_recv}",
+    );
+    assert!(
+        db.transmits().is_empty(),
+        "premise: and B spent none of it, so the credit is still there to \
+         be wrongly spent by A: {:?}",
+        db.outs,
+    );
+    assert!(
+        room(&b) > 31,
+        "premise: B's own window is genuinely open again (room {})",
+        room(&b),
+    );
+
+    assert_eq!(
+        a.conn.amplification_budget(),
+        Some(before_a),
+        "§7.3: *funding one must not credit the other*. A shared `recv` \
+         counter moves A's here.",
+    );
+
+    // The counters are the state; this is the behaviour. A still holds
+    // thousands of unsent bytes from `write_all` above, so a pump is all it
+    // takes — and under a shared counter B's credit pays for them.
+    a.conn.flush(later);
+    let da = drain(&mut a.conn);
+    assert!(
+        da.transmits().is_empty(),
+        "A's budget is still exhausted, so nothing may leave it on credit \
+         **B** earned: {:?}",
+        da.outs,
+    );
+}
