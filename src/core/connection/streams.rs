@@ -119,12 +119,18 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(dir: Dir, index: u64, local: bool) -> Self {
+    /// **[ruling 259(viii)]** `stream_window` is what the *receive* half
+    /// advertises. [`SendHalf`]'s limit is the **peer's**, un-negotiated,
+    /// and stays at §10.2's constant whatever this endpoint advertises.
+    fn new(dir: Dir, index: u64, local: bool, stream_window: u64) -> Self {
         // §9.1: a uni stream has one half at each end — the opener sends.
         let (send, recv) = match (dir, local) {
-            (Dir::Bi, _) => (Some(SendHalf::new()), Some(RecvHalf::new())),
+            (Dir::Bi, _) => (
+                Some(SendHalf::new()),
+                Some(RecvHalf::with_window(stream_window)),
+            ),
             (Dir::Uni, true) => (Some(SendHalf::new()), None),
-            (Dir::Uni, false) => (None, Some(RecvHalf::new())),
+            (Dir::Uni, false) => (None, Some(RecvHalf::with_window(stream_window))),
         };
         Self {
             dir,
@@ -306,6 +312,16 @@ pub(crate) struct Streams {
     /// `ResetState` is terminated by the half being freed, which is exactly
     /// what has already happened here.
     retained_resets: BTreeMap<StreamRef, RetainedReset>,
+    /// **[ruling 259(viii)]** §10.2's per-stream receive window, as this
+    /// endpoint advertises it — every receive half this table creates is
+    /// born with it.
+    ///
+    /// One field rather than a value threaded through the two
+    /// [`Stream::new`] call sites, because a stream created by §9.2's
+    /// implicit-open walk and one created by [`open`](Self::open) must
+    /// advertise the same thing, and there is no reading of §10.2 on which
+    /// they differ.
+    stream_window: u64,
     /// **[RATIFIED 2026/08/18 — ruling 263]** Ruling 253's copy work from
     /// halves that have since retired.
     ///
@@ -368,7 +384,15 @@ struct RetainedReset {
 
 impl Streams {
     pub(crate) fn new() -> Self {
+        Self::with_window(constants::INITIAL_MAX_STREAM_DATA)
+    }
+
+    /// A table whose receive halves advertise `stream_window`
+    /// (**ruling 259(viii)**). Identical to [`new`](Self::new) at §10.2's
+    /// ratified value.
+    pub(crate) fn with_window(stream_window: u64) -> Self {
         Self {
+            stream_window,
             role: None,
             local: Default::default(),
             remote: Default::default(),
@@ -433,7 +457,8 @@ impl Streams {
         let r = self.alloc();
         self.local[dir.slot()].ever_opened += 1;
         self.local[dir.slot()].open.insert(index, r);
-        self.entries.insert(r, Stream::new(dir, index, true));
+        self.entries
+            .insert(r, Stream::new(dir, index, true, self.stream_window));
         Ok(r)
     }
 
@@ -782,6 +807,16 @@ impl Streams {
 
         if recv.is_readable() {
             events.push(ConnEvent::StreamReadable { r });
+        }
+        // **[ruling 259(viii)]** The peer has now named this stream, so a
+        // MAX_STREAM_DATA for it lands rather than arriving inert (§8.4).
+        // This is the first moment at which that is true for a *locally*
+        // opened stream, and `pack_control` runs before the STREAM fill, so
+        // announcing at open would lose the raise. A no-op on every build
+        // that did not configure one.
+        let announce = recv.take_initial_grant();
+        if announce {
+            self.owed.max_stream_data.insert(r);
         }
 
         // §9.8's seam. `MessageReadable` and `StreamReadable` are **both**
@@ -1526,7 +1561,7 @@ impl Streams {
             let table = self.table(local, dir);
             table.open.insert(i, r);
             table.ever_opened = i + 1;
-            let mut stream = Stream::new(dir, i, false);
+            let mut stream = Stream::new(dir, i, false, self.stream_window);
             stream.unclaimed = true;
             self.entries.insert(r, stream);
             self.unclaimed[dir.slot()].push_back(r);

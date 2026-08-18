@@ -181,9 +181,17 @@ pub(crate) fn take_varint(buf: &[u8], at: &mut usize) -> u64 {
 
 /// Decode a whole plaintext frame stream (§8.3).
 ///
-/// Panics, with the offending type byte named, on a frame type slice 4
-/// cannot legitimately emit. That panic is itself an assertion: a core
-/// emitting an ACK in slice 4 has crossed the slice boundary.
+/// Panics, with the offending type byte named, on a frame type **this
+/// fixture does not yet decode** — a signal to extend the match below, not
+/// a claim about what the core may emit.
+///
+/// **[corrected 2026/08/18 — ruling 264]** *This read "a frame type slice 4
+/// cannot legitimately emit … a core emitting an ACK in slice 4 has crossed
+/// the slice boundary", which the function's own body refutes: the `ACK`
+/// arm below decodes one. It is the fourth instance of the aged-out-decoder
+/// problem the comment two arms further down already names — after `Ack`
+/// (slice 5), `Datagram` (slice 6) and the path frames (slice 7b) — and the
+/// only one that had reached the doc comment.*
 pub(crate) fn parse_frames(pt: &[u8]) -> Vec<Wire> {
     let mut out = Vec::new();
     let mut at = 0usize;

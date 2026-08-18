@@ -180,7 +180,7 @@ use self::timers::{TimerKind, Timers};
 pub use self::stream_id::{Dir, StreamId};
 pub(crate) use self::streams::{StreamRef, Streams, StreamsExhausted};
 
-use super::{EstablishedSession, Install, Role, ToEndpoint, Transmit};
+use super::{ConnSeed, EstablishedSession, Install, Role, ToEndpoint, Transmit};
 
 /// A connection's core state machine. §16.4.
 pub(crate) struct Connection<C: Handshake> {
@@ -279,7 +279,24 @@ struct PathPacked {
 impl<C: Handshake> Connection<C> {
     /// A connection `connect()` created: no session until its `Install`
     /// arrives.
-    pub(crate) fn connecting(sub_seed: [u8; 32]) -> Self {
+    ///
+    /// **[ruling 259(viii)]** `seed` carries §10.2's advertised windows
+    /// beside §16.6's sub-seed. A bare `[u8; 32]` converts, and converts to
+    /// the **ratified** windows — which is what every caller that has no
+    /// opinion should get.
+    pub(crate) fn connecting(seed: impl Into<ConnSeed>) -> Self {
+        let ConnSeed { sub_seed, windows } = seed.into();
+        let mut streams = Streams::with_window(windows.stream);
+        let mut flow = Flow::with_window(windows.connection);
+        // §10.2's initial windows are never sent, so a peer assumes the
+        // **constants** until a credit frame says otherwise. A configured
+        // connection-level raise therefore has to be said, and the first
+        // packet this connection sends is the earliest it can be: MAX_DATA
+        // names no stream, so unlike the per-stream grant there is nothing
+        // the peer has to have learned first. A no-op at the default.
+        if flow.recv_window().take_announcement() {
+            streams.owe_max_data();
+        }
         Self {
             session: None,
             sub_seed,
@@ -291,9 +308,9 @@ impl<C: Handshake> Connection<C> {
             closed_emitted: false,
             scratch: Vec::new(),
             role: None,
-            streams: Streams::new(),
+            streams,
             datagrams: Datagrams::default(),
-            flow: Flow::new(),
+            flow,
             events: Vec::new(),
             lost: None,
             ack: AckState::new(),
@@ -332,11 +349,11 @@ impl<C: Handshake> Connection<C> {
     /// read a clock, so the instant has to arrive here.
     pub(crate) fn established(
         now: Instant,
-        sub_seed: [u8; 32],
+        seed: impl Into<ConnSeed>,
         session: EstablishedSession<C>,
         role: Role,
     ) -> Self {
-        let mut conn = Self::connecting(sub_seed);
+        let mut conn = Self::connecting(seed);
         // §7.3's second arming event: an **accepted initiation's msg1
         // anchor**. The msg1 qualifies as authenticated — *"its handshake
         // tail tags having verified at admission"* — so it credits the
@@ -3520,10 +3537,16 @@ pub(crate) struct AckSnapshot(Vec<(StreamRef, u64)>);
 
 /// One item of the connection core's drain. §16.4.
 ///
-/// The variants §16.4 lists that this slice cannot yet construct — every
-/// `ConnEvent` but `Established` and `Closed` — are absent rather than
-/// stubbed: an uninhabited variant is a claim about the protocol, and these
-/// will each arrive with the section that defines them.
+/// **[corrected 2026/08/18 — ruling 264]** *This said the only `ConnEvent`s
+/// this core could construct were `Established` and `Closed`, and that the
+/// rest "will each arrive with the section that defines them". They have:
+/// [`ConnEvent`] below carries **fourteen** variants and this file emits
+/// them. The paragraph was a slice-scoped absence note that outlived its
+/// slice — the shape ruling 264 swept the crate for.*
+///
+/// The counting rule ruling 259(i) states for §16.2/§16.4: fourteen
+/// variants, eleven verb-served, three notification-fillers, and every
+/// future variant lands in exactly one of the two lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnOutput {
     /// Send this datagram.

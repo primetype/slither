@@ -102,6 +102,14 @@ impl RecvHalf {
     /// A fresh half with §10.2's un-negotiated stream window already
     /// advertised (**H15**).
     pub(crate) fn new() -> Self {
+        Self::with_window(constants::INITIAL_MAX_STREAM_DATA)
+    }
+
+    /// A fresh half advertising the stream window this endpoint was
+    /// configured with (**ruling 259(viii)**).
+    ///
+    /// Identical to [`new`](Self::new) at the ratified value.
+    pub(crate) fn with_window(window: u64) -> Self {
         Self {
             reassembly: Reassembly::new(),
             read_offset: 0,
@@ -109,7 +117,7 @@ impl RecvHalf {
             final_size: None,
             reset: None,
             reset_observed: false,
-            credit: CreditWindow::new(constants::INITIAL_MAX_STREAM_DATA),
+            credit: CreditWindow::configured(window, constants::INITIAL_MAX_STREAM_DATA),
             earns_stream_credit: true,
             counted: 0,
         }
@@ -348,6 +356,31 @@ impl RecvHalf {
             return None;
         }
         self.credit.take_grant()
+    }
+
+    /// **[ruling 259(viii)]** Whether this half still owes the peer the
+    /// one-shot announcement of a configured window raise.
+    ///
+    /// Called on the **first STREAM frame the peer sends on this stream**,
+    /// and not at open, for two reasons that both cost a wire byte to get
+    /// wrong:
+    ///
+    /// - `pack_control` runs **before** the STREAM fill, so a
+    ///   MAX_STREAM_DATA for a *locally-opened* stream would reach the peer
+    ///   before the frame that tells it the stream exists. §8.4 makes that
+    ///   frame inert on arrival — credit for a stream in the sender's space
+    ///   that the receiver has not seen — so the raise would be silently
+    ///   dropped. A frame the peer has sent on is a stream the peer has
+    ///   opened, whichever side opened it.
+    /// - It costs nothing on a stream the peer never writes to.
+    ///
+    /// The `earns_stream_credit` guard is §9.8's: a sugar-consumed stream
+    /// is never extended, and this is an extension.
+    pub(crate) fn take_initial_grant(&mut self) -> bool {
+        if !self.earns_stream_credit {
+            return false;
+        }
+        self.credit.take_announcement()
     }
 
     /// The value §10.3's retirement true-up brings this half's contribution

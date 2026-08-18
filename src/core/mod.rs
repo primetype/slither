@@ -72,6 +72,9 @@ pub use self::endpoint::IntroId;
 // Same reason as `packet`'s: the driver that consumes these is slice 3b.
 #[allow(unused_imports)]
 pub(crate) use self::connection::{ConnEvent, ConnOutput, Connection, StreamRef, StreamsExhausted};
+// §10.2's advertised windows, which [`ConnSeed`] carries from the endpoint
+// that minted a connection to the connection itself (ruling 259(viii)).
+pub(crate) use self::connection::flow::FlowWindows;
 // §9.1's two public types. They live in the `pub(crate)` core and are
 // re-exported from `lib.rs` beside `ConnectionId`/`IntroId`/`Timestamp`
 // (ruling 101).
@@ -182,6 +185,43 @@ pub struct Transmit {
     pub to: SocketAddr,
     /// The complete datagram — header ‖ Noise message ‖ mac1.
     pub data: Vec<u8>,
+}
+
+/// What an endpoint hands a connection at birth.
+///
+/// **[ruling 259(viii)]** Two things, and they travel together on purpose.
+/// §16.6's per-connection sub-seed is the older half; §10.2's advertised
+/// receive windows are the new one. A connection is born on **two** paths —
+/// `connect()`'s pending ([`Endpoint::mint_pending`]) and `accept()`'s
+/// established (`endpoint::staged`'s `accept`) — and a policy that has to
+/// be threaded to both call sites is a policy two call sites can disagree
+/// about. Minting the pair in one place makes the agreement structural.
+///
+/// *Named for its older half:* the endpoint's minting verb is still
+/// `draw_sub_seed`, and the rename is a one-line follow-up in a file this
+/// slice's partition did not hold.
+///
+/// [`Endpoint::mint_pending`]: endpoint::Endpoint::mint_pending
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnSeed {
+    /// §16.6's per-connection CSPRNG seed.
+    pub(crate) sub_seed: [u8; 32],
+    /// §10.2's two advertised receive windows.
+    pub(crate) windows: FlowWindows,
+}
+
+/// A bare seed carries §10.2's **ratified** windows.
+///
+/// This is what makes the knob's default path unmissable rather than
+/// remembered: a caller that says nothing about windows gets the
+/// constants, and there is no third value the conversion could produce.
+impl From<[u8; 32]> for ConnSeed {
+    fn from(sub_seed: [u8; 32]) -> Self {
+        Self {
+            sub_seed,
+            windows: FlowWindows::default(),
+        }
+    }
 }
 
 /// The completed session an [`Install`] carries. §16.4, §5.6.

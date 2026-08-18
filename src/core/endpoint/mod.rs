@@ -23,22 +23,26 @@
 //!   fails to open touches nothing" — is the connection core's to keep;
 //!   the endpoint's part is that a miss changes nothing here.
 //!
-//! # The slice boundary this core knowingly carries
+//! # §5.4's three-valued rule, all three rows
+//!
+//! **[corrected 2026/08/18 — ruling 264]** *This section described LIVE as
+//! a slice boundary that "still returns `AcceptError::Stale`". It has not
+//! been one for several slices, and the paragraph outlived its subject.*
 //!
 //! §5.4's post-`ss` responder rule is three-valued: **LIVE** / **PENDING**
-//! / **NONE**. Two of the three are complete: NONE from slice 2a, and
+//! / **NONE**, and all three are implemented. NONE landed in slice 2a;
 //! **PENDING** with ruling 91, which pulled §6.5's routing and §6.6's
-//! internal tie-break forward into this slice — [`routing`] holds both,
-//! and §6.4's PENDING branch is in [`staged`]'s `accept()`.
+//! internal tie-break forward — [`routing`] holds both, and §6.4's PENDING
+//! branch is in [`staged`]'s `accept()`.
 //!
-//! **LIVE is what remains.** §6.4's re-home walk and its proven-LIVE
-//! replacement admission — the basis check, `ConnectionLost::Replaced`,
-//! and §7.5's contested-connection probe — still return
-//! [`AcceptError::Stale`] here. That is not correct in general: a
-//! replacement whose timestamp passes both the guard and the basis must
-//! succeed. It is a documented, deliberate boundary, and what it preserves
-//! meanwhile is §16.1's **one session per peer static**, which returning
-//! `Stale` cannot violate.
+//! **LIVE is [`staged`]'s `accept()` too**, and it is the basis check, not
+//! a blanket refusal, that keeps §16.1's **one session per peer static**:
+//! a candidate whose timestamp is strictly greater than the row's
+//! `replacement_basis` is admitted and the old connection is retired with
+//! `EndpointOutput::Replaced`; one that is not is refused; and a row with
+//! **no** basis — a connection we dialled, so we hold no timestamp of this
+//! peer's — refuses and emits `EndpointOutput::Contested`, which is §7.5's
+//! probe asking the live peer whether it is still there (ruling 36).
 //!
 //! §6.5 is complete, step 4 included: **[RATIFIED 2026/08/15 — ruling 92]**
 //! gave `read_identity` the `now` §6.6's guard record needs, which is what
@@ -71,8 +75,8 @@ use rand_core::{Rng, SeedableRng};
 use crate::config::Config;
 use crate::constants;
 use crate::core::{
-    Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession, Install, Role,
-    Timestamp, ToEndpoint, Transmit,
+    ConnSeed, Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession,
+    FlowWindows, Install, Role, Timestamp, ToEndpoint, Transmit,
 };
 use crate::error::ConnectError;
 use crate::identity::{Identity, PublicKeyOf};
@@ -239,11 +243,14 @@ impl<I: Identity> Endpoint<I> {
     /// — including a dial that **lost** §6.7's tie-break and installed as
     /// responder over §6.6 step 4.
     ///
-    /// Not part of §16.4's API. §6.4's proven-LIVE admission — the basis's
-    /// only reader — is still a later slice, so without an accessor the
-    /// field is written and never checked, and a value written wrongly
-    /// today would surface as a bug in that slice. `pub(crate)`, so it
-    /// costs the public surface nothing.
+    /// Not part of §16.4's API. **[corrected 2026/08/18 — ruling 264]**
+    /// *This said §6.4's proven-LIVE admission "is still a later slice, so
+    /// without an accessor the field is written and never checked". It is
+    /// checked: [`staged`]'s `accept()` reads `replacement_basis` off the
+    /// static row directly, and the module doc above records the correction
+    /// in full.* What the accessor is for now is **observation** — every
+    /// caller is a test, which is why it stays `pub(crate)` and costs the
+    /// public surface nothing.
     pub(crate) fn replacement_basis(&self, peer_static: &[u8]) -> Option<Option<Timestamp>> {
         self.statics
             .get(peer_static)
@@ -325,16 +332,29 @@ impl<I: Identity> Endpoint<I> {
     // §16.6 — the seeded RNG
     // ═══════════════════════════════════════════════════════════════════
 
-    /// §16.6's per-connection sub-seed, **drawn even while unused**.
+    /// §16.6's per-connection sub-seed, **drawn even while unused**, and —
+    /// **[ruling 259(viii)]** — §10.2's advertised windows stamped on it.
     ///
     /// The parenthesis in §16.6 is written for exactly this slice: the
     /// connection core uses no randomness until slice 4, and omitting the
     /// draw now would silently shift every seeded test's index and jitter
     /// sequence when slice 4 added it.
-    fn draw_sub_seed(&mut self) -> [u8; 32] {
-        let mut seed = [0u8; 32];
-        self.rng.fill_bytes(&mut seed);
-        seed
+    ///
+    /// The windows ride here because this is the **one** place both birth
+    /// paths pass through — `mint_pending`'s `connect()` and `staged`'s
+    /// `accept()` — so the two cannot advertise different policy, and the
+    /// draw order §16.6 pins is untouched: the RNG is read exactly as
+    /// before, and the windows are a `Copy` read off the config.
+    fn draw_sub_seed(&mut self) -> ConnSeed {
+        let mut sub_seed = [0u8; 32];
+        self.rng.fill_bytes(&mut sub_seed);
+        ConnSeed {
+            sub_seed,
+            windows: FlowWindows {
+                stream: self.config.stream_window(),
+                connection: self.config.connection_window(),
+            },
+        }
     }
 
     /// §5.5 rule 2's `RETRANSMIT_BASE + U[0, RETRANSMIT_JITTER_MAX]`.

@@ -49,6 +49,46 @@ impl WallClock for SystemClock {
     }
 }
 
+/// Why [`Config::with_flow_windows`] refused a pair of windows.
+///
+/// **[ruling 259(viii)]** Every variant is a *raise* that is not a raise:
+/// the knob may only widen §10.2's ratified initial windows, and it may
+/// not widen them past what §8.1's varint can carry or past each other.
+///
+/// **Integrator note (this slice's partition):** these three belong beside
+/// [`crate::error::ConfigError`]'s keepalive variants, and the crate root
+/// should re-export the type alongside `Config`. `src/error.rs` and
+/// `src/lib.rs` were outside the partition this knob was written in, so
+/// the type lives here and is reachable as
+/// `slither::config::WindowError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WindowError {
+    /// A window below §10.2's ratified initial value.
+    ///
+    /// The knob **raises**; it does not lower. Lowering re-opens every
+    /// sizing proof that rests on the constants — §17.5's memory ceiling,
+    /// §9.8's message bound, and the un-negotiated initial value a peer
+    /// assumes before any credit frame arrives.
+    #[error("a flow-control window below §10.2's ratified initial value")]
+    TooSmall,
+    /// A window above the largest value a §8.1 varint carries.
+    ///
+    /// MAX_DATA and MAX_STREAM_DATA carry the advertised limit as one
+    /// varint (§8.4), and the limit is an **absolute offset** that only
+    /// grows, so a window the frame cannot encode is unusable from the
+    /// first grant. `constants.rs` pins the same bound on the defaults.
+    #[error("a flow-control window above VarInt::MAX_VALUE (2^62 - 1)")]
+    TooLarge,
+    /// The stream window exceeds the connection window.
+    ///
+    /// `constants.rs` pins `INITIAL_MAX_STREAM_DATA <= INITIAL_MAX_DATA`
+    /// for the defaults; a configured pair that inverts it advertises
+    /// per-stream credit the connection ledger will refuse anyway (§10.5
+    /// checks both levels).
+    #[error("the stream window exceeds the connection window")]
+    StreamAboveConnection,
+}
+
 /// An endpoint's configuration.
 ///
 /// The two introduction-queue bounds are configurable because §6.3 says so
@@ -59,6 +99,8 @@ pub struct Config {
     intro_queue_cap: usize,
     intro_max_per_source: usize,
     epoch_size: NonZeroU64,
+    stream_window: u64,
+    connection_window: u64,
     clock: Rc<dyn WallClock>,
 }
 
@@ -68,6 +110,8 @@ impl fmt::Debug for Config {
             .field("intro_queue_cap", &self.intro_queue_cap)
             .field("intro_max_per_source", &self.intro_max_per_source)
             .field("epoch_size", &self.epoch_size)
+            .field("stream_window", &self.stream_window)
+            .field("connection_window", &self.connection_window)
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +122,8 @@ impl Default for Config {
             intro_queue_cap: constants::INTRO_QUEUE_CAP,
             intro_max_per_source: constants::INTRO_MAX_PER_SOURCE,
             epoch_size: Config::DEFAULT_EPOCH_SIZE,
+            stream_window: Config::DEFAULT_STREAM_WINDOW,
+            connection_window: Config::DEFAULT_CONNECTION_WINDOW,
             clock: Rc::new(SystemClock),
         }
     }
@@ -92,8 +138,24 @@ impl Config {
         None => panic!("REKEY_EPOCH_MSGS is nonzero"),
     };
 
-    /// The defaults: §6.3's ratified caps, §7.7's epoch size and a
-    /// `SystemTime` clock.
+    /// §10.2's ratified per-stream receive window:
+    /// [`INITIAL_MAX_STREAM_DATA`](crate::constants::INITIAL_MAX_STREAM_DATA)
+    /// (262 144 B).
+    ///
+    /// The production value, and what a shipped build advertises unless
+    /// [`with_flow_windows`](Self::with_flow_windows) says otherwise.
+    pub const DEFAULT_STREAM_WINDOW: u64 = constants::INITIAL_MAX_STREAM_DATA;
+
+    /// §10.2's ratified connection-level receive window:
+    /// [`INITIAL_MAX_DATA`](crate::constants::INITIAL_MAX_DATA)
+    /// (1 048 576 B).
+    ///
+    /// The production value, and what a shipped build advertises unless
+    /// [`with_flow_windows`](Self::with_flow_windows) says otherwise.
+    pub const DEFAULT_CONNECTION_WINDOW: u64 = constants::INITIAL_MAX_DATA;
+
+    /// The defaults: §6.3's ratified caps, §7.7's epoch size, §10.2's two
+    /// receive windows and a `SystemTime` clock.
     pub fn new() -> Self {
         Self::default()
     }
@@ -185,6 +247,89 @@ impl Config {
         self
     }
 
+    /// Raise §10.2's two advertised receive windows — **the knob raises,
+    /// never lowers** (**ruling 259(viii)**).
+    ///
+    /// The defaults are [`DEFAULT_STREAM_WINDOW`](Self::DEFAULT_STREAM_WINDOW)
+    /// (256 KiB) and
+    /// [`DEFAULT_CONNECTION_WINDOW`](Self::DEFAULT_CONNECTION_WINDOW)
+    /// (1 MiB), which are §10.2's ratified constants and what a `Config`
+    /// nobody configured advertises. Ruling 247(a) measured what they cost:
+    /// one stream is capped at `stream_window / RTT`, about 2.5 MiB/s at
+    /// 100 ms, and before this knob a consumer had no way to buy more.
+    ///
+    /// # What changes, and what does not
+    ///
+    /// **Nothing on the wire changes shape.** §10.2's initial windows are
+    /// protocol constants that are never sent; MAX_DATA and
+    /// MAX_STREAM_DATA already carry whatever the receiver has decided to
+    /// advertise, so a raised window is announced through the frames §10.3
+    /// already emits, at values §8.4 already admits. The ratified
+    /// constants keep their values and stay the defaults.
+    ///
+    /// Three things this deliberately does **not** touch:
+    ///
+    /// - **The peer's limits.** A connection still assumes the *peer*
+    ///   advertises §10.2's constants until a credit frame says otherwise.
+    ///   The knob is one endpoint's receive policy; it is not negotiated
+    ///   and the peer needs no matching build.
+    /// - **[`MESSAGE_RECV_MAX`](crate::constants::MESSAGE_RECV_MAX).**
+    ///   §9.8's message bound is a *cross-peer* contract checked on the
+    ///   **send** side, and a sender cannot know what its receiver
+    ///   configured. Raising it locally would make `send_message` emit a
+    ///   payload that a default peer resets with `MESSAGE_OVERFLOW`. It
+    ///   stays equal to
+    ///   [`INITIAL_MAX_STREAM_DATA`](crate::constants::INITIAL_MAX_STREAM_DATA),
+    ///   which is what `constants.rs` asserts and §9.8's table states.
+    ///   Messages stay bounded at 256 KiB however wide this endpoint's
+    ///   streams are; larger transfers use real streams, exactly as §9.8
+    ///   says.
+    /// - **§17.5's memory ceiling shape.** The receive commitment per
+    ///   connection is the *connection* window, so raising it is a
+    ///   deliberate purchase of memory: `connection_window` bytes per live
+    ///   connection, plus reassembly metadata. Raise the pair, not one of
+    ///   them, and size it against how many connections this endpoint
+    ///   expects.
+    ///
+    /// # Errors
+    ///
+    /// - [`WindowError::TooSmall`] if either value is below its ratified
+    ///   default. Lowering re-opens every sizing proof that rests on the
+    ///   constants, so it is refused rather than clamped.
+    /// - [`WindowError::TooLarge`] if either value exceeds `2^62 - 1`, the
+    ///   largest offset a §8.1 varint carries.
+    /// - [`WindowError::StreamAboveConnection`] if `stream` exceeds
+    ///   `connection` — the relation `constants.rs` pins for the defaults.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use slither::Config;
+    ///
+    /// // 2 MiB per stream, 8 MiB per connection: ~20 MiB/s on one stream
+    /// // at a 100 ms RTT.
+    /// let config = Config::new()
+    ///     .with_flow_windows(2 * 1024 * 1024, 8 * 1024 * 1024)
+    ///     .expect("a raise within the varint bound");
+    /// assert_eq!(config.stream_window(), 2 * 1024 * 1024);
+    /// ```
+    pub fn with_flow_windows(mut self, stream: u64, connection: u64) -> Result<Self, WindowError> {
+        if stream < Self::DEFAULT_STREAM_WINDOW || connection < Self::DEFAULT_CONNECTION_WINDOW {
+            return Err(WindowError::TooSmall);
+        }
+        if stream > crate::varint::VarInt::MAX_VALUE
+            || connection > crate::varint::VarInt::MAX_VALUE
+        {
+            return Err(WindowError::TooLarge);
+        }
+        if stream > connection {
+            return Err(WindowError::StreamAboveConnection);
+        }
+        self.stream_window = stream;
+        self.connection_window = connection;
+        Ok(self)
+    }
+
     /// Replace the wall-clock service (§16.5).
     #[must_use]
     pub fn with_clock(mut self, clock: Rc<dyn WallClock>) -> Self {
@@ -205,6 +350,17 @@ impl Config {
     /// §7.7's epoch size, for hiss's ratcheting datagram split.
     pub fn epoch_size(&self) -> NonZeroU64 {
         self.epoch_size
+    }
+
+    /// §10.2's per-stream receive window, as this endpoint advertises it.
+    pub fn stream_window(&self) -> u64 {
+        self.stream_window
+    }
+
+    /// §10.2's connection-level receive window, as this endpoint
+    /// advertises it.
+    pub fn connection_window(&self) -> u64 {
+        self.connection_window
     }
 
     /// The injected wall clock.
@@ -236,5 +392,103 @@ mod tests {
     fn the_epoch_size_override_takes_effect() {
         let config = Config::new().with_epoch_size(NonZeroU64::new(8).unwrap());
         assert_eq!(config.epoch_size().get(), 8);
+    }
+
+    /// **[ruling 259(viii)]** The knob's whole premise: the ratified
+    /// constants stay the defaults. A `Config` nobody configured advertises
+    /// §10.2's two values and nothing else.
+    #[test]
+    fn the_default_windows_are_the_ratified_constants() {
+        let config = Config::new();
+        assert_eq!(config.stream_window(), constants::INITIAL_MAX_STREAM_DATA);
+        assert_eq!(config.connection_window(), constants::INITIAL_MAX_DATA);
+        assert_eq!(
+            Config::DEFAULT_STREAM_WINDOW,
+            constants::INITIAL_MAX_STREAM_DATA
+        );
+        assert_eq!(
+            Config::DEFAULT_CONNECTION_WINDOW,
+            constants::INITIAL_MAX_DATA
+        );
+    }
+
+    #[test]
+    fn the_window_override_takes_effect() {
+        let config = Config::new()
+            .with_flow_windows(1 << 20, 1 << 23)
+            .expect("a raise");
+        assert_eq!(config.stream_window(), 1 << 20);
+        assert_eq!(config.connection_window(), 1 << 23);
+    }
+
+    /// The knob raises, never lowers — on **either** value independently,
+    /// and at the boundary the defaults themselves are accepted (a no-op
+    /// raise), so the refusal is `< default`, not `<= default`.
+    #[test]
+    fn a_window_below_its_ratified_default_is_refused() {
+        assert_eq!(
+            Config::new()
+                .with_flow_windows(
+                    constants::INITIAL_MAX_STREAM_DATA - 1,
+                    constants::INITIAL_MAX_DATA,
+                )
+                .unwrap_err(),
+            WindowError::TooSmall,
+        );
+        assert_eq!(
+            Config::new()
+                .with_flow_windows(
+                    constants::INITIAL_MAX_STREAM_DATA,
+                    constants::INITIAL_MAX_DATA - 1,
+                )
+                .unwrap_err(),
+            WindowError::TooSmall,
+        );
+        let at_the_defaults = Config::new()
+            .with_flow_windows(
+                constants::INITIAL_MAX_STREAM_DATA,
+                constants::INITIAL_MAX_DATA,
+            )
+            .expect("the defaults restated are a legal no-op raise");
+        assert_eq!(
+            at_the_defaults.stream_window(),
+            constants::INITIAL_MAX_STREAM_DATA
+        );
+    }
+
+    /// The §8.1 varint ceiling, from both sides of the boundary: the
+    /// largest encodable offset is accepted and one more is refused.
+    #[test]
+    fn a_window_past_the_varint_bound_is_refused() {
+        let max = crate::varint::VarInt::MAX_VALUE;
+        assert_eq!(
+            Config::new()
+                .with_flow_windows(max, max)
+                .unwrap()
+                .stream_window(),
+            max,
+            "the largest encodable absolute offset is admissible",
+        );
+        assert_eq!(
+            Config::new()
+                .with_flow_windows(max + 1, max + 1)
+                .unwrap_err(),
+            WindowError::TooLarge,
+        );
+        assert_eq!(
+            Config::new().with_flow_windows(max, max + 1).unwrap_err(),
+            WindowError::TooLarge,
+            "the connection window is checked on its own, not only via the pair",
+        );
+    }
+
+    #[test]
+    fn the_stream_window_may_not_exceed_the_connection_window() {
+        assert_eq!(
+            Config::new()
+                .with_flow_windows(1 << 23, 1 << 20)
+                .unwrap_err(),
+            WindowError::StreamAboveConnection,
+        );
     }
 }

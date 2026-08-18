@@ -34,6 +34,36 @@ use crate::constants;
 
 use super::stream_id::{Dir, MAX_STREAMS_CEILING};
 
+/// §10.2's two **advertised** receive windows, as one endpoint has
+/// configured them (**ruling 259(viii)**).
+///
+/// [`Default`] is the ratified pair, and the pair a shipped build uses:
+/// `INITIAL_MAX_STREAM_DATA` and `INITIAL_MAX_DATA`. The values reach a
+/// connection through the endpoint that mints it, so both construction
+/// paths — `connect()`'s pending and `accept()`'s established — carry the
+/// same policy by construction rather than by two agreeing call sites.
+///
+/// **Receive only.** The peer's limits ([`Flow::send_max_data`] and
+/// [`SendHalf::max_data`](super::send::SendHalf)) stay at §10.2's
+/// constants: the initial values are un-negotiated, so what *this*
+/// endpoint advertises tells us nothing about what the peer will accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlowWindows {
+    /// What each receive half advertises. §10.2.
+    pub(crate) stream: u64,
+    /// What the connection-level ledger advertises. §10.2.
+    pub(crate) connection: u64,
+}
+
+impl Default for FlowWindows {
+    fn default() -> Self {
+        Self {
+            stream: constants::INITIAL_MAX_STREAM_DATA,
+            connection: constants::INITIAL_MAX_DATA,
+        }
+    }
+}
+
 /// §10.5's violations, plus §10.6's — the set ruling 104 makes
 /// three-membered.
 ///
@@ -88,6 +118,17 @@ pub(crate) struct CreditWindow {
     /// The highest limit ever advertised at this level. **H15**: seeded to
     /// `window`, not zero.
     last_advertised: u64,
+    /// **[ruling 259(viii)]** Whether the raise this window was configured
+    /// with still has to be *said*.
+    ///
+    /// §10.2's initial values are never sent, so the peer assumes the
+    /// **constants** — a window configured above one is invisible until a
+    /// credit frame carries it, and [`take_grant`](Self::take_grant) only
+    /// fires on application consumption. The flag is the one-shot that
+    /// closes that gap; it is `false` for the ratified window, where H15's
+    /// seeding already matches what the peer assumes and a frame on open
+    /// would be the spurious MAX_STREAM_DATA H15 exists to prevent.
+    pending_announce: bool,
 }
 
 impl CreditWindow {
@@ -97,7 +138,30 @@ impl CreditWindow {
             window,
             consumed: 0,
             last_advertised: window,
+            pending_announce: false,
         }
+    }
+
+    /// A window this endpoint **configured**, against the ratified initial
+    /// value the peer will assume. **[ruling 259(viii)]**
+    ///
+    /// Identical to [`new`](Self::new) when the two agree — which is what a
+    /// shipped build does — and otherwise carries the one-shot that makes
+    /// the raise reach the peer.
+    pub(crate) fn configured(window: u64, ratified: u64) -> Self {
+        Self {
+            pending_announce: window > ratified,
+            ..Self::new(window)
+        }
+    }
+
+    /// Take the one-shot raise announcement, if this window owes one.
+    ///
+    /// The frame's **value** is read from [`advertised`](Self::advertised)
+    /// at packing time, like every other §8.7 regenerate identity — this
+    /// only says *that* one is owed.
+    pub(crate) fn take_announcement(&mut self) -> bool {
+        std::mem::take(&mut self.pending_announce)
     }
 
     /// The highest limit ever advertised at this level.
@@ -177,13 +241,22 @@ pub(crate) struct Flow {
 impl Flow {
     /// §10.2's initial values, in both directions and all four spaces.
     pub(crate) fn new() -> Self {
+        Self::with_window(constants::INITIAL_MAX_DATA)
+    }
+
+    /// §10.2's initial values, with the connection-level receive window
+    /// this endpoint advertises (**ruling 259(viii)**).
+    ///
+    /// `send_max_data` stays at the **constant**: it is the peer's limit,
+    /// un-negotiated, and no local configuration speaks for it.
+    pub(crate) fn with_window(window: u64) -> Self {
         let initial = [
             constants::INITIAL_MAX_STREAMS_BIDI,
             constants::INITIAL_MAX_STREAMS_UNI,
         ];
         Self {
             recv_charged: 0,
-            recv: CreditWindow::new(constants::INITIAL_MAX_DATA),
+            recv: CreditWindow::configured(window, constants::INITIAL_MAX_DATA),
             send_charged: 0,
             send_max_data: constants::INITIAL_MAX_DATA,
             local_max_streams: initial,

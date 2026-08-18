@@ -169,7 +169,13 @@ futures-sink = { version = "0.3", optional = true }
 # deliberately: the default pulls `tokio/io-util` and more than `codec` needs.
 tokio-util = { version = "0.7", default-features = false, features = ["codec"], optional = true }
 
-# `Service` over the message verb (feature `tower`).
+# `tower_service::Service` over ONE BI STREAM PER CALL (feature `tower`).
+# [corrected 2026/08/18 — ruling 264] This read "`Service` over the message
+# verb", which is the shape ruling 225 *rejected*: slither carries no
+# request/response correlation on the wire, so a message-verb `Service`
+# would need a request id the transport does not have. `call()` opens a bi
+# stream; `finish()` ends the request and EOF the response. No `Rpc`
+# (ruling 230) — see `src/compat/tower.rs`'s module doc.
 tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -359,4 +365,12 @@ required-features = ["test-util"]
 name = "throughput"
 harness = false
 test = false
+required-features = ["test-util"]
+
+# Ruling 259(viii) — the flow-control `Config` knob, end to end: the two
+# ratified windows as the observed defaults, the raise measured on both
+# birth paths, and §9.8's message bound held still while they move.
+# Drives two endpoints over `testutil`, so `test-util` like its neighbours.
+[[test]]
+name = "story_flow"
 required-features = ["test-util"]
