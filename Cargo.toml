@@ -318,6 +318,17 @@ required-features = ["test-util", "tower"]
 name = "spec_compat"
 required-features = ["test-util", "sink"]
 
+# Round 41 (ruling 260). Appendix B's O53a/O53b, re-scoped from
+# pre-ratification gates to measured, pinned obligations: the ACK-loss-burst
+# simulation and the no-stall throughput floor. Same reasoning as every
+# stanza above — cargo auto-discovers the file *without* its
+# `required-features` unless the stanza names them (ruling 194), and the
+# feature-less `cargo test` gate then fails on `unresolved import
+# slither::testutil` rather than skipping the target.
+[[test]]
+name = "spec_ack_burst"
+required-features = ["test-util"]
+
 # ── Benchmarks ────────────────────────────────────────────────────────────
 # Throughput measurement, not a gate. Three things about this stanza are
 # load-bearing:
