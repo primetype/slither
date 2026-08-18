@@ -39,6 +39,7 @@
 > | 267 | §6.1 | `authenticate()` is idempotent on a `Proven` chain — same peer, same timestamp, 0 DH; the symmetric clause `read_identity()` already had |
 > | 268 | Appendix B | O13's flush parenthetical becomes admission-driven — the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
 > | 269 | §10.2 | the window-limited cap is ≈ window/(2 × RTT) — §10.3's half-window re-grant is the factor; the 259(viii) clause read window/RTT until the benchmark measured it (`bench-vs-tcp-2026-08.md`) |
+> | 270 | §10.2 kinds, §10.5, §10.6, §17.5, Appendix B | the reassembly ceiling derives from the advertised credit — max(`REASSEMBLY_CHUNKS_MAX`, W/`REASSEMBLY_MIN_CONFORMING_FRAME`+1); a conforming full-frame sender inside its credit can no longer be killed by loss; the flood still dies 512× above the ceiling; O53b's gate recorded run |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -4169,7 +4170,9 @@ them in one table gives the policy knob the wire pins' protection, so a
 future tuning change looks like a wire change and draws a ratification
 round it does not need.
 
-`REASSEMBLY_CHUNKS_MAX` (§10.6) is a **third** kind: receiver policy like
+`REASSEMBLY_CHUNKS_MAX` — and, since ruling 270,
+`REASSEMBLY_MIN_CONFORMING_FRAME` beside it (§10.6) — is a **third** kind:
+receiver policy like
 the batch, but externally *observable*, since a peer that fragments past
 one receiver's ceiling is killed and past another's is not (§10.5). The
 values and their locations do not move — that would be wire-pin churn for
@@ -4341,11 +4344,15 @@ itself from what this endpoint advertised, so a peer that exceeds one has
 either miscounted or is probing.
 
 **[RATIFIED 2026/08/15 — ruling 104]** The third is defined in §10.6: a
-stream whose stored discontiguous ranges would exceed
-`REASSEMBLY_CHUNKS_MAX` after coalescing is a protocol violation, CLOSE
+stream whose stored discontiguous ranges would exceed §10.6's
+credit-derived ceiling (floor `REASSEMBLY_CHUNKS_MAX` — ruling 270) after
+coalescing is a protocol violation, CLOSE
 with `PROTOCOL_VIOLATION` (§15.3). **It is a tolerance and not an exact
-limit** — the sender cannot compute it, since it depends on this
-receiver's coalescing and on the arrival order the *network* produced;
+limit** — the ceiling's *value* is now computable from the advertised
+window and a published constant **[AMENDED 2026/08/18 — ruling 270]**, but
+a sender still cannot compute its own *standing* against it, which depends
+on this receiver's coalescing and on the arrival order the *network*
+produced;
 §10.6 ships the value revisitable, and its admissible implementation (a)
 makes the ceiling unreachable entirely. It is the memory-safety bound of
 the three, and the one an implementer building §10's violation handling
@@ -4398,6 +4405,33 @@ defragment-plus-hard-fail shape). The ceiling value ships
 ratified-but-revisitable, gated on the Appendix B
 defragmentation/throughput check.
 
+**[AMENDED 2026/08/18 — ruling 270]** **The ceiling is derived from the
+advertised credit, and `REASSEMBLY_CHUNKS_MAX` is its floor.** A receiver
+tolerates `max(REASSEMBLY_CHUNKS_MAX, W / P + 1)` stored discontiguous
+ranges per stream, where `W` is the stream window it advertises and `P` is
+`REASSEMBLY_MIN_CONFORMING_FRAME` (1024 B — receiver policy, observable,
+the same third kind as the ceiling itself). The flat value was **stricter
+than this section's own mandate**, which is already stated as *O(advertised
+credit)*, and the strictness is what killed honest peers: a stream's credit
+and its tolerated hole count were two constants that did not scale
+together, so at a raised window a sender **inside its credit**, on a path
+losing packets in the pattern a saturated receive socket produces, exceeded
+the second while obeying the first. The property the derivation buys — and
+the reason the divisor is packet-scale rather than 2 — is this: **a peer
+that never exceeds its advertised credit and whose STREAM frames each carry
+at least `P` bytes cannot cross the ceiling under any loss or reordering
+pattern.** Stored ranges are maximal runs, since they coalesce on
+*adjacency* and not merely on overlap, so each is at least one frame wide
+except the partially-read front one, and disjoint ranges of at least `P`
+bytes inside a `W`-byte span number at most `W / P`. **The disposition does
+not change.** Crossing the ceiling is still CLOSE with `PROTOCOL_VIOLATION`
+(§10.5's third violation), and this section's own worked flood — one-byte
+frames at offsets 0, 2, 4, …, some `W / 2` ranges — sits **512×** above the
+derived ceiling and still dies there. That boundary is the point of the
+change and not a casualty of it. This is the revisit the paragraph above
+reserved: the Appendix B defragmentation/throughput check was run at a
+raised window and came back **fatal rather than slow**.
+
 **[AMENDED 2026/08/17 — ruling 253]** **The mandate above bounds state;
 this clause bounds work.** Coalesce-on-insert's total copy work per
 stream MUST be O(that stream's advertised credit · log credit) — every
@@ -4415,7 +4449,8 @@ evidence, because the whole-span merge passes it.
 
 | Constant | Value |
 |---|---|
-| `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream |
+| `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream — since ruling 270, the **floor** of the credit-derived ceiling |
+| `REASSEMBLY_MIN_CONFORMING_FRAME` | 1024 B — the divisor: tolerance = max(floor, `W / P` + 1) (ruling 270) |
 
 **[RATIFIED 2026/08/15 — ruling 94]** **slither implements (b), and
 allocates lazily — and the level this mandate is stated at is not the
@@ -6938,7 +6973,7 @@ policy:
 | stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 220 B raw bytes each, ≈ 225 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
-| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by `REASSEMBLY_CHUNKS_MAX` (§10.6 — the second bound is what makes the credit term the dominant term rather than a 25–50× underestimate) — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
+| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by §10.6's ceiling — `REASSEMBLY_CHUNKS_MAX` at the ratified window and `window / REASSEMBLY_MIN_CONFORMING_FRAME + 1` above it (ruling 270), ~40 B per stored range: ~40 KiB against 256 KiB of credit at the ratified window, ~320 KiB against 8 MiB at a raised one — under 4 % either way, which is what makes the credit term the dominant term rather than a 25–50× underestimate — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
 
 **The caveat on the sent map, stated because ruling 43 changed what it
 covers.** "Bounded by cwnd" is exact for congestion-controlled output
@@ -7421,7 +7456,9 @@ clock (§16.10); no test sleeps.
   `final_size` beyond the advertised limit *before* any true-up (no
   credit inflation, no `u64` wrap).
 - **The reassembly-fragment bound** (§10.6): a one-byte-frames-at-
-  even-offsets flood stays O(credit) or dies at `REASSEMBLY_CHUNKS_MAX`
+  even-offsets flood stays O(credit) or dies at §10.6's credit-derived
+  ceiling (ruling 270; `REASSEMBLY_CHUNKS_MAX` is its floor, and the flood
+  sits 512× above the derived term at any window)
   with `PROTOCOL_VIOLATION`; the defragmentation cost is measured by the
   throughput gate below.
 - **The reassembly work bound** (§10.6, ruling 253): an alternating
@@ -7886,7 +7923,13 @@ measured, pinned obligation — the constants stay ratified either way.]**
   zero-delay wire completes in 0 ns of virtual time (bound at
   `K_GRANULARITY`), and over the 20 ms-RTT fabric at 6.45 MiB/s with the
   regression floor at half that (`tests/spec_ack_burst.rs`) — before the
-  §10.2 constants and `REASSEMBLY_CHUNKS_MAX` ratify.
+  §10.2 constants and `REASSEMBLY_CHUNKS_MAX` ratify. **[Run 2026/08/18 —
+  ruling 270]** Run at a raised window (8 MiB, ruling 259(viii)'s knob),
+  the gate came back **fatal rather than slow**: the flat ceiling killed a
+  conforming sender under one socket-buffer loss burst (`round42-C`). The
+  credit-derived ceiling is the discharge, pinned red-to-green by
+  `tests/story_reassembly.rs` and the `tests_reassembly_credit` property
+  suite.
 
 ## Named constants *(consolidated; reference suite where suite-dependent)*
 
@@ -7915,7 +7958,8 @@ measured, pinned obligation — the constants stay ratified either way.]**
 | `MESSAGE_RECV_MAX` | = `INITIAL_MAX_STREAM_DATA` | §9.8 |
 | `MAX_DATAGRAM_PAYLOAD` | 1169 B (= `MAX_PLAINTEXT` − 1) | §11.2 |
 | `DATAGRAM_SEND_QUEUE` / `DATAGRAM_RECV_QUEUE` | 64 / 64 (count; drop-oldest, newest always accepted; ≈ 73 KiB worst case each) | §11.3 |
-| `REASSEMBLY_CHUNKS_MAX` | 1024 stored discontiguous ranges per stream | §10.6 — receiver policy, **externally observable** (ruling 103) |
+| `REASSEMBLY_CHUNKS_MAX` | 1024 — the credit-derived ceiling's **floor** (ruling 270) | §10.6 — receiver policy, **externally observable** (ruling 103) |
+| `REASSEMBLY_MIN_CONFORMING_FRAME` | 1024 B — ceiling = max(floor, `W / P` + 1) | §10.6 — receiver policy, observable (ruling 270) |
 | `CLOSE_REASON_MAX` | 256 B | §8.4 |
 | `CLOSE_LINGER` / close-reply rate | 5 s / ≤ 1 per s | §15.1 |
 | `MAX_ACK_RANGES` | 64 | §12.2 |

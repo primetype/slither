@@ -1,5 +1,16 @@
 # Round 42 material — recorded at the benchmark slice (2026/08/18)
 
+**[Item 1 DONE 2026/08/18 — the R42 slice, rulings 269(iii) + 270
+implemented: implementation `ba50a33` (VecDeque ring + credit-derived
+ceiling), blind acceptance `03fc192` (red-on-base with the exact kill),
+integration `069d7a0`, review carry-alongs `de50def`; verification in
+`round42-F` (four ceiling mutants separating; Fable-fork review GO, two
+findings landed); records in rulings 270 + the 269 addendum. Bench
+after: ladder 83/80/97/97/95 MiB/s (was 12.3× spread), 100 ms column
+monotone to 17.66 MiB/s, the kill cell completes. Carried onward, NOT
+closed: the syscall/async-datapath bucket (~50 % of CPU, 7.8 vs 2.3 µs
+floor) — the next attribution when throughput work resumes.]**
+
 1. **The O(window) ack-path drain** (ruling 269(iii), deferred by
    decision). `SendHalf`'s send buffer is a contiguous `Vec<u8>`;
    `release()` (`send.rs:581–595`) is `Vec::drain(..drop)`, memmoving

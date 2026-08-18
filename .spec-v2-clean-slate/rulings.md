@@ -8750,3 +8750,68 @@ pays ~35 % of its per-byte cost here. The measured 100 ms optimum,
 memmove rate and is recorded as measured-on-this-host, **not** a
 recommended constant; the guidance that survives the host is *size ≈
 2 × RTT × target rate, and not larger*.
+
+**Addendum (2026/08/18 — ruling 270 and the R42 slice).** 269(ii)'s
+surviving guidance — *"size ≈ 2 × RTT × target rate, and not larger"* —
+was, when it shipped, advice that steered operators into a fatal region:
+at 100 ms any target above ~22 MiB/s recommends a stream window past the
+~4.5 MiB crossing where §10.6's flat 1024-range ceiling killed a
+conforming connection (`round42-C`). With 270's credit-derived ceiling
+the guidance is safe at any raise. And 269(iii)'s deferred slice has
+run: the send half's buffer is a ring (`VecDeque` — no slack bound to
+budget, ruling 94 untouched), the ladder is flat (83/80/97/97/95 MiB/s
+where it fell 12.3×), and 269's recorded host optimum (2 MiB/8 MiB at
+9.01 MiB/s) is superseded — the 100 ms column now rises monotonically
+to 17.66 MiB/s at 8 MiB/16 MiB.
+
+### 270 — the reassembly ceiling derives from the credit it polices
+
+**Ruling: §10.6's hole ceiling becomes
+`max(REASSEMBLY_CHUNKS_MAX, W / REASSEMBLY_MIN_CONFORMING_FRAME + 1)`
+per stream — the flat 1024 is its floor, the divisor `P` = 1024 B is
+receiver policy of the same observable kind, and the
+CLOSE(`PROTOCOL_VIOLATION`) disposition does not move. The guaranteed
+property, proved at `ceiling_for`'s rustdoc and pinned by tests: a
+sender inside its advertised credit whose STREAM frames each carry
+≥ `P` bytes cannot cross the ceiling under any loss or reordering
+pattern.**
+
+Found by the R42 attribution, not by a report: the drain mutant's
+"stall" at 8 MiB/100 ms was a **kill** — `recv.rs`'s flat ceiling
+against ruling 259(viii)'s raised credit, reached the moment the sender
+was fast enough (`round42-C`, separated three ways: identical death
+with the mutant reverted verbatim; a deterministic virtual-time
+reproducer, seed 0x4200_0001, with a rule-9 survival control; the
+mutant's invariant verified clean). Steady loss cannot reach it — the
+congestion controller collapses first; it takes zero-loss-then-burst,
+which is what a saturated receive socket produces, and on the measured
+path every lost datagram died in the receiving endpoint's own UDP
+buffer. §10.6 had shipped the value *ratified-but-revisitable* gated on
+the Appendix B check; the check was run and came back fatal rather than
+slow, so this is the reserved revisit, taken.
+
+The slice ran blind (author `03fc192`: the survival stories red at base
+with the exact kill, the property pinned from credit arithmetic without
+knowing the formula, the abuse flood and floor pinned from the
+separating side; implementer `ba50a33`: the ring and the ceiling, with
+the flat-ceiling-plus-ring control proving the ceiling load-bearing on
+its own). **`P`'s value is the slice's second rule-5 refusal recorded
+as precedent**: the brief suggested `MAX_DATAGRAM_PAYLOAD` (1169) and
+the implementer refuted it against the code — `streams.rs` fills at
+`STREAM_FILL_QUANTUM` = 1024, so a 1169 divisor makes the guarantee
+false of slither's own sender. P = 1024, tied to the quantum by a
+compile-time guard on the *sender's* side (review F1, `de50def`), so
+the hypothesis is true by construction rather than by coincidence. The
+residue edge is stated honestly rather than implied (review F2): sub-P
+packet-tail frames are outside the hypothesis, bounded by two facts —
+same-datagram frames open holes per lost *span*, and `max()` means no
+receiver became stricter than the flat era, so nothing regressed.
+Mutation verification: flat-revert, deleted-ceiling and dropped-floor
+mutants each red exactly where predicted (the deleted-ceiling mutant
+additionally caught by two pre-R42 legacy tests); the off-by-one probe
+green everywhere, by design — the tests pin the property, not the
+formula. Memory at a raised window: 8 193 ranges ≈ 320 KiB of metadata
+against 8 MiB of credit (< 4 %), §17.5's row updated. Bench after the
+slice: the ladder flat at 83–97 MiB/s where it fell 12.3×, and the
+100 ms column monotone to 17.66 MiB/s — the knob, the ceiling and the
+ring now compose instead of colliding.
