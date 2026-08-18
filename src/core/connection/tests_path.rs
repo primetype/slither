@@ -1924,8 +1924,16 @@ fn two_sessions_at_one_peer_address_hold_two_independent_budgets() {
     );
 
     // The counters are the state; this is the behaviour. A still holds
-    // thousands of unsent bytes from `write_all` above, so a pump is all it
-    // takes — and under a shared counter B's credit pays for them.
+    // unsent bytes from `write_all` above, so a pump is all it takes — and
+    // under a shared counter B's credit pays for them.
+    let (a_sent, _) = before_a;
+    assert!(
+        a_sent < 4096,
+        "premise (review N1): A must still hold unsent stream bytes for the \
+         behavioural half to test anything — stream payload on the wire \
+         cannot exceed A's total wire spend ({a_sent}), which is below the \
+         4096 written",
+    );
     a.conn.flush(later);
     let da = drain(&mut a.conn);
     assert!(
