@@ -269,6 +269,26 @@ fn feed(s: &mut Solo, now: Instant, dgram: &[u8]) -> Drained {
     drain(&mut s.conn)
 }
 
+/// **The end of the driver's receive drain, at the core seam.**
+///
+/// **[ruling 271]** §12.4's every-2nd trigger arms `AckDelay` at `now`
+/// itself — a deadline *already due* — and the ACK stays `pending` until
+/// something fires it. `shell::driver`'s `biased` `select!` is what fires
+/// it: `recv_from` sits above `sleep_until`, so an already-due deadline
+/// loses to every datagram still on the socket and wins the instant the
+/// socket empties. The core has no notion of that boundary, so a core-level
+/// test that wants the coalesced ACK **on the wire** supplies it here.
+///
+/// `handle_timeout` runs only deadlines that are due (§16.5), so this is a
+/// no-op while the ACK is still riding `now + MAX_ACK_DELAY` — which is
+/// exactly what makes it usable as an unconditional "the socket is empty
+/// now" step, and what lets the tests below keep asserting *which* of the
+/// two arms §12.4 took.
+fn drain_boundary(s: &mut Solo, now: Instant) -> Drained {
+    s.conn.handle_timeout(now);
+    drain(&mut s.conn)
+}
+
 /// A window with `counters` marked, in the order given.
 fn window_of(counters: &[u64]) -> ReplayWindow {
     let mut w = ReplayWindow::new();
@@ -891,7 +911,16 @@ mod policy {
     }
 
     /// **A-1, both halves.** After one in-order ack-eliciting packet the
-    /// ACK is *armed*, not owed; after the second it is owed.
+    /// ACK is armed at `MAX_ACK_DELAY`; after the second it is armed at
+    /// **`now` itself** and is due.
+    ///
+    /// **[ruling 271]** The second half read *"after the second it is
+    /// owed"*, and asserted `AckAction::Now` with `is_owed()`. §12.4's
+    /// every-2nd trigger no longer emits — it **arms at `now`**, a deadline
+    /// already due, which `shell::driver`'s `biased` `select!` fires the
+    /// instant the socket is empty. The property this test always held is
+    /// untouched: *one is not two, and two is not one*. Only the second
+    /// trigger's output moved, from an emission to a due deadline.
     ///
     /// The session is primed first (its first packet forces an immediate
     /// ACK by the rule above) and `on_ack_packed()` clears it, so what this
@@ -899,9 +928,17 @@ mod policy {
     ///
     /// Mutation caught: **an immediate-ACK-per-packet build** — the
     /// pre-ratification policy §12.4 replaced — fails the first half; a
-    /// **delay-only build** with no counter fails the second. Either half
-    /// alone is passed by one of the two wrong builds, which is why they
-    /// are one test.
+    /// **delay-only build** with no counter fails the second, because it
+    /// returns `Arm(t + MAX_ACK_DELAY)` where the ratified cadence returns
+    /// `Arm(t)` and leaves nothing due. Either half alone is passed by one
+    /// of the two wrong builds, which is why they are one test.
+    ///
+    /// The last two assertions are ruling 271's own separation, and are why
+    /// `is_ready()` and `is_owed()` are **both** read: a build that
+    /// collapsed `pending` into `owed` — the one thing `ack.rs` says
+    /// restores the pre-271 cadence *"exactly"* — satisfies `is_ready()`
+    /// and fails `!is_owed()`, and no assertion on the returned
+    /// `AckAction` alone can see it.
     #[test]
     fn an_ack_is_owed_after_every_second_ack_eliciting_packet() {
         let t = t0();
@@ -916,11 +953,19 @@ mod policy {
             AckAction::Arm(t + MAX_ACK_DELAY),
             "§12.4: the 1st unacknowledged ack-eliciting packet arms"
         );
-        assert!(!a.is_owed(), "§12.4: one is not two");
+        assert!(!a.is_ready(), "§12.4: one is not two — nothing is due yet");
 
         let second = a.on_recv(t, 2, Some(1), true, true);
-        assert_eq!(second, AckAction::Now, "§12.4: after every 2nd");
-        assert!(a.is_owed());
+        assert_eq!(
+            second,
+            AckAction::Arm(t),
+            "§12.4 (ruling 271): the 2nd arms at `now` itself, already due"
+        );
+        assert!(a.is_ready(), "…and the ACK rides the next packet built");
+        assert!(
+            !a.is_owed(),
+            "ruling 271: …but it is not, by itself, a reason to build one"
+        );
     }
 
     /// The arming instant is `now + MAX_ACK_DELAY` exactly.
@@ -1093,6 +1138,18 @@ mod policy {
     /// early forever after, so half the ACKs are immediate and the delayed
     /// policy silently degrades toward the per-packet one it replaced —
     /// while every "an ACK eventually arrives" test stays green.
+    ///
+    /// **[ruling 271]** The debt is now **two** flags, not one, and this
+    /// test is where that shows: the 2nd packet leaves the ACK `pending`
+    /// rather than `owed`, so a build clearing only `owed` here leaves
+    /// `is_ready()` true for ever — every packet built for any reason
+    /// carries a redundant ACK, and `ACK_COALESCE_MAX` is then measured
+    /// from the wrong origin. `ack.rs` states that consequence in terms
+    /// (*"all three, not two"*); `!a.is_ready()` is the assertion that
+    /// makes it a pin rather than a comment. The counter reset is asserted
+    /// exactly as before, through its consequence, because `since_ack` is
+    /// private — only the consequence's *shape* changed, from `Now` on the
+    /// 2nd to `Arm(t)` on the 2nd.
     #[test]
     fn packing_an_ack_resets_the_every_second_counter_not_only_the_debt() {
         let t = t0();
@@ -1100,10 +1157,14 @@ mod policy {
         a.on_recv(t, 0, None, true, true);
         a.on_ack_packed();
 
-        a.on_recv(t, 1, Some(0), true, true); // 1st → Arm
-        assert_eq!(a.on_recv(t, 2, Some(1), true, true), AckAction::Now); // 2nd
+        a.on_recv(t, 1, Some(0), true, true); // 1st → Arm at +25 ms
+        assert_eq!(a.on_recv(t, 2, Some(1), true, true), AckAction::Arm(t)); // 2nd
         a.on_ack_packed();
         assert!(!a.is_owed());
+        assert!(
+            !a.is_ready(),
+            "ruling 271: packing clears `pending` too, not only `owed`"
+        );
 
         assert_eq!(
             a.on_recv(t, 3, Some(2), true, true),
@@ -1112,8 +1173,7 @@ mod policy {
         );
     }
 
-    /// An ACK owed and not yet packed **stays** owed across further
-    /// arrivals.
+    /// An ACK due and not yet packed **stays** due across further arrivals.
     ///
     /// Deliberately weak, and the weakness is the point: §12.4 does not say
     /// what `on_recv` returns for a third ack-eliciting packet while the
@@ -1122,10 +1182,25 @@ mod policy {
     /// `TESTS-5a-ack.md` as an unstated scope). What §12.4 *does* fix is
     /// that the debt does not evaporate.
     ///
-    /// Mutation caught: `owed` recomputed from `since_ack % 2 == 0` on each
-    /// receive rather than latched. The third packet clears a debt nobody
-    /// paid, and the ACK is simply never sent — which under loss is an
-    /// indefinite stall, since the peer is waiting on it.
+    /// **[ruling 271]** The debt the second packet leaves is now `pending`
+    /// rather than `owed`, so the survival is read through `is_ready()`.
+    /// The unstated scope above narrowed but did not close: the ratified
+    /// text says the burst *"folds into the same ACK"*, which fixes that
+    /// the debt survives — this test's subject — and still leaves the
+    /// returned `AckAction` unstated, so it is still not asserted here.
+    ///
+    /// The loop deliberately stays **well below** `ACK_COALESCE_MAX` (32).
+    /// That is the coalescing window, where the debt is held; at the valve
+    /// the debt is discharged by design, and a test that walked into it
+    /// would be asserting the flush rather than the survival.
+    ///
+    /// Mutation caught: `pending` recomputed from `since_ack % 2 == 0` on
+    /// each receive rather than latched. The third packet clears a debt
+    /// nobody paid, and the ACK is simply never sent — which under loss is
+    /// an indefinite stall, since the peer is waiting on it. Post-271 that
+    /// mutation is **easier** to write and no easier to see: the coalescing
+    /// branch is reached by every packet of the burst, so a `= (…)` where a
+    /// `|= (…)` was meant is one character.
     #[test]
     fn an_unpacked_debt_survives_further_arrivals() {
         let t = t0();
@@ -1134,11 +1209,12 @@ mod policy {
         a.on_ack_packed();
         a.on_recv(t, 1, Some(0), true, true);
         a.on_recv(t, 2, Some(1), true, true);
-        assert!(a.is_owed());
+        assert!(a.is_ready(), "§12.4: the 2nd leaves an ACK due");
+        assert!(!a.is_owed(), "ruling 271: due, and it builds no packet");
 
         for c in 3..=5u64 {
             a.on_recv(t, c, Some(c - 1), true, true);
-            assert!(a.is_owed(), "counter {c}: the debt is not paid by arrival");
+            assert!(a.is_ready(), "counter {c}: the debt is not paid by arrival");
         }
     }
 }
@@ -1153,13 +1229,36 @@ mod policy_on_the_wire {
     /// **A-1 through the core**, with the `AckDelay` timer observed
     /// directly.
     ///
+    /// **[ruling 271]** This test was named
+    /// `one_packet_arms_the_timer_and_the_second_emits_the_ack`, and the
+    /// second half of that name stopped being true: the 2nd ack-eliciting
+    /// packet **re-arms** the timer at `now` itself and emits nothing. The
+    /// emission is one step further on, at the drain boundary
+    /// [`drain_boundary`] supplies.
+    ///
     /// Mutation caught: everything `an_ack_is_owed_after_every_second…`
     /// catches, plus the wiring — a core that computes the right
     /// `AckAction` and never arms the timer, or arms a different one.
     /// `conn.timer(TimerKind::AckDelay)` is what separates "the policy is
-    /// right" from "the policy is connected".
+    /// right" from "the policy is connected", and post-271 it carries more
+    /// of the test than it used to: `Some(t1 + MAX_ACK_DELAY)` after the
+    /// 1st and `Some(t1)` after the 2nd are the **only** observable
+    /// difference between the two arrivals, since neither transmits.
+    ///
+    /// Two further separations, both new and both load-bearing:
+    ///
+    /// * `d.transmits().is_empty()` after the **2nd** fails a build that
+    ///   kept the pre-271 emission point — the plain restatement of what
+    ///   ruling 271 changed.
+    /// * the final `None` fails a build that emits the coalesced ACK and
+    ///   leaves `AckDelay` armed. That build ACKs correctly here and then
+    ///   emits a standalone ACK at every subsequent `handle_timeout` for
+    ///   the life of the connection, which is the reverse-path flood
+    ///   `a_repeated_timeout_at_the_same_instant_emits_no_second_ack`
+    ///   describes — reachable post-271 from an *ordinary* burst rather
+    ///   than only from the 25 ms timer.
     #[test]
-    fn one_packet_arms_the_timer_and_the_second_emits_the_ack() {
+    fn one_packet_arms_the_timer_and_the_second_makes_it_due_now() {
         let t = t0();
         let mut s = Solo::installed_at(t);
 
@@ -1172,7 +1271,7 @@ mod policy_on_the_wire {
             "§12.4: packing the ACK disarms the timer"
         );
 
-        // 1st unacknowledged: armed, nothing sent.
+        // 1st unacknowledged: armed at MAX_ACK_DELAY, nothing sent.
         let t1 = t + Duration::from_millis(100);
         let d = s.deliver(t1, &ping());
         assert!(
@@ -1185,10 +1284,22 @@ mod policy_on_the_wire {
             "§12.4: armed at MAX_ACK_DELAY on the first unacknowledged packet"
         );
 
-        // 2nd: the ACK goes out, covering both.
+        // 2nd: still nothing sent — the deadline moves *back* to `now`.
         let d = s.deliver(t1, &ping());
+        assert!(
+            d.transmits().is_empty(),
+            "§12.4 (ruling 271): the 2nd arms, it does not emit"
+        );
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t1),
+            "§12.4 (ruling 271): re-armed at `now` itself — already due"
+        );
+
+        // The drain boundary: the ACK goes out, covering both.
+        let d = drain_boundary(&mut s, t1);
         let got = acks(&mut s, &d);
-        assert_eq!(got.len(), 1, "§12.4: after every 2nd");
+        assert_eq!(got.len(), 1, "§12.4: one ACK for the whole batch");
         assert_eq!(got[0].largest, 2, "it acknowledges the newest counter");
         assert_eq!(got[0].counters(), vec![2, 1, 0], "and everything received");
         assert_eq!(s.conn.timer(TimerKind::AckDelay), None);
@@ -1312,7 +1423,23 @@ mod policy_on_the_wire {
     ///
     /// The replay is delivered where a **second** ack-eliciting packet
     /// would tip the "every 2nd" rule, so a build that folds replays in has
-    /// no way to hide: it emits an ACK the correct build does not.
+    /// no way to hide.
+    ///
+    /// **[ruling 271]** The way it used to have no way to hide was that it
+    /// *"emits an ACK the correct build does not"*, and that observable is
+    /// gone: post-271 the 2nd packet emits nothing either, so a replay
+    /// folded into the counter is invisible on the wire. What replaces it
+    /// is **the armed deadline** — `t + MAX_ACK_DELAY` if the replay was
+    /// correctly dropped, `t` if it was counted — and that assertion was
+    /// already in this test, one line below the one that used to do the
+    /// work. It is now the separator, and the emission it used to be is
+    /// asserted at the drain boundary instead.
+    ///
+    /// This is exactly the amplification the pre-271 rationale in
+    /// `fold_ack_policy` warns about, and ruling 271 records that
+    /// coalescing makes it *cheaper*: a burst of genuine packets now buys
+    /// one ACK, so a replay that advanced the counter would be worth
+    /// proportionally more.
     ///
     /// Mutation caught: `on_recv` called before the window's
     /// check-and-mark, or on its `false` branch. An attacker replaying one
@@ -1330,6 +1457,11 @@ mod policy_on_the_wire {
         let dgram = s.peer.seal(&ping());
         let d = feed(&mut s, t, &dgram);
         assert!(d.transmits().is_empty(), "counter 1 is the 1st: armed only");
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t + MAX_ACK_DELAY),
+            "…and the 1st arms at MAX_ACK_DELAY, not at `now`"
+        );
 
         let d = feed(&mut s, t, &dgram);
         assert!(
@@ -1340,15 +1472,31 @@ mod policy_on_the_wire {
         assert_eq!(
             s.conn.timer(TimerKind::AckDelay),
             Some(t + MAX_ACK_DELAY),
-            "and the armed deadline is untouched"
+            "and the armed deadline is untouched — a build that counted the \
+             replay would have moved it to `now`"
+        );
+        assert!(
+            drain_boundary(&mut s, t).transmits().is_empty(),
+            "…so the drain boundary has nothing to flush: the replay bought \
+             the attacker no ACK at all"
         );
 
         // A genuinely fresh second packet still works.
         let d = s.deliver(t, &ping());
+        assert!(
+            d.transmits().is_empty(),
+            "the 2nd arms rather than emitting"
+        );
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t),
+            "§12.4: the 2nd *fresh* ack-eliciting packet makes the ACK due"
+        );
+        let d = drain_boundary(&mut s, t);
         assert_eq!(
             acks(&mut s, &d).len(),
             1,
-            "§12.4: the 2nd *fresh* ack-eliciting packet"
+            "…and one ACK leaves at the drain boundary"
         );
     }
 
@@ -1732,8 +1880,20 @@ mod processing {
         // Burn counters cheaply: each ack-eliciting packet the peer sends
         // is answered by a pure ACK, which is one sealed counter and is
         // never tracked.
+        //
+        // **[ruling 271]** The `drain_boundary` call is what keeps this
+        // *cheap*, and it is a fixture repair rather than a change of
+        // subject: this test's property is §12.5's per-block walk, which
+        // has nothing to do with the ACK cadence, but the counters it
+        // needs were being bought at the cadence's exchange rate. Under
+        // coalescing, 400 undrained pings buy **13** counters — the first
+        // immediate ACK plus one per `ACK_COALESCE_MAX` — and the
+        // precondition below fails on the fixture, not on the behaviour.
+        // Firing the already-due deadline after each ping is the driver's
+        // own drain boundary and restores one ACK per two pings.
         for _ in 0..400 {
             s.deliver(t, &ping());
+            drain_boundary(&mut s, t);
         }
         let floor = s.conn.next_counter().expect("installed");
         assert!(
@@ -1835,6 +1995,16 @@ mod processing {
     /// the two flags are easy to conflate into one. A build that conflates
     /// them ACKs padding, and §8.4 lets a peer send any number of PADDING
     /// bytes anywhere.
+    ///
+    /// **[ruling 271]** The middle assertion had to be **strengthened**, not
+    /// merely translated. It read *"this is the 1st and not the 2nd"* off
+    /// `d.transmits().is_empty()` — and post-271 the 2nd transmits nothing
+    /// either, so that observable stopped separating the two and the test
+    /// would have passed a build that counted the PADDING packet. The
+    /// deadline separates them: the 1st arms at `t + MAX_ACK_DELAY`, the
+    /// 2nd re-arms at `t`. A build that let PADDING advance `since_ack`
+    /// puts a due deadline where a 25 ms one belongs, and *nothing on the
+    /// wire says so* until the drain boundary.
     #[test]
     fn a_padding_only_packet_elicits_no_ack() {
         let t = t0();
@@ -1852,15 +2022,18 @@ mod processing {
         // only the 1st: proof that the PADDING packet did not advance
         // §12.4's counter either.
         let d = s.deliver(t, &ping());
-        assert!(
-            d.transmits().is_empty(),
+        assert!(d.transmits().is_empty(), "§8.3: nothing is owed yet");
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t + MAX_ACK_DELAY),
             "§2.1: a non-eliciting packet does not advance `since_ack`, so \
-             this is the 1st and not the 2nd"
+             this is the 1st — armed at MAX_ACK_DELAY, not due at `now`"
         );
 
         // …and the ACK the 2nd provokes covers the PADDING packet's
         // counter all the same.
-        let d = s.deliver(t, &ping());
+        s.deliver(t, &ping());
+        let d = drain_boundary(&mut s, t);
         let got = acks(&mut s, &d);
         assert_eq!(got.len(), 1);
         assert_eq!(
@@ -1880,6 +2053,13 @@ mod processing {
     /// somewhere, and the second half (the counter appearing in the ACK)
     /// fails a build that skips the window mark for keepalives entirely,
     /// which is the shortcut that makes the peer retransmit them forever.
+    ///
+    /// **[ruling 271]** Same strengthening as
+    /// [`a_padding_only_packet_elicits_no_ack`]: *"counter 1 is only the
+    /// 1st"* was read off an empty transmit list, which the 2nd now
+    /// satisfies too. The armed deadline is what still tells the two
+    /// apart — `t + MAX_ACK_DELAY` for the 1st, `t` for the 2nd — and the
+    /// ACK itself is collected at the drain boundary.
     #[test]
     fn a_keepalive_elicits_no_ack_but_is_still_acknowledged() {
         let t = t0();
@@ -1890,12 +2070,30 @@ mod processing {
             d.transmits().is_empty(),
             "§3.4/§12.4: a keepalive carries no ack-eliciting frame"
         );
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            None,
+            "§12.4: a keepalive arms no timer either"
+        );
 
         // Counter 1 is in order behind the keepalive's 0, so it is the 1st
-        // and only arms; the 2nd is what emits.
+        // and arms at MAX_ACK_DELAY; the 2nd makes the ACK due.
         let d = s.deliver(t, &ping());
         assert!(d.transmits().is_empty());
-        let d = s.deliver(t, &ping());
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t + MAX_ACK_DELAY),
+            "§12.4: the keepalive did not advance `since_ack`, so this is \
+             the 1st"
+        );
+
+        s.deliver(t, &ping());
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t),
+            "§12.4 (ruling 271): …and this is the 2nd"
+        );
+        let d = drain_boundary(&mut s, t);
         let got = acks(&mut s, &d);
         assert_eq!(got.len(), 1);
         assert_eq!(
@@ -1915,6 +2113,16 @@ mod processing {
     /// core that folds the two before calling `on_recv` loses it silently.
     /// The unit tests in `ack_delay` cannot see this: they call `on_recv`
     /// with the flag the test chose.
+    ///
+    /// **[ruling 271]** Only the **first** stanza moved, and only in how the
+    /// ACK is collected: the 2nd ack-eliciting packet arms `AckDelay` at
+    /// its own `now` instead of emitting, so the ACK is taken from the
+    /// drain boundary at that same instant. The instant is what the stanza
+    /// is about — `ack_delay = 0` because emission and the largest's
+    /// arrival coincide — and it is unchanged, which is why the assertion
+    /// is unchanged. The two `MAX_ACK_DELAY` stanzas below were green
+    /// through ruling 271 and are untouched: §12.4's *first* unacknowledged
+    /// packet still arms at 25 ms, and a keepalive still arms nothing.
     #[test]
     fn the_wire_delay_is_zero_when_a_keepalive_holds_the_greatest() {
         let t = t0();
@@ -1925,8 +2133,15 @@ mod processing {
         // `gap` after the largest's arrival.
         let mut s = Solo::installed_at(t);
         s.deliver(t, &ping()); // counter 0, immediate ACK
-        s.deliver(t, &ping()); // counter 1, armed
-        let d = s.deliver(t + gap, &ping()); // counter 2, the 2nd → ACK now
+        s.deliver(t, &ping()); // counter 1, armed at t + 25 ms
+        s.deliver(t + gap, &ping()); // counter 2, the 2nd → due at t + gap
+        assert_eq!(
+            s.conn.timer(TimerKind::AckDelay),
+            Some(t + gap),
+            "§12.4 (ruling 271): the 2nd re-arms at this packet's `now`, \
+             which is earlier than the 1st's `t + 25 ms`"
+        );
+        let d = drain_boundary(&mut s, t + gap);
         let got = acks(&mut s, &d);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].largest, 2);

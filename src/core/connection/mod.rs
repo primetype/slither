@@ -3941,6 +3941,43 @@ mod smoke {
         panic!("the two cores never went quiet");
     }
 
+    /// [`exchange`], then §12.4's **drain boundary**, then [`exchange`]
+    /// again.
+    ///
+    /// **[RATIFIED 2026/08/18 — ruling 271]** `exchange` shuttles until
+    /// neither core has a datagram left to *build*, and a coalesced ACK is
+    /// precisely the thing that has not been built at that point: it sits
+    /// `pending` behind an `AckDelay` armed at `now` itself, which
+    /// [`shell::driver`](crate::shell)'s `biased` `select!` fires the
+    /// instant the socket empties. Nothing in the core names that instant —
+    /// the driver's loop *is* the receive drain — so a fixture that shuttles
+    /// to quiescence has to supply it.
+    ///
+    /// Without it the ACK never leaves, and every test downstream of one
+    /// reads as a §12.5 failure rather than as a missing boundary: this is
+    /// working rule 13, *the fixture bounds the coverage*, arriving as a
+    /// fixture that cannot express a state the protocol now requires.
+    ///
+    /// Only the **already-due** deadline is fired, and only `AckDelay`: a
+    /// deadline in the future belongs to the test's own clock, and firing
+    /// one here would silently advance a §13 timer the caller is measuring.
+    fn settle(
+        a: &mut Connection<Suite>,
+        b: &mut Connection<Suite>,
+        now: Instant,
+    ) -> (Vec<ConnEvent>, Vec<ConnEvent>) {
+        let (mut events_a, mut events_b) = exchange(a, b, now);
+        for conn in [&mut *a, &mut *b] {
+            if conn.timer(TimerKind::AckDelay).is_some_and(|at| at <= now) {
+                conn.handle_timeout(now);
+            }
+        }
+        let (rest_a, rest_b) = exchange(a, b, now);
+        events_a.extend(rest_a);
+        events_b.extend(rest_b);
+        (events_a, events_b)
+    }
+
     /// Hand every datagram `from` produced to `to`, and drain `to`.
     fn deliver(
         from: &mut Connection<Suite>,
@@ -4148,6 +4185,18 @@ mod smoke {
     ///
     /// `StreamFinished` **cannot** fire without every one of those working,
     /// which is what makes one assertion cover the seam.
+    ///
+    /// **[ruling 271]** The middle of this test is the delayed-ACK policy
+    /// being real rather than nominal, and that is where it moved. It used
+    /// to assert `AckDelay == Some(now + MAX_ACK_DELAY)` — the odd packet
+    /// out waiting on the 25 ms timer. Under coalescing the flight is
+    /// several packets, so the 2nd of them re-arms at `now` itself and
+    /// every later one folds in: the deadline is `Some(now)`, already due,
+    /// and the pump has deliberately declined to build the ACK-only
+    /// datagram it would have built before. The defect class is unchanged
+    /// and so is its shape — **a build that ACKed every packet has an empty
+    /// timer here and settles a step early**, passing every completion
+    /// test — only the instant asserted moved from `+25 ms` to `+0`.
     #[test]
     fn an_ack_drains_the_sent_map_and_completes_the_send_half() {
         let now = Instant::now();
@@ -4169,23 +4218,24 @@ mod smoke {
         let (mut events, _) = exchange(&mut a, &mut b, now);
 
         // §12.4, and this is the delayed-ACK policy being real rather than
-        // nominal: A's last packet is the 1st since B's previous ACK and
-        // arrived in order, so B owes nothing yet and `AckDelay` carries it.
-        // A build that ACKed every packet has an empty timer here and
-        // settles a step early — and passes every completion test.
-        let delayed = now + constants::MAX_ACK_DELAY;
+        // nominal: B has taken A's whole flight without emitting an ACK for
+        // it, and `AckDelay` — armed at `now` itself by the 2nd packet, and
+        // re-armed no later by any of the rest — is what carries it. A build
+        // that ACKed every packet has an empty timer here and settles a step
+        // early, and passes every completion test.
         assert_eq!(
             b.timer(TimerKind::AckDelay),
-            Some(delayed),
-            "§12.4: the odd packet out waits on the timer"
+            Some(now),
+            "§12.4 (ruling 271): the coalesced ACK waits on a due deadline"
         );
         assert!(
             a.bytes_in_flight() > 0,
-            "…and until it fires, that packet is still in flight"
+            "…and until it fires, those packets are still in flight"
         );
 
-        b.handle_timeout(delayed);
-        let (rest, _) = exchange(&mut a, &mut b, delayed);
+        // The drain boundary: the socket is empty, so the due deadline wins.
+        b.handle_timeout(now);
+        let (rest, _) = exchange(&mut a, &mut b, now);
         events.extend(rest);
 
         assert_eq!(
@@ -4207,8 +4257,28 @@ mod smoke {
     /// An **in-order** first ack-eliciting packet must *not* draw an
     /// immediate ACK; it arms `AckDelay` at exactly `MAX_ACK_DELAY`. A build
     /// that kept the old policy passes every completion test and fails this.
+    ///
+    /// **[RATIFIED 2026/08/18 — ruling 271]** This test was named
+    /// `the_second_in_order_packet_draws_the_ack_the_first_only_arms_the_timer`,
+    /// and the second packet no longer draws the ACK: §12.4's every-2nd
+    /// trigger **re-arms `AckDelay` at `now` itself** — a deadline already
+    /// due — and the emission happens when that fires, which at the core
+    /// seam is `handle_timeout(now)` and at the driver is the `select!`
+    /// finding the socket empty.
+    ///
+    /// The distinguishability the test exists for is *intact and sharper*:
+    /// the two triggers are now told apart by the **instant** `AckDelay`
+    /// carries, `now + MAX_ACK_DELAY` against `now`, where before the second
+    /// was told apart by a datagram. Neither packet transmits, so dropping
+    /// either timer assertion would leave two indistinguishable arrivals and
+    /// a test that asserts nothing — working rule 9's degenerate case,
+    /// reachable here by *deleting* rather than by weakening.
+    ///
+    /// The final `handle_timeout` half is not decoration either: without it
+    /// this test passes a build that arms correctly and never emits, which
+    /// is the one shape coalescing makes easy to write.
     #[test]
-    fn the_second_in_order_packet_draws_the_ack_the_first_only_arms_the_timer() {
+    fn the_first_in_order_packet_arms_the_timer_and_the_second_makes_it_due_now() {
         let now = Instant::now();
         let (mut a, mut b) = pair(now);
         let _ = drain(&mut a);
@@ -4241,8 +4311,22 @@ mod smoke {
         a.write(now, r, b"third").expect("write");
         let (third, _) = drain(&mut a);
         b.handle_datagram(now, v4(1), &third[0]);
+        let (still_none, _) = drain(&mut b);
+        assert!(
+            still_none.is_empty(),
+            "§12.4 (ruling 271): the 2nd arms too — it does not emit: \
+             {still_none:?}"
+        );
+        assert_eq!(
+            b.timer(TimerKind::AckDelay),
+            Some(now),
+            "§12.4 (ruling 271): …re-armed at `now`, so the driver flushes \
+             it the moment the socket is empty"
+        );
+
+        b.handle_timeout(now);
         let (ack, _) = drain(&mut b);
-        assert_eq!(ack.len(), 1, "§12.4: an ACK is owed after every 2nd");
+        assert_eq!(ack.len(), 1, "§12.4: one ACK, at the drain boundary");
         assert_eq!(
             b.timer(TimerKind::AckDelay),
             None,
@@ -4390,7 +4474,15 @@ mod smoke {
             if a.bytes_in_flight() == 0 {
                 break;
             }
-            // §12.4 holds the odd packet's ACK on `AckDelay`; step to it.
+            // §12.4 holds the batch's ACK on `AckDelay`; step past it.
+            //
+            // **[ruling 271]** This read *"the odd packet's ACK"*, which is
+            // the pre-271 shape: one ACK per two packets left at most one
+            // straggler on the timer. Coalescing puts the **whole** batch
+            // there, on a deadline armed at `now` rather than at
+            // `now + 25 ms`. Stepping by `MAX_ACK_DELAY` fires either — a
+            // due deadline is still due later — so the loop is unchanged;
+            // only the sentence explaining it was wrong.
             clock += constants::MAX_ACK_DELAY;
             a.handle_timeout(clock);
             b.handle_timeout(clock);
@@ -4414,6 +4506,13 @@ mod smoke {
     /// A build whose snapshot is "all streams' current offsets, re-read at
     /// each poll" never terminates under a writer loop, and one that settles
     /// at `write()` settles before the bytes have left.
+    ///
+    /// **[ruling 271]** Nothing here is about §12.4, and nothing here
+    /// changed except the fixture: `exchange` alone now goes quiet with B's
+    /// ACK still `pending`, so A is never told and the snapshot never
+    /// settles. [`settle`] adds the drain boundary the driver supplies, and
+    /// the failure it repairs is worth naming — a §16.2 assertion went red
+    /// for a §12.4 reason, with no §12 vocabulary anywhere in the panic.
     #[test]
     fn a_snapshot_settles_only_once_its_bytes_are_acknowledged() {
         let now = Instant::now();
@@ -4439,7 +4538,7 @@ mod smoke {
         // so this second write must not keep it from settling.
         a.write(now, r, &vec![4u8; 4_000]).expect("write");
         a.flush(now);
-        let _ = exchange(&mut a, &mut b, now);
+        let _ = settle(&mut a, &mut b, now);
         assert!(
             a.snapshot_settled(&snap),
             "§16.2: the snapshot covers what was handed over at the call"
