@@ -322,6 +322,38 @@ pub const MESSAGE_RECV_MAX: u64 = 262_144;
 /// third (ruling 104).
 pub const REASSEMBLY_CHUNKS_MAX: usize = 1024;
 
+/// The conforming STREAM-frame size §10.6's **credit-derived** reassembly
+/// ceiling divides the advertised stream window by. §10.6.
+///
+/// **[RATIFIED 2026/08/18 — ruling 270]** [`REASSEMBLY_CHUNKS_MAX`] is the
+/// **floor** of that ceiling, not the ceiling itself: a receiver tolerates
+/// `max(REASSEMBLY_CHUNKS_MAX, window / REASSEMBLY_MIN_CONFORMING_FRAME + 1)`
+/// stored discontiguous ranges per stream. The flat 1 024 is *stricter* than
+/// §10.6's own mandate — *"per-stream reassembly state MUST be O(advertised
+/// credit)"* — and the strictness is what killed conforming peers at a raised
+/// window: a stream's credit and its tolerated hole count were set by two
+/// constants that did not scale together, so a sender inside its credit, on a
+/// path that lost packets in the pattern a saturated receive socket produces,
+/// exceeded the second while obeying the first.
+///
+/// **Why a packet-scale divisor, and why this one.** Dividing by a frame size
+/// is what separates the honest case (holes ≤ window ÷ frame size) from the
+/// adversarial one (one-byte frames at alternating offsets, ≤ credit ÷ 2):
+/// the flood the ceiling exists to kill is **512× above** the derived value
+/// and still dies. The value is one fill quantum's worth of stream data —
+/// deliberately its **own** constant and not a reference to
+/// `frame::STREAM_FILL_QUANTUM`, which is §8.5's implementation-defined
+/// round-robin quantum, is kept out of this table on purpose, and is the
+/// **local sender's** choice rather than anything a receiver may derive a
+/// policy from. They agree at 1 024 today, and this is the receiver's own
+/// number.
+///
+/// **Receiver policy, observable** — the same third kind as
+/// [`REASSEMBLY_CHUNKS_MAX`] (ruling 103), and for the same reason: no wire
+/// byte moves, and a peer that fragments past one receiver's ceiling is
+/// killed and past another's is not.
+pub const REASSEMBLY_MIN_CONFORMING_FRAME: u64 = 1024;
+
 // ═══════════════════════════════════════════════════════════════════════
 // Unreliable datagrams (§11.2, §11.3)
 // ═══════════════════════════════════════════════════════════════════════

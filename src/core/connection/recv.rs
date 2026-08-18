@@ -14,9 +14,23 @@
 //! 32× remote memory amplification produced by following the section that
 //! exists to forbid it. This is (b): ranges are **coalesced on insert**,
 //! nothing is allocated ahead of arrival, and a stream whose stored
-//! discontiguous ranges would exceed `REASSEMBLY_CHUNKS_MAX` after
-//! coalescing is a `PROTOCOL_VIOLATION` (§10.6, ruling 104's third §10
+//! discontiguous ranges would exceed [`ceiling_for`] its advertised window
+//! after coalescing is a `PROTOCOL_VIOLATION` (§10.6, ruling 104's third §10
 //! violation).
+//!
+//! # The ceiling is derived from the credit, and floored at the constant
+//!
+//! **[RATIFIED 2026/08/18 — ruling 270]** That ceiling was a flat
+//! `REASSEMBLY_CHUNKS_MAX`, which is *stricter* than §10.6's own mandate —
+//! *"per-stream reassembly state MUST be O(advertised credit)"* — and the
+//! strictness killed conforming peers: a stream's credit and its tolerated
+//! hole count were two constants that did not scale together, so at a raised
+//! window a sender **inside its credit**, on a path that lost packets in the
+//! pattern a saturated receive socket produces, exceeded the second while
+//! obeying the first and was answered with `PROTOCOL_VIOLATION`. The ceiling
+//! is now `max(REASSEMBLY_CHUNKS_MAX, window / REASSEMBLY_MIN_CONFORMING_FRAME
+//! + 1)`; the constant is its **floor**, the disposition is unchanged, and
+//! [`ceiling_for`] carries the property and its proof.
 //!
 //! [`Reassembly::capacity`] is the accounting ruling 94 requires be
 //! **test-visible**: §10.6's memory bound is otherwise an untestable MUST,
@@ -111,7 +125,7 @@ impl RecvHalf {
     /// Identical to [`new`](Self::new) at the ratified value.
     pub(crate) fn with_window(window: u64) -> Self {
         Self {
-            reassembly: Reassembly::new(),
+            reassembly: Reassembly::new(window),
             read_offset: 0,
             high_water: 0,
             final_size: None,
@@ -621,22 +635,95 @@ impl Chunk {
     }
 }
 
+/// §10.6's ceiling on stored discontiguous ranges, **derived from the
+/// advertised credit** and floored at [`constants::REASSEMBLY_CHUNKS_MAX`].
+///
+/// **[RATIFIED 2026/08/18 — ruling 270]**
+///
+/// # The property this guarantees
+///
+/// *A peer that never exceeds its advertised stream credit, and whose STREAM
+/// frames each carry at least [`constants::REASSEMBLY_MIN_CONFORMING_FRAME`]
+/// bytes, cannot cross this ceiling under any loss or reordering pattern the
+/// network produces.*
+///
+/// # Why it holds
+///
+/// 1. **Stored chunks are maximal runs.** [`Reassembly::insert`] merges on
+///    *adjacency*, not merely on overlap (ruling 253's gap-merge invariant),
+///    so stored chunks are pairwise disjoint **and** non-adjacent and the
+///    stored count is `holes + 1`.
+/// 2. **Every chunk is at least one frame wide.** A chunk is the union of the
+///    frames that built it, so it is no smaller than the smallest of them:
+///    ≥ `P`. The one exception is the **front** chunk, which
+///    [`Reassembly::read`] may have partially handed to the application
+///    (`Chunk::advance`); that is the `+ 1`.
+/// 3. **Every stored byte lies inside the window.** Below `read_offset` the
+///    bytes are already delivered and `insert` drops them; above
+///    `read_offset + W` is a `FLOW_CONTROL_ERROR` that `check_stream` raises
+///    before `insert` is reached.
+/// 4. Disjoint ranges of ≥ `P` bytes inside a `W`-byte span number at most
+///    `W / P`. With (2)'s exception: `W / P + 1`.
+///
+/// # What still dies, unchanged
+///
+/// The disposition is **not** relaxed: crossing the ceiling is still
+/// `PROTOCOL_VIOLATION` (§10.5's third violation, ruling 104), and the
+/// tiny-fragment flood §10.6 exists to stop still crosses it. That flood
+/// stores ~`W / 2` ranges — one-byte frames at offsets 0, 2, 4, … — which is
+/// **512×** the derived ceiling. No sender of `P`-byte frames can reach the
+/// region where the two differ; that boundary is the whole point of dividing
+/// by a packet-scale constant rather than by 2.
+///
+/// # The floor
+///
+/// [`constants::REASSEMBLY_CHUNKS_MAX`] does not move — it is §10.6's
+/// ratified value and the ceiling's floor, so no receiver becomes *stricter*
+/// than today and the ratified 256 KiB window (which derives 257) keeps
+/// exactly the tolerance it has always had.
+///
+/// # Memory
+///
+/// Per-chunk metadata is `size_of::<Chunk>()` in a `VecDeque`, and the bytes
+/// themselves are the credit already committed. At the ratified window that
+/// is the floor's 1 024 chunks; at an 8 MiB window it is 8 193, whose
+/// metadata is a low single-digit percentage of the 8 MiB of credit the
+/// operator deliberately purchased — so §17.5's *"the credit term dominates"*
+/// survives the raise.
+fn ceiling_for(window: u64) -> usize {
+    let derived = window / constants::REASSEMBLY_MIN_CONFORMING_FRAME + 1;
+    // `usize` on a 16-bit target could not hold this; slither's targets are
+    // 32- and 64-bit, and a saturating conversion is the honest clamp rather
+    // than a cast that would wrap the ceiling to something *smaller* than the
+    // floor.
+    let derived = usize::try_from(derived).unwrap_or(usize::MAX);
+    derived.max(constants::REASSEMBLY_CHUNKS_MAX)
+}
+
 /// §10.6's admissible implementation (b): coalesce on insert, hard-fail past
-/// `REASSEMBLY_CHUNKS_MAX`.
+/// the credit-derived ceiling (ruling 270; [`ceiling_for`]).
 struct Reassembly {
     /// Disjoint, non-adjacent, ascending by offset.
     chunks: VecDeque<Chunk>,
     /// Ruling 253's accounting — see [`Reassembly::copy_work`].
     copy_work: u64,
+    /// §10.6's ceiling for **this** stream, [`ceiling_for`] the window this
+    /// half advertises. Read at construction because the window is fixed for
+    /// the half's life (ruling 259(viii) configures it at open; MAX_STREAM_DATA
+    /// re-grants the same window as the application consumes, and never
+    /// widens it).
+    chunks_max: usize,
 }
 
 impl Reassembly {
-    fn new() -> Self {
+    fn new(window: u64) -> Self {
         // **Ruling 94: allocate lazily.** No `with_capacity` here — this is
-        // the line that would turn 128 peer-opened streams into 32 MiB.
+        // the line that would turn 128 peer-opened streams into 32 MiB. The
+        // ceiling is a bound on what may be stored, never a reservation.
         Self {
             chunks: VecDeque::new(),
             copy_work: 0,
+            chunks_max: ceiling_for(window),
         }
     }
 
@@ -865,9 +952,12 @@ impl Reassembly {
             }
         }
 
-        // §10.6: *"would exceed `REASSEMBLY_CHUNKS_MAX` (= 1024) **after
-        // coalescing**"*, so the count is checked here and not before.
-        if self.chunks.len() > constants::REASSEMBLY_CHUNKS_MAX {
+        // §10.6: *"would exceed [the ceiling] **after coalescing**"*, so the
+        // count is checked here and not before. **[ruling 270]** The ceiling
+        // is `REASSEMBLY_CHUNKS_MAX` **or** what this half's advertised
+        // credit derives, whichever is larger — see [`ceiling_for`] for the
+        // property that makes an honest peer unable to reach it.
+        if self.chunks.len() > self.chunks_max {
             return Err(Violation::Reassembly);
         }
         Ok(())

@@ -672,11 +672,21 @@ impl BulkMeter {
 }
 
 /// The shared cells every bulk cell drives: the meter, the flag its writers
-/// watch, and the optional wire seams sampled at the timed section's edges.
+/// watch, the cell's cause of death, and the optional wire seams sampled at
+/// the timed section's edges.
 #[derive(Clone)]
 struct BulkState {
     meter: Rc<RefCell<BulkMeter>>,
     done: Rc<Cell<bool>>,
+    /// Why this cell stopped early, if it did — see [`BulkState::fail`].
+    ///
+    /// **`done` is set only by the meter, so a cell whose connection dies
+    /// never sets it.** Every task that watches `done` must watch this too or
+    /// it idles forever: round 42 spent six minutes at 0 % CPU watching a
+    /// `while !done.get()` loop whose connection had been killed by a
+    /// `PROTOCOL_VIOLATION` ten seconds in, and the failure presented as a
+    /// hang rather than as the protocol error it was.
+    failure: Rc<RefCell<Option<String>>>,
     /// `(sender, receiver)` counters, absent for the TCP cells where the wire
     /// belongs to the kernel and no seam is available.
     wires: Option<(Rc<WireCounters>, Rc<WireCounters>)>,
@@ -704,6 +714,7 @@ impl BulkState {
                 samples,
             ))),
             done: Rc::new(Cell::new(false)),
+            failure: Rc::new(RefCell::new(None)),
             wires: None,
             edges: Rc::new(Cell::new(Edges::default())),
         }
@@ -748,8 +759,47 @@ impl BulkState {
         }
     }
 
+    /// Record why this cell stopped early. The **first** cause wins: a dead
+    /// connection makes every task fail, and the first one to notice holds
+    /// the diagnosis closest to the cause.
+    fn fail(&self, why: impl Into<String>) {
+        let mut slot = self.failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(why.into());
+        }
+    }
+
+    /// Whether the cell has already died. Every loop that watches
+    /// [`BulkState::done`] watches this as well, so a task cannot outlive
+    /// the connection it is driving.
+    fn failed(&self) -> bool {
+        self.failure.borrow().is_some()
+    }
+
+    /// The per-window figures — **or a panic**.
+    ///
+    /// A cell that died mid-run used to return whatever the meter had
+    /// collected, and the `BENCH` line said `n=2` with nothing to say that
+    /// anything had gone wrong. These lines are read to decide whether a
+    /// change worked; a short one is not a slow result, it is **no result**,
+    /// and it must not be mistaken for a measurement. Fail loudly instead.
     fn finish(self) -> Vec<f64> {
-        self.meter.borrow().out.clone()
+        let failure = self.failure.borrow().clone();
+        let out = self.meter.borrow().out.clone();
+        let wanted = self.meter.borrow().wanted;
+        assert!(
+            failure.is_none(),
+            "the cell died after {} of {wanted} windows: {}",
+            out.len(),
+            failure.unwrap_or_default()
+        );
+        assert!(
+            out.len() >= wanted,
+            "the cell produced {} of {wanted} windows and reported no cause — \
+             the transfer ended without the meter being satisfied",
+            out.len()
+        );
+        out
     }
 
     /// A comma-separated note describing what the wire carried for the payload
@@ -994,16 +1044,19 @@ async fn slither_link(
 /// Write every byte of `buf`, looping over partial writes; `false` once the
 /// stream can take no more. `write` is a partial verb (§16.4) and a benchmark
 /// that ignored that would move less than it reported.
-async fn write_all(tx: &mut SendStream<ReferenceSuite>, buf: &[u8]) -> bool {
+/// The error is **carried out**, not discarded: it is the diagnosis a dead
+/// cell reports, and swallowing it is what made a `PROTOCOL_VIOLATION` look
+/// like a hang.
+async fn write_all(tx: &mut SendStream<ReferenceSuite>, buf: &[u8]) -> Result<(), String> {
     let mut off = 0;
     while off < buf.len() {
         match tx.write(&buf[off..]).await {
             Ok(0) => panic!("write returned 0 for a non-empty buffer"),
             Ok(n) => off += n,
-            Err(_) => return false,
+            Err(e) => return Err(format!("write failed after {off} B of a chunk: {e}")),
         }
     }
-    true
+    Ok(())
 }
 
 /// Open `count` uni streams from `ca` and accept them on `cb`.
@@ -1065,10 +1118,13 @@ async fn slither_bulk(
 
     let mut tasks = Vec::with_capacity(streams * 2);
     for mut tx in txs {
-        let (done, chunk) = (Rc::clone(&state.done), Rc::clone(&chunk));
+        let (state, chunk) = (state.clone(), Rc::clone(&chunk));
         tasks.push(tokio::task::spawn_local(async move {
-            while !done.get() {
-                if !write_all(&mut tx, &chunk).await {
+            // `failed()` as well as `done`: `done` is the meter's flag and a
+            // dead cell never satisfies the meter.
+            while !state.done.get() && !state.failed() {
+                if let Err(why) = write_all(&mut tx, &chunk).await {
+                    state.fail(why);
                     return;
                 }
             }
@@ -1082,8 +1138,13 @@ async fn slither_bulk(
         let state = state.clone();
         tasks.push(tokio::task::spawn_local(async move {
             let mut scratch = vec![0u8; CHUNK];
-            while let Ok(Some(n)) = rx.read(&mut scratch).await {
-                state.record(n);
+            loop {
+                match rx.read(&mut scratch).await {
+                    Ok(Some(n)) => state.record(n),
+                    // The FIN the writer sends once the meter is satisfied.
+                    Ok(None) => return,
+                    Err(e) => return state.fail(format!("read failed: {e}")),
+                }
             }
         }));
     }
@@ -1119,8 +1180,9 @@ async fn tcp_bulk(relay: Option<(&Relay, Duration)>, nodelay: bool) -> Vec<f64> 
             let mut scratch = vec![0u8; CHUNK];
             loop {
                 match sock.read(&mut scratch).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => state.record(n),
+                    Err(e) => return state.fail(format!("TCP read failed: {e}")),
                 }
             }
         })
@@ -1133,8 +1195,9 @@ async fn tcp_bulk(relay: Option<(&Relay, Duration)>, nodelay: bool) -> Vec<f64> 
         client.set_nodelay(true).expect("TCP_NODELAY on the client");
     }
     let chunk: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
-    while !state.done.get() {
-        if client.write_all(&chunk).await.is_err() {
+    while !state.done.get() && !state.failed() {
+        if let Err(e) = client.write_all(&chunk).await {
+            state.fail(format!("TCP write failed: {e}"));
             break;
         }
     }

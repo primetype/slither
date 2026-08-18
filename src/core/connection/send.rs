@@ -36,7 +36,48 @@
 //! known, temporary condition closed by slice 5 — and **not** a licence to
 //! free on send, which would be a collapsed implementation that makes slice
 //! 5's tests pass for free.
+//!
+//! # The write buffer is a ring
+//!
+//! **[RATIFIED 2026/08/18 — ruling 269(iii)]** [`SendHalf::buf`] is a
+//! [`VecDeque<u8>`], and [`SendHalf::release`] retires the ACKed prefix by
+//! advancing the ring's head. It was a `Vec<u8>` with a
+//! `drain(..acked_prefix)` on every acknowledged STREAM range — an O(live
+//! bytes) `memmove` per incoming ACK, which round 42's profile measured at
+//! **21 %** of the per-datagram CPU budget at the ratified 256 KiB window and
+//! **94 %** at 8 MiB, where it collapsed single-stream throughput 12× down
+//! the window ladder.
+//!
+//! **The bound this representation is chosen for.** A ring has **no slack**:
+//! `buf.len()` is exactly the live byte count, `write_offset − base`, the
+//! same identity the `Vec` had — [`SendHalf::release`] asserts it. Peak
+//! allocation is therefore bounded by the peak live count under the same
+//! geometric growth policy `Vec` already used, and the live count is bounded
+//! by the stream's advertised credit because [`SendHalf::write`] accepts only
+//! `max_data − write_offset`, capped again by the connection's own headroom.
+//! **Ruling 94's discipline is that per-stream allocation is a first-class
+//! budget**, and the alternative — keeping the `Vec` and carrying a dead
+//! prefix behind an offset cursor — buys its O(1) amortisation by *spending*
+//! that budget: compaction is only amortised O(1) if it triggers at a slack
+//! proportional to the live size, which is precisely a multiple of the window
+//! held in dead bytes (round 42's measurement mutant used 2×). The ring pays
+//! nothing: no dead byte is ever retained and no byte is ever copied by a
+//! release.
+//!
+//! Two consequences, both deliberate. A `VecDeque` cannot hand out one
+//! contiguous slice, so [`SendHalf::copy_range`] rebuilds the retransmission
+//! range out of the ring's two halves — at most two `memcpy`s, into the
+//! `Vec` the caller was going to allocate anyway. And a front `drain` on a
+//! `VecDeque` moves no element, which is the whole point: the cost of
+//! releasing `n` bytes is O(1), not O(what is left).
+//!
+//! This is the shape the **receive** half already had: `recv.rs`'s reassembly
+//! `Chunk` carries its own head and `advance()`s it rather than shifting its
+//! tail down. The send half was the outlier.
+//!
+//! [`VecDeque<u8>`]: std::collections::VecDeque
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::constants;
@@ -75,7 +116,13 @@ struct ResetState {
 pub(crate) struct SendHalf {
     /// Bytes accepted from the application and not yet released, starting at
     /// `base`.
-    buf: Vec<u8>,
+    ///
+    /// **A ring, and never a `Vec`** — see the module doc's *"The write
+    /// buffer is a ring"*. `buf.len()` is exactly the live byte count
+    /// `write_offset − base` (outside a reset, which clears the buffer and
+    /// leaves both offsets where they stood), so the buffer holds no slack
+    /// and retiring the ACKed prefix moves no byte.
+    buf: VecDeque<u8>,
     base: u64,
     /// The next offset a write will occupy — and §10.1's per-stream
     /// contribution to the connection-level send sum.
@@ -122,7 +169,7 @@ impl SendHalf {
     /// limit.
     pub(crate) fn new() -> Self {
         Self {
-            buf: Vec::new(),
+            buf: VecDeque::new(),
             base: 0,
             write_offset: 0,
             fresh: RangeSet::default(),
@@ -277,7 +324,10 @@ impl SendHalf {
         }
         self.blocked = false;
         let start = self.write_offset;
-        self.buf.extend_from_slice(&data[..room]);
+        // `VecDeque`'s `Extend<&u8>` is specialised to a `copy_slice` for
+        // `Copy` elements, so this is the same single `memcpy` the `Vec`'s
+        // `extend_from_slice` was.
+        self.buf.extend(&data[..room]);
         self.write_offset += room as u64;
         self.fresh.insert(start..self.write_offset);
         Ok(room)
@@ -326,7 +376,7 @@ impl SendHalf {
         self.fresh.clear();
         self.retransmit.clear();
         self.unacked.clear();
-        self.buf = Vec::new();
+        self.buf = VecDeque::new();
         self.blocked = false;
     }
 
@@ -349,7 +399,7 @@ impl SendHalf {
         self.fresh.clear();
         self.retransmit.clear();
         self.unacked.clear();
-        self.buf = Vec::new();
+        self.buf = VecDeque::new();
         self.blocked = false;
         true
     }
@@ -392,7 +442,7 @@ impl SendHalf {
         }
         let start = range.start;
         let end = start + take as u64;
-        let data = self.slice(start, end).to_vec();
+        let data = self.copy_range(start, end);
 
         if fresh {
             self.fresh.remove(start..end);
@@ -570,13 +620,40 @@ impl SendHalf {
             .unwrap_or(0)
     }
 
-    fn slice(&self, start: u64, end: u64) -> &[u8] {
+    /// The stream bytes `[start, end)`, copied out of the ring.
+    ///
+    /// The `Vec` this returns is the one [`next_chunk`](SendHalf::next_chunk)
+    /// was going to allocate anyway — the `Vec` buffer's `slice(..).to_vec()`
+    /// allocated it too. A ring cannot hand out one contiguous slice, so the
+    /// copy is made from the two halves `as_slices` reports rather than from
+    /// one: two `memcpy`s at worst, one whenever the range does not straddle
+    /// the wrap.
+    ///
+    /// Out-of-range indices panic, exactly as the `Vec`'s `&buf[lo..hi]` did:
+    /// a caller asking for bytes outside `[base, write_offset)` has a defect
+    /// in its range sets, and the loud failure is the point.
+    fn copy_range(&self, start: u64, end: u64) -> Vec<u8> {
         let lo = (start - self.base) as usize;
         let hi = (end - self.base) as usize;
-        &self.buf[lo..hi]
+        let (front, back) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(hi - lo);
+        if lo < front.len() {
+            out.extend_from_slice(&front[lo..hi.min(front.len())]);
+        }
+        if hi > front.len() {
+            out.extend_from_slice(&back[lo.saturating_sub(front.len())..hi - front.len()]);
+        }
+        out
     }
 
     /// Release the ACKed contiguous prefix of the write buffer.
+    ///
+    /// **[ruling 269(iii)]** O(1) in the bytes released and O(1) in the bytes
+    /// left: a front `drain` on a `VecDeque` advances the ring's head and
+    /// moves no element. The `Vec` this replaced re-`memmove`d every live
+    /// byte on **every** acknowledged STREAM range — the cost round 42's
+    /// profile found at 21 % of the per-datagram budget at the ratified
+    /// window and 94 % at 8 MiB. See the module doc.
     fn release(&mut self) {
         let Some(first) = self.acked.first() else {
             return;
@@ -589,9 +666,20 @@ impl SendHalf {
             return;
         }
         let drop = (up_to - self.base) as usize;
+        // The clamp is against the **live** length, which is what
+        // `buf.len()` is — see the field's doc. It bites only after a reset
+        // has emptied the buffer while leaving the offsets standing; without
+        // it, a late ACK for a range sent before the reset would advance
+        // `base` past `write_offset`.
         let drop = drop.min(self.buf.len());
         self.buf.drain(..drop);
         self.base += drop as u64;
+        debug_assert!(
+            self.reset.is_some()
+                || self.peer_reset.is_some()
+                || self.buf.len() as u64 == self.write_offset - self.base,
+            "the ring holds exactly the live bytes"
+        );
     }
 }
 
