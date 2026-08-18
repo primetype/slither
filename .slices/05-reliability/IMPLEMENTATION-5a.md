@@ -460,7 +460,7 @@ exist.
 | test | what it pins |
 |---|---|
 | `an_ack_drains_the_sent_map_and_completes_the_send_half` | the whole §12.4 → §12.2 → §12.5 → §9.7 loop, plus the delayed ACK carrying the odd packet out |
-| `the_second_in_order_packet_draws_the_ack_the_first_only_arms_the_timer` | §12.4's two triggers are distinguishable; an immediate-ACK build fails the middle assertion |
+| `the_second_in_order_packet_draws_the_ack_the_first_only_arms_the_timer` | §12.4's two triggers are distinguishable; an immediate-ACK build fails the middle assertion *[Superseded 2026/08/18 by ruling 271: the emission point this row argues moved to the receive-drain boundary and the test is now `the_first_in_order_packet_arms_the_timer_and_the_second_makes_it_due_now`; the due trigger is unchanged.]* |
 | `the_pto_is_armed_only_while_something_is_in_flight` | §13.3's precondition, from both sides |
 | `a_firing_pto_probes_a_flight_loss_detection_cannot_yet_judge` | §13.4's probe rescuing a flight with `largest_acked == None`, and ruling 43's track-but-do-not-gate |
 | `the_window_defers_the_seal_and_never_the_acceptance` | ruling 134 and §14.5's gate together, at datagram granularity, with a 32 KiB transfer completing through it |

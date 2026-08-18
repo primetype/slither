@@ -1217,6 +1217,68 @@ mod policy {
             assert!(a.is_ready(), "counter {c}: the debt is not paid by arrival");
         }
     }
+
+    /// §12.4's safety valve (ruling 271): at exactly `ACK_COALESCE_MAX`
+    /// unacknowledged ack-eliciting packets the debt is discharged
+    /// **mid-drain** — `owed`, `AckAction::Now` — without waiting for the
+    /// boundary, and the every-2nd counter resets with it.
+    ///
+    /// Written at integration, after two independent matrices found the
+    /// same hole (ruling 271's record): deleting the valve branch from
+    /// `on_recv` turned **nothing** red across the whole suite — the
+    /// deepest burst any test fed the policy was 20, and the valve starts
+    /// mattering at 32. The `const _` guard in `constants.rs` pins only
+    /// the ratio to the trigger, not the branch's existence.
+    ///
+    /// Mutation caught, two-sided (rule 9), against the **literal** 32 —
+    /// deliberately not the constant, which a drifted build would drag
+    /// along with it (the first cut of this test did exactly that, and a
+    /// valve=16 mutant sailed through green): a build with the branch
+    /// deleted, or the valve raised, returns `Arm(t)` at the 32nd and
+    /// fails the flush assertion; a build with the valve lowered (16, or
+    /// the =2 revert) returns `Now` inside the loop and fails the fold
+    /// assertion. A red here on a deliberate value change is a wire-pin
+    /// red: it needs a ruling, not an updated expectation.
+    #[test]
+    fn the_coalesce_valve_discharges_the_debt_mid_drain() {
+        /// `ACK_COALESCE_MAX`'s ratified value, as a literal.
+        const VALVE: u64 = 32;
+        let t = t0();
+        let mut a = AckState::new();
+        a.on_recv(t, 0, None, true, true);
+        a.on_ack_packed();
+
+        assert_eq!(
+            a.on_recv(t, 1, Some(0), true, true),
+            AckAction::Arm(t + MAX_ACK_DELAY),
+            "the 1st since the pack arms long, valve or no valve"
+        );
+        for c in 2..VALVE {
+            assert_eq!(
+                a.on_recv(t, c, Some(c - 1), true, true),
+                AckAction::Arm(t),
+                "counter {c}: under the valve the burst folds — it does not flush"
+            );
+            assert!(!a.is_owed(), "counter {c}: due is not owed");
+        }
+
+        assert_eq!(
+            a.on_recv(t, VALVE, Some(VALVE - 1), true, true),
+            AckAction::Now,
+            "§12.4 (ruling 271): the {VALVE}th discharges mid-drain"
+        );
+        assert!(
+            a.is_owed(),
+            "…and it builds a packet rather than riding one"
+        );
+
+        a.on_ack_packed();
+        assert_eq!(
+            a.on_recv(t, VALVE + 1, Some(VALVE), true, true),
+            AckAction::Arm(t + MAX_ACK_DELAY),
+            "the valve resets the every-2nd counter, not only the debt"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

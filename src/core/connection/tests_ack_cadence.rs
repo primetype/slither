@@ -330,9 +330,12 @@ fn a_burst_of_twenty_in_one_receive_batch_emits_at_most_one_ack() {
 /// Separating mutation: none that
 /// [`a_burst_of_twenty_in_one_receive_batch_emits_at_most_one_ack`] does
 /// not already catch — a debt latch consumed once per drain satisfies this
-/// for free. **If this passes at base it pins nothing** and should be read
-/// as documentation of the seam, not as a gate. The red-green matrix in
-/// `AUTHOR-ACK-REPORT.md` records which it was.
+/// for free. This doc once continued *"if this passes at base it pins
+/// nothing … not as a gate"*; the recorded matrices settled it the other
+/// way (`AUTHOR-ACK-REPORT.md`, `MUTATION-271-REPORT.md`): red at base
+/// before the fix, red under the `ACK_COALESCE_MAX` → 2 revert after it.
+/// It **is** a working gate for the drain-scoped reading, kept as one —
+/// author conflict C1, closed in ruling 271's record.
 #[test]
 fn twenty_datagrams_before_a_single_poll_output_loop_emit_at_most_one_ack() {
     let t = t0();
