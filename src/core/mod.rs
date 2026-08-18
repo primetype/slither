@@ -197,9 +197,9 @@ pub struct Transmit {
 /// be threaded to both call sites is a policy two call sites can disagree
 /// about. Minting the pair in one place makes the agreement structural.
 ///
-/// *Named for its older half:* the endpoint's minting verb is still
-/// `draw_sub_seed`, and the rename is a one-line follow-up in a file this
-/// slice's partition did not hold.
+/// The endpoint's minting verb is `mint_conn_seed` — renamed from
+/// `draw_sub_seed` at integration, once the partition that had kept
+/// `staged.rs` out of reach lifted.
 ///
 /// [`Endpoint::mint_pending`]: endpoint::Endpoint::mint_pending
 #[derive(Debug, Clone, Copy)]

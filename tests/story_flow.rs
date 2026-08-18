@@ -44,7 +44,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use slither::config::WindowError;
+use slither::ConfigError;
 use slither::constants::{INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA, MESSAGE_RECV_MAX};
 use slither::testutil::{Pair, TestSendStream, local};
 use slither::{Config, MessageError};
@@ -418,8 +418,9 @@ async fn the_message_bound_does_not_move_with_the_window() {
 // Validation — the knob raises, never lowers
 // ══════════════════════════════════════════════════════════════════════
 
-/// The refusals, from **outside** the crate: `WindowError` is part of the
-/// public surface, and a consumer must be able to name what it caught.
+/// The refusals, from **outside** the crate: the window variants sit on
+/// `ConfigError` beside the keepalive pair (folded there at integration,
+/// ruling 259(viii)), and a consumer must be able to name what it caught.
 ///
 /// The three rejections and the two boundaries they sit on. `config.rs`'s
 /// unit tests assert the same predicates from inside; this asserts that the
@@ -433,13 +434,13 @@ fn the_knob_refuses_to_lower_or_to_overflow() {
         Config::new()
             .with_flow_windows(INITIAL_MAX_STREAM_DATA - 1, INITIAL_MAX_DATA)
             .unwrap_err(),
-        WindowError::TooSmall
+        ConfigError::WindowTooSmall
     );
     assert_eq!(
         Config::new()
             .with_flow_windows(INITIAL_MAX_STREAM_DATA, INITIAL_MAX_DATA - 1)
             .unwrap_err(),
-        WindowError::TooSmall
+        ConfigError::WindowTooSmall
     );
     // At the defaults: a legal no-op raise, so the refusal is `<`, not `<=`.
     assert!(
@@ -460,7 +461,7 @@ fn the_knob_refuses_to_lower_or_to_overflow() {
         Config::new()
             .with_flow_windows(varint_max, varint_max + 1)
             .unwrap_err(),
-        WindowError::TooLarge
+        ConfigError::WindowTooLarge
     );
     // `INITIAL_MAX_STREAM_DATA <= INITIAL_MAX_DATA` is a `constants.rs`
     // const-assert for the defaults; the configured pair keeps it. Both
@@ -470,6 +471,6 @@ fn the_knob_refuses_to_lower_or_to_overflow() {
         Config::new()
             .with_flow_windows(RAISED_CONNECTION, INITIAL_MAX_DATA)
             .unwrap_err(),
-        WindowError::StreamAboveConnection
+        ConfigError::StreamWindowAboveConnection
     );
 }

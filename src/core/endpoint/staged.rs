@@ -709,7 +709,7 @@ impl<I: Identity> Endpoint<I> {
         // index, so the endpoint's draw order is the same shape as
         // `connect()`'s and later connection-side randomness cannot
         // perturb it.
-        let sub_seed = self.draw_sub_seed();
+        let sub_seed = self.mint_conn_seed();
         let our_index = self.indices.mint(&mut self.rng);
 
         let read = {

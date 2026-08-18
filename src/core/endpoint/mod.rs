@@ -345,7 +345,7 @@ impl<I: Identity> Endpoint<I> {
     /// `accept()` — so the two cannot advertise different policy, and the
     /// draw order §16.6 pins is untouched: the RNG is read exactly as
     /// before, and the windows are a `Copy` read off the config.
-    fn draw_sub_seed(&mut self) -> ConnSeed {
+    fn mint_conn_seed(&mut self) -> ConnSeed {
         let mut sub_seed = [0u8; 32];
         self.rng.fill_bytes(&mut sub_seed);
         ConnSeed {
@@ -442,7 +442,7 @@ impl<I: Identity> Endpoint<I> {
         }
 
         let conn = self.next_connection_id();
-        let sub_seed = self.draw_sub_seed();
+        let sub_seed = self.mint_conn_seed();
         let peer_mac1 = Mac1Key::derive(&key);
 
         let mut pending = Pending {

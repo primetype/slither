@@ -382,7 +382,8 @@ pub enum DatagramError {
     ConnectionLost(#[from] ConnectionLost),
 }
 
-/// Why a configuration value was rejected. §16.2, ruling 44.
+/// Why a configuration value was rejected. §16.2, ruling 44; the flow
+/// windows, ruling 259(viii).
 ///
 /// Outside §18.1 by that ruling — a configuration error, not a protocol
 /// one: no peer, no packet, no connection state, nothing observable on the
@@ -395,6 +396,30 @@ pub enum ConfigError {
     /// The persistent-keepalive interval is at or above `DEAD_TIMEOUT`.
     #[error("the persistent-keepalive interval is at or above DEAD_TIMEOUT")]
     KeepaliveTooLong,
+    /// A flow-control window below §10.2's ratified initial value.
+    ///
+    /// **[ruling 259(viii)]** The knob **raises**; it does not lower.
+    /// Lowering re-opens every sizing proof that rests on the constants —
+    /// §17.5's memory ceiling, §9.8's message bound, and the un-negotiated
+    /// initial value a peer assumes before any credit frame arrives.
+    #[error("a flow-control window below §10.2's ratified initial value")]
+    WindowTooSmall,
+    /// A flow-control window above the largest value a §8.1 varint carries.
+    ///
+    /// MAX_DATA and MAX_STREAM_DATA carry the advertised limit as one
+    /// varint (§8.4), and the limit is an **absolute offset** that only
+    /// grows, so a window the frame cannot encode is unusable from the
+    /// first grant. `constants.rs` pins the same bound on the defaults.
+    #[error("a flow-control window above VarInt::MAX_VALUE (2^62 - 1)")]
+    WindowTooLarge,
+    /// The configured stream window exceeds the connection window.
+    ///
+    /// `constants.rs` pins `INITIAL_MAX_STREAM_DATA <= INITIAL_MAX_DATA`
+    /// for the defaults; a configured pair that inverts it advertises
+    /// per-stream credit the connection ledger will refuse anyway (§10.5
+    /// checks both levels).
+    #[error("the stream window exceeds the connection window")]
+    StreamWindowAboveConnection,
 }
 
 #[cfg(test)]
@@ -527,6 +552,9 @@ mod tests {
             Box::new(DatagramError::ConnectionLost(ConnectionLost::TimedOut)),
             Box::new(ConfigError::KeepaliveTooShort),
             Box::new(ConfigError::KeepaliveTooLong),
+            Box::new(ConfigError::WindowTooSmall),
+            Box::new(ConfigError::WindowTooLarge),
+            Box::new(ConfigError::StreamWindowAboveConnection),
         ]
     }
 

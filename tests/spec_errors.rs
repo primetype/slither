@@ -278,14 +278,21 @@ fn match_datagram_error(e: DatagramError) {
 /// (ruling 44: "`ConfigError` is a **configuration** error and
 /// deliberately sits outside §18.1's protocol-error taxonomy ... no peer,
 /// no packet, and no connection state is involved, and nothing about it is
-/// observable on the wire"). Its home is §16.2: `set_persistent_keepalive`
-/// returns `Result<(), ConfigError>` with exactly two variants, each naming
-/// the bound it violated — `KeepaliveTooShort` (below 1 s, the floor,
-/// ruling 42) and `KeepaliveTooLong` (at or above `DEAD_TIMEOUT`, the
-/// ceiling, ruling 40).
+/// observable on the wire"). Its homes are §16.2 and §10.2:
+/// `set_persistent_keepalive` returns `Result<(), ConfigError>` —
+/// `KeepaliveTooShort` (below 1 s, the floor, ruling 42) and
+/// `KeepaliveTooLong` (at or above `DEAD_TIMEOUT`, the ceiling, ruling
+/// 40) — and `Config::with_flow_windows` returns
+/// `Result<Config, ConfigError>` with ruling 259(viii)'s three window
+/// refusals: `WindowTooSmall` (below the ratified initial),
+/// `WindowTooLarge` (above `2^62 - 1`), `StreamWindowAboveConnection`
+/// (the pair inverted). Each variant names the bound it violated.
 fn match_config_error(e: ConfigError) {
     match e {
         ConfigError::KeepaliveTooShort => {}
         ConfigError::KeepaliveTooLong => {}
+        ConfigError::WindowTooSmall => {}
+        ConfigError::WindowTooLarge => {}
+        ConfigError::StreamWindowAboveConnection => {}
     }
 }

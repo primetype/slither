@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants;
 use crate::core::Timestamp;
+use crate::error::ConfigError;
 
 /// The one wall-clock reading the protocol performs (§5.3, §16.5).
 ///
@@ -47,46 +48,6 @@ impl WallClock for SystemClock {
             Err(_) => Timestamp::new(0, 0),
         }
     }
-}
-
-/// Why [`Config::with_flow_windows`] refused a pair of windows.
-///
-/// **[ruling 259(viii)]** Every variant is a *raise* that is not a raise:
-/// the knob may only widen §10.2's ratified initial windows, and it may
-/// not widen them past what §8.1's varint can carry or past each other.
-///
-/// **Integrator note (this slice's partition):** these three belong beside
-/// [`crate::error::ConfigError`]'s keepalive variants, and the crate root
-/// should re-export the type alongside `Config`. `src/error.rs` and
-/// `src/lib.rs` were outside the partition this knob was written in, so
-/// the type lives here and is reachable as
-/// `slither::config::WindowError`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum WindowError {
-    /// A window below §10.2's ratified initial value.
-    ///
-    /// The knob **raises**; it does not lower. Lowering re-opens every
-    /// sizing proof that rests on the constants — §17.5's memory ceiling,
-    /// §9.8's message bound, and the un-negotiated initial value a peer
-    /// assumes before any credit frame arrives.
-    #[error("a flow-control window below §10.2's ratified initial value")]
-    TooSmall,
-    /// A window above the largest value a §8.1 varint carries.
-    ///
-    /// MAX_DATA and MAX_STREAM_DATA carry the advertised limit as one
-    /// varint (§8.4), and the limit is an **absolute offset** that only
-    /// grows, so a window the frame cannot encode is unusable from the
-    /// first grant. `constants.rs` pins the same bound on the defaults.
-    #[error("a flow-control window above VarInt::MAX_VALUE (2^62 - 1)")]
-    TooLarge,
-    /// The stream window exceeds the connection window.
-    ///
-    /// `constants.rs` pins `INITIAL_MAX_STREAM_DATA <= INITIAL_MAX_DATA`
-    /// for the defaults; a configured pair that inverts it advertises
-    /// per-stream credit the connection ledger will refuse anyway (§10.5
-    /// checks both levels).
-    #[error("the stream window exceeds the connection window")]
-    StreamAboveConnection,
 }
 
 /// An endpoint's configuration.
@@ -293,12 +254,12 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// - [`WindowError::TooSmall`] if either value is below its ratified
+    /// - [`ConfigError::WindowTooSmall`] if either value is below its ratified
     ///   default. Lowering re-opens every sizing proof that rests on the
     ///   constants, so it is refused rather than clamped.
-    /// - [`WindowError::TooLarge`] if either value exceeds `2^62 - 1`, the
+    /// - [`ConfigError::WindowTooLarge`] if either value exceeds `2^62 - 1`, the
     ///   largest offset a §8.1 varint carries.
-    /// - [`WindowError::StreamAboveConnection`] if `stream` exceeds
+    /// - [`ConfigError::StreamWindowAboveConnection`] if `stream` exceeds
     ///   `connection` — the relation `constants.rs` pins for the defaults.
     ///
     /// # Example
@@ -313,17 +274,17 @@ impl Config {
     ///     .expect("a raise within the varint bound");
     /// assert_eq!(config.stream_window(), 2 * 1024 * 1024);
     /// ```
-    pub fn with_flow_windows(mut self, stream: u64, connection: u64) -> Result<Self, WindowError> {
+    pub fn with_flow_windows(mut self, stream: u64, connection: u64) -> Result<Self, ConfigError> {
         if stream < Self::DEFAULT_STREAM_WINDOW || connection < Self::DEFAULT_CONNECTION_WINDOW {
-            return Err(WindowError::TooSmall);
+            return Err(ConfigError::WindowTooSmall);
         }
         if stream > crate::varint::VarInt::MAX_VALUE
             || connection > crate::varint::VarInt::MAX_VALUE
         {
-            return Err(WindowError::TooLarge);
+            return Err(ConfigError::WindowTooLarge);
         }
         if stream > connection {
-            return Err(WindowError::StreamAboveConnection);
+            return Err(ConfigError::StreamWindowAboveConnection);
         }
         self.stream_window = stream;
         self.connection_window = connection;
@@ -433,7 +394,7 @@ mod tests {
                     constants::INITIAL_MAX_DATA,
                 )
                 .unwrap_err(),
-            WindowError::TooSmall,
+            ConfigError::WindowTooSmall,
         );
         assert_eq!(
             Config::new()
@@ -442,7 +403,7 @@ mod tests {
                     constants::INITIAL_MAX_DATA - 1,
                 )
                 .unwrap_err(),
-            WindowError::TooSmall,
+            ConfigError::WindowTooSmall,
         );
         let at_the_defaults = Config::new()
             .with_flow_windows(
@@ -473,11 +434,11 @@ mod tests {
             Config::new()
                 .with_flow_windows(max + 1, max + 1)
                 .unwrap_err(),
-            WindowError::TooLarge,
+            ConfigError::WindowTooLarge,
         );
         assert_eq!(
             Config::new().with_flow_windows(max, max + 1).unwrap_err(),
-            WindowError::TooLarge,
+            ConfigError::WindowTooLarge,
             "the connection window is checked on its own, not only via the pair",
         );
     }
@@ -488,7 +449,7 @@ mod tests {
             Config::new()
                 .with_flow_windows(1 << 23, 1 << 20)
                 .unwrap_err(),
-            WindowError::StreamAboveConnection,
+            ConfigError::StreamWindowAboveConnection,
         );
     }
 }
