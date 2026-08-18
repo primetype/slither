@@ -675,6 +675,20 @@ impl Chunk {
 /// region where the two differ; that boundary is the whole point of dividing
 /// by a packet-scale constant rather than by 2.
 ///
+/// # The hypothesis's edge, honestly (review F2)
+///
+/// The guarantee covers senders whose frames each carry ≥ `P` bytes.
+/// slither's own sender emits sub-`P` frames as **packet residue**
+/// (`fill` takes `room.min(STREAM_FILL_QUANTUM)`, and the tail of a
+/// packet can leave less than `P` of room), so a stream fed *only*
+/// residues — a round-robin-starved stream on a busy connection — is
+/// outside the stated hypothesis. Two things bound the honesty debt:
+/// same-stream frames within one datagram are offset-contiguous, so a
+/// lost datagram opens one hole per *span*, not per frame; and the flat
+/// ceiling this derivation replaces was **never more lenient** (`max`
+/// means no receiver became stricter), so any traffic pattern outside
+/// the hypothesis is no worse off than it ever was.
+///
 /// # The floor
 ///
 /// [`constants::REASSEMBLY_CHUNKS_MAX`] does not move — it is §10.6's

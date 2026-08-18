@@ -57,6 +57,16 @@ use super::stream_id::StreamId;
 /// packet in one pass while two streams alternate within one.
 pub(super) const STREAM_FILL_QUANTUM: usize = 1024;
 
+// Ruling 270's conforming-frame hypothesis, guarded where it can drift:
+// slither-as-sender must fill frames at least as large as the minimum its
+// own receiver's credit-derived reassembly ceiling assumes conforming
+// (`REASSEMBLY_MIN_CONFORMING_FRAME`). Lowering this quantum below that
+// constant would silently carry slither's own saturating sender outside
+// the guarantee ruling 270 proves — this assertion makes that a compile
+// error instead (review finding F1, 2026/08/18).
+const _: () =
+    assert!(STREAM_FILL_QUANTUM as u64 >= crate::constants::REASSEMBLY_MIN_CONFORMING_FRAME);
+
 /// §8.4's fixed body width for `PATH_CHALLENGE`/`PATH_RESPONSE`: **eight
 /// opaque bytes, not a varint**. **[ruling 208]**
 ///

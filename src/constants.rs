@@ -311,7 +311,9 @@ pub const CREDIT_REGRANT_DIVISOR: u64 = 2;
 /// than one stream's credit could never arrive whole.
 pub const MESSAGE_RECV_MAX: u64 = 262_144;
 
-/// Distinct out-of-order chunks the reassembler will hold per stream. §10.6.
+/// The **floor** of §10.6's credit-derived reassembly ceiling (ruling 270):
+/// the distinct out-of-order chunks every receiver tolerates per stream,
+/// whatever its window. §10.6.
 ///
 /// **Receiver policy, observable** (ruling 103) — the third kind, and the
 /// one §10.2's table has no row for. A peer that fragments past one

@@ -5,11 +5,12 @@
 //!
 //! **[RATIFIED 2026/08/15 — ruling 104]** §10.5 is titled "Violations",
 //! sits inside the chapter that defines all three, and enumerates **two**.
-//! The third is §10.6's: reassembly ranges exceeding `REASSEMBLY_CHUNKS_MAX`
-//! after coalescing is a `PROTOCOL_VIOLATION`. §10.5's closing *"There is no
-//! tolerance band; the limits are exact"* is true of the two it lists and
-//! **false of the third** — `REASSEMBLY_CHUNKS_MAX` is explicitly a
-//! tolerance. [`Violation`] carries all three.
+//! The third is §10.6's: reassembly ranges exceeding the credit-derived
+//! ceiling (floor `REASSEMBLY_CHUNKS_MAX` — ruling 270) after coalescing is
+//! a `PROTOCOL_VIOLATION`. §10.5's closing *"There is no tolerance band;
+//! the limits are exact"* is true of the two it lists and **false of the
+//! third** — the ceiling is explicitly a tolerance. [`Violation`] carries
+//! all three.
 //!
 //! # The connection-level consumed count is a per-stream absolute sum
 //!
