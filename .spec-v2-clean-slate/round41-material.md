@@ -18,7 +18,10 @@ release gates today — all nine are green at `65af633`.
    `REPLAY_WINDOW` (2 048) counters of a boundary — 32× tighter than the
    sentence reads at the production epoch (same-epoch packets 3 000
    counters back are refused by §7.2, not the ratchet). Rule 8's shape;
-   worth a §7.7 clause.
+   worth a §7.7 clause. **[RESOLVED 2026/08/18 — ruling 256:
+   delivery-scope clause + Appendix B companion; the verb corrected —
+   the retained key opens the whole preceding epoch, §7.2 bounds
+   *delivery*.]**
 3. **Coalescing granularity in the [40, 49) both-owed window** (ruling
    250 implemented the amended sentence's letter: all-or-nothing over
    the owed set). Greedy is strictly better by one 9 B frame there.
@@ -39,7 +42,9 @@ release gates today — all nine are green at `65af633`.
    over-promised")` fires at `Pair::seeded(0xE5B0000C)`, one 2 KiB uni
    stream, `FlakyPolicy::lossy(0.5).with_delay(20 ms, 0)` (R40-A author).
    Benign in release (the arm defers via `return_chunk`), panics debug
-   drivers. No existing test reaches it — rule 13's shape.
+   drivers. No existing test reaches it — rule 13's shape. **[RESOLVED
+   2026/08/18 — ruling 257: one-predicate fix, deterministic
+   regression, `extends_to_end` scope noted at the query.]**
 8. **The pump loop's `contested.is_pending()` offer disjunct is
    unreachable** (predates ruling 250; reported in place at the R40-B
    merge). Its comment reads as a live mechanism.

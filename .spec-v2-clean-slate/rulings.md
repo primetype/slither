@@ -7708,3 +7708,149 @@ does_not_kill_the_driver`, the reproducer verbatim — red on the
 first-strike build, green on this one. No spec text moves: the guard was
 never ratified prose; ruling 249's amendment-table row ("the driver's
 past-deadline guard goes release-mode") remains true.
+
+## Round 41 — the recorded residue, in ranked order (2026/08/18)
+
+> **Resuming?** The round's input is `round41-material.md` (15 items,
+> committed at `1395ea6`). The maintainer ordered the two ranked first.
+> Each was re-verified by a fresh Opus agent before ruling — item 2
+> read-only against spec, code and hiss's vendored source; item 7
+> reproduced, instrumented and fixed in an isolated worktree — and the
+> two verification reports are persisted beside this file as
+> `round41-A-straggler-scope.md` and `round41-B-streams-1077.md`. Line
+> references at `1395ea6`.
+
+### 256 — §7.7 states the straggler window's delivery scope: retention is not reach
+
+**Ruling: §7.7's retention sentence gains its scope clause — the
+retained previous-epoch key opens any counter of the preceding epoch,
+but §7.2 binds after it, so a straggler *delivers* only while the
+receiver's greatest authenticated counter is within `REPLAY_WINDOW`
+(2048) counters of the epoch boundary: one part in 32 of
+`REKEY_EPOCH_MSGS`. Appendix B's straggler obligation gains the
+companion: both pins are about opening, and must be built at an epoch
+size below `REPLAY_WINDOW`, because at the production size §7.2 refuses
+every preceding-epoch packet. No code changes.**
+
+The recorded item (`round41-material.md` item 2) had the right number
+and the wrong verb: it said the one-epoch-back key is *reachable* only
+within `REPLAY_WINDOW` of a boundary. It is not — hiss's past-epoch arm
+(`hiss-0.3.2/src/noise/datagram.rs:350–359`) carries no counter-distance
+term and opens every counter of epoch `e−1` under the retained key. What
+is bounded is **delivery**: the receive path is AEAD-then-window
+(`session.rs:588–599` — "Only now: the window check"), and the window
+drops anything more than `REPLAY_WINDOW` behind the greatest. Measured,
+not argued (report §3c, a probe crate at the knob epoch): a
+previous-epoch packet 2048 behind the greatest is delivered, 2049 is
+dropped — identical to the same-epoch control — and 2048 rather than
+2047 is exact only because the greatest sits outside the bitmap
+(`session.rs:52–64`, pinned two-sided at `session.rs:671`). Both
+framings give 65 536 / 2048 = 32: the fraction of the previous epoch
+ever deliverable, and the fraction of the current epoch during which
+the previous key still delivers.
+
+Rule 8's shape — a stated construction ("one epoch back") with an
+unstated scope — and a promotion, not a discovery: §2.1's hiss-facts
+row (SPEC.md:542, pre-amendment) already argues the same arithmetic as
+reassurance, and the consequence is written out in-tree twice
+(`tests/spec_rekey.rs:798–822`, `tests/story_rekey.rs:384–405`). The
+rule-4 sweep re-read both places a reader forms this belief plus §7.2's
+sizing bullet (SPEC.md:2166–2169); all three are consistent with the
+clause as landed, and no other SPEC text argues from straggler reach
+(every `straggler` and `reorder` hit checked). Rule 3's tiebreak also
+points at tightening the prose: no proof rests on the loose "one epoch
+back", while §12.2's ACK fusion rests on the window being the single
+received-packet record.
+
+Why the prose tightens rather than the code widening — none of it would
+move a wire byte (the Data header carries no epoch field,
+`src/packet/header.rs:83–103`; straggler reach is receiver-local), yet
+every route is blocked: enlarging `REPLAY_WINDOW` touches a ratified
+constant, and the window *is* the ACK record (§7.2's fusion,
+SPEC.md:2171–2172) — matching one epoch costs 8 KB per connection per
+direction; a second, epoch-scoped acceptance record is what the fusion
+forbids, a delivered-but-unwindowed packet is un-ACKable, and
+`the_derivation_never_reaches_past_the_windows_edge`
+(`tests_ack.rs:684–689`) exists to kill exactly that second tracker;
+delivering old packets unmarked deletes ruling 169's "no replayed
+packet ever moves the endpoint" for precisely the widened class. And
+the widening buys nothing the protocol claims: §7.2 sizes 2048 as the
+reordering budget, and a datagram 2049 counters late is outside that
+budget whether or not a key boundary sits in between.
+
+Options declined, one by one to the maintainer: extending the clause
+with the refusal attribution (the two refusals differ at exactly one
+surface — the opened-but-out-of-window straggler reaches
+`slither::replay`, §18.2, where two-epochs-back is a bare decrypt
+failure; measured in report §5) hard-couples a crypto section to a
+trace target the `session.rs:600` comment already records; the
+self-contained variant folding test methodology into §7.7 puts it where
+authors don't look — Appendix B is the methodology's home; record-only
+leaves rule 8's defect live in the section.
+
+### 257 — the bare FIN defers when no frame fits: `None` and `Some(0)` are opposite facts
+
+**Ruling: the rotation pump treats `stream_payload_room`'s `None` as
+its own fact — "not even an empty frame fits", so defer — instead of
+collapsing it onto `Some(0)`'s "a frame fits, with no payload". One
+predicate at `streams.rs:1071`:
+`fits.is_none() || (room == 0 && has_data_pending())`. The
+`debug_assert!` stays — it caught a real defect. A deterministic
+regression replaces the seed hunt, and `stream_payload_room`'s doc
+records the `extends_to_end` scope. No spec text moves.**
+
+The defect (R40-A's author, `round41-material.md` item 7; reproduced
+verbatim on the first try, and on 3 of a 64-seed sweep at 50 % loss):
+`streams.rs:1071`'s `unwrap_or(0)` collapses the seam's two return
+values, and the guard on the next line rescues only
+`has_data_pending()`. A **bare FIN** — §9.5's empty FIN-only frame,
+owed after the data drained — is not data: `next_chunk`'s FIN branch
+(`send.rs:373–383`) never consults `max_len`, so against a packet at
+`used == budget` the pump walks past the defer and offers a 5-byte
+frame to a packet with no room. `fill` refuses — correctly: `push`'s
+`used + len > budget` check is §8.6's per-seal bound, so the caller,
+not the seam, was wrong — and the assert fires. Instrumentation showed
+every packing quantity identical at query and fill: not a state race,
+and not an over-strict `fill`.
+
+Release behaviour was verified, not trusted (rule 12): transfers
+complete bytes-intact, the arm fires at most once per affected transfer
+(the packet is full; the next starts empty), and the pre/post-fix
+virtual-time completion instants across all 64 sweep seeds are
+**identical** — the broken release build and the fixed one are
+observationally indistinguishable. A debug-driver panic only; nothing
+on the wire, no constant, no timer.
+
+The regression is built, not hunted (rule 13's lesson written forward):
+the arm needs a retransmit prefix summing to exactly `MAX_PLAINTEXT`
+with a bare FIN owed in the same pump — a **coincidence** class the
+fixture population cannot produce on demand (the deliberate-loss tests
+drop chosen indices precisely so their geometry stays stable; the only
+two `lossy` stream tests are two fixed seeds at a fifth of the
+reproducing loss rate). The deterministic four-step geometry: 2048 B on
+a uni stream, pumped; `finish()` after the drain, so the FIN is a bare
+obligation at offset 2048; the first packet declared lost, so the
+retransmit repacks to exactly 1170 B; pump. Two separating assertions,
+because the builds are release-identical and rule 9 demands the broken
+version fail something: the pump completes without panicking (red on
+the unfixed build, deterministically, under the ordinary `cargo test`
+gate), and **the deferred FIN is emitted by the very next packet** with
+the reader reaching end-of-stream — the half that kills a "fix" which
+defers by `set_queued(false)` instead of `push_front`, or which forgets
+`return_chunk`'s `fin_sent` restoration; both hang the peer forever
+while passing the no-panic half.
+
+Recorded with the fix, for whoever adds a third `extends_to_end`
+contributor: `stream_payload_room` never consults
+`Packing::extends_to_end`, while `push` (`frame.rs:1100–1102`) refuses
+everything once the flag is set — rule 8's shape again, unreachable
+today only by arithmetic accident: a ¬LEN DATAGRAM leaves at most one
+byte of room, every stream frame's fixed fields need at least two, so
+the query returns `None` there and funnels into this ruling's defer
+rather than a second defect. The structural fix — a three-valued room
+result with somewhere to consult the flag — was presented and declined
+for today: it changes ruling 207(c)'s `pub(crate)` seam, which the
+slice-6 datagram contributor and the slice-7 probe packing both sit on,
+for zero behavioural difference; it becomes the required shape the
+moment a third extends-to-end contributor or a ¬LEN STREAM emitter
+exists.

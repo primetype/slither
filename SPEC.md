@@ -28,6 +28,7 @@
 > | 252 | §6.4, §6.5, §6.8 | drain `accept()` is every application's obligation, not the dialler's — a lost msg2 is only closed by the next accept (S34) |
 > | 253 | §10.6 | coalesce-on-insert gains its work bound, O(credit · log credit), and capacity stays the arrived span |
 > | 254 | §13.3, §14.4, the constants tables | `PTO_BACKOFF_CAP` 2⁶ → 2³: the ladder fits inside `DEAD_TIMEOUT`'s window; survival envelope stated |
+> | 256 | §7.7, Appendix B | retention is not reach: the previous-epoch key delivers only within `REPLAY_WINDOW` counters of the boundary — one part in 32 — and the straggler pins must be built below it |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -3186,7 +3187,14 @@ a wrong `Rekey()` agrees with itself):
 `REKEY(0³²) = 25ce5d37df19f3783185f2ffd5ab17fa3397c212f02d62fb1733e0b875b74c58`.
 The receiver retains the current and immediately preceding epoch keys
 (straggler tolerance: one epoch back); anything older is refused, its key
-ratcheted away. The ratchet is **forward rotation only, not healing**:
+ratcheted away. Retention is not reach **[AMENDED 2026/08/18 — ruling
+256]**: the retained key opens **any** counter of the preceding epoch,
+but §7.2 binds after it — a packet more than `REPLAY_WINDOW` counters
+behind the greatest authenticated counter is dropped post-AEAD without
+delivery. The previous-epoch key therefore delivers only while the
+receiver's greatest is within `REPLAY_WINDOW` counters of the boundary:
+2048 of `REKEY_EPOCH_MSGS`' 65 536, one part in 32. The ratchet is
+**forward rotation only, not healing**:
 post-compromise healing within a connection **does not exist** — an
 exfiltrated session key decrypts its direction until the application
 reconnects, and healing is application reconnect policy (the TLS 1.3
@@ -7292,8 +7300,12 @@ clock (§16.10); no test sleeps.
   run if debug-slow.
 - **Straggler tolerance** (§7.7): a packet from the immediately preceding
   epoch opens after the receiver commits to the new one; a packet from
-  **two** epochs back is refused without key derivation. The refusal is
-  the separating assertion — a build that never rekeys opens the e−2
+  **two** epochs back is refused without key derivation. Both pins are
+  about **opening**, and must be built at an epoch size below
+  `REPLAY_WINDOW`: §7.2's window is what refuses a preceding-epoch
+  packet further back than that, and at `REKEY_EPOCH_MSGS` it refuses
+  every one of them **[AMENDED 2026/08/18 — ruling 256]**. The refusal
+  is the separating assertion — a build that never rekeys opens the e−2
   straggler happily, where boundary-invisibility alone is satisfied for
   free by the build in which nothing ever happens.
 - The `REKEY(0³²)` vector (§7.7), pinned test-only in slither via
