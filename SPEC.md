@@ -40,6 +40,7 @@
 > | 268 | Appendix B | O13's flush parenthetical becomes admission-driven — the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
 > | 269 | §10.2 | the window-limited cap is ≈ window/(2 × RTT) — §10.3's half-window re-grant is the factor; the 259(viii) clause read window/RTT until the benchmark measured it (`bench-vs-tcp-2026-08.md`) |
 > | 270 | §10.2 kinds, §10.5, §10.6, §17.5, Appendix B | the reassembly ceiling derives from the advertised credit — max(`REASSEMBLY_CHUNKS_MAX`, W/`REASSEMBLY_MIN_CONFORMING_FRAME`+1); a conforming full-frame sender inside its credit can no longer be killed by loss; the flood still dies 512× above the ceiling; O53b's gate recorded run |
+| 271 | §12.4, §16.5 | the ACK emission point: due stays every-2nd, emission coalesces to the receive-drain boundary (at most one per drain per `ACK_COALESCE_MAX` — 32, new, named; gap the sole exception); §16.5's drain-before-deadline order becomes normative. **No wire byte moves; the wire mix does**: ACK-only datagrams 33.6 % → 3.4 %, bulk ~88 → 108–115 MiB/s default, 129–135 raised |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -4614,16 +4615,54 @@ estimator subtracts the peer's `ack_delay` capped at `MAX_ACK_DELAY`
 QUIC's default; congestion control now consumes ACK timing, and streams
 make 1:1 ACK traffic a real reverse-path cost, while 25 ms is already the
 PTO formula's assumption — the change is self-consistent. The cost is one
-more named timer and slightly laggier RTT samples; immediate-ACK remains
-the conservative fallback if the Appendix B timing obligations disappoint.
+more named timer and slightly laggier RTT samples. **[AMENDED 2026/08/18
+— ruling 271]** This paragraph ended *"immediate-ACK remains the
+conservative fallback if the Appendix B timing obligations disappoint"*,
+written when the emission point was the every-2nd trigger itself, one
+step up from immediate. Ruling 271 moved emission to the drain boundary,
+so the ladder now has two steps back: the pre-271 emission point (build
+the ACK inside the receive that crossed the threshold — ruling 271's
+control run, measured at 33.6 % of all wire datagrams and −30 %
+throughput) is the conservative fallback, and per-packet immediate-ACK
+is a step further behind it. Both are cadence regressions, not
+correctness fixes; the timing obligations themselves did not move.
 
 | Constant | Value |
 |---|---|
 | `MAX_ACK_DELAY` | 25 ms |
+| `ACK_COALESCE_MAX` | 32 |
 
-- An ACK is owed after every **2nd** ack-eliciting packet, or when the
-  `AckDelay` timer (armed at `MAX_ACK_DELAY` on receipt of the first
-  unacknowledged ack-eliciting packet) fires — whichever first.
+- **[AMENDED 2026/08/18 — ruling 271]** An ACK becomes **due** after every
+  **2nd** ack-eliciting packet. It is **emitted** at the earliest of: any
+  outgoing packet built for another reason, which it rides (third bullet
+  below); the end of the receiver's current **receive drain**;
+  `ACK_COALESCE_MAX` unacknowledged ack-eliciting packets; or the `AckDelay`
+  timer, armed at `MAX_ACK_DELAY` on receipt of the first unacknowledged
+  ack-eliciting packet.
+
+  A **receive drain** is one pass of the shell's event loop over everything
+  the substrate has already delivered; it ends when no datagram is ready
+  (§16.5). A sans-io core cannot observe it and does not have to — the drain
+  boundary reaches the core as an `AckDelay` armed at `now`, which by §16.5
+  is due at `now` and therefore fires on the first pass with nothing else
+  ready. The **normative reading**: within one receive drain, in-order
+  traffic draws at most **one** ACK emission per `ACK_COALESCE_MAX`
+  ack-eliciting packets — for any burst under the valve, exactly one, at
+  the boundary. Distinct drains may share an `Instant` (a paused or coarse
+  clock makes this ordinary); the bound is per drain, not per clock
+  reading. The out-of-order rule (next bullet) is the **sole exception**
+  that emits outside this cadence: its job is a loss signal, and
+  coalescing it would blunt §13.2's detection.
+
+  This replaces *"an ACK is owed after every 2nd ack-eliciting packet …
+  whichever first"*, under which the ACK was built inside the receive that
+  crossed the threshold. Because the driver delivers one datagram per loop
+  turn, that put **one ACK-only datagram on the wire for every two data
+  datagrams** — 33.6 % of all wire traffic, measured, against quinn's 1.68 %
+  for the same workload, and ≈3.69 µs of a 14.11 µs per-data-datagram budget
+  on both sides combined (`round42-G`, `round42-H`). Neither `MAX_ACK_DELAY`
+  nor `ACK_ELICITING_PER_ACK` changes value or job; only the emission point
+  moved.
 - An ACK is owed **immediately** on out-of-order arrival: an ack-eliciting
   packet whose counter is not exactly one greater than the window's
   previous greatest (it opens, fills, or sits inside a gap). The first
@@ -4634,6 +4673,9 @@ the conservative fallback if the Appendix B timing obligations disappoint.
   is pending, a standalone ACK packet is generated. Pure-ACK packets are
   sealed `seal_quiet` (§7.4), are not ack-eliciting (no ACK-of-ACK loops),
   are never tracked for loss, and bypass the congestion window (§14.5).
+  (**[Ruling 271]** This is now the *first* of §12.4's emission triggers
+  rather than a convenience: a due ACK riding a packet that already exists
+  is the whole reason coalescing does not delay a bidirectional flow.)
   **[Scope — the one packet this does not name.]** **[AMENDED 2026/08/18
   — ruling 258]** The contested-connection probe (§7.5, §7.3) is built
   before the pump's ordinary packets and carries only the PING and the
@@ -6326,6 +6368,17 @@ enum ToEndpoint {
 - **`handle_timeout` is idempotent**: each due timer is stopped before its
   logic runs, so spurious or repeated calls no-op. For `Loss`/`Pto` the
   idempotency additionally rests on synchronous sealing (§16.7).
+- **The drain-before-deadline order is normative.** **[RATIFIED 2026/08/18
+  — ruling 271]** The shell's event loop MUST poll inbound datagrams
+  **before** an expired deadline. A deadline already due when it is read
+  therefore fires on the first pass on which no datagram is ready, which is
+  what makes it expressible as *"the end of the receive drain"* (§12.4) and
+  the only reason §12.4's coalescing needs no core API. Polling the deadline
+  first is not a correctness failure and moves no wire byte a per-packet
+  conformance check can see; it silently restores the pre-271 every-2nd
+  emission — the deadline armed at `now` by the 2nd arrival fires before
+  the 3rd is read — forfeiting the coalescing win with nothing red to show
+  for it.
 - **Equal-deadline priorities** (normative). **[RATIFIED 2026/08/15 —
   ruling 76]** This list is **exhaustive**: every pair of deadlines that
   can fall on one instant is ordered here, because §16.4 makes generation
@@ -7493,8 +7546,8 @@ clock (§16.10); no test sleeps.
   newest accepted; the drop counter emitted on `slither::frames` (§11).
 
 **ACK, recovery, congestion.**
-- Delayed-ACK policy timing: every-2nd, the 25 ms timer, immediate on
-  gap (§12.4).
+- Delayed-ACK policy timing: every-2nd due, per-drain coalescing bounded
+  by `ACK_COALESCE_MAX`, the 25 ms timer, immediate on gap (§12.4).
 - Window-2048 admit/duplicate/edge cases; ACK truncation newest-first at
   the cap and at packet capacity; over-cap received ACK ⇒ structural
   failure (CLOSE with `PROTOCOL_VIOLATION`, §8.2);
@@ -7963,8 +8016,9 @@ measured, pinned obligation — the constants stay ratified either way.]**
 | `CLOSE_REASON_MAX` | 256 B | §8.4 |
 | `CLOSE_LINGER` / close-reply rate | 5 s / ≤ 1 per s | §15.1 |
 | `MAX_ACK_RANGES` | 64 | §12.2 |
-| ACK policy | every 2nd ack-eliciting, `MAX_ACK_DELAY` cap, immediate on gap | §12.4 |
+| ACK policy | every 2nd ack-eliciting **due**, coalesced per receive drain (ruling 271), `MAX_ACK_DELAY` cap, immediate on gap | §12.4 |
 | `MAX_ACK_DELAY` | 25 ms | §12.4 / §13.3 |
+| `ACK_COALESCE_MAX` | 32 — the coalescing valve (ruling 271) | §12.4 |
 | `K_PACKET_THRESHOLD` / time threshold / `K_GRANULARITY` | 3 / 9⁄8 / 1 ms | §13.2 |
 | `K_INITIAL_RTT` / `PTO_BACKOFF_CAP` | 333 ms / 2³ | §13.1 / §13.3 |
 | `INITIAL_WINDOW` / `MINIMUM_WINDOW` | 12 000 / 2 400 B | §14.2 |

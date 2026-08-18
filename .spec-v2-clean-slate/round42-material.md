@@ -149,3 +149,19 @@ estimation and loss detection).]**
      gap is the path toward quinn's 270.
 
 
+
+
+**Addendum (2026/08/18 — ruling 271, the ACK-cadence lever taken).**
+Lever (i) is landed and ratified: emission moved to the receive-drain
+boundary (`ACK_COALESCE_MAX` 32, §12.4 amended, §16.5's
+drain-before-deadline order normative). Measured: ACK-only datagrams
+33.6 % → 3.4 %, bulk ~88 → 108–115 MiB/s default / 129–135 raised; the
+−8 % at 100 ms/default is an accepted bounded trade (mechanism
+measured: ACK-arrival rate gates cwnd-growth cadence; credit starvation
+refuted by counter — `round42-K`). Slice evidence: `round42-I`
+(implementer), `-J` (blind author), `-K` (valve sweep + regression
+hunt), `-L` (the twelve pins rewritten), `-M` (mutation matrices).
+Still open, in order: the in-situ syscall excess (the ~4.2 µs "sendto
+anomaly", `round42-H`) and lever (ii) connect()-per-peer; carried
+follow-ups: sender-idle instrumentation, `MAX_ACK_RANGES`-under-loss
+FlakyWire test.

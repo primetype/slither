@@ -8815,3 +8815,104 @@ against 8 MiB of credit (< 4 %), §17.5's row updated. Bench after the
 slice: the ladder flat at 83–97 MiB/s where it fell 12.3×, and the
 100 ms column monotone to 17.66 MiB/s — the knob, the ceiling and the
 ring now compose instead of colliding.
+
+
+### 271 — the ACK emission point moves to the receive-drain boundary
+
+**Ruling: §12.4's every-2nd trigger makes an ACK *due*; emission moves
+to the earliest of a ride-along packet, the end of the receive drain,
+`ACK_COALESCE_MAX` (32 — new, named) unacknowledged ack-eliciting
+packets, or the `AckDelay` timer. The out-of-order ACK is the sole
+exception and is untouched, as is every constant that existed —
+`ACK_ELICITING_PER_ACK` and `MAX_ACK_DELAY` keep value and job; only
+the emission point moved. The normative reading is at most one emission
+per receive drain per `ACK_COALESCE_MAX` eliciting packets, scoped per
+drain because distinct drains may share an `Instant`. §16.5 gains the
+normative drain-before-deadline order the boundary depends on. No wire
+byte moves; the wire *mix* moves: ACK-only datagrams fall 33.6 % →
+3.4 % of all datagrams, and bulk rises ~88 → 108–115 MiB/s default,
+129–135 raised (M4 Max loopback, `bench-vs-tcp-2026-08.md` harness).**
+
+Found by round 42's datapath attribution (`round42-G`/`round42-H`):
+after the ring and the ceiling, the residual per-datagram budget was
+14.11 µs against quinn's 4.1, and the largest single lever was the ACK
+fraction — the pre-271 policy built the ACK inside the receive that
+crossed the threshold, and a driver that delivers one datagram per loop
+turn makes "every 2nd" one ACK-only datagram per two data datagrams.
+quinn's measured fraction on the same workload: 1.68 % (1 per 58.6).
+The true lever was ≈3.69 µs of both sides' combined budget; the rest of
+the gap lives in the syscall bucket, still open (`round42-material`).
+
+The slice ran blind. The author (10 tests, `878fd8e`; `round42-J`)
+reproduced round42-G's measurement at the core seam before any fix
+existed — two tests red at base at exactly 10 ACK emissions from 20
+datagrams — and pinned the eight properties a cadence fix must not buy
+with the peer's recovery: `MAX_ACK_DELAY` with a silent peer, the gap
+ACK, coalesced ranges, loss repair in zero virtual time, the RTT
+sample, ruling 33's liveness-neutrality on both clocks. Its sharpest
+finding: **the fix cannot live in the drain** — §16.7 seals
+synchronously inside the mutating call, so by the first `poll_output`
+the ACKs are already queued; a coalescing fix has to be in the policy.
+Its predicted-green literal-reading test went red at base for exactly
+that reason, and its third reading of "per drain" became the ratified
+text's vocabulary, scoped per drain by the review (below). The
+implementer (`193b122`; `round42-I`) landed the same architecture
+independently: the every-2nd trigger **arms `AckDelay` at `now`**
+instead of emitting — a due deadline the min-clamp can never push
+later — the drain boundary is `handle_timeout(now)` finding it due, and
+the driver's `biased` `select!`, socket before deadline, is what makes
+"end of drain" real. That order is now RATIFIED in §16.5 — working
+rule 8's shape (a stated construction with an unstated scope)
+discharged by writing the scope down.
+
+The valve was settled by experiment, not argument (`round42-K`):
+sweeping `ACK_COALESCE_MAX` ∈ {32, 64, 128, 1024} moved throughput
+inside noise (107–115 default) while the ACK fraction fell 3.7 % →
+1.1 %; 32 keeps the RTT-sample cadence closest to pre-271 with the win
+already banked. The same experiment characterised the one regression:
+**−8 % at 100 ms/default windows, accepted as a bounded trade.**
+Mechanism measured, not proven: the ACK-arrival rate gates NewReno's
+cwnd-growth cadence in slow start; the competing hypothesis — credit
+starvation via delayed `MAX_STREAM_DATA` — was refuted by direct
+counter (frame-pack count unchanged across the sweep). Carried:
+sender-idle instrumentation to convert measured to proven, and a
+`MAX_ACK_RANGES`-under-loss FlakyWire test for the raised-window
+regime.
+
+Integration rewrote the twelve pre-271 pins under the ruling
+(`e5c8b1e`; `round42-L`): each asserts **both halves** — the armed
+deadline as state, the emission at the boundary — and two were
+strengthened rather than translated (`a_padding_only…` and
+`a_keepalive_elicits…` read "1st not 2nd" off an empty transmit list,
+which post-271 the 2nd also satisfies; both re-founded on the armed
+deadline, so a build letting PADDING advance the counter still fails).
+The replay test's separator was destroyed by the ruling itself and
+re-founded the same way. Verification (`round42-M`), four mutants over
+the full lib suite: never-arm 16 red, gap-drop 27 red (one a genuine
+subtract-overflow panic — the same `in_order` test covers the vacuous
+first packet, so the mutant cascades into path/roam/recovery tests),
+arm-late 15 red — refuting, in the good direction, the hypothesis that
+only the rewritten deadline pins would catch it — and valve-delete
+**0 red of 776**. Two independent matrices found that hole; the
+integrator closed it at `975f71f` against the **literal** 32, after a
+first cut against the constant sailed green under a valve=16 mutant —
+the test adapted with the drift it existed to catch. Verified red under
+branch-delete, valve=16 and valve=64, each at the predicted assertion.
+
+The adversarial review corrected the drafted §16.5 consequence clause
+before it was inscribed — deadline-first restores *every-2nd*, not
+one-per-packet; the drafted sentence overclaimed in the direction that
+flattered the ruling — and scoped the normative reading per drain,
+since a paused clock makes same-`Instant` drains ordinary and an
+unscoped "per distinct `now`" is falsifiable by a legitimate build.
+Author conflict C1 closed by the matrices: the literal-reading test is
+a working gate and stays, its caveat rewritten. `.slices/05`'s two
+superseded acceptance rows are annotated, not rewritten. The
+`exchange`/`settle` fixture pair stays split: a helper that flushes due
+timers inside a test measuring them is the hazard `settle`'s doc names,
+and the one test that must observe the armed deadline between exchanges
+uses neither. §12.4's prose-stated-ratio lesson (SPEC.md's named-constants
+appendix) does **not** gain `ACK_COALESCE_MAX`: the amendment names it,
+so the premise — invented by the implementation, absent from the spec —
+is false post-271; the implementer's sweep row said "gains a member"
+about the pre-amendment state.
