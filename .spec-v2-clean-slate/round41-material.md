@@ -109,3 +109,12 @@ release gates today — all nine are green at `65af633`.
     one-token fix, the untested 2⁶²−1 offset bound (2.2b). The p99
     item's "0 % CPU" premise is refuted — samples were idle-window
     only; re-scoped to "split the phase-C timer" when next measured.]**
+    **[DISCHARGED 2026/08/18 — slice R41-T: the six test gaps closed at
+    `7501921`/`6e292a0`/`80dedfa` (five tests + F2's two tokens; eleven
+    mutants red under independent re-execution — round41-{O,P,Q}); the
+    p99 item measured with the split timer and closed NOT REPRODUCED at
+    `61c9671` (round41-N; harness committed as `examples/audit_udp.rs`;
+    re-open on a sighting under a recorded environment). Two rulings
+    fell out: 267 (§6.1 authenticate idempotency stated) and 268 (O13's
+    flush parenthetical named a flood mitigation (i) defeats — now
+    admission-driven).]**

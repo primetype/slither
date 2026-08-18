@@ -36,6 +36,8 @@
 > | 262 | §16.4 | the cores expose `next_deadline(&self)`: the deadline is read, never popped — the driver's destroy-arms disappear (a reentrant inline-executor consumer could reach them and silently lose a datagram in release) |
 > | 264 | §6.3, §16.4 | the NAT'd-population clause on the per-source cap, and the `Identity` seam defined where its bound is used |
 > | 265 | §7.5, §13.6, §16.5, Appendix B | neither keepalive deadline is announced while §7.3's budget or a pending mark holds it, and a vetoed keepalive announces the death clock — the measured immortal-park ends in death or recovery; §16.5's "both wait" was two timers and is four |
+> | 267 | §6.1 | `authenticate()` is idempotent on a `Proven` chain — same peer, same timestamp, 0 DH; the symmetric clause `read_identity()` already had |
+> | 268 | Appendix B | O13's flush parenthetical becomes admission-driven — the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -1181,6 +1183,13 @@ the cumulative cost above**:
   `es` itself and landing on exactly **2 DH cumulative**. §6.1 prices
   stages cumulatively, so the permissive answer costs precisely the
   ratified amount and no error need be invented (ruling 75).
+  **And it is idempotent once the chain is `Proven`** **[AMENDED
+  2026/08/18 — ruling 267]**: a second `authenticate()` on the same
+  `IntroId` returns the same peer static and the same timestamp and pays
+  **0 DH** — the guarantee the block's opening sentence implies and
+  `read_identity()`'s bullet states explicitly, now stated for this verb
+  too. The ladder holds at 2 DH cumulative however many times either
+  verb is called.
 - **A structurally unreadable msg1 discards the chain.** `read_identity()`
   returning `IntroError::Malformed` is definitive — 1 DH is spent, the
   entry is destroyed, and its stage-0 slot is freed. This is what
@@ -7354,7 +7363,11 @@ clock (§16.10); no test sleeps.
   index re-draw across both tables.
 - **The post-mortem pin** (§17.1, ruling 37): an entry written by a
   tie-break admission or a winner-side record survives orphan aging
-  **and** a full LRU flush (≈ 1024 authenticate-then-drop statics) for
+  **and** a full LRU flush (≈ 1024 distinct **admitted** statics — an
+  admission-driven flood: admission is cap eviction's only driver, and
+  an authenticate-then-drop flood mints no guard entries at all, being
+  exactly what §17.1 mitigation (i)'s `GuardUndo` defeats **[AMENDED
+  2026/08/18 — ruling 268]**) for
   `HANDSHAKE_GIVEUP` after its connection dies, then demotes to an
   ordinary orphan and ages normally. Paired with the replay it exists to
   stop: kill the connection, flush the tier, replay the captured

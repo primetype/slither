@@ -8631,3 +8631,69 @@ diagnosed it one commit before the gap opened. Round 40's sweep read
 straight past it (`SWEEP-round40.md:496–527` quotes 215 and 221 in
 consecutive findings); a sweep looking for stale text does not notice
 absent text.
+
+## Round 41 — slice R41-T, the carried gaps (2026/08/18)
+
+Item 15's close-out carried seven pieces of work "needing no ruling".
+Six were exactly that — five separating tests and a two-token fixture
+fix, landed at `7501921`/`6e292a0`/`80dedfa` and verified red under
+eleven independently constructed mutants (`round41-Q`). The seventh,
+the p99 re-measurement, closed audit item 8 (`round41-N`, landed
+`61c9671`): the 22 ms tail did not reproduce — total p99 106–149 µs
+across 7 × 1000 round trips against the original 22 105 µs, worst
+single `send_to` 43 µs in 10 500 calls, the sequential-send hypothesis
+refuted by measurement, and the measurement's own decision rule
+corrected first (rule 11: `send_datagram` issues no syscall, so a
+two-way split could not have indicted the send path however slow it
+was). Closed **not reproduced**; re-open condition: a sighting under a
+recorded environment (loaded host or Linux). The harness is committed
+(`examples/audit_udp.rs`), so the re-run is one command. Runner notes
+for the record: two mutants had second, pre-existing observers (the
+routing give-up test; the parked-decision TTL test) — the named tests
+separate regardless. And two of the seven "no ruling needed" pieces
+surfaced spec text needing rulings after all:
+
+### 267 — §6.1 states authenticate()'s idempotency, not only read_identity()'s
+
+**Ruling: §6.1's verb-rules block gains the missing symmetric clause —
+a second `authenticate()` on a `Proven` chain returns the same peer
+static and the same timestamp at 0 DH.**
+
+Rule 8's shape. The block rulings 74/75 ratified states a construction
+("no route can perturb the cumulative cost above") and gives
+`read_identity()` an explicit second-call bullet, while
+`authenticate()`'s bullet covers only the still-parked advance — the
+`Proven` arm (`staged.rs`) was spec-implied only, and the audit
+reported its deletion mutation as unobserved by the suite. Now pinned
+by `a_second_authenticate_is_idempotent_at_zero_incremental_dh`
+(`src/core/endpoint/tests.rs`), verified red by the independent runner
+under both the arm's deletion (the second call errors) and a
+succeed-by-redoing-the-work mutant (an extra provider DH while still
+returning `Ok` — red on the zero-incremental-DH assertion
+specifically, which is the half a conclusion-only check would miss).
+
+### 268 — O13's flush parenthetical named a flood the same section defeats
+
+**Ruling: Appendix B's post-mortem-pin obligation is re-worded — the
+LRU flush is admission-driven (≈ 1024 distinct admitted statics), not
+"authenticate-then-drop".**
+
+Found by package B under working rule 5, and verified twice: the
+implementer measured it with a throwaway probe (authenticate-then-
+reject leaves `greatest=None, pins=0`), and the integrator re-read
+both artefacts before ruling. §17.1 mitigation (i)'s
+`GuardUndo`/`revert` removes exactly the entries an
+authenticate-then-drop flood would mint — `revert`'s own comment names
+defeating that flood as its purpose — so the obligation's illustration
+described an attack another clause of the same section forbids. The
+mechanism that fills the tier is admission: `record()` is
+`evict_if_over_cap`'s sole caller, so the test's `record()`-driven
+flush (`the_post_mortem_pin_survives_orphan_aging_and_a_full_lru_flush`)
+drives the *same* path any adversarial flood must. Recorded for
+fixture authors: the literal route was doubly blocked — `Ep::new`'s
+`key_seed: u8` can express at most 256 distinct identities. On the
+prose-vs-formal ledger this one lands with ruling 182: the mechanism
+was right and the illustration was wrong. B's demotion-timing note
+(C2) was reviewed and closed no-change: `age_deadline` is
+max(orphan TTL, exemption) — no fresh 15 s window exists, and the test
+pins re-admission at 90 s + ε.
