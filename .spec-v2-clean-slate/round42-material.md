@@ -43,3 +43,40 @@
    stream window 1.19 MiB (4.8× slither's), connection window
    effectively unbounded, send buffer 9.5 MiB.
 
+   **Attribution DONE (2026/08/18) — `round42-A` (profile) +
+   `round42-B` (mutant), both at `d8bb652`.** Step (a) is discharged,
+   both ways at once, and the results reshape the slice:
+   - **The drain is confirmed twice**: 21.45 % of on-CPU time at the
+     default window (the exact `apply_ack_outcome → on_ack_range →
+     release` path), 94.32 % at 8 MiB. The offset-cursor mutant
+     (behaviour-preserving; 1095/1095 tests green unmodified) flattens
+     the ladder 12.3× → 1.06×: default 72.5 → 88.5 MiB/s (+22 %; the
+     fit's "~35 %" was an over-estimate — measured 18–24 %), 8 MiB
+     5.7 → 90–94 (≈16×), **and the knob's sign flips** (a raise was
+     12.7× slower, becomes 1.02× faster). At 100 ms the optimum stays
+     2 MiB/8 MiB; best becomes 9.39 MiB/s (+4 %).
+   - **The perceived-RTT hypothesis is retired as a cause**: srtt is a
+     standing-queue *effect* (Little's law — srtt ≈ inflight ÷
+     throughput across the whole ladder; min_rtt is 0.08–0.25 ms; the
+     buffer mutant alone moves srtt 969 → 42 ms at 8 MiB).
+   - **New, gates the slice: the 8 MiB/16 MiB cell at 100 ms RTT
+     STALLS under the mutant, 3/3 runs** — 0 % CPU, parked in kevent,
+     every timer idle; baseline finishes the same cell (its only lossy
+     cell: 5.6 % loss, amp 1.101). 20 ms and 50 ms are fine with
+     inflight pinned to cwnd. Unseparated: rate-enabled *pre-existing*
+     defect vs mutant-only defect on a mass-retransmission path.
+     Rule 13 squarely: FlakyWire cannot express a saturated socket.
+     **The slice must resolve this before any representation change
+     lands.**
+   - The real fix wants a ring buffer or an explicit slack bound, not
+     the mutant's compact-at-half (peak buffer doubles; ruling 94
+     makes per-stream allocation a budget).
+   - **The next fruit after the drain is the syscall/async-datapath
+     bucket**: 50 % of on-CPU time (~7.8 µs/datagram) against the
+     measured 2.3 µs raw-socket floor — cause unattributed (tokio
+     readiness machinery / wakeup churn are candidates, not findings);
+     quinn's whole pipeline fits in 4.1 µs on the same discipline.
+     Post-drain ceiling measured 90–95 MiB/s; recovering the syscall
+     gap is the path toward quinn's 270.
+
+
