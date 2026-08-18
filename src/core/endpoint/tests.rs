@@ -57,7 +57,8 @@ use super::*;
 use crate::config::{Config, WallClock};
 use crate::constants::{
     HANDSHAKE_GIVEUP, INIT_PACKET_LEN, MAC1_LEN, PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP,
-    RESP_PACKET_LEN, RETRANSMIT_BASE, RETRANSMIT_JITTER_MAX, TS_GUARD_ORPHAN_TTL, VERSION,
+    RESP_PACKET_LEN, RETRANSMIT_BASE, RETRANSMIT_JITTER_MAX, TS_GUARD_ORPHAN_CAP,
+    TS_GUARD_ORPHAN_TTL, VERSION,
 };
 use crate::core::{ConnectionId, Disposition, EndpointOutput, Role, Timestamp};
 use crate::error::{AcceptError, AuthError, ConnectError, IntroError};
@@ -896,6 +897,89 @@ fn a_second_read_identity_after_the_static_became_pending_does_not_intercept() {
     assert!(local.present(id), "the chain is still the application's");
 }
 
+/// **[RATIFIED 2026/08/18 — ruling 267]** `authenticate()` is **idempotent**:
+/// a second call on the same `IntroId` returns the *same* `(peer, timestamp)`
+/// and pays **0 incremental DH**.
+///
+/// §6.1's rule list (`SPEC.md:1175-1191`) states idempotency explicitly only
+/// for `read_identity()` — "a second call on an already `Claimed` or `Proven`
+/// chain returns the revealed static and pays **0 DH**" (ruling 74, the test
+/// directly above this one) — while its `authenticate()` bullet covers only
+/// ruling 75's *still-parked* direction. The `Proven` arm at
+/// `src/core/endpoint/staged.rs:492-496` already implements the missing half;
+/// ruling 267 is the clause that makes it obligatory rather than incidental,
+/// and this is its test. It is exactly rule 8's shape: a stated construction
+/// whose scope the list left unwritten.
+///
+/// The **core** verb is the only seam where this is reachable at all. §6.2's
+/// handle typestate self-consumes, so no application can call the staged verb
+/// twice; the core is keyed by `IntroId` and takes `&mut self`, which is why
+/// §6.1 says these rules "are the core's".
+///
+/// # Mutations this separates
+///
+/// **(a) The `Proven` arm deleted.** `ChainState::Proven` then falls through
+/// to the `_ => return Err(AuthError::Expired)` three lines below it, and the
+/// second call errors — the `expect` on `second_peer` goes red.
+///
+/// **(b) The arm re-driving the work** instead of answering from the recorded
+/// state (an `ss` charged twice for one proof). The tuple halves still pass —
+/// it recomputes the same answer — and only `local.dh() == 0` separates it.
+/// Neither half catches both, which is why both are asserted: §6.1 prices
+/// this ladder cumulatively, so a verb that silently recharges is the same
+/// class of defect as `a_demoted_intro_keeps_section_6_1s_cumulative_ladder`
+/// above.
+#[test]
+fn a_second_authenticate_is_idempotent_at_zero_incremental_dh() {
+    let now = t0();
+    let (mut local, mut peer) = tie_pair(now);
+    let msg1 = real_msg1(&mut peer, now, &local);
+    let d = local.feed(now, peer.addr, &msg1);
+    let (id, _) = d.one_intro();
+    local.ep.read_identity(now, id).expect("readable");
+    let _ = local.drain();
+
+    let (first_peer, first_ts) = local
+        .ep
+        .authenticate(now, id)
+        .expect("a genuine msg1 authenticates");
+    let _ = local.drain();
+
+    // Preconditions, stated rather than assumed: the chain really is at
+    // `Proven`, it proved the peer we think it did, and it carries the
+    // initiation timestamp the fixture predicts. Without these three, "the
+    // same tuple again" could hold over a pair of *wrong* answers, and the
+    // 0-DH assertion could hold because no work was ever done at all.
+    assert_eq!(local.dh(), 2, "§6.1: authenticate is 2 DH cumulative");
+    assert_eq!(first_peer.as_ref(), peer.canonical(), "the proven static");
+    assert_eq!(
+        first_ts,
+        peer.nth_timestamp(1),
+        "the initiation's own timestamp, not some default"
+    );
+    assert!(local.present(id), "the chain is still staged");
+
+    local.reset_dh();
+    let (second_peer, second_ts) = local
+        .ep
+        .authenticate(now, id)
+        .expect("ruling 267: authenticate() is idempotent at Proven");
+    let d = local.drain();
+
+    assert_eq!(
+        second_peer.as_ref(),
+        first_peer.as_ref(),
+        "ruling 267: the same peer, again"
+    );
+    assert_eq!(second_ts, first_ts, "ruling 267: the same timestamp, again");
+    assert_eq!(local.dh(), 0, "ruling 267: zero incremental DH");
+    assert!(d.is_silent(), "an idempotent read writes nothing");
+    assert!(
+        local.present(id),
+        "and the chain is still the application's"
+    );
+}
+
 /// §6.5 step 3, first bullet: an initiation whose claim **is** a pending
 /// outbound remote "never touches the accept queue and the application never
 /// sees it". Both key orders — the routing decision is taken at `es`, before
@@ -1348,6 +1432,230 @@ fn losing_the_internal_tie_break_pins_the_record_against_orphan_aging() {
         Some(peer.nth_timestamp(1)),
         "§17.1: a pinned entry is never evicted or aged"
     );
+}
+
+/// §17.1's **post-mortem pin** (ruling 37), both halves and both sides of its
+/// horizon — Appendix B's O13, and the only place `TS_GUARD_ORPHAN_CAP` is
+/// exercised behaviourally.
+///
+/// §17.1: *"An entry written by the internal tie-break's admit step (§6.6
+/// step 4) or by a **winner-side record** … stays exempt from orphan aging
+/// **and** LRU eviction for `HANDSHAKE_GIVEUP` (90 s) after the connection it
+/// belongs to dies … Only when the extension lapses does the entry demote to
+/// an ordinary orphan and enter the LRU below."* §6.7's single-use bound is
+/// **conditional on that entry surviving**, so both halves are security
+/// properties, not bookkeeping.
+///
+/// One mechanism carries both: `GuardEntry::exempt_until`, read by
+/// `GuardEntry::age_deadline` (the aging half) and by `GuardEntry::pinned`
+/// (the LRU half). The test therefore drives *both* readers against one
+/// entry, and pins the replay on both sides of the 90 s — which is what
+/// Appendix B asks for and what
+/// [`losing_the_internal_tie_break_pins_the_record_against_orphan_aging`]
+/// above cannot reach: that test's entry is protected by a live `pins > 0`,
+/// so it says nothing about `exempt_until`.
+///
+/// # The precondition that makes this a test of the exemption
+///
+/// After the connection is retired the entry holds **zero pins**, so
+/// `age_deadline`'s `pins > 0` short-circuit and `pinned`'s `pins > 0` half
+/// are both out of the picture and `exempt_until` is the only thing left that
+/// can protect it. The endpoint's announced deadline is asserted to be
+/// exactly `now + HANDSHAKE_GIVEUP` rather than `now + TS_GUARD_ORPHAN_TTL`,
+/// which is a direct reading of the stamp: `age_deadline` is
+/// `max(orphaned_at + TS_GUARD_ORPHAN_TTL, exempt_until)`, and 90 s can only
+/// be the second.
+///
+/// # Filling the tier: `record()`, not authenticate-then-drop
+///
+/// Appendix B's parenthetical says "≈ 1024 authenticate-then-drop statics".
+/// **That flood creates no entries at all** — §17.1 mitigation (i) hands
+/// every unaccepted chain a `GuardUndo` and `TimestampGuard::revert` removes
+/// an entry the record created, which `revert`'s own comment names as the
+/// point ("makes the authenticate-then-drop flood mint orphans after all,
+/// which is the exact attack mitigation (i) forbids"). Measured, not assumed:
+/// authenticate-then-`reject()` leaves `greatest = None` and `pins = 0`. The
+/// tier is filled here through `TimestampGuard::record` — the admission
+/// primitive itself, and the sole caller of `evict_if_over_cap` — which is
+/// what a flush *is*, at 1025 distinct statics and no fictional crypto.
+///
+/// The exempt entry is recorded at `now` and every filler strictly later, so
+/// the exempt entry is the LRU-**oldest**: it is the first victim
+/// `evict_if_over_cap`'s `min_by(last_admitted)` would take. Without that
+/// ordering the LRU half would pass vacuously on a build with no exemption at
+/// all, by evicting a filler instead.
+///
+/// # Mutations this separates
+///
+/// **(a) `GuardEntry::pinned` loses its `exempt_until` half** (`self.pins > 0`
+/// alone). The exempt entry then counts in the unpinned tier, and being the
+/// LRU-oldest it is the first thing the flush takes — "survived the flush"
+/// goes red. Nothing else in the suite reaches this: no other test puts an
+/// unpinned-but-exempt entry in front of a full tier.
+///
+/// **(b) `evict_if_over_cap` early-returns** (or the cap is raised). The
+/// flush never happens, `filler(0)` is still present, and the
+/// precondition-style assertion that the flush *actually occurred* goes red —
+/// without it, (a) would be untestable because there would be no flush to
+/// survive.
+///
+/// **(c) `age_deadline` drops its `exempt_until` maximum.** The entry ages at
+/// `TS_GUARD_ORPHAN_TTL` and the 15 s survival assertion goes red.
+///
+/// **(d) The cap's value.** Asserted from both sides: at exactly
+/// `TS_GUARD_ORPHAN_CAP` unpinned entries nothing is evicted, at one more
+/// exactly one is. A cap of 1023 fails the low side, a cap of 1025 the high.
+///
+/// **(e) The exemption made unconditional or infinite.** The post-90 s half
+/// goes red: the replay is refused forever and §6.7's bound stops being the
+/// conditional one the spec states.
+#[test]
+fn the_post_mortem_pin_survives_orphan_aging_and_a_full_lru_flush() {
+    let now = t0();
+    let (mut local, mut peer) = sides(now, false);
+    let (conn, msg1) = crossing(now, &mut local, &mut peer);
+
+    // §6.6 step 4: we lose the tie-break, so the inbound is admitted, its
+    // timestamp recorded permanently, and the pending's own connection
+    // installed. This is one of the two writes §17.1's bullet names.
+    let d = local.feed(now, peer.addr, &msg1);
+    assert_eq!(d.installs(), vec![conn], "the tie-break installed");
+    let (ours, _theirs) = resp_indices(&d.one_transmit().1);
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        Some(peer.nth_timestamp(1)),
+        "§6.6 step 4 recorded the admitted timestamp"
+    );
+    assert_eq!(
+        local.ep.guard_pins(peer.canonical()),
+        1,
+        "§17.1: the live connection pins its static's entry"
+    );
+
+    // The connection it belongs to dies. §17.1 dates the 90 s from here.
+    local
+        .ep
+        .handle_connection_event(now, conn, ToEndpoint::Retired { our_index: ours });
+    let d = local.drain();
+
+    // The preconditions, all three, before anything is asserted to survive:
+    assert_eq!(
+        local.ep.guard_pins(peer.canonical()),
+        0,
+        "the entry is unpinned — only `exempt_until` can protect it from here"
+    );
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        Some(peer.nth_timestamp(1)),
+        "the record outlived the connection"
+    );
+    assert_eq!(
+        d.deadline,
+        Some(now + HANDSHAKE_GIVEUP),
+        "§17.1: the exemption is stamped at death + HANDSHAKE_GIVEUP, and it \
+         dominates the ordinary orphan window — a bare TS_GUARD_ORPHAN_TTL \
+         deadline here would mean no exemption was written at all"
+    );
+
+    // ── Half one: orphan aging. Past TS_GUARD_ORPHAN_TTL, inside the 90 s.
+    let aged = now + TS_GUARD_ORPHAN_TTL + Duration::from_nanos(1);
+    let d = local.timeout(aged);
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        Some(peer.nth_timestamp(1)),
+        "§17.1: the exemption survives orphan aging"
+    );
+    assert_eq!(
+        d.deadline,
+        Some(now + HANDSHAKE_GIVEUP),
+        "and the announced deadline is still the exemption's"
+    );
+
+    // ── Half two: a full LRU flush of the unpinned tier.
+    //
+    // Every filler is recorded strictly after the exempt entry, so the exempt
+    // entry is the LRU-oldest and would be victim number one.
+    let ts = peer.nth_timestamp(1);
+    let fill_from = aged + Duration::from_millis(1);
+    for i in 0..TS_GUARD_ORPHAN_CAP {
+        local.ep.guard.record(
+            &filler_static(i),
+            ts,
+            fill_from + Duration::from_millis(i as u64),
+        );
+    }
+
+    // The cap's low side: exactly TS_GUARD_ORPHAN_CAP unpinned entries is not
+    // over the cap, so nothing has been evicted yet.
+    assert!(
+        local.ep.guard.greatest(&filler_static(0)).is_some(),
+        "the LRU evicted below TS_GUARD_ORPHAN_CAP"
+    );
+
+    // One more: the tier is over cap and the flush must run.
+    local.ep.guard.record(
+        &filler_static(TS_GUARD_ORPHAN_CAP),
+        ts,
+        fill_from + Duration::from_millis(TS_GUARD_ORPHAN_CAP as u64),
+    );
+    assert!(
+        local.ep.guard.greatest(&filler_static(0)).is_none(),
+        "the flush did not happen — nothing below is a test of surviving it"
+    );
+    assert!(
+        local.ep.guard.greatest(&filler_static(1)).is_some(),
+        "exactly one victim: the cap evicts down to TS_GUARD_ORPHAN_CAP, not further"
+    );
+
+    // The obligation's LRU half.
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        Some(peer.nth_timestamp(1)),
+        "§17.1: the exempt entry survived a full LRU flush, as the oldest \
+         entry in the tier"
+    );
+
+    // ── Inside the horizon: the captured initiation still dies at the guard.
+    //
+    // A fresh source address, so this is a new parked intro rather than a
+    // same-address refresh of one.
+    let inside = now + HANDSHAKE_GIVEUP - Duration::from_secs(1);
+    let d = local.feed(inside, v4(9, 1), &msg1);
+    let (replay, _) = d.one_intro();
+    assert_eq!(
+        local.ep.authenticate(inside, replay),
+        Err(AuthError::Replay),
+        "§6.7: the captured initiation is single-use while its entry survives"
+    );
+    let _ = local.drain();
+
+    // ── Past the horizon: the extension lapses, the entry goes, and the
+    // documented re-admission happens. §6.7's bound is conditional and this
+    // is the side of it that says so.
+    let after = now + HANDSHAKE_GIVEUP + Duration::from_nanos(1);
+    let _ = local.timeout(after);
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        None,
+        "§17.1: the extension lapsed and the ordinary orphan — already \
+         TS_GUARD_ORPHAN_TTL past its stamp — aged out"
+    );
+    let d = local.feed(after, v4(9, 2), &msg1);
+    let (again, _) = d.one_intro();
+    assert!(
+        local.ep.authenticate(after, again).is_ok(),
+        "§6.7's single-use bound is conditional: past the horizon the same \
+         captured initiation is re-admitted"
+    );
+}
+
+/// A distinct 33-byte static for the LRU flush. Only the guard's `Vec<u8>`
+/// key-space is exercised, so these need to be distinct and nothing else.
+fn filler_static(i: usize) -> Vec<u8> {
+    let mut key = vec![0xF0; 33];
+    key[1] = (i & 0xFF) as u8;
+    key[2] = ((i >> 8) & 0xFF) as u8;
+    key
 }
 
 /// The mirror, stated as one assertion: the same crossing initiation, the

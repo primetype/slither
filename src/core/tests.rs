@@ -1120,7 +1120,7 @@ fn the_per_source_cap_is_four_chains_per_ip() {
     let mut ids = Vec::new();
 
     for n in 0..INTRO_MAX_PER_SOURCE {
-        let now = t + Duration::from_secs(n as u64);
+        let now = t + Duration::from_secs(n as u64 + 1);
         ids.push(
             b.feed(
                 now,
@@ -1144,7 +1144,7 @@ fn the_per_source_cap_is_four_chains_per_ip() {
         .0;
 
     // One above: exactly one of that IP's entries goes.
-    let now = t + Duration::from_secs(INTRO_MAX_PER_SOURCE as u64);
+    let now = t + Duration::from_secs(INTRO_MAX_PER_SOURCE as u64 + 1);
     let fifth = b
         .feed(now, v4(5, 200), &forged_init(&b, 0xAAAA, 0x33))
         .one_intro()
