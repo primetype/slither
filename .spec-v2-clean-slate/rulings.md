@@ -7640,6 +7640,15 @@ recomputes the `Timeout`. (ii) The driver's past-deadline guard
 (`driver.rs:1028`) is promoted from `debug_assert!` to `assert!` — after
 (i) has landed, and not before.**
 
+**[Addendum 2026/08/18 — ruling 265: "`Liveness` at the latest" has an
+unstated scope.** It is true where this ruling measured it — a `Pto`
+suppressed with a non-empty sent map — and false as a general backstop:
+§7.4 disarms `Liveness` at the very receive that sets the passive
+keepalive's debt, so in the vetoed-keepalive state the announced
+`Timeout` otherwise falls to **`None`**, the immortal-park state ruling
+265 constructed at core and shell. Ruling 265's backstop closes it; this
+sentence must not be copied into any further gate clause without it.]**
+
 The finding, measured and reproduced at shipped constants: a
 budget-suppressed, saturated PTO announces a deadline ≤ `now`, and the
 single shared driver — §16.3's one `!Send` actor serving every connection
@@ -8418,6 +8427,52 @@ Expired`'s Display string was equally false for evictions and was
 taxonomy closed and this ruling splits `IntroError` only. Both new
 pins verified red-on-base (`Some(Expired)` vs `Some(Evicted)`).
 
+### 262 — the driver reads deadlines without popping: the destroy-arms were reachable
+
+**Ruling: the deadline-collection arms in `driver.rs` — two
+`debug_assert!(false)` arms whose release behaviour silently destroys
+whatever the core queued, a datagram included — are removed by removing
+their cause: each core exposes `next_deadline(&self) ->
+Option<Instant>`, the value the terminal `Timeout` carries, and the
+driver's deadline collection reads instead of popping. §16.4 gains the
+accessor. The regression pin is the constructed reach: a reentrant
+inline-executor consumer's write must be delivered with no advance of
+virtual time — red on the base build in both profiles, and red against
+a fix that merely deletes the assert.**
+
+Commissioned on the audit's adjacent finding (`round41-H-audit-triage.md`
+§2.1b) with the 249-shape discipline: reachability first, mechanism
+second. The measurement half scored zero hits across the whole suite —
+a fixture artefact (rule 13) — and the adversarial half then
+**constructed** the reach (`round41-K-driver-arms.md`): `serve()`'s
+post-drain tail calls into consumer code, and a consumer whose executor
+polls inline re-enters `poll_write` from `dispatch_intros`; against
+byte-identical `driver.rs`, debug panics inside a `JoinHandle` the shell
+drops — the arms were not even a working detector — and release destroys
+the 57-byte `Transmit` whose `Ok(15)` the write just returned. The two
+refuted mechanisms are part of the record: re-queue is impossible (no
+`push_front` on the core queue), and promotion to a release `assert!` is
+*wrong* here — it converts silent single-datagram loss into a
+whole-driver panic killing every connection, the ordering error ruling
+249(ii) only avoided because 249(i) had removed the reachable trip
+first. The root cause is grammatical: a popping verb used to read a
+value. Reading it removes the arms, the loss, and the assert in one
+move. Residue recorded, untouched: `drain_endpoint`'s looping arm
+(`shared.rs:872`) is the same shape but processes what it pops, and
+`poll_read`'s latch-recheck comment justifies itself by a state
+`Driver::stop` no longer produces — both go to the comment slice.
+
+A process incident from this slice belongs in the record (rule 14's
+edge): the evidence agent's isolated worktree was auto-removed between
+turns, its cwd silently fell back to the **main repository**, and a
+`git reset --hard` ran there while the integrator held uncommitted
+record edits. No work was lost — the reset was HEAD-neutral, the
+integrator's every batch edit carries a count-assert that would have
+failed loudly against a wiped file, and the tranche was verified
+amendment-by-amendment afterwards — but the lesson is rule 14's
+sharpened form: **verify-your-base is not a first-act check, it is an
+every-act check when the worktree can vanish mid-task.**
+
 ### 263 — `copy_work()` is monotone at the connection
 
 **Ruling: `Streams` gains `retired_copy_work`, absorbed at the one
@@ -8465,6 +8520,56 @@ use"*; the code holds a plain `[u8; 32]` and drops it unwiped — no
 `zeroize` dependency exists. The rewritten text states what is true. If
 wiping is wanted, that is a dependency decision for a future round, not
 a documentation edit.
+
+### 265 — the vetoed keepalive arms the death clock: the immortal-park state, constructed and closed
+
+**Ruling: (i) slice 7b's shipped announce-gate is ratified into §7.5 —
+neither keepalive deadline is announced while §7.3's budget refuses the
+30-byte empty plaintext or a contested mark is pending; the gate is on
+the announcement, the state is untouched. (ii) The backstop that makes
+it sound: while a keepalive is owed and vetoed, the connection announces
+`last_authenticated_recv + DEAD_TIMEOUT` — death at 25 s or recovery at
+the first qualifying receive, never silence. (iii) §16.5's "both wait on
+the same budget predicate" — false since ruling 249 wrote it: four
+timers wait, not two — is corrected; §13.6's exhaustive roam table gains
+its keepalive row; Appendix B gains the obligation with both backstop
+sides. (iv) Ruling 249's "`Liveness` at the latest" is scoped by
+addendum: true where 249 measured it, false as a general backstop, and
+not to be copied into any further gate clause.**
+
+The round-41 item was documentary — "the spec is silent on the shipped
+gate" — and the verification found a hole where the clause's soundness
+paragraph would go (`round41-C-keepalive-gate.md` §4.2): ruling 249's
+backstop argument does not transfer, because `Liveness` is disarmed by
+the very receive that sets the passive debt, and the blind author's
+90 B-floor unconstructibility argument (`tests_livelock.rs`) had one
+wrong step — a pure ACK does not cost ~35 bytes; it is sized to the
+whole remaining room. Measured, both layers
+(`round41-I-keepalive-death-measure.md`): the six-step construction
+reaches `budget=(105,35) room=0 armed=false passive_debt=true`, **every
+timer `None`**, and the connection is alive and silent at +60 s virtual
+— at the cores and end-to-end through the shell. The measured pure ACK:
+105 B against a 105 B room, 33 range pairs. Three fix candidates were
+measured, two refuted by ratified text: waiving the budget for the
+keepalive breaks §7.3's cannot-be-waived (and waiving only the
+announcement is the spin ruling 220 closed F1 against);
+never-disarming `Liveness` deletes §7.4's second conjunct (ruling 85).
+The backstop — five lines in `sync_liveness_timer` — produces death at
+exactly `DEAD_TIMEOUT`, and its mirror holds: a peer returning at +10 s
+re-funds the budget, the keepalive resumes, death moves to 35 s. The
+gate did not create the defect and removing it does not fix it: the
+pre-gate build spins in the same state and dies in neither.
+
+Landed at `426286d` with three regressions — the park test (premise read
+at the ACK instant, so a build that kills the connection fails the
+premise rather than vacuously passing the verdict; died-**or**-sent, not
+died), the shell story `s5`, and the recovering-peer mirror (the guard
+on the fix: an unconditional `Liveness` fails it) — plus the rule-4(a)
+sweep of the file whose comments asserted what the measurement refutes:
+the "~35 bytes" step, the module header's "not constructible", and the
+"overstated" closing note, each corrected in place with the original
+kept. The author's flag on its own uncertain step is what the
+measurement was aimed at; the flag was right.
 
 ### 266 — the record had a five-ruling hole, and the discipline that prevents the next one
 

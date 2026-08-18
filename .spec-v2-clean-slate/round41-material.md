@@ -12,7 +12,10 @@ release gates today — all nine are green at `65af633`.
    F1 fix gates both keepalives on §7.3's budget
    (`keepalive_can_leave()`, `mod.rs`), pinned in `tests_livelock.rs`;
    no SPEC sentence states it. Ruling 249's recorded deferral — the
-   documentary twin of the `Pto` gate it ratified.
+   documentary twin of the `Pto` gate it ratified. **[RESOLVED
+   2026/08/18 — ruling 265, and the measurement found more than a
+   documentary gap: the immortal-park state, constructed at core and
+   shell, fixed by the death-clock backstop.]**
 2. **§7.7's straggler tolerance has an unstated scope** (R40-C author,
    measured): the one-epoch-back key is reachable only within
    `REPLAY_WINDOW` (2 048) counters of a boundary — 32× tighter than the

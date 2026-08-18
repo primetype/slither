@@ -33,7 +33,9 @@
 > | 259 | §16.2, §16.4, §16.11 | ruling 248's listings: `SendCreditAvailable` enters both `ConnEvent` lists with the counting rule; `join` is fallible in §16.11 as ruling 120 ratified |
 > | 260 | Appendix B | O53a discharged by measurement (spurious ≤ 1.55 %, envelope 2.5 %); O53b's quinn bar ruled untestable, the no-stall clause pinned in virtual time |
 > | 261 | §6.3, §18.1, §18.2 | `IntroError::Evicted` splits cap-pressure from TTL; the eviction events enter `slither::policy` |
+> | 262 | §16.4 | the cores expose `next_deadline(&self)`: the deadline is read, never popped — the driver's destroy-arms disappear (a reentrant inline-executor consumer could reach them and silently lose a datagram in release) |
 > | 264 | §6.3, §16.4 | the NAT'd-population clause on the per-source cap, and the `Identity` seam defined where its bound is used |
+> | 265 | §7.5, §13.6, §16.5, Appendix B | neither keepalive deadline is announced while §7.3's budget or a pending mark holds it, and a vetoed keepalive announces the death clock — the measured immortal-park ends in death or recovery; §16.5's "both wait" was two timers and is four |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -2863,6 +2865,35 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   application choosing above 10 s should know it has bought a beacon
   with no loss tolerance. This is why the recommendation is
   `KEEPALIVE_TIMEOUT` and not the largest admissible value.
+- **Neither keepalive's deadline is announced while a keepalive cannot
+  leave — and a vetoed keepalive arms the death clock.** **[RATIFIED
+  2026/08/18 — ruling 265]** `Keepalive` and `PersistentKeepalive`
+  (§16.5) are armed only while §7.3's budget admits the 30-byte empty
+  plaintext **and** no contested mark is pending — rank 2 outranks rank
+  7 (§7.3), so a keepalive may not spend budget the probe is waiting
+  for. Both deadlines are functions of `last_send`, and a held keepalive
+  is held without moving `last_send`, so arming from it regardless puts
+  the deadline at an instant already passed: the shell's `sleep_until`
+  returns immediately and the one `!Send` driver every connection
+  shares spins (§16.3). The gate is on the announcement, not the state:
+  `last_send`, the passive rule's debt and §7.4's arming bit are
+  untouched; both holds lift only on an authenticated, window-fresh
+  receive, which recomputes both deadlines — no dedicated re-arm
+  machinery exists, and no future instant is predictable while the hold
+  stands, so arming nothing is right and arming later is wrong.
+
+  **`Liveness` is not the backstop here — measured, not argued.** §7.4
+  disarms the death clock at the very receive that sets the passive
+  rule's debt, and §7.3's rank-5 pure ACKs — cwnd-exempt, sized to the
+  whole remaining room — can spend the refunded budget before anything
+  arms, so the suppressed state can otherwise reach `Timeout(None)` with
+  a keepalive owed and every timer dark: a connection that neither talks
+  nor dies. The rule that closes it: **while a keepalive is owed and
+  vetoed, the connection announces `last_authenticated_recv +
+  DEAD_TIMEOUT`** — the death clock's own anchor, so the parked state
+  ends in death at 25 s or in recovery at the first qualifying receive,
+  which re-funds the budget, resumes the keepalive, and moves death out
+  by its own rule. Never silence.
 - **Liveness** (`DEAD_TIMEOUT`) keys on the receive clock (§7.4): a
   connection that has *armed* the clock since its last authenticated
   receive — by a marking send **or** by any ack-eliciting send — and then
@@ -4780,6 +4811,7 @@ builds against it, so the list is the thing that has to exist.
 | an outstanding **`PATH_RESPONSE` obligation** (one we owe the peer) | **kept** — it answers the peer's question about *its* path, which our endpoint moving does not change; like all output it is sent to the new endpoint, and it is capped by the re-armed budget like everything else | §7.3, §8.4, ruling 208 |
 | sent-packet map | **kept** — in-flight ACKs still resolve, `bytes_in_flight` stays consistent | §13.5, above |
 | PTO / loss detection | **state undisturbed** — sent map, `pto_count`, anchor and `loss_time` carry across, nothing is reset; the `Pto` **announcement** is budget-gated (§13.3, ruling 249), so it is suppressed from the roam — which zeroes the budget, four rows up — until the first qualifying receive | §13.3, §13.4 |
+| `Keepalive` / `PersistentKeepalive` announcements | **suppressed** — the roam zeroes the budget four rows up, so §7.5's announce-gate withholds both deadlines until the first qualifying receive, the death-clock backstop announcing in their stead (ruling 265); `last_send`, the passive debt and §7.4's arming bit carry across untouched | §7.5, §7.3 |
 | RTT estimator | **kept as a prior** (suspect-but-kept); `min_rtt` re-seeded from the first post-roam sample | §13.1 |
 | pending contested mark and its `probe_floor` | **kept intact, floor unchanged** — a roam changes the pending probe's budget prospects, not the question it asks | §7.5, ruling 176 |
 | `Contested` deadline, once armed | **undisturbed** — it is armed at the probe's transmission and disarmed only by an ACK covering `probe_floor` | §16.5, §7.5 |
@@ -5878,6 +5910,12 @@ single-`poll_output` contract: **every mutating call** (`handle_datagram`,
 `handle_timeout`, verb calls, stream/datagram/message operations,
 `connect`) **is followed by draining `poll_output()` to the terminal
 `Timeout(Option<Instant>)`**, which is simultaneously the drain sentinel
+**[AMENDED 2026/08/18 — ruling 262: each core additionally exposes
+`next_deadline(&self) -> Option<Instant>`, returning exactly the value
+the terminal `Timeout` carries — a read-only path to the announcement
+half, so a driver collecting deadlines never pops (a popping read at
+that position destroyed a queued datagram when a reentrant inline
+consumer left a queue non-empty)]**
 and the next-deadline announcement — a driver cannot forget to drain.
 Connection→endpoint events fold into `ConnOutput::ToEndpoint` (one drain
 loop, no second queue to forget). The generic `I: Identity` must reach the
@@ -5892,6 +5930,7 @@ impl<I: Identity> core::Endpoint<I> {
     fn handle_timeout(&mut self, now: Instant);                        // idempotent
     fn handle_connection_event(&mut self, now: Instant, id: ConnectionId, ev: ToEndpoint);  // [ruling 80]
     fn poll_output(&mut self) -> EndpointOutput;                       // drain to Timeout
+    fn next_deadline(&self) -> Option<Instant>;                        // the Timeout's value, read-only [ruling 262]
     // staged verbs (§6.2), by IntroId:
     fn read_identity(&mut self, id: IntroId) -> Result<PublicKey, IntroError>;
     fn authenticate(&mut self, now: Instant, id: IntroId)
@@ -5966,6 +6005,7 @@ impl core::Connection {
     fn recv_message(&mut self, now: Instant) -> Option<Vec<u8>>;   // ruling 151        // claim the oldest complete unclaimed message
     fn recv_datagram(&mut self) -> Option<Vec<u8>>;       // claim the oldest queued datagram
     fn poll_output(&mut self) -> ConnOutput;
+    fn next_deadline(&self) -> Option<Instant>;   // the Timeout's value, read-only [ruling 262]
 }
 
 enum ConnOutput {
@@ -6178,9 +6218,15 @@ enum ToEndpoint {
   ack-eliciting packet is in the sent map **and §7.3's budget admits a
   probe** (§13.3, ruling 249) — the probe is ack-eliciting and is in that
   map (§13.5), so `Pto` and `Contested` can be armed together; they are
-  not independent in one respect: both wait on the same budget predicate,
-  `Contested` at the probe's transmission (§16.4) and `Pto` at the
-  announcement; `Liveness` is armed by the first
+  not independent in one respect: **four of the eight timers wait on
+  §7.3's budget** **[AMENDED 2026/08/18 — ruling 265]** — `Contested` at
+  the probe's **transmission** (§16.4), `Pto` at its **announcement**
+  (§13.3), and `Keepalive` and `PersistentKeepalive` at theirs (§7.5),
+  the last two additionally waiting on the absence of a **pending**
+  contested mark, with the vetoed-keepalive state announcing the death
+  clock in their stead (§7.5, ruling 265). The sizes asked differ —
+  39 B for the probe's challenge datagram (§13.4), 30 B for §3.4's empty
+  plaintext — but the predicate is one predicate; `Liveness` is armed by the first
   **marking or ack-eliciting** send after an authenticated, window-fresh
   receive, is not re-armed by later sends of either kind, and is disarmed
   and re-anchored by every such receive (§7.4). The endpoint core's
@@ -7362,11 +7408,27 @@ clock (§16.10); no test sleeps.
 - **PTO-disarm** (§13.3, amended by ruling 249): an idle connection with
   an empty sent map arms no `Pto` — no self-sustaining PING train — and a
   **non-empty** map under a closed §7.3 budget announces no `Pto` either:
-  the announced `Timeout` falls to the next armed timer, `Liveness` at
-  the latest (the livelock separation — the pre-249 build announces a
+  the announced `Timeout` falls to the next armed timer — `Liveness`,
+  or ruling 265's vetoed-keepalive backstop, at the latest **[AMENDED
+  2026/08/18 — ruling 265]** (the livelock separation — the pre-249 build announces a
   past deadline and spins the shared driver), re-announcing at the
   receive that refunds the budget. The timer re-arms with the next
   ack-eliciting send **the budget admits**.
+- **Keepalive-disarm and the parked-state backstop** (§7.5, ruling 265):
+  at a budget with no room for the 30-byte empty plaintext, and —
+  separately — at a **pending** contested mark with room for the
+  keepalive but not the probe, **neither** keepalive deadline is
+  announced (the two holds must be separated: a build consulting only
+  one passes the other's test), the announcement returns at the receive
+  that lifts the hold, and the admissible path still fires and re-arms —
+  a build that suppresses unconditionally satisfies every
+  non-retrospection assertion and has deleted §7.5. And the backstop,
+  both sides: a starved passive keepalive ends in **death or a send,
+  never silence** (the premise read at the ACK instant, the verdict read
+  past `DEAD_TIMEOUT`), while a peer that returns and re-funds the
+  budget is **not** reaped — the mirror a build with an unconditional
+  `Liveness` fails. Discharged: `tests_livelock.rs` (the gate),
+  `tests_park.rs` and `story_park.rs` (the backstop).
 - **The backoff ladder and the survival envelope** (§13.3, ruling 254):
   probe intervals under a black-holed path are **not all equal** and are
   **capped at 8 ×** the base PTO with the capped rung reached — both
