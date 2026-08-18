@@ -137,6 +137,8 @@ mod tests_reassembly;
 mod tests_reassembly_credit;
 // Ruling 265's core regression — the vetoed keepalive and the death clock.
 #[cfg(test)]
+mod tests_ack_cadence;
+#[cfg(test)]
 mod tests_park;
 //
 // **Integrator — `testfix.rs` has aged out again, and it is the reason 13
