@@ -29,6 +29,11 @@
 > | 253 | §10.6 | coalesce-on-insert gains its work bound, O(credit · log credit), and capacity stays the arrived span |
 > | 254 | §13.3, §14.4, the constants tables | `PTO_BACKOFF_CAP` 2⁶ → 2³: the ladder fits inside `DEAD_TIMEOUT`'s window; survival envelope stated |
 > | 256 | §7.7, Appendix B | retention is not reach: the previous-epoch key delivers only within `REPLAY_WINDOW` counters of the boundary — one part in 32 — and the straggler pins must be built below it |
+> | 258 | §7.3, §8.5, §12.4, §14.5 | what rides the contested probe's packet: coalescing is all-or-nothing over the owed set; the owed ACK rides behind, not aboard; no fill — the 18 B bound is the exemption's proof; §8.5's collision sentence scoped to the PTO probe |
+> | 259 | §16.2, §16.4, §16.11 | ruling 248's listings: `SendCreditAvailable` enters both `ConnEvent` lists with the counting rule; `join` is fallible in §16.11 as ruling 120 ratified |
+> | 260 | Appendix B | O53a discharged by measurement (spurious ≤ 1.55 %, envelope 2.5 %); O53b's quinn bar ruled untestable, the no-stall clause pinned in virtual time |
+> | 261 | §6.3, §18.1, §18.2 | `IntroError::Evicted` splits cap-pressure from TTL; the eviction events enter `slither::policy` |
+> | 264 | §6.3, §16.4 | the NAT'd-population clause on the per-source cap, and the `Identity` seam defined where its bound is used |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -1309,7 +1314,11 @@ below).
   carried entries remain counted under this cap and expire at
   `INTRO_TTL` like any entry (honesty clause below).
   `read_identity()` is net-zero for its source's count (−1 unconsumed,
-  +1 consumed).
+  +1 consumed). Initiators sharing one public IP share one allowance —
+  the cap key is the source IP, so a NAT'd population competes for
+  `INTRO_MAX_PER_SOURCE` slots; the constant is marked `configurable`,
+  and `Config::with_intro_max_per_source` is the operator's remedy
+  **[AMENDED 2026/08/18 — ruling 264]**.
 - **Overflow: evict-oldest.** **[RATIFIED 2026/08/15 — ruling 69]** A full
   queue evicts the oldest unconsumed entry **by last refresh — the same
   clock `INTRO_TTL` runs on**, never by original park time. A same-source
@@ -1327,7 +1336,9 @@ below).
   Consumed chains are never evicted by overflow.
 - **Expiry** is silent eviction at `INTRO_TTL`; staged verbs on an expired
   attempt return `IntroError::Expired` (`AuthError::Expired` at that
-  stage). A consumed chain's mid-state expires 15 s after the initiation
+  stage). An attempt evicted by overflow (above) returns
+  `IntroError::Evicted` instead, while the bounded eviction record holds
+  its id **[AMENDED 2026/08/18 — ruling 261]**. A consumed chain's mid-state expires 15 s after the initiation
   that fed it. `accept()` alone is exempt — the re-home rule (§6.4) means a
   chain's age never fails an `accept()`, only the absence of any parked
   initiation does.
@@ -2506,6 +2517,20 @@ holds both and always does" was a universal over **armed** budgets with an
 unstated scope; the pump-time room check is the guarantee the
 implementation can keep.
 
+**Coalescing is all-or-nothing over the owed set, and the "otherwise"
+above is that rule.** **[AMENDED 2026/08/18 — ruling 258]** The three
+sizes are indexed by what is *owed*, not by what fits: with both path
+frames owed, a remaining room of 40–48 B admits one of them and the pump
+nonetheless emits the bare 31 B PING, leaving **both** to ranks 3 and 4.
+The alternative — packing whichever frames fit — buys one 9 B frame in a
+9 B-wide window, at the cost of a per-frame room check that must also
+reserve the PING's own byte, since §8.5 packs the PING after the path
+frames and a probe packet with no PING is not a probe. One invariant,
+checked once, is worth more than nine bytes recovered on a window this
+narrow. (The residue either choice leaves is unusable in both readings:
+40 − 31 = 9 and 48 − 40 = 8 are each below §3.4's 30 B minimum datagram,
+so no later packet is funded by the bytes saved.)
+
 The probe's place is the load-bearing one, and §7.5 already makes the
 argument exactly once, for the congestion gate: *"a probe the gate could
 delay past its own deadline would silently convert congestion into a
@@ -3632,8 +3657,11 @@ reads as *last among length-prefixed frames*. A sender may equally emit
 the datagram in its `0x31` LEN form and keep PING physically last — both
 parse identically and the choice is the sender's — but the ¬LEN form
 **must never be followed by anything**. Slice 7 makes the collision
-routine, since the contested probe and the PTO probe both emit PING into
-packets that may already carry an extends-to-end frame.
+routine, since the **PTO** probe (§13.4) emits its PING into a packet
+that may already carry an extends-to-end frame. **[AMENDED 2026/08/18 —
+ruling 258]** The **contested** probe (§7.5) does not: it is built ahead
+of the pump's ordinary packets and carries only the PING and §7.3's owed
+path frames (§14.5, §16.5), so the collision cannot arise there.
 
 Within
 the STREAM fill, streams with pending data are served **round-robin** —
@@ -4485,6 +4513,16 @@ the conservative fallback if the Appendix B timing obligations disappoint.
   is pending, a standalone ACK packet is generated. Pure-ACK packets are
   sealed `seal_quiet` (§7.4), are not ack-eliciting (no ACK-of-ACK loops),
   are never tracked for loss, and bypass the congestion window (§14.5).
+  **[Scope — the one packet this does not name.]** **[AMENDED 2026/08/18
+  — ruling 258]** The contested-connection probe (§7.5, §7.3) is built
+  before the pump's ordinary packets and carries only the PING and the
+  owed path frames (§16.5). An owed ACK does **not** ride it; it rides
+  the first ordinary packet behind it, in the same pass, and waits for
+  the budget where §7.3 ranks it (rank 5, under the probe and both path
+  frames). Two reasons, and the second is load-bearing: the probe exists
+  to ask one question and is sized to it, and §14.5's exemption for *"the
+  probe's packet as built"* is earned by a piggyback bounded at 18 B,
+  which an ACK frame — up to `MAX_ACK_RANGES` ranges — is not.
 
 ### 12.5 Processing a received ACK
 
@@ -4848,7 +4886,19 @@ send permitted  iff  bytes_in_flight + candidate_size ≤ cwnd
   piggyback adds at most 18 B of frames, and gating the merged packet
   would starve the challenge at collapsed cwnd exactly where a roam makes
   it owed. (The dedicated path-frame packet the coalescing replaces was
-  cwnd-gated; its work now rides the exempt probe.)
+  cwnd-gated; its work now rides the exempt probe.) **Scope of "as
+  built".** **[AMENDED 2026/08/18 — ruling 258]** The probe's packet
+  carries the PING and the owed `PATH_RESPONSE`/`PATH_CHALLENGE`, and
+  **nothing else** — no STREAM fill, no DATAGRAM, no credit grant, no
+  ACK. That is what makes the 18 B bound above a fact rather than a
+  hope, and it is the whole of what this exemption was widened to cover.
+  §8.5 orders the frames a packet carries; it does not decide which
+  packet a frame rides in, and its permission for a STREAM fill to sit
+  beside a PING is about the **PTO** probe (§13.4), which is built in
+  the ordinary pump pass and does carry fill. Application data that is
+  ready while a probe is pending leaves in the packet **behind** the
+  probe, on the same pass (§7.3, ruling 250(i)), where this section's
+  gate applies to it normally.
 - **Non-ack-eliciting control packets** — pure ACKs, CLOSE, keepalives —
   are never tracked in flight and never gated.
 
@@ -5421,10 +5471,11 @@ kinds are handed over in generation order (§16.4's ordering rule).
 **Why this is not `core::ConnEvent`.** The core enum's remaining variants
 — `Established`, `StreamOpened`, `StreamsAvailable`, `StreamReadable`,
 `StreamWritable`, `StreamFinished`, `StreamReset`, `MessageReadable`,
-`DatagramReadable`, `Closed` — are **already served**: each is the wakeup
-behind a blocking verb (`Connecting`'s resolution, `accept_bi`/
-`accept_uni`, `open_*`, `read`, `write`, ruling 47's `acked`, `read`'s
-`Reset`, `recv_message`, `recv_datagram`, `closed()`). Publishing them a
+`DatagramReadable`, `SendCreditAvailable`, `Closed` — are **already
+served**: each is the wakeup behind a blocking verb (`Connecting`'s
+resolution, `accept_bi`/`accept_uni`, `open_*`, `read`, `write`, ruling
+47's `acked`, `read`'s `Reset`, `recv_message`, `recv_datagram`, a
+blocked `send_message` — ruling 150 — and `closed()`). Publishing them a
 second time would hand an application two ways to learn one fact and
 invite the read-the-event-stream-instead-of-calling-the-verb style that
 §10.6 and §16.8 exist to forbid — an event consumer that claims nothing
@@ -5435,7 +5486,11 @@ only what **no verb can deliver**: a change to the connection itself.
 **This is a shell change; the sans-io core is untouched.** The **shell
 translates**: `ConnEvent::Closed(lost)` latches `closed()`;
 `ConnEvent::AddressMoved`, `Contested` and `ContestCleared` fill the
-notification slots. No new core event, no new `poll_output` variant, no
+notification slots. **[AMENDED 2026/08/18 — ruling 259]** The counting
+rule, stated so the lists can be checked: the core enum has **fourteen**
+variants — eleven verb-served above, three notification-fillers here —
+and a variant added to `ConnEvent` must land in exactly one of the two
+lists. No new core event, no new `poll_output` variant, no
 timer, no state machine, and nothing on the wire. §16.4's "signals, not
 payload carriers" framing holds unchanged at both layers: a
 `Notification` is a signal about the connection, carries no application
@@ -5848,7 +5903,31 @@ impl<I: Identity> core::Endpoint<I> {
     fn intro_source(&self, id: IntroId) -> Option<SocketAddr>;
     fn intro_sender_index(&self, id: IntroId) -> Option<u32>;
 }
+```
 
+**The `Identity` seam.** **[AMENDED 2026/08/18 — ruling 264]** `I:
+Identity` is the static-key and DH-provider abstraction (§2.4's
+canonical encoding is what `public_static()` returns the octets of;
+§17.5 is why `open()` is lazy):
+
+```rust
+pub trait Identity {
+    type Suite: Handshake;
+    type Provider: DhProvider<CurveOf<Self>>;
+    type Error: core::error::Error + 'static;
+    fn public_static(&self) -> &PublicKeyOf<Self>;
+    fn open(&self) -> Result<(Self::Provider, PrivateKeyOf<Self>), Self::Error>;
+}
+```
+
+`open()` mints the provider and static-key handle for **one** handshake,
+called lazily — at `read_identity()` on the responder path, and once per
+attempt on the initiator path — never at park, so an enclave-backed
+static does not hold up to `INTRO_QUEUE_CAP` concurrent provider handles
+for introductions nobody has inspected yet. No `Send` bound appears
+anywhere on `Provider`, deliberately (§16.3, S21).
+
+```rust
 enum Disposition { ForConnection(ConnectionId), Done }
 
 enum EndpointOutput {
@@ -5904,6 +5983,9 @@ enum ConnEvent {
     StreamWritable { r: StreamRef },             // stream/connection credit arrived for a blocked writer
     StreamFinished { r: StreamRef },             // send half fully acknowledged
     StreamReset { r: StreamRef, error_code: u64 },
+    SendCreditAvailable,                         // connection MAX_DATA credit for a blocked
+                                                 // message sender — companion to
+                                                 // StreamWritable, ruling 150
     MessageReadable,                             // signal: claim via recv_message() (§9.8)
     DatagramReadable,                            // signal: claim via recv_datagram() (§11)
     AddressMoved { from: SocketAddr, to: SocketAddr },
@@ -6339,7 +6421,10 @@ impl tokio::io::AsyncRead  for RecvStream {}
 pub struct BiStream { /* SendStream + RecvStream */ }
 impl BiStream {
     pub fn split(self) -> (SendStream, RecvStream);
-    pub fn join(send: SendStream, recv: RecvStream) -> Self;
+    pub fn join(send: SendStream, recv: RecvStream)
+        -> Result<Self, (SendStream, RecvStream)>;  // ruling 120; Err = not the
+                                                    // same stream — [AMENDED
+                                                    // 2026/08/18 — ruling 259]
 }
 impl tokio::io::AsyncRead  for BiStream {}
 impl tokio::io::AsyncWrite for BiStream {}
@@ -6796,8 +6881,14 @@ deleted.
   72]**: *our own* `Identity::open()` failed — a locked or
   biometrics-gated enclave, a hardware fault, a provider that is
   momentarily unavailable. See the note below.
-- **`IntroError::{Expired, Internal, Malformed, Local, EndpointDropped}`** —
-  `Expired`: the parked entry outlived `INTRO_TTL` (§6.3); `Internal`:
+- **`IntroError::{Expired, Evicted, Internal, Malformed, Local, EndpointDropped}`**
+  **[AMENDED 2026/08/18 — ruling 261]** —
+  `Expired`: the parked entry outlived `INTRO_TTL` (§6.3); `Evicted`:
+  the parked entry was displaced by §6.3's cap pressure — per-source or
+  global overflow — before any verb consumed it. The eviction record is
+  bounded at the queue's own cap, so a verb arriving after that many
+  further evictions reports `Expired`; the §18.2 `intro_evicted` event
+  is the unconditional signal and has no such window; `Internal`:
   the §6.5 interception — the initiation belonged to a pending outbound
   remote (a simultaneous open) and
   was consumed by the endpoint; the application learns no identity;
@@ -6905,7 +6996,7 @@ ruling 44.)
 
 | Target | Carries |
 |---|---|
-| `slither::policy` | guard rejections, internal tie-break outcomes (admissions, tag deaths, winner-side drops), and the **contested-connection probe's three events** — the mark (with its probe floor), the probe's transmission, and the verdict (cleared, or `TimedOut`) — §7.5 |
+| `slither::policy` | guard rejections, internal tie-break outcomes (admissions, tag deaths, winner-side drops), the **intro-queue evictions** (per-source and global overflow, with the evicted id — ruling 261), and the **contested-connection probe's three events** — the mark (with its probe floor), the probe's transmission, and the verdict (cleared, or `TimedOut`) — §7.5 |
 | `slither::replay` | replay-window rejections |
 | `slither::frames` | the frame layer's violation CLOSEs (post-AEAD structural failures and semantic violations, §8.2), the **datagram queue-overflow drop counters** (§11.5), and the **message-mode overflow reset** we emit — the stream, its final size, and the mode conflict that caused it (§9.8, ruling 59) |
 | `slither::roam` | endpoint moves (§7.3), and — **[AMENDED 2026/08/16 — ruling 208]** — the address-validation exchange at the same seam: the challenge drawn and sent at each arming, the matching `PATH_RESPONSE` that validates and disarms the budget, and a **mismatched** `PATH_RESPONSE`, which §8.4 makes a silent no-op and which is therefore visible *only* here. The last is the operative one for an operator: it is what an off-path guess, a superseded arming, or a duplicate after validation all look like, and a rate of it is the signal that a mechanism with no error surface is nevertheless being exercised |
@@ -7648,19 +7739,32 @@ composability layer wrong"*. Working rule 11 in the maintainer's own text.
   survives the connection's death; an empty write is `Ok(0)` while a
   blocked non-empty write parks.
 
-**Post-implementation validation obligations (gates on the flagged
-rulings).**
-- **The ACK-loss-burst simulation** (the §7.2/D-5 gate): FlakyWire on
-  the paused clock, sustained ACK-loss bursts against the 2048-bit fused
-  window under the every-2nd ACK policy, quantifying spurious-retransmit
-  and false-congestion-event rates. If the numbers disappoint, the
-  range-tracker ACK (§19) is the ready remedy — before ratification
-  hardens the fused choice.
+**Post-implementation validation obligations.** **[AMENDED 2026/08/18 —
+ruling 260: both were stated as pre-ratification gates; ratification
+(2026/08/14) overtook them undischarged, so each is re-scoped to a
+measured, pinned obligation — the constants stay ratified either way.]**
+- **The ACK-loss-burst simulation** (the §7.2/D-5 obligation):
+  **discharged by measurement 2026/08/18** (`tests/spec_ack_burst.rs`,
+  ruling 260). A 2 MiB stream at 20 ms RTT under return-path bursts of
+  2/8, 4/8 and 6/8 datagrams measured spurious retransmission at 0.11 %,
+  0.43 % and 1.55 % of forward datagrams; the pinned regression envelope
+  is 2.5 %. The structural finding recorded with the numbers: on a
+  lossless forward path the fused window is one contiguous block, so
+  every ACK carries the receiver's complete state — ACK loss costs
+  feedback *timing*, not *information* — and §19's range-tracker remedy
+  is not needed. The separation mutant (a window that forgets ACKed
+  ranges) scores 50.9 % spurious at zero ACK loss and dies at the first
+  burst severity.
 - **The window-constants throughput sanity check** (the §10.2 and §10.6
-  gate): bulk-transfer throughput over the same FlakyWire topology MUST
-  be **within 20 % of quinn under its shipped defaults**, with no stall,
-  measured with the §10.6 reassembly bound active (the
-  defragmentation/coalescing cost is part of the number) — before the
+  obligation): the wall-clock bar this stated — **within 20 % of quinn
+  under its shipped defaults** — is machine-relative and is **not
+  dischargeable as a test** (ruling 260); `benches/throughput.rs` remains
+  the wall-clock instrument. What survives as the pinned obligation is
+  the other clause, *"with no stall"*, held deterministically in virtual
+  time with the §10.6 reassembly bound active: a 2 MiB transfer over a
+  zero-delay wire completes in 0 ns of virtual time (bound at
+  `K_GRANULARITY`), and over the 20 ms-RTT fabric at 6.45 MiB/s with the
+  regression floor at half that (`tests/spec_ack_burst.rs`) — before the
   §10.2 constants and `REASSEMBLY_CHUNKS_MAX` ratify.
 
 ## Named constants *(consolidated; reference suite where suite-dependent)*

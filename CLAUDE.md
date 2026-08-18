@@ -267,8 +267,12 @@ the spec rounds.
    findings were unreachable from all 451 tests **by construction**,
    because `FlakyWire` models everything a *network* does and nothing a
    *socket* does: a fabric that loses, delays, duplicates and reorders
-   cannot express "this send fails" or "this driver panics". No amount of
-   test-writing against it would have found them. When a whole class of
+   could not, at review time, express "this send fails" or "this driver
+   panics". Ruling 49 later added `FlakyPolicy::send_failure`
+   (`ENETUNREACH` injection, toggleable mid-run), closing the first gap;
+   "this driver panics" remains unexpressed today (ruling 264). No
+   amount of test-writing against the fixture as it stood would have
+   found either at the time. When a whole class of
    fault is absent from the results, suspect the harness before the
    authors.
 14. **An isolated agent sees a commit, not a working tree — cut its

@@ -7580,7 +7580,17 @@ covered case's cost, not the return's presence.]** The
 overlap policy — `recv.rs:566` claims *"stored bytes win"* — is relaxed
 to §9.5's "either" (small-to-large can invert which copy survives;
 `tests_reassembly.rs:191–196` already uses equal bytes so as not to
-lean on it) **[S-71]**. And `recv.rs:702`'s `assert_eq!(half.capacity(), 2_000)`
+lean on it) **[S-71]**. **[Addendum 2026/08/18 — the landed merge does
+not invert.** The code doc at `recv.rs:44–50` states the landed merge is
+deterministic and always keeps the **stored** copy — the arriving frame
+is written only where no stored chunk already holds the byte, which is
+both first-copy-wins and the cheap side to keep under small-to-large.
+"Can invert" described a hypothetical alternative merge under
+consideration at ruling time, not the one that shipped. The **conclusion
+stands**: the relaxation to §9.5's "either" is a specification
+permission, so nothing may depend on today's determinism — a future
+merge that did invert would still be conformant — but as shipped, it
+does not.]** And `recv.rs:702`'s `assert_eq!(half.capacity(), 2_000)`
 goes red under any growth-amortised merge: it is **re-derived** under the
 new accounting, never relaxed to an inequality — an upper bound the
 degenerate build satisfies for free is rule 9's trap, and this is the one
@@ -7854,3 +7864,189 @@ slice-6 datagram contributor and the slice-7 probe packing both sit on,
 for zero behavioural difference; it becomes the required shape the
 moment a third extends-to-end contributor or a ¬LEN STREAM emitter
 exists.
+
+### 258 — what rides the contested probe's packet: the three scope clauses ruling 250 left unstated
+
+**Ruling: (i) coalescing is all-or-nothing over the owed set — a room
+admitting only part of it emits the bare 31 B PING and leaves the whole
+set to ranks 3 and 4 (§7.3 gains the clause). (ii) An owed pure ACK
+never rides the probe's packet; it rides the first ordinary packet
+behind it, same pass (§12.4 gains the scope). (iii) The probe's packet
+carries the PING and the owed path frames and nothing else — no STREAM
+or DATAGRAM fill, no grants, no ACK — because §14.5's cwnd exemption is
+*earned* by the 18 B piggyback bound (§14.5 gains the "as built" scope);
+§8.5's sentence claiming the contested probe collides with
+extends-to-end frames is corrected to name only the PTO probe, which
+does. No code changes: all three clauses state the shipped behaviour.**
+
+All three were round-40 residue from ruling 250's slice
+(`round41-material.md` items 3–5), verified against the pump at
+`94dab20`: the all-or-nothing predicate at `mod.rs:3232` (`owed > 0 &&
+packing.room() >= coalesced`), `pack_ack` absent from
+`pump_contested_probe` (two call sites, `mod.rs:2209`/`2816`, neither
+the probe's), and the probe built at `mod.rs:2191` before the fill loop
+at `:2201`. Item 3's window is real — ruling 250 itself retired the 90 B
+arming floor, so [40, 49) is reachable — and greedy's gain is measured
+worthless: the 9–18 B recovered fund nothing (both residues sit under
+§3.4's 30 B minimum datagram), while greedy must also reserve the PING's
+byte since `frame.rs:1114–1120` forbids packing it first. Item 4 was a
+genuine rule-3 conflict: §12.4's *"an owed ACK rides the next outgoing
+packet"* reads on the probe, and three ratified texts read against it —
+§16.5's exhaustive contested cell, §14.5's 18 B bound (an ACK frame is
+sized to the room, up to `MAX_ACK_RANGES` ranges), §7.3's rank 5. The
+statement a proof depends on wins: the exemption's soundness *is* the
+bound, so the ACK stays behind the probe and §12.4 states its one
+exception. Item 5's tiebreak is the same bound one level up — §8.5's
+"any packet" is placement-only by its own words, and its
+collision sentence was false of the contested probe from the day it was
+written (ruling 250's pre-fix measurement was already a bare 31 B PING).
+The blind author's filtered assertion at `tests_contested.rs:1623–1632`
+measured item 4's behaviour and deliberately declined to pin it; with
+the scope now ratified, a pin is legal — left to the next test slice.
+
+### 259 — ruling 248's eight, disposed in one sitting
+
+**Ruling, per item of ruling 248's list: (i) `ConnEvent`'s two spec
+listings are corrected — `SendCreditAvailable` (ruling 150) enters
+§16.4's block and §16.2's verb-served list, and §16.2 states the
+counting rule: fourteen variants, eleven verb-served, three
+notification-fillers, every future variant lands in exactly one list.
+(ii) §16.11's `join` becomes the fallible form §16.2, ruling 120 and the
+code agree on. (iii) `ConnectionId`/`IntroId` are un-exported — no
+public signature names them, no story needs them; `lib.rs`'s "three
+identifiers" comment becomes true. (iv) The second-handle pattern is
+documented on `Connection`: app-side `Rc::new` — doc-only, the crate
+already permits it. (v) Every public type gains `Debug` (11 named + 7
+testutil), manual impls where a field cannot derive; no key material
+printed. (vi) STORIES.md's stale `ConnEvent::AddressMoved` becomes
+`Notification::AddressMoved` (sweep fix). (vii) CI gains a curated
+feature-matrix job: the four single-feature legs, one OS — the interior
+points where ruling 246's class lives. (viii) Flow control gains a
+static `Config` knob raising what this endpoint advertises; the ratified
+constants stay the defaults. The knob ships in its own slice with its
+own spec clause (ruling 82's shape).**
+
+Every item was re-verified open at `94dab20` before disposal (report
+`round41-F-ruling-248-status.md`; none was touched by rounds 40–41's
+first nine commits). Implementation notes from the landing
+(`f148140`): the CI legs run **clippy `-D warnings`**, not `cargo
+check` — the implementer declined the brief's check-only instruction
+under working rule 5, because ruling 246's defect class is `dead_code`,
+a warning `cargo check` exits green on; a check-only job would have
+passed on ruling 246's own tree. Correct, and recorded here as the
+precedent. The 18 `Debug` impls are all manual: `WakerSlot` holds a
+`Box<dyn FnMut>`, a derive on a generic emits an `impl<S: Debug>` bound
+that silently vanishes, and `CountingProvider`/`CountingIdentity` wrap
+key material that must not print.
+
+### 260 — O53a and O53b, discharged by measurement
+
+**Ruling: Appendix B's two stranded pre-ratification gates are re-scoped
+to measured, pinned obligations. O53a ran (`tests/spec_ack_burst.rs`,
+`7f175e6`): 2 MiB at 20 ms RTT under return-path ACK bursts of 2/8, 4/8,
+6/8 → spurious retransmission 0.11 % / 0.43 % / 1.55 % of forward
+datagrams; the regression envelope is pinned at 2.5 % (1.55 × 1.5).
+O53b's "within 20 % of quinn" is ruled untestable as stated — the bar is
+machine-relative wall-clock, and taking a quinn dev-dependency to
+validate constants that can no longer move was declined — while its
+"with no stall" clause is pinned deterministically in virtual time: 0 ns
+over a zero-delay wire (bound at `K_GRANULARITY`) and a floor of half
+the measured 6.45 MiB/s over the 20 ms fabric. `benches/throughput.rs`
+remains the wall-clock instrument.**
+
+The audit ranked this its #1 finding — the spec's own text in an
+unresolved state: gates written to run *"before ratification hardens the
+fused choice"*, ratification passed 2026/08/14, nothing marked them
+satisfied, waived, or historical. The measurement settles the question
+the gate was built to ask, and the answer is structural, better than a
+rate: on a lossless forward path the fused window is one contiguous
+block, so **every ACK carries the receiver's complete state — ACK loss
+costs feedback timing, not information** — and §19's range-tracker
+remedy is not needed at this wire's ACK policy. The separation mutant
+(rule 9: `ack::derive` forgetting the first range) scores 50.9 %
+spurious at zero ACK loss and dies at the first burst severity, so the
+envelope assertion is a real pin, not a name. Determinism of the
+virtual-time floors: three release runs and a debug run identical to the
+nanosecond — the paused clock replays one schedule.
+
+### 261 — `IntroError::Evicted`: cap pressure stops reporting itself as a timeout
+
+**Ruling: the `Expired` conflation is split. A parked introduction
+displaced by §6.3's cap pressure — per-source or global overflow —
+reports `IntroError::Evicted`; `Expired` is true of `INTRO_TTL` expiry
+alone. Both eviction sites emit an unconditional `slither::policy`
+`intro_evicted` event (§18.2 gains the row), which is the operator's
+windowless signal. §18.1's closed taxonomy gains the variant; the
+Display strings become true.**
+
+The audit's finding, verified at `94dab20`
+(`round41-H-audit-triage.md` §2.3): one production site
+(`staged.rs:267`'s table miss) fed by three causes, and for the two
+evictions the string *"outlived INTRO_TTL"* was affirmatively false —
+reporting a 15-second timeout for a microseconds-old displacement,
+pointing an operator at TTL tuning when the signal is "you are at your
+intro-queue cap", during exactly the flood where it matters. Both
+eviction call sites additionally dropped the evicted entry traceless:
+invisible twice. Unpublished 0.2.x priced the breaking variant at
+now-or-never, and now won.
+
+The landing (`f148140`) is honest about its bound, and the bound is
+ratified with it: the eviction record is a ring capped at the queue's
+own cap (≈8 KiB at 1024 — an exact record is unbounded, because an
+application may hold an `Intro` handle forever, and unbounded state
+keyed on eviction is a memory amplifier reachable by the very flood the
+cap exists to survive). A verb arriving after cap-many further evictions
+reports `Expired` again; the trace event has no such window, which is
+why both exist. One deliberate extension, accepted: `AuthError::
+Expired`'s Display string was equally false for evictions and was
+**reworded** — no `AuthError::Evicted`, since §18.1 declares that
+taxonomy closed and this ruling splits `IntroError` only. Both new
+pins verified red-on-base (`Some(Expired)` vs `Some(Evicted)`).
+
+### 263 — `copy_work()` is monotone at the connection
+
+**Ruling: `Streams` gains `retired_copy_work`, absorbed at the one
+`recv.take()` where a half retires, so the connection-level meter never
+shrinks; the per-half accessors are untouched.**
+
+Round-40 residue (`round41-material.md` item 9). The sum dropped at
+exactly one line — `streams.rs:1501`, reachable from five events
+including `claim_message`, so message workloads zeroed the meter
+continuously. §10.6 and ruling 253 bound work per stream, so the
+non-monotone sum was *defensible*; it was also the unsafe direction — a
+work meter that under-reports is the one an auditor cannot trust, and
+§10.6's own state-bound-versus-work-bound distinction is the argument:
+capacity may shrink with state, performed work must not. Landed at
+`f148140` with the pinning test verified red-on-base (94 208 → 0 across
+retirement on the unfixed build).
+
+### 264 — the documentary sweep: five artefacts catch up with the code
+
+**Ruling: (i) README, CHANGELOG (0.2.0 entry), SECURITY.md are rewritten
+against the shipped API and constants; TODO.md is deleted as wholly
+superseded (`99cdc56`). (ii) CLAUDE.md working rule 13's fixture claim
+is narrowed to the truth: ruling 49's `FlakyPolicy::send_failure` closed
+the "this send fails" gap at review time's expense; "this driver panics"
+remains inexpressible. (iii) §16.4 defines the `Identity` seam where its
+bound is first used — the trait's five items, `open()`'s laziness
+(§17.5), and the deliberate absence of a `Send` bound (S21). (iv) §6.3
+states the NAT consequence beside the per-source cap, with
+`with_intro_max_per_source` named as the remedy. (v) Ruling 253 gains
+the dated addendum: the landed merge is deterministic and always keeps
+the stored copy — "can invert" described a hypothetical, and the §9.5
+"either" relaxation stands as a specification permission. (vi) The
+remaining in-code stale comments (the survey's proven-LIVE quartet,
+`recovery.rs`'s path_gen prose, `Cargo.toml:172`, the slice-scoped
+absence comments, and this round's finds: `FlakyPolicy`'s false
+"every field is public" rustdoc, `poll_read`'s stale latch-recheck
+justification) land in a dedicated comment slice, alongside R40-D's two
+testing conventions written into `testutil`'s module docs — session ids
+are wall-clock-fed, never golden-pin one; the `Tap` records before the
+loss draw.**
+
+The SECURITY.md rewrite surfaced one claim worth its own line rather
+than a silent fix: the old text said the RNG seed is *"zeroized after
+use"*; the code holds a plain `[u8; 32]` and drops it unwiped — no
+`zeroize` dependency exists. The rewritten text states what is true. If
+wiping is wanted, that is a dependency decision for a future round, not
+a documentation edit.
