@@ -329,6 +329,11 @@ required-features = ["test-util", "sink"]
 name = "spec_ack_burst"
 required-features = ["test-util"]
 
+# ruling 265
+[[test]]
+name = "story_park"
+required-features = ["test-util"]
+
 # ── Benchmarks ────────────────────────────────────────────────────────────
 # Throughput measurement, not a gate. Three things about this stanza are
 # load-bearing:

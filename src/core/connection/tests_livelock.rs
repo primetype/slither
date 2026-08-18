@@ -67,6 +67,16 @@
 //! variant `ADVERSARIAL-liveness.md` calls *unbounded* is, on this author's
 //! arithmetic, **not constructible**, and the reason is a one-line
 //! inequality. It is reported rather than half-tested.
+//!
+//! **[CORRECTED 2026/08/18 — ruling 265.] It is constructible, it was
+//! built, and the state it reaches is worse than the spin this file pins:
+//! a connection that announces `Timeout(None)` with no timer armed at all
+//! and neither dies nor sends.** The inequality's second step is the one
+//! that fails — a pure ACK is *sized to the room*, not ~35 bytes — and
+//! [`the_passive_form`] carries the corrected arithmetic. The tests are
+//! `tests_park.rs` (core) and `tests/story_park.rs` (shell); reporting
+//! rather than half-testing was still the right call, and the report is
+//! what got measured.
 
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::too_many_lines)]
@@ -916,6 +926,14 @@ fn a_freshly_installed_core_announces_its_death_clock_and_not_none() {
 /// [`an_admissible_passive_keepalive_fires_and_then_disarms`]; what is missing
 /// is the refusal, and it is missing because it does not appear to exist.
 ///
+/// **[Ruling 265.]** It exists, and it is now covered — in `tests_park.rs`
+/// rather than here, because the construction needs a fragmented replay
+/// window and a full congestion window and belongs with the assertions it
+/// serves. This note is kept whole, with its corrections marked inline, for
+/// the reason ruling 220 kept the last one: the argument is sound down to a
+/// single step, and deleting it would lose both the step and the flag the
+/// author put on it.
+///
 /// `ADVERSARIAL-liveness.md` F1 names two *unbounded* variants, both of which
 /// require §7.5's **passive** debt — `owes_passive_keepalive()` — to be set
 /// at the instant of the refusal. On this author's arithmetic that state
@@ -942,6 +960,25 @@ fn a_freshly_installed_core_announces_its_death_clock_and_not_none() {
 ///   costs ~35 bytes against the ≥ 90 its own trigger credited: the room
 ///   grows monotonically. Every other member sets `armed`, which puts the
 ///   connection back in the **bounded** case this file already tests.
+///
+///   **[CORRECTED 2026/08/18 — ruling 265.] A pure ACK does not cost ~35
+///   bytes. It is sized to the room, and the room does not grow
+///   monotonically.** [`Connection::packing`](super::Connection::packing)
+///   clamps the plaintext to `room − 30` (ruling 203/207(c)) and
+///   [`ack::derive`](super::ack::derive) truncates newest-first *at that
+///   room*, up to `MAX_ACK_RANGES` = 64 pairs — so on a replay window with
+///   enough gaps **one** non-marking, non-arming packet takes the whole
+///   budget. Measured in `tests_park.rs`: a roam funding `3 × 35 = 105`
+///   datagram bytes is answered by a **105-byte ACK carrying 33 range
+///   pairs**, leaving `room == 0` with `armed == false` and the debt set.
+///   The end-to-end form is `tests/story_park.rs`, where a 39-byte roam
+///   trigger funds 117 bytes and the ACK takes all 117.
+///
+///   The author flagged its own uncertainty here — *"building it needs
+///   assumptions about `Packing`'s budget clamp that a blind author would
+///   be guessing at"* — and that flag was exactly right: the clamp is the
+///   step. Nothing else in this file's reasoning moves, and the
+///   `Pending`-mark disjunct below is untouched.
 /// * **contested.** A mark is `Pending` only while the budget refuses the
 ///   31-byte probe. The same ≥ 90 bytes of credit release it on the very
 ///   pump the receive triggers, so a pending mark and a fresh receive cannot
@@ -965,6 +1002,22 @@ fn a_freshly_installed_core_announces_its_death_clock_and_not_none() {
 /// after a receive — which is exactly the moment the room is largest. The
 /// unbounded claim looks to me **overstated**; the bounded claim is exact and
 /// is what this file tests. Reported, not resolved (working rule 3).
+///
+/// **[CORRECTED 2026/08/18 — ruling 265.]** The unbounded claim was
+/// **understated**, not overstated. `armed == false` *is* the moment the
+/// room is largest, and the room is spent to nothing in the very next
+/// packet — so the reachable state is not an unbounded spin but something
+/// the announce-gate turned into an unbounded **park**: `Timeout(None)`,
+/// no timer armed, alive and silent at 2.4 × `DEAD_TIMEOUT`. Ruling 265
+/// closes it by announcing §7.4's own deadline for a keepalive that is
+/// owed and vetoed.
+///
+/// Two things worth keeping from this note rather than deleting with it.
+/// The author **flagged the exact step it was unsure of** and left the test
+/// out rather than shipping a fixture it could not verify — that flag is
+/// what the measurement was aimed at, and it was aimed correctly. And the
+/// **`contested` half above is untouched**: a pending mark and a fresh
+/// receive still cannot coexist, for precisely the reason given.
 #[allow(dead_code)]
 fn the_passive_form() {}
 

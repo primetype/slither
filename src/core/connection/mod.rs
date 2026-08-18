@@ -133,6 +133,9 @@ mod tests_path;
 mod tests_pto_gate;
 #[cfg(test)]
 mod tests_reassembly;
+// Ruling 265's core regression — the vetoed keepalive and the death clock.
+#[cfg(test)]
+mod tests_park;
 //
 // **Integrator — `testfix.rs` has aged out again, and it is the reason 13
 // lib tests are red on this commit.** `parse_frames`' fallback arm panics
@@ -2944,15 +2947,78 @@ impl<C: Handshake> Connection<C> {
     /// too would turn a spinning connection into an immortal one, which is
     /// the collapse ruling 182's beacon proof warns about and is strictly
     /// worse than the spin.
+    ///
+    /// # The vetoed keepalive arms the death clock (**[ruling 265]**)
+    ///
+    /// **The paragraph above is true only where `Liveness::deadline()` is
+    /// `Some`, and that scope went unstated for a slice** — working rule 8's
+    /// exact shape, *a stated construction with an unstated scope*. `armed`
+    /// is cleared by every authenticated, window-fresh receive, and
+    /// `deadline()` returns `None` while it is clear (§7.4, `session.rs`).
+    /// *Not suppressing* a `None` suppresses nothing.
+    ///
+    /// So the suppression above has a hole, and it is the one §7.5's own
+    /// soundness proof forbids. §7.4's death predicate has **two** conjuncts
+    /// — `now − last_authenticated_recv >= DEAD_TIMEOUT` **and** *"at least
+    /// one **arming** send has occurred since that last authenticated
+    /// receive"* — and the second is sound only because §7.5 promises an
+    /// arming send within `KEEPALIVE_TIMEOUT` of every receive. Ruling 182
+    /// states the promise as *"every send that can establish `S > R` is a
+    /// marking send, so the death clock is armed there"*. That quantifies
+    /// over **sends**, and says nothing about a keepalive that is *owed and
+    /// never sent*: the very receive that sets the passive debt clears
+    /// `armed`, so the keepalive is owed **precisely** in the window where
+    /// the death clock is disarmed — and [`keepalive_can_leave`] can veto
+    /// it. Measured on a roamed connection whose budget one pure ACK
+    /// exhausts: `Timeout(None)`, **no timer armed at all**, alive and
+    /// silent at 60 s — 2.4 × `DEAD_TIMEOUT`. That is the immortal half-open
+    /// session, reached through a door ruling 182 did not enumerate.
+    ///
+    /// **The fix is an anchor, not a new timer.** A keepalive of either kind
+    /// that is owed and vetoed *is* the arming event §7.4's second conjunct
+    /// is waiting for, so the death clock is announced in its place, at
+    /// `last_authenticated_recv + DEAD_TIMEOUT` — exactly what
+    /// `Liveness::deadline()` would return were `armed` set.
+    ///
+    /// **Why the backstop cannot misfire.** Both disjuncts of
+    /// [`keepalive_can_leave`](Self::keepalive_can_leave) lift *only* on an
+    /// authenticated, window-fresh receive (the budget grows on `on_recv`,
+    /// ruling 169; the mark clears on an ACK covering its floor), and such a
+    /// receive **moves `last_authenticated_recv`** — so this deadline slides
+    /// with it and can fire only on a connection that has genuinely stopped
+    /// hearing from its peer. It is ruling 249's principle read in the other
+    /// direction: 249 withheld an announcement for output that cannot leave;
+    /// this supplies one for a *hold* that nothing else would ever end.
+    ///
+    /// **The second disjunct is provably redundant and is written anyway.**
+    /// `armed` is set by any marking **or** ack-eliciting send while the
+    /// passive debt is cleared **only** by a marking one, so after a receive
+    /// the state is `!armed && debt`, after an ack-eliciting quiet send
+    /// `armed && debt`, after a marking send `armed && !debt` — hence
+    /// `!armed` **implies** `debt` everywhere except §7.4's install pin
+    /// (`armed && !debt`). The `or_else` arm therefore only ever runs with
+    /// the debt already set, and naming the beacon costs nothing. It is
+    /// named because ruling 265 is stated over *"a keepalive, active or
+    /// passive"* and a reader must not have to re-derive the implication to
+    /// see that the code covers both.
     fn sync_liveness_timer(&mut self) {
         if !self.lifecycle.is_live() {
             return;
         }
         let clocks = self.session.as_ref().map(Session::liveness).copied();
-        let deadline = clocks.and_then(|liveness| liveness.deadline());
-        self.timers.set(TimerKind::Liveness, deadline);
-
         let can_leave = self.keepalive_can_leave();
+
+        // **[RATIFIED 2026/08/18 — ruling 265]** The backstop. `or_else`, so
+        // an armed clock is untouched and only the `None` this rule exists
+        // for is filled.
+        let owed = clocks.is_some_and(|l| l.owes_passive_keepalive())
+            || self.persistent_keepalive.is_some();
+        let deadline = clocks.and_then(|liveness| liveness.deadline()).or_else(|| {
+            clocks
+                .filter(|_| owed && !can_leave)
+                .map(|l| l.last_authenticated_recv() + constants::DEAD_TIMEOUT)
+        });
+        self.timers.set(TimerKind::Liveness, deadline);
 
         // Ruling 195: the flag, not `R > S`. The comparison is false when
         // the two instants coincide — which the driver's once-per-turn
