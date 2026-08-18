@@ -63,8 +63,9 @@ use super::streams::StreamRef;
 
 use crate::constants::{
     FINAL_SIZE_ERROR, FLOW_CONTROL_ERROR, INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA,
-    INITIAL_MAX_STREAMS_BIDI, INITIAL_MAX_STREAMS_UNI, MAX_PLAINTEXT, PROTOCOL_VIOLATION,
-    REASSEMBLY_CHUNKS_MAX, STREAM_LIMIT_ERROR, STREAM_STATE_ERROR, STREAMS_CREDIT_BATCH,
+    INITIAL_MAX_STREAMS_BIDI, INITIAL_MAX_STREAMS_UNI, MAX_DATAGRAM, MAX_PLAINTEXT,
+    PROTOCOL_VIOLATION, REASSEMBLY_CHUNKS_MAX, STREAM_LIMIT_ERROR, STREAM_STATE_ERROR,
+    STREAMS_CREDIT_BATCH,
 };
 use crate::core::{Install, Role};
 use crate::error::{ReadError, WriteError};
@@ -2618,6 +2619,199 @@ mod packing {
             found,
             "no packet carried both a credit frame and stream data, so this \
              test asserted nothing: {packets:?}"
+        );
+    }
+
+    /// `(id, offset, data length, fin)` for every STREAM frame in a
+    /// packet.
+    ///
+    /// §8.5's geometry is a statement about frame *sizes*, and a failed
+    /// `assert_eq!` on `Wire` itself would print two kilobytes of payload
+    /// to say that one length was 136 and not 138.
+    fn stream_shape(pkt: &[Wire]) -> Vec<(u64, u64, usize, bool)> {
+        pkt.iter()
+            .filter_map(|f| match f {
+                Wire::Stream {
+                    id,
+                    offset,
+                    data,
+                    fin,
+                    ..
+                } => Some((*id, *offset, data.len(), *fin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **[RATIFIED 2026/08/18 — ruling 257]** A bare FIN owed against a
+    /// packet with no room **defers to the next packet**; it is never
+    /// offered to a `Packing` that can only refuse it.
+    ///
+    /// # The defect
+    ///
+    /// `Packing::stream_payload_room` answers `None` for *"not even an
+    /// empty frame fits"* and `Some(0)` for the **opposite** — *"a frame
+    /// fits, with no payload"*, reachable only at `room() == fixed + 1`,
+    /// which is exactly the width of the bare-FIN frame. The fill loop
+    /// collapsed the two with `unwrap_or(0)` and guarded only the second,
+    /// whose guard is `has_data_pending()`. A bare FIN is not data, so it
+    /// walked past that guard into a `fill` that could only refuse it, and
+    /// `Streams::fill`'s own `debug_assert` fired.
+    ///
+    /// # Why it takes four steps to reach, and why none of them is loss
+    ///
+    /// The arm needs a **coincidence**, not a fault:
+    ///
+    /// 1. a retransmit prefix that ends **strictly below** the final size,
+    ///    so `next_chunk`'s `carries_fin` is false and the FIN stays a
+    ///    separate obligation rather than a flag on the last data frame;
+    /// 2. that prefix packing to **exactly** `MAX_PLAINTEXT` — the
+    ///    round-robin quantum is 1024, and `1028 + 142 = 1170` to the byte;
+    /// 3. the FIN still owed at the moment the packet fills;
+    /// 4. all three inside one pump.
+    ///
+    /// It was found at a 50 % two-way loss rate, on 3 seeds in 64. Working
+    /// rule 13's shape: no fixture built on *chosen* loss (`drop_at`,
+    /// `block_path`, a blackhole) can produce it, because a chosen loss is
+    /// chosen precisely to keep the geometry stable. So the coincidence is
+    /// **built** here — a hand-shaped ACK that leaves two counters behind —
+    /// and the test holds on every run rather than 3 runs in 64.
+    ///
+    /// # Mutation caught — both halves, because one is release-invisible
+    ///
+    /// * **The unguarded `unwrap_or(0)`.** The pump hands `Packing` a
+    ///   five-byte frame a full packet cannot take and the `debug_assert`
+    ///   fires, so this test panics on a base build under `cargo test`.
+    ///   That is the *whole* of the defect: with the assert compiled out
+    ///   the broken and fixed builds are observationally identical (64
+    ///   seeds, same virtual-time completion instant to the millisecond),
+    ///   so there is deliberately nothing else for the debug half to
+    ///   observe.
+    /// * **A "fix" that defers by dropping the half out of the rotation**
+    ///   (`set_queued(false)` where `push_front` belongs), or one that
+    ///   drops `return_chunk`'s `fin_sent = false` restoration. Both
+    ///   survive the first half in every profile and strand the FIN for
+    ///   ever. Separated by the last two assertions: the deferred FIN is
+    ///   on the wire in the **very next** packet, and the send half then
+    ///   reaches §9.7's `DataRecvd`.
+    ///
+    /// The `MAX_DATAGRAM` assertion is the "asserted nothing" guard this
+    /// module already uses elsewhere: if the retransmission packet were
+    /// one byte short of full, the FIN would fit inside it and every
+    /// remaining assertion would pass for the wrong reason.
+    #[test]
+    fn a_bare_fin_against_a_full_packet_defers_to_the_next_packet() {
+        let t = t0();
+        let mut s = Solo::installed_at(t);
+
+        // 1. 2048 bytes. The quantum is 1024, so the first packet takes
+        //    1024 + 136 = 1160 of them and the second takes the tail.
+        let r = s.conn.open(Dir::Uni).expect("open");
+        let id = s.conn.stream_id(r).expect("installed").as_u64();
+        assert_eq!(write_all(&mut s.conn, t, r, &ramp(0, 2048)), 0);
+
+        // 2. `finish` **after** those bytes reached the pump. A `finish`
+        //    before it rides out as a flag on the tail frame and the bare
+        //    obligation never exists.
+        s.conn.finish(t, r).expect("finish");
+
+        // 3. A filler stream whose only job is to put counters *above* the
+        //    FIN's packet on the wire. A packet at or above `largest_acked`
+        //    can never be declared lost, and the bare FIN rides the last
+        //    packet this stream sends — so without this the FIN's packet is
+        //    unreachable by either loss threshold.
+        let filler = s.conn.open(Dir::Uni).expect("open");
+        assert_eq!(write_all(&mut s.conn, t, filler, &ramp(0, 4096)), 0);
+
+        let first = drain(&mut s.conn);
+        let sent = s.packets(&first);
+        assert_eq!(
+            stream_shape(&sent[0]),
+            vec![(id, 0, 1024, false), (id, 1024, 136, false)],
+            "the premise: one quantum plus what the length varints leave is \
+             `MAX_PLAINTEXT` to the byte"
+        );
+        assert_eq!(
+            first.transmits()[0].data.len(),
+            MAX_DATAGRAM,
+            "§8.6: a plaintext of `MAX_PLAINTEXT` is a datagram of \
+             `MAX_DATAGRAM`; if this packet is not full the rest of this \
+             test asserts nothing"
+        );
+        assert_eq!(
+            stream_shape(&sent[2]),
+            vec![(id, 2048, 0, true)],
+            "§9.5's empty end-of-stream marker, alone in its packet — the \
+             bare obligation this test is about"
+        );
+
+        // 4. ACK everything **except** counter 0 (the full packet) and
+        //    counter 2 (the FIN's). `K_PACKET_THRESHOLD` is 3 and the
+        //    largest acknowledged is 6, so both are declared lost in one
+        //    detection pass and the pump that follows owes the retransmit
+        //    prefix *and* the bare FIN together.
+        let highest = s.conn.next_counter().expect("established") - 1;
+        assert!(
+            highest >= 5,
+            "counter 2 is only reachable by the packet threshold once the \
+             largest acknowledged is 5 or more; got {highest}"
+        );
+        let mut ack = Vec::new();
+        put(&mut ack, crate::constants::FRAME_ACK);
+        put(&mut ack, highest); // largest
+        put(&mut ack, 0); // ack_delay
+        put(&mut ack, 1); // one further (gap, range) pair
+        put(&mut ack, highest - 3); // first_range: `highest` down to 3
+        put(&mut ack, 0); // gap: the next range's largest is 1
+        put(&mut ack, 0); // range: counter 1 alone
+        let d = s.deliver_packed(t, &[ack]);
+        let rtx = s.packets(&d);
+
+        // ── the line ruling 257 turns on ─────────────────────────────
+        assert_eq!(
+            stream_shape(&rtx[0]),
+            vec![(id, 0, 1024, false), (id, 1024, 136, false)],
+            "§8.7: only the still-unacknowledged prefix is resent, and it \
+             fills the packet exactly"
+        );
+        assert_eq!(
+            d.transmits()[0].data.len(),
+            MAX_DATAGRAM,
+            "the retransmission packet is full to the byte — the state in \
+             which `stream_payload_room` answers `None` and a bare FIN has \
+             nowhere to go"
+        );
+        assert_eq!(
+            rtx.len(),
+            2,
+            "ruling 257: the refused FIN is **deferred**, not dropped — a \
+             build that strands it sends the retransmission alone"
+        );
+        assert_eq!(
+            stream_shape(&rtx[1]),
+            vec![(id, 2048, 0, true)],
+            "ruling 257: the deferred FIN is emitted by the **very next** \
+             packet. A build that defers by leaving the rotation, or that \
+             loses `return_chunk`'s `fin_sent = false`, strands it here"
+        );
+
+        // The half that separates a wrong fix in **release** too: with the
+        // FIN acknowledged the send half reaches §9.7's `DataRecvd`. A
+        // stranded FIN is never sent, never acknowledged, and never gets
+        // here.
+        let highest = s.conn.next_counter().expect("established") - 1;
+        let mut ack_all = Vec::new();
+        put(&mut ack_all, crate::constants::FRAME_ACK);
+        put(&mut ack_all, highest);
+        put(&mut ack_all, 0);
+        put(&mut ack_all, 0);
+        put(&mut ack_all, highest);
+        let done = s.deliver_packed(t, &[ack_all]);
+        assert_eq!(
+            done.count_events(|e| matches!(e, ConnEvent::StreamFinished { r: got } if *got == r)),
+            1,
+            "§9.7: every byte and the FIN are acknowledged, so the send half \
+             is `DataRecvd`"
         );
     }
 }

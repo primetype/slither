@@ -1068,8 +1068,19 @@ impl Streams {
                     send.set_queued(false);
                     continue;
                 };
-                let room = packing.stream_payload_room(id, offset).unwrap_or(0);
-                if room == 0 && send.has_data_pending() {
+                // `None` and `Some(0)` are **opposite** facts and must not
+                // be collapsed: `None` is *"not even an empty frame fits"*,
+                // `Some(0)` is *"a frame fits, with no payload"* — reachable
+                // only at `room() == fixed + 1`, which is exactly the width
+                // of the bare-FIN frame. `has_data_pending()` is the guard
+                // for the second (`send.rs`: an empty FIN frame still fits
+                // where a data frame does not); only `fits.is_none()` is the
+                // guard for the first, because a bare FIN is not data and
+                // walks past the other one into a `fill` no packet can
+                // honour.
+                let fits = packing.stream_payload_room(id, offset);
+                let room = fits.unwrap_or(0);
+                if fits.is_none() || (room == 0 && send.has_data_pending()) {
                     defer = true;
                 } else if let Some(chunk) = send.next_chunk(room.min(STREAM_FILL_QUANTUM)) {
                     let (at, fin, fresh) = (chunk.offset, chunk.fin, chunk.fresh);

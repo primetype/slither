@@ -1049,9 +1049,33 @@ impl Packing {
     /// The largest STREAM payload that still fits, given the frame's fixed
     /// fields. `None` when not even an empty frame fits.
     ///
+    /// **The two answers are opposites and a caller must not collapse
+    /// them** — `None` is *"no frame of any size fits"*, `Some(0)` is *"a
+    /// frame fits, with no payload"*, which is reachable only at
+    /// `room() == fixed + 1` and is exactly the width of §9.5's empty
+    /// FIN-bearing frame. **[ruling 257]** `Streams::fill` read them
+    /// through `unwrap_or(0)` and guarded only the second, so a bare FIN
+    /// against a full packet was built and handed to
+    /// [`fill`](Packing::fill), which could only refuse it.
+    ///
     /// Written here because the length varint's own width depends on the
     /// payload length it describes — the one place in the codec where a
     /// field's size is a function of the value it precedes.
+    ///
+    /// # Scope: this query does **not** consult `extends_to_end`
+    ///
+    /// [`push`](Packing::push) refuses *everything* once that flag is set,
+    /// whatever [`room`](Packing::room) says, and this answer is derived
+    /// from `room()` alone. The gap is unreachable today only by an
+    /// arithmetic accident: the sole frame that sets the flag is a ¬LEN
+    /// (`0x30`) DATAGRAM, chosen only when `varint_len(n) + n > body`, so
+    /// it always leaves `body - n < varint_len(n) <= 2` bytes — below the
+    /// `fixed >= 2` of any STREAM frame, which makes this return `None`
+    /// anyway. **[ruling 257]** Add a third extends-to-end contributor, or
+    /// start emitting the ¬LEN STREAM form
+    /// [`Stream::new`](Stream::new) declines, and that accident stops
+    /// holding: the flag must then move into this query rather than being
+    /// checked one layer down.
     pub(crate) fn stream_payload_room(&self, id: StreamId, offset: u64) -> Option<usize> {
         let fixed = 1 + varint_len(id.as_u64()) + if offset != 0 { varint_len(offset) } else { 0 };
         let avail = self.room().checked_sub(fixed)?;
