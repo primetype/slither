@@ -298,7 +298,7 @@ Home Wi-Fi → 5G, with the connection intact.
 
 - **Accepts:** an authenticated, window-fresh packet from a new address
   re-homes the connection; streams continue with no re-handshake and no
-  data loss. The application observes `ConnEvent::AddressMoved` and
+  data loss. The application observes `Notification::AddressMoved` and
   `remote_address()` reflects the new address.
 - **Accepts (RESOLVED at approval):** roaming is driven by
   *authenticated receipt*, so **the mover must send — and the keepalive

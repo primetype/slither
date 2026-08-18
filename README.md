@@ -19,10 +19,12 @@ layer.
   cookie gate), the anti-replay window (RFC 6479), endpoint roaming, and the
   timers are WireGuard's, adapted.
 - **QUIC-style frames** — the reliable frame layer (frames, ACK ranges, RFC
-  9002 loss detection + PTO — retransmit frames, never packets) is **Leg 2**,
-  riding ON TOP of this unreliable, authenticated packet layer. Built and
-  **ratified** in `SPEC.md` §9; congestion control, streams, and fragmentation
-  stay reserved.
+  9002 loss detection + PTO — retransmit frames, never packets — and NewReno
+  congestion control) is **Leg 2**, riding ON TOP of this unreliable,
+  authenticated packet layer. Built and **ratified** in `SPEC.md` §§9, 14:
+  streams, reliable messages, unreliable datagrams and congestion control
+  all ship in v1. Pacing, ECN and alternate controllers (CUBIC/BBR) stay
+  reserved (§14.7).
 
 ## The protocol in one paragraph
 
@@ -30,16 +32,17 @@ The dialling peer runs the Noise IK handshake as the initiator (the responder's
 static is pre-known), retransmitting a **completely fresh initiation** — new
 ephemerals, index, and a strictly-greater timestamp, carried **encrypted** as
 msg1's Noise payload — every ~5 s until it establishes or gives up at 90 s. The responder verifies a keyed-BLAKE2b **mac1**
-before any curve work (the DoS gate), authenticates the initiator's static,
-checks it against an **allow-list** (the family-devices set) and a **per-static
-greatest-timestamp** replay guard, then replies. Both sides convert the completed
+before any curve work (the DoS gate), authenticates the initiator's static
+and checks a **per-static greatest-timestamp** replay guard, then replies —
+whether to *admit* that static at all is the application's call, made via
+the staged accept ladder (below), not a slither-held allow-list. Both sides convert the completed
 handshake into `hiss`'s datagram transport: every Data packet carries the
 hiss-owned monotonic counter in its 14-byte header (which is also the AEAD
 associated data), and the receiver runs a 128-bit sliding **replay window**. An
 authenticated packet from a new source **roams** the session to it; nothing
-unauthenticated ever does. Idle sessions exchange 10 s keepalives; a session that
-sends into 15 s of silence is declared dead; a session past 120 s rekeys on its
-next send and is refused outright at 180 s.
+unauthenticated ever does. Idle sessions exchange 10 s keepalives; a session
+that sends into 25 s of silence is declared dead; a session rekeys after
+65 536 (2¹⁶) messages in the current epoch (§7.7), not on a wall-clock timer.
 
 On top of that packet layer, the Leg 2 **frame layer** (ratified) makes
 `send` a **reliable, unordered, exactly-once message**: each message is a
@@ -51,38 +54,46 @@ connection — what a dead connection had not delivered is lost.
 ## Usage sketch
 
 ```rust,ignore
-use slither::endpoint::{Config, Endpoint};
-use slither::handshake::SoftwareIdentity;
+use slither::{Config, Endpoint};
+use slither::identity::SoftwareIdentity;
 
 // Inside a tokio current-thread runtime + LocalSet (the actor is `!Send`):
 let identity = SoftwareIdentity::from_scalar(my_static_scalar, my_rng)?;
 let socket = tokio::net::UdpSocket::bind("0.0.0.0:51820").await?;
-let config = Config::new().allow(&family_device_static);
-let mut endpoint = Endpoint::start(identity, socket, config);
+let endpoint: Endpoint<_> = Endpoint::builder()
+    .identity(identity)
+    .wire(socket)
+    .config(Config::new())
+    .build();
 
-let session = endpoint.connect(peer_addr, peer_static);
-session.send(b"hello".to_vec())?;             // reliable, unordered, exactly-once
+// Dial: connect() is sync (0 DH so far); the returned `Connecting` future
+// is what spends the 2 initiator DH and resolves once the handshake lands.
+let connection = endpoint.connect(peer_addr, peer_static)?.await?;
+connection.send_message(b"hello").await?;   // reliable, unordered, exactly-once
 
-while let Some(event) = endpoint.next_event().await {
-    // Established, Incoming { payload, .. }, Dead, EndpointMoved, Failed
+// Accept: a staged ladder, so the app can inspect a claimed identity
+// before spending a DH on it. `accept()` is driven in a loop.
+while let Some(intro) = endpoint.accept().await {
+    let claimed = intro.read_identity().await?;      // 1 DH
+    if !my_allow_list.contains(claimed.claimed_static()) {
+        continue; // dropping `claimed` is the silent reject
+    }
+    let proven = claimed.authenticate().await?;       // 2 DH
+    let connection = proven.accept().await?;
+    // connection.recv_message().await, connection.notified().await, ...
 }
 ```
 
-The runnable version — two endpoints over real UDP loopback sockets,
-handshake, one reliable message each way — is
-[`examples/udp_loopback.rs`](examples/udp_loopback.rs):
-
-```sh
-cargo run --example udp_loopback
-```
+There is no `examples/` directory in the tree today; if one is added, this
+section should link it rather than repeat the sketch inline.
 
 ## Testability
 
 The socket sits behind a small `Wire` trait, so the whole protocol is drivable
 without a kernel. The tests run two endpoints over an in-memory
-`FlakyWire` (loss, reorder, duplication, delay, partitioning) on tokio's **paused
-clock**, so the 5 s / 15 s / 90 s / 120 s / 180 s timers resolve in virtual time;
-one test uses a real UDP loopback socket.
+`FlakyWire` (loss, reorder, duplication, delay, partitioning) on tokio's
+**paused clock**, so the 5 s / 10 s / 25 s / 90 s timers resolve in virtual
+time; one test uses a real UDP loopback socket (`tests/spec_shell.rs`).
 
 ## Status
 

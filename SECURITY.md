@@ -56,24 +56,30 @@ ride fresh packet counters, so reliability never weakens the replay rule.
   moves only when a packet from the new address *authenticates and is
   replay-fresh*. An off-path attacker cannot redirect a session; an on-path
   attacker who can drop and re-inject traffic can, as in WireGuard.
-- **Allow-list gating.** Inbound handshakes are accepted only from statics
-  on the caller-supplied allow-list; the caller owns that policy, including
-  revocation (a revoked static kills the session at the next timer scan).
+- **Admission is application-driven, not a slither allow-list.** slither
+  holds no list of permitted statics. The staged accept ladder
+  (`Intro` → `Claimed` → `Proven` → `Connection`) hands the application
+  the claimed static after 1 DH; the application decides whether to
+  continue (`authenticate()`) or reject (drop the object — no bytes
+  sent). Revoking an established peer is the application's own job:
+  nothing here re-checks a list once a connection is up.
 - **Randomness.** Handshake ephemerals are drawn from a caller-supplied
   CSPRNG via hiss; every handshake *retransmit* uses a fresh ephemeral (the
   WireGuard requirement). The endpoint's index/jitter CSPRNG is a
-  `ChaCha20Rng` seeded from OS entropy (`getrandom`); the seed is zeroized
-  after use.
+  `ChaCha20Rng` seeded from OS entropy (`getrandom`). **The seed is not
+  currently zeroized after use** — it is a plain `[u8; 32]` on the stack,
+  dropped without an explicit wipe.
 
 ## Known limitations and non-goals (v1, ratified)
 
 - **No cookies / mac2**: under a spoofed-source flood, mac1 bounds the work
   per packet to one keyed hash, but there is no per-source cookie challenge;
   CPU-exhaustion resistance is weaker than WireGuard's full design.
-- **No congestion control or pacing** (ratified out of Leg 2): the frame
-  layer retransmits on RFC 9002 loss detection/PTO but will not yield
-  fairly under sustained congestion. Do not point it at the open internet
-  at scale.
+- **Congestion control has no pacing** (ratified out of v1, §14.7): NewReno
+  backs off on loss (RFC 9002 recovery + PTO), but sends are not paced to
+  sub-RTT smoothness — a 12 KB initial window bounds bursts, but there is
+  no ECN and no alternate controller (CUBIC/BBR). Evaluate burstiness
+  before pointing it at the open internet at scale.
 - **Traffic analysis is out of scope**: packet sizes, timing, and the
   cleartext header fields (type, version, indices, counter) are visible.
   There is no padding.

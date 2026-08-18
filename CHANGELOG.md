@@ -5,6 +5,80 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-18
+
+A clean rewrite against `SPEC.md`, now **ratified** as slither's v1
+wire (80 rulings across ten rounds, `cd12ed7`). Replaces the
+pre-rewrite design described below in its entirety — different object
+model, different handle API, different timers. See `SPEC.md` and
+`.spec-v2-clean-slate/rulings.md` for the specification and the record
+of why.
+
+### Added
+
+- **Two sans-io cores plus one shell.** `core::Endpoint<I: Identity>`
+  and `core::Connection` are pure state machines — `now: Instant` is an
+  argument on every mutating call, neither reads a clock — driven by a
+  single `!Send` shell actor (`tokio::task::spawn_local`, one `Wire`
+  trait for the socket seam), so the whole protocol is drivable without
+  a kernel on tokio's paused clock.
+- **A. Connection lifecycle** — dial and close (`Endpoint::connect`,
+  `Connection::close`/`closed`), a dial that never answers times out and
+  reports why, a second `connect()` to a live peer is refused rather
+  than silently superseding it, simultaneous dial-dial resolves to one
+  connection, and an idle connection with no traffic is reaped rather
+  than held open for free.
+- **B. Inbound admission — the staged accept.** A four-rung ladder
+  (`Intro` → `Claimed` → `Proven` → `Connection`, 0/1/2 DH) so an
+  application can reject an inbound identity, or park the decision
+  across event-loop turns, before spending a DH on it; a flood of
+  inbound initiations does not disturb established connections.
+- **C. Data transfer** — reliable unordered exactly-once messages
+  (`send_message`/`recv_message`), multiple concurrent streams with no
+  head-of-line blocking (`open_bi`/`open_uni`/`accept_bi`/`accept_uni`),
+  stream abandonment without killing the connection, unreliable
+  datagrams (`send_datagram`/`recv_datagram`), and backpressure via
+  flow-control credit rather than unbounded buffering.
+- **D. Mobility** — a connection survives the peer changing network or
+  our own address changing (NAT rebind), and a peer that restarts gets
+  a working connection back, all via authenticated-only roaming.
+- **E. Identity and crypto** — the `Identity`/`DhProvider` seam admits a
+  hardware-backed static key (no `Send` bound anywhere on the driver
+  path), a pluggable crypto suite with fail-closed mismatches, and
+  silent long-lived rekeying (message-count epochs, §7.7).
+- **F. Operational** — the whole protocol drivable without a kernel
+  (`testutil::FlakyWire` on tokio's paused clock), a caller-supplied
+  `Wire` with explicable send failures, and clean teardown on dropping
+  every handle.
+- **G/H — death, contest and redial.** `Connection::closed()`/
+  `notified()` for death/roam/contest events, `acked()` to wait for
+  send-and-close, immediate redial after giving up on a dial, and loud
+  (not silent) failure when an application mixes `send_message` with
+  uni streams.
+- **I. Composability** (`compat`, ratified ruling 209) —
+  `AsyncRead`/`AsyncWrite` over a stream, a `Sink`/`Stream`-backed codec
+  surface, and a `tower::Service` adapter.
+- **J. Liveness of the accept loop** (ruling 252) — a responder that
+  keeps calling `accept()` survives a lost msg2.
+- **RFC 9002 loss recovery and NewReno congestion control** (`SPEC.md`
+  §§13–14), fully implemented — not deferred, contrary to the previous
+  `[Unreleased]` entry below.
+
+### Changed
+
+- Endpoint construction moved from a one-shot `start()` (below) to
+  `Endpoint::builder().identity(..).wire(..).config(..).build()`.
+- Session events moved from a single `Event` stream to per-connection
+  `notified()`/`closed()` plus the staged-accept ladder.
+- Peer admission moved from a `Config`-level allow-list to an
+  application-driven decision mid-ladder (`Claimed::claimed_static()`).
+- `hiss` pinned to `0.3.2` (was `0.3.1`).
+
+### Removed
+
+- `examples/udp_loopback.rs` — not present in the current tree; either
+  restore it against the new API or drop the README's reference to it.
+
 ## [Unreleased]
 
 Initial release, extracted from the bubble-reboot workspace (2026/08/13)
