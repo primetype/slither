@@ -202,17 +202,91 @@ fn cap(s: &Solo) -> u64 {
 /// every stored byte re-copied during a merge. Never reset, so every
 /// assertion here is over a *delta* or over a fresh core's total.
 ///
-/// **A scope question the contract leaves open, reported rather than
-/// assumed.** `reassembly_capacity()` sums over the *live* receive halves,
-/// which is right for capacity — an abandoned half's allocation really is
-/// gone. Summed the same way, copy **work** is not monotone: retiring a half
-/// would subtract its history, and a peer could reset the accounting by
-/// opening and abandoning streams. Nothing here depends on the answer (no
-/// test in this file abandons or resets a half while measuring), so the tests
-/// hold either way — but "never reset" and "sum the live halves" cannot both
-/// be true, and the integrator picks one.
+/// **The scope question this doc used to leave open is answered: ruling
+/// 263 picked "never reset".** It read, verbatim:
+///
+/// > `reassembly_capacity()` sums over the *live* receive halves, which is
+/// > right for capacity — an abandoned half's allocation really is gone.
+/// > Summed the same way, copy **work** is not monotone: retiring a half
+/// > would subtract its history, and a peer could reset the accounting by
+/// > opening and abandoning streams. […] "never reset" and "sum the live
+/// > halves" cannot both be true, and the integrator picks one.
+///
+/// The reported conflict was real and the diagnosis of the consequence was
+/// exact. `Streams` now carries a `retired_copy_work` accumulator, so a
+/// retirement moves the total by zero and the peer-triggered reset is gone.
+/// Every assertion in this file was written when the answer was the other
+/// one and every one of them still holds — they are over deltas, or over a
+/// fresh core's total, and neither is affected by an addend that is zero
+/// until something retires. [`retirement_does_not_hand_back_copy_work`] is
+/// the test that pins the choice.
+///
+/// [`retirement_does_not_hand_back_copy_work`]: self::retirement_does_not_hand_back_copy_work
 fn work(s: &Solo) -> u64 {
     s.conn.reassembly_copy_work()
+}
+
+/// **[RATIFIED 2026/08/18 — ruling 263]** Retiring a receive half does not
+/// give its copy work back.
+///
+/// # Why this is the unsafe direction, and not a tidiness point
+///
+/// The meter is the instrument §10.6's *work* bound is measured with, and
+/// retirement made it **under**-report. An Appendix B work-bound test that
+/// happens to retire a half mid-workload therefore reads a *better* ratio
+/// than the truth and **passes a build with the defect** — working rule 9's
+/// trap arriving through the fixture instead of the assertion. Worse, the
+/// likeliest such workload retires on every unit of work: §9.8's
+/// `claim_message` retires the receive half, so a work-bound test written
+/// over messages measures approximately nothing.
+///
+/// # Why `abandon_recv` is the right retirement to use here
+///
+/// All five retirement paths — the message claim, a fully-read FIN, a read
+/// reset, this one, and §9.8's overflow reset — funnel through
+/// `Streams::retire_recv`, and the sum could only ever drop at the single
+/// `recv.take()` inside it. Driving the cheapest of the five exercises that
+/// line; driving all five would exercise it five times.
+///
+/// # Separation (working rule 9)
+///
+/// On the build this ruling replaced the first assertion reads 0 against a
+/// `before` of `SPAN`, and the second is what stops the fix from being a
+/// counter that is *assigned* rather than accumulated.
+#[test]
+fn retirement_does_not_hand_back_copy_work() {
+    let t = t0();
+    let (mut s, r) = buffered_with_slack(t);
+
+    let before = work(&s);
+    assert!(
+        before > 0,
+        "the fixture must have done some copying, or this test asserts nothing"
+    );
+
+    s.conn.abandon_recv(t, r);
+
+    assert_eq!(
+        work(&s),
+        before,
+        "retiring a receive half handed its copy work back: the connection \
+         meter fell from {before} to {}. Work a peer has already made us \
+         spend is not returned by the retirement that same peer can trigger \
+         — §10.6 bounds work, and freed memory is the only thing summing \
+         the live halves is right for",
+        work(&s)
+    );
+
+    // And the accumulator adds rather than replaces: a second stream's work
+    // lands *on top of* the retired total.
+    let d = s.deliver_stream_bytes(t, Solo::peer_uni(1), 0, 1024, false);
+    assert_alive(&d);
+    assert!(
+        work(&s) > before,
+        "work on a fresh half did not accumulate on top of the retired \
+         total ({} vs {before})",
+        work(&s)
+    );
 }
 
 /// Assert a covered frame did **nothing** — no copying, no allocation.

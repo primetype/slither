@@ -46,7 +46,7 @@
 //! moment a refresh changes the key*, whereas a scan recomputes the
 //! ordering every time and cannot be silently stale.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
@@ -174,6 +174,43 @@ pub(crate) struct IntroQueue<I: Identity> {
     /// makes it net-zero *by construction* rather than by a matched pair of
     /// ±1s that can drift.
     per_source: HashMap<SourceKey, u32>,
+    /// **[RATIFIED 2026/08/18 — ruling 261]** The `IntroId`s the two
+    /// overflow rules have evicted, oldest at the front — so a staged verb
+    /// that later misses on one of them can say **why** it missed.
+    ///
+    /// # Why it exists
+    ///
+    /// An `IntroId` is absent from `entries` for three reasons — it expired
+    /// at `INTRO_TTL`, it was evicted under the per-source or global cap, or
+    /// its chain was already spent — and until ruling 261 the miss reported
+    /// all three as `IntroError::Expired`. In the eviction cases that is not
+    /// a vague message but a **false** one: it names a 15 s timeout for
+    /// something that happened in microseconds under queue pressure, which
+    /// points an operator at TTL tuning when the signal is *"you are at your
+    /// intro-queue cap"*. Eviction is the one of the three the queue can
+    /// distinguish, and this is where it records it.
+    ///
+    /// # Bounded, and bounded by the thing it describes
+    ///
+    /// It holds at most `cap` ids — an `IntroId` is 8 bytes, so the record
+    /// is under 4 % of the ~225 KB of entries the same `cap` already
+    /// permits, and **it cannot grow without the queue growing with it**. A
+    /// per-id tombstone set with no ceiling is the shape this deliberately
+    /// is not: the application may hold an `Intro` for an evicted chain
+    /// indefinitely, so an exact record is unbounded, and an unbounded
+    /// record keyed on eviction is a memory amplifier reachable by exactly
+    /// the flood `cap` exists to survive.
+    ///
+    /// # What the bound costs, stated because it is invisible
+    ///
+    /// An id falls out of the record after `cap` further evictions, and a
+    /// verb on it from then on reports `Expired` again. The window is one
+    /// complete turnover of the queue under sustained pressure, and the
+    /// application's own read follows the `IntroReady` that surfaced the
+    /// chain by a driver turn or two — but it **is** a window, and
+    /// `slither::policy`'s eviction event at the two call sites is the
+    /// unconditional signal that does not have one.
+    evicted: VecDeque<IntroId>,
     next_id: u64,
     cap: usize,
     max_per_source: usize,
@@ -186,10 +223,45 @@ impl<I: Identity> IntroQueue<I> {
             entries: HashMap::new(),
             by_addr: HashMap::new(),
             per_source: HashMap::new(),
+            evicted: VecDeque::new(),
             next_id: 0,
             cap,
             max_per_source,
         }
+    }
+
+    /// Ruling 261: note that `id` left by an overflow eviction, dropping the
+    /// oldest note once the record is as long as the queue is wide.
+    ///
+    /// Called from the two overflow arms of [`arrive`](Self::arrive) and
+    /// **nowhere else** — in particular not from
+    /// [`remove`](Self::remove), which [`expire`](Self::expire) and the
+    /// discard path also go through. A record that answered `Evicted` for a
+    /// TTL reap would be the same defect pointed the other way.
+    fn note_eviction(&mut self, id: IntroId) {
+        // `cap` is `IntroQueue`'s own configured width, so the record can
+        // never outgrow the entries it describes. A `cap` of 0 is a queue
+        // that parks nothing and therefore evicts nothing, but guard it
+        // rather than rely on that.
+        if self.cap == 0 {
+            return;
+        }
+        while self.evicted.len() >= self.cap {
+            self.evicted.pop_front();
+        }
+        self.evicted.push_back(id);
+    }
+
+    /// **[RATIFIED 2026/08/18 — ruling 261]** Did `id` leave under cap
+    /// pressure?
+    ///
+    /// `true` is definitive: only [`note_eviction`](Self::note_eviction)
+    /// writes the record, and only the overflow arms call it. `false` is
+    /// **not** — see the record's own doc for the window — so a caller
+    /// reads this as *"say `Evicted` when we know it"*, never as *"this
+    /// expired"*.
+    pub(crate) fn was_evicted(&self, id: IntroId) -> bool {
+        self.evicted.contains(&id)
     }
 
     /// §6.3's arrival algorithm: **dedup, then the per-source cap, then the
@@ -246,7 +318,13 @@ impl<I: Identity> IntroQueue<I> {
         //    there is nothing evictable and the arrival is dropped.
         if u64::from(self.count_for(source_key)) >= self.max_per_source as u64 {
             match self.oldest_unconsumed(Some(source_key)) {
-                Some(victim) => evicted = self.remove(victim),
+                Some(victim) => {
+                    // Ruling 261, before the removal: `remove` is shared
+                    // with `expire` and the discard path, so the note goes
+                    // here, where the *reason* is known.
+                    self.note_eviction(victim);
+                    evicted = self.remove(victim);
+                }
                 None => {
                     return ArrivalOutcome {
                         arrival: Arrival::Dropped,
@@ -260,7 +338,11 @@ impl<I: Identity> IntroQueue<I> {
         //    the two never compound into a double eviction.
         if self.entries.len() >= self.cap {
             match self.oldest_unconsumed(None) {
-                Some(victim) => evicted = self.remove(victim),
+                Some(victim) => {
+                    // Ruling 261, as above.
+                    self.note_eviction(victim);
+                    evicted = self.remove(victim);
+                }
                 None => {
                     return ArrivalOutcome {
                         arrival: Arrival::Dropped,

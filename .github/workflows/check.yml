@@ -57,6 +57,46 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  features:
+    # **[RATIFIED 2026/08/18 — ruling 259(vii)]** One cheap leg per feature,
+    # in isolation. `clippy-doc` above builds only the two extreme points of
+    # the lattice — all-off (`cargo test`, no `-D warnings`) and all-on
+    # (`--all-features`) — and ruling 246's defect lived at an interior
+    # point: `Connection::clone_handle` was dead code with `tower` off, and
+    # no gate compiled a combination in which it warned.
+    #
+    # Curated, not a power set: `default = []`, so each single feature is
+    # exactly one interior point, and those four are where a `cfg` mistake
+    # actually lands. Pairs are covered by `--all-features` for compilation
+    # and by nothing for deadness, which is the trade this job accepts.
+    #
+    # **`clippy`, not `cargo check`.** The class this exists to catch is a
+    # *warning* — `dead_code` — and `cargo check` exits 0 on warnings, so a
+    # check-only job would have been green on ruling 246's tree. `clippy
+    # -- -D warnings` scopes the denial to slither itself, unlike
+    # `RUSTFLAGS`, which would fail on a dependency's warnings.
+    #
+    # One OS and stable only: this axis is about feature `cfg`s, not
+    # targets or toolchains, both of which the jobs around it cover.
+    name: "features (${{ matrix.feature }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [test-util, sink, codec, tower]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-feature key: matrix instances share one by default, so
+          # without this the four legs evict each other every run.
+          key: ${{ matrix.feature }}
+      - name: "clippy (${{ matrix.feature }} alone, all targets)"
+        run: cargo clippy --no-default-features --features ${{ matrix.feature }} --all-targets -- -D warnings
+
   msrv:
     # Pinned to the declared MSRV (Cargo.toml `rust-version`). Policy:
     # a recent stable, floored at `stable - 3`; bump both in lockstep.

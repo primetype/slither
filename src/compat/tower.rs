@@ -43,6 +43,7 @@
 //! with channels. The handle shapes are already compatible with adding one
 //! later without a breaking change.
 
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -129,6 +130,26 @@ impl<I: Identity> Future for Connect<I> {
     }
 }
 
+/// **[RATIFIED 2026/08/18 — ruling 259(v)]** C-DEBUG. Hand-written for the
+/// reason `compat::stream`'s eight are: a derive would emit
+/// `impl<I: Identity + Debug>`, and §16.2's surface must be `Debug` for
+/// every identity.
+///
+/// The state is worth naming — *did `connect()` already fail
+/// synchronously?* is the question this future exists to answer, and it
+/// carries no key material either way.
+impl<I: Identity> fmt::Debug for Connect<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match &self.state {
+            ConnectState::Dialling(_) => "dialling",
+            ConnectState::Failed(_) => "failed",
+        };
+        f.debug_struct("Connect")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // The stream-opener
 // ═══════════════════════════════════════════════════════════════════════
@@ -208,6 +229,14 @@ impl<S: Handshake> Future for OpenBi<'_, S> {
     }
 }
 
+/// **[RATIFIED 2026/08/18 — ruling 259(v)]** C-DEBUG. Hand-written: the
+/// `WakerSlot` holds a `Box<dyn FnMut(u64)>`, which no derive can print.
+impl<S: Handshake> fmt::Debug for OpenBi<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenBi").finish_non_exhaustive()
+    }
+}
+
 /// The dialling side on the **owned** handle — the form `UnsyncBoxService`
 /// and every other `'static` combinator require.
 ///
@@ -280,6 +309,17 @@ impl<S: Handshake> Future for OpenBiOwned<S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.conn.poll_open_bi(cx, this.slot.key())
+    }
+}
+
+/// **[RATIFIED 2026/08/18 — ruling 259(v)]** C-DEBUG, [`OpenBi`]'s reason.
+/// The owned handle is printed through `Connection`'s own `Debug`, which
+/// already withholds the peer static and the session id.
+impl<S: Handshake> fmt::Debug for OpenBiOwned<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenBiOwned")
+            .field("conn", &self.conn)
+            .finish_non_exhaustive()
     }
 }
 

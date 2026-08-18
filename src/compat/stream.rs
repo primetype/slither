@@ -44,6 +44,7 @@
 //! `spawn_local`** — the handle moves in and the adapter is built inside the
 //! task. Each type's rustdoc shows that shape.
 
+use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -599,5 +600,83 @@ impl<S: Handshake> Sink<Vec<u8>> for DatagramSink<'_, S> {
     /// **Does not close the connection** — [`MessageSink`]'s reason.
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// `Debug`, for all eight
+// ═══════════════════════════════════════════════════════════════════════
+//
+// **[RATIFIED 2026/08/18 — ruling 259(v)]** Rust API guideline C-DEBUG:
+// every public type is `Debug`. All eight are written by hand rather than
+// derived, for two reasons, both of which apply to every one of them.
+//
+// 1. Most hold a [`WakerSlot`], whose payload here is a
+//    `Box<dyn FnMut(u64)>`. A closure is never `Debug`, so a derive does
+//    not compile.
+// 2. A derive on a generic type emits `impl<S: Handshake + Debug>`, so the
+//    impl would silently vanish for any suite whose type is not itself
+//    `Debug` — and §16.2's surface must be `Debug` for *every* suite.
+//
+// The output is the shape the rest of the crate already uses (`Endpoint`,
+// `SendStream`, `Connection`): the type's name, whatever is cheap and
+// non-secret, and `finish_non_exhaustive`. **None of these holds key
+// material** — the peer static and the session id live behind the
+// `Connection` they borrow, whose own hand-written `Debug` prints neither.
+
+impl<S: Handshake> fmt::Debug for Messages<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Messages").finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for Datagrams<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Datagrams").finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for IncomingBi<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IncomingBi").finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for IncomingUni<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IncomingUni").finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for Notifications<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Notifications").finish_non_exhaustive()
+    }
+}
+
+impl<I: Identity> fmt::Debug for Incoming<'_, I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Whether a request is outstanding is the one thing worth seeing
+        // here: it is what decides whether dropping this adapter may drop
+        // an `Intro` — §6.2's silent reject.
+        f.debug_struct("Incoming")
+            .field("request_outstanding", &self.pending.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for MessageSink<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The slot's **occupancy**, never its bytes: a pending payload is
+        // application plaintext.
+        f.debug_struct("MessageSink")
+            .field("pending", &self.pending.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Handshake> fmt::Debug for DatagramSink<'_, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatagramSink").finish_non_exhaustive()
     }
 }

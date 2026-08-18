@@ -13,6 +13,15 @@
 //! worse half, because the variant a local fault fell through to there is
 //! the taxonomy's one **security signal**.
 //!
+//! **[RATIFIED 2026/08/18 — ruling 261]** [`IntroError::Evicted`] is the
+//! third such decision, and its shape is the same one a third time: the
+//! taxonomy could not say *"§6.3's cap displaced this chain before its
+//! TTL"*, so it said `Expired` — a message that was not vague but **false**,
+//! naming a 15 s timeout for a microsecond-scale loss of a race for a slot.
+//! Taken before release for ruling 72's stated reason. **§18.1 still lists
+//! five `IntroError` variants and owes the amendment**; the fence that
+//! enforces the count is `tests/spec_errors.rs`, and it names the debt too.
+//!
 //! **[RATIFIED 2026/08/15 — ruling 79]** None of the three `Local`
 //! variants carries the provider's error, and none can: these types are
 //! `Clone + PartialEq + Eq + Send + Sync` and
@@ -97,9 +106,46 @@ pub enum ConnectError {
 /// Why a parked introduction could not be taken up. §18.1.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IntroError {
-    /// The parked introduction outlived `INTRO_TTL`.
-    #[error("the parked introduction outlived INTRO_TTL")]
+    /// The parked introduction is no longer queued — it outlived
+    /// `INTRO_TTL`, unless [`Evicted`](IntroError::Evicted) says otherwise.
+    ///
+    /// **[AMENDED 2026/08/18 — ruling 261.]** The string read *"the parked
+    /// introduction outlived INTRO_TTL"* and this variant was the answer to
+    /// every table miss, including the two overflow evictions of §6.3 — so
+    /// for those it reported a 15-second timeout for something that happened
+    /// in microseconds under queue pressure. `Evicted` now carries the
+    /// eviction case wherever the queue still remembers it, and this
+    /// variant's string no longer asserts a cause it cannot always know.
+    ///
+    /// TTL expiry is what it means and what it almost always is; the
+    /// residue it also covers is a chain already spent, and an eviction
+    /// older than the queue's eviction record (see `Evicted`). §18.2's
+    /// `slither::policy` eviction event is the signal with no such residue.
+    #[error("the parked introduction is no longer queued")]
     Expired,
+    /// The parked introduction was **evicted under intro-queue pressure** —
+    /// §6.3's per-source cap or its global cap displaced it before its TTL.
+    ///
+    /// **[RATIFIED 2026/08/18 — ruling 261.]** This is the operationally
+    /// distinct case: the introduction did not age out, it lost a race for a
+    /// slot, and the useful thing to know is *"you are at your intro-queue
+    /// cap"* — a fact about load, not about latency. An application may
+    /// reasonably retry a peer immediately on this and back off on
+    /// [`Expired`](IntroError::Expired), which is the opposite of what the
+    /// single variant supported.
+    ///
+    /// **It never says the peer misbehaved.** §6.3's flood posture is a
+    /// per-packet race that a genuine initiator can lose to an attacker's
+    /// arrival, so — like [`AuthError::Replay`] — this is evidence about
+    /// *our* queue and not about the party named by it.
+    ///
+    /// **Reported when the queue still remembers the eviction**, which it
+    /// does for its own width in evictions; past that the miss reports
+    /// `Expired`. The record is bounded on purpose: an exact one is
+    /// unbounded, and unbounded state keyed on eviction is reachable by the
+    /// flood the cap exists to survive.
+    #[error("the parked introduction was evicted under intro-queue pressure")]
+    Evicted,
     /// The initiation belonged to a pending outbound dial and was consumed
     /// by it.
     #[error("the initiation belonged to a pending outbound dial and was consumed")]
@@ -184,8 +230,27 @@ pub enum AuthError {
     /// a caller learns that authentication failed, never why.
     #[error("the handshake failed to authenticate")]
     HandshakeFailed,
-    /// The parked introduction outlived `INTRO_TTL`.
-    #[error("the parked introduction outlived INTRO_TTL")]
+    /// The parked introduction is no longer queued — it outlived
+    /// `INTRO_TTL`, or §6.3's caps displaced it first.
+    ///
+    /// **[AMENDED 2026/08/18 — ruling 261.]** The **string** is corrected
+    /// here and the variant is not split, and the asymmetry with
+    /// [`IntroError`] is deliberate. Ruling 261 splits `IntroError::Expired`
+    /// into `Expired` and [`IntroError::Evicted`] because that is the seam
+    /// §6.3's cap pressure is visible at; §18.1 declares this taxonomy
+    /// closed and ratified no `AuthError::Evicted`, so the eviction case
+    /// arrives here as `Expired`, and the old string — *"the parked
+    /// introduction outlived INTRO_TTL"* — was false of it. A `Display` that
+    /// asserts a cause it does not know is the defect ruling 261 exists to
+    /// remove, in whichever type it appears.
+    ///
+    /// **An application that needs the distinction reads it off
+    /// [`read_identity()`]'s [`IntroError`]**, which is the verb the split
+    /// landed on. §18.2's `slither::policy` eviction event carries it for an
+    /// operator either way.
+    ///
+    /// [`read_identity()`]: crate::shell::Intro::read_identity
+    #[error("the parked introduction is no longer queued")]
     Expired,
     /// **Our own** provider failed, exactly as [`IntroError::Local`].
     /// §18.1, **ruling 78**.
@@ -429,6 +494,7 @@ mod tests {
             Box::new(ConnectError::TimedOut),
             Box::new(ConnectError::Local),
             Box::new(IntroError::Expired),
+            Box::new(IntroError::Evicted),
             Box::new(IntroError::Internal),
             Box::new(IntroError::Malformed),
             Box::new(IntroError::Local),

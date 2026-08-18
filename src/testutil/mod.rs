@@ -51,6 +51,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -1363,6 +1364,109 @@ fn derive_seed(seed: u64, salt: u8) -> [u8; 32] {
     let mut out = [salt; 32];
     out[..8].copy_from_slice(&seed.to_le_bytes());
     out
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// `Debug`, for the seven that lacked it
+// ═══════════════════════════════════════════════════════════════════════
+//
+// **[RATIFIED 2026/08/18 — ruling 259(v)]** Rust API guideline C-DEBUG.
+// `test-util` exports this module, so these are public types like any
+// other. All seven are hand-written, and the reasons split three ways:
+//
+// 1. **Interior mutability.** [`Network`], [`FlakyWire`] and [`SharedWire`]
+//    keep their state behind `RefCell`/`Cell`. A derive would `borrow()`,
+//    and a `Debug` that panics when the fabric happens to be mid-delivery
+//    is worse than no `Debug` at all — every read below is a `try_borrow`
+//    or a `Cell::get`.
+// 2. **Key material.** [`CountingProvider`] wraps a *key provider* and
+//    [`CountingIdentity`] wraps a `SoftwareIdentity`, i.e. a private
+//    scalar. Neither is printed. (`SoftwareIdentity`'s own `Debug` already
+//    refuses; the point of writing these by hand is not to depend on
+//    that.)
+// 3. **Generics.** A derive on `CountingProvider<P>`/`CountingIdentity<S>`
+//    would emit `impl<P: Debug>`, so the impl would vanish for exactly the
+//    providers a test is most likely to be debugging.
+
+/// A summary, never the whole fabric: how many endpoints are registered and
+/// how many `send_to` calls have been made. Uses `try_borrow`, so printing
+/// a `Network` from inside a delivery cannot panic.
+impl fmt::Debug for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("Network");
+        match self.0.try_borrow() {
+            Ok(inner) => out
+                .field("seed", &inner.seed)
+                .field("endpoints", &inner.endpoints.len())
+                .field("sends", &inner.sends),
+            Err(_) => out.field("state", &"borrowed"),
+        }
+        .finish_non_exhaustive()
+    }
+}
+
+/// The address this wire answers at **right now** (ruling 180's `Cell`, so a
+/// rebind is followed) and its 0-based send index — the two things a
+/// `drop_at`/`drop_first` policy is reasoned about with.
+impl fmt::Debug for FlakyWire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlakyWire")
+            .field("addr", &self.addr.get())
+            .field("sent", &self.sent.get())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Delegates to the one [`FlakyWire`] behind the `Rc`: every clone shares
+/// it, so there is nothing per-handle to print.
+impl fmt::Debug for SharedWire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedWire")
+            .field("wire", &*self.0)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The DH count, and **not the wrapped provider**: `P` is a key provider,
+/// and this type exists to be wrapped around one that holds secrets.
+impl<P> fmt::Debug for CountingProvider<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountingProvider")
+            .field("dhs", &self.dhs.get())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The DH count, and **not the identity**: the inner `SoftwareIdentity`
+/// holds a private scalar.
+impl<S> fmt::Debug for CountingIdentity<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountingIdentity")
+            .field("dhs", &self.dhs.get())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Address and DH count. The static public key is omitted for the reason
+/// `shell::Connection`'s hand-written `Debug` omits the peer's: a key is not
+/// something to print by default, even a public one.
+impl fmt::Debug for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Peer")
+            .field("addr", &self.addr())
+            .field("dhs", &self.dhs.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Pair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pair")
+            .field("net", &self.net)
+            .field("a", &self.a)
+            .field("b", &self.b)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

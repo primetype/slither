@@ -947,10 +947,18 @@ impl<C: Handshake> Connection<C> {
         self.streams.reassembly_capacity()
     }
 
-    /// **Ruling 253.** Total bytes ever written into reassembly storage
-    /// across every live receive half — §10.6's work bound made
-    /// test-visible, mirroring `reassembly_capacity` for its memory bound.
-    /// Monotone per half; see `Reassembly::copy_work`.
+    /// **Ruling 253.** Total bytes ever written into reassembly storage on
+    /// this connection — §10.6's work bound made test-visible, mirroring
+    /// `reassembly_capacity` for its memory bound.
+    ///
+    /// **[AMENDED 2026/08/18 — ruling 263.]** Read *"across every live
+    /// receive half"*, and so fell back whenever one retired — most
+    /// sharply on a message workload, where `claim_message` retires a half
+    /// per message. It is **monotone** now: `Streams` carries the retired
+    /// halves' totals forward. See `Streams::retired_copy_work` for why a
+    /// work meter aggregates differently from `reassembly_capacity`'s state
+    /// one, and for what this is *not* evidence of — §10.6's bound is per
+    /// stream, and a growing connection total is not a defect.
     // **Working rule 15 — the integrator removes this attribute.** This
     // accessor's caller is slice R40-E's blind author's work-bound test in
     // `tests_reassembly.rs`, which does not exist on the implementer's tree;

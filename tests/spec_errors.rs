@@ -119,16 +119,28 @@ fn match_connect_error(e: ConnectError) {
     }
 }
 
-/// SPEC.md §18.1: `IntroError::{Expired, Internal, Malformed, Local,
-/// EndpointDropped}` — exactly five variants, all unit. `Superseded`
-/// appears nowhere (§6.3) — it is not a sixth variant to add here.
-/// `Local` **[RATIFIED 2026/08/15 — ruling 72]** is *our own* provider
-/// failing, and is the opposite of `Malformed` in every way that matters:
-/// the chain is left **parked** and a retry can still succeed, where a
-/// `Malformed` chain is discarded and the verdict is definitive.
+/// SPEC.md §18.1: `IntroError::{Expired, Evicted, Internal, Malformed,
+/// Local, EndpointDropped}` — exactly **six** variants, all unit.
+/// `Superseded` appears nowhere (§6.3) — it is still not a variant to add
+/// here. `Local` **[RATIFIED 2026/08/15 — ruling 72]** is *our own*
+/// provider failing, and is the opposite of `Malformed` in every way that
+/// matters: the chain is left **parked** and a retry can still succeed,
+/// where a `Malformed` chain is discarded and the verdict is definitive.
+///
+/// **[RATIFIED 2026/08/18 — ruling 261]** `Evicted` is the sixth. This
+/// doc read *"exactly five variants"* and it was the fence §18.1's closure
+/// is enforced by, so the count is corrected here with the enum. §6.3's two
+/// cap rules displace a parked chain **before** its TTL, and every staged
+/// verb reported that as `Expired` — not a vague message but a false one,
+/// naming a 15 s timeout for a microsecond-scale loss of a race for a slot.
+///
+/// **§18.1 itself still lists five and owes the amendment** — the section
+/// is normative and this file is the fence for it, so until SPEC.md carries
+/// `Evicted` the two disagree by exactly this ruling.
 fn match_intro_error(e: IntroError) {
     match e {
         IntroError::Expired => {}
+        IntroError::Evicted => {}
         IntroError::Internal => {}
         IntroError::Malformed => {}
         IntroError::Local => {}

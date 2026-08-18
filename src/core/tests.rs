@@ -1354,6 +1354,76 @@ fn the_per_source_cap_evicts_the_oldest_by_last_refresh() {
     assert!(b.present(fifth));
 }
 
+/// **[RATIFIED 2026/08/18 — ruling 261]** A staged verb on a **cap-evicted**
+/// id says `Evicted`; on a **TTL-reaped** one it still says `Expired`.
+///
+/// Both halves are load-bearing and they fail in opposite directions.
+///
+/// * The first separates against the build this ruling replaced, where the
+///   table miss answered `Expired` for all three of its causes — a message
+///   naming a 15 s timeout for a chain that lost a microsecond-scale race
+///   for a slot. That build returns `Expired` here and this assertion is
+///   red on it.
+/// * The second separates against the obvious over-correction: recording
+///   the eviction inside `IntroQueue::remove`, which `expire()` also goes
+///   through, would answer `Evicted` for an expiry and be the same defect
+///   pointed the other way. Only a build that notes the eviction at the two
+///   **overflow** sites passes both.
+///
+/// §6.3 states neither answer: it says only *"staged verbs on an expired
+/// attempt return `IntroError::Expired`"* and is silent on what a
+/// cap-evicted attempt returns — the unstated-scope shape of working rule
+/// 8, which is why it went unnoticed.
+#[test]
+fn a_cap_evicted_id_says_evicted_where_a_ttl_reaped_one_says_expired() {
+    let t = t0();
+    let (_a, mut b) = pair(t);
+    let ip = 5u8;
+
+    // Fill one source's whole allowance; the first is the oldest.
+    let mut ids = Vec::new();
+    for n in 0..INTRO_MAX_PER_SOURCE {
+        let now = t + Duration::from_secs(n as u64);
+        ids.push(
+            b.feed(
+                now,
+                v4(ip, 100 + n as u16),
+                &forged_init(&b, n as u32 + 1, 0x11),
+            )
+            .one_intro()
+            .0,
+        );
+    }
+
+    // One more from the same IP trips the per-source cap, which evicts the
+    // oldest unconsumed entry — `ids[0]`, well inside its TTL.
+    let now = t + Duration::from_secs(1);
+    let _ = b.feed(now, v4(ip, 500), &forged_init(&b, 0xEEEE, 0x66));
+    assert!(!b.present(ids[0]), "the per-source cap did not evict");
+
+    assert_eq!(
+        b.ep.read_identity(now, ids[0]).err(),
+        Some(IntroError::Evicted),
+        "a chain the per-source cap displaced one second after it parked did \
+         not outlive INTRO_TTL, and the old `Expired` said it had"
+    );
+    let _ = b.drain();
+
+    // The other half, on a fresh endpoint so the eviction record above
+    // cannot be what answers: a chain that really did age out.
+    let (_c, mut d) = pair(t);
+    let id = d.feed(t, v4(6, 6), &forged_init(&d, 1, 0x22)).one_intro().0;
+    let after = t + INTRO_TTL;
+    let _ = d.timeout(after);
+    assert_eq!(
+        d.ep.read_identity(after, id).err(),
+        Some(IntroError::Expired),
+        "§6.3's expiry is still `Expired` — the eviction record must be \
+         written on the overflow path only, never inside `remove`"
+    );
+    let _ = d.drain();
+}
+
 // ── consumption, freezing, and the tiers ───────────────────────────────
 
 /// §6.3: "The moment `read_identity()` runs, the chain owns its bytes and

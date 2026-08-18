@@ -61,6 +61,22 @@ type PublicKeyFor<S> = <<S as Channel>::Curve as hiss::curve::Curve>::PublicKey;
 /// depends on the order your values fall out of scope. Keeping an
 /// [`Endpoint`](super::Endpoint) alive across the drop is what makes the
 /// CLOSE happen.
+///
+/// # A second handle: wrap it in an `Rc`
+///
+/// **[RATIFIED 2026/08/18 — ruling 259(iv)]** `Connection` is deliberately
+/// not `Clone` (§16.2), and the supported way to hold it from two places is
+/// the one that needs nothing from this crate: `let conn = Rc::new(conn);`
+/// and clone the `Rc`. Sharing works because every data-path verb takes
+/// `&self` — §16.3's shared cell is already inside — so a `&Connection`
+/// reached through an `Rc` can do everything an owned one can.
+///
+/// **Both drop rules above are unchanged by it**, and that is the point of
+/// preferring an `Rc` to a `clone()`: the two rules turn on the *last*
+/// handle, and an `Rc` keeps exactly one `Connection` in existence however
+/// many holders it has. `close(NO_ERROR, "")` therefore fires when the last
+/// `Rc` goes, not when the first one does. The driver is `!Send` and the
+/// handle is `!Send` with it, so `Rc` — not `Arc` — is the right pointer.
 pub struct Connection<S: Handshake> {
     shell: Rc<dyn ShellLink>,
     cell: Rc<RefCell<ConnCell<S>>>,

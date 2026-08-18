@@ -264,7 +264,20 @@ impl<I: Identity> Endpoint<I> {
         verb: &'static str,
     ) -> Result<PublicKeyOf<I>, IntroError> {
         let msg1 = {
-            let entry = self.intros.get(id).ok_or(IntroError::Expired)?;
+            // **[RATIFIED 2026/08/18 — ruling 261]** The miss itself is
+            // ambiguous — an id is absent because it expired, because a cap
+            // evicted it, or because its chain was spent — so the answer is
+            // taken from the one record that knows: the queue's own
+            // eviction note. `was_evicted` is definitive when `true` and
+            // says nothing when `false`, which is exactly the shape the
+            // default arm needs.
+            let entry = self.intros.get(id).ok_or_else(|| {
+                if self.intros.was_evicted(id) {
+                    IntroError::Evicted
+                } else {
+                    IntroError::Expired
+                }
+            })?;
             match &entry.state {
                 // Ruling 74: a repeat call is answered from the chain, at 0
                 // incremental DH and with no provider opened.
@@ -421,6 +434,22 @@ impl<I: Identity> Endpoint<I> {
             self.read_identity_as(id, "authenticate")
                 .map_err(|e| match e {
                     IntroError::Expired => AuthError::Expired,
+                    // **[RATIFIED 2026/08/18 — ruling 261]** The sixth
+                    // variant this comment anticipated, and it stops here
+                    // as instructed rather than being swept into a security
+                    // signal.
+                    //
+                    // Unreachable *from here*: the arm above this `match`
+                    // observed `ChainState::Parked`, so the entry existed
+                    // one statement ago and nothing between can evict it —
+                    // eviction happens only on an arrival, and an arrival
+                    // is a different call. It is answered anyway, because
+                    // §18.1 has no `AuthError::Evicted` — the taxonomy is
+                    // closed and ruling 261 split `IntroError` only — and
+                    // the reachable eviction miss on this verb is the
+                    // `ok_or(AuthError::Expired)` below, whose string
+                    // ruling 261 corrected to say no more than it knows.
+                    IntroError::Evicted => AuthError::Expired,
                     // Ruling 78. Routing *our* locked enclave to
                     // `HandshakeFailed` did not merely misattribute the fault;
                     // it reported the peer as an attacker through the one

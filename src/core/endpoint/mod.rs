@@ -79,7 +79,7 @@ use crate::identity::{Identity, PublicKeyOf};
 use crate::packet::{Handshake, Inbound, Mac1Key, classify};
 
 use self::guard::TimestampGuard;
-use self::intro_queue::{Arrival, IntroQueue};
+use self::intro_queue::{Arrival, IntroEntry, IntroQueue};
 use self::staged::InitiatorSent;
 use self::tables::{IndexTables, StaticEntry, StaticMap, StaticState};
 
@@ -652,11 +652,8 @@ impl<I: Identity> Endpoint<I> {
     fn park_initiation(&mut self, now: Instant, src: SocketAddr, sender_index: u32, msg1: &[u8]) {
         let outcome = self.intros.arrive(now, src, sender_index, msg1);
         if let Some(evicted) = outcome.evicted {
-            // Only unconsumed entries are evictable, and an unconsumed
-            // entry has neither a provisional guard write nor a pin — but
-            // release both anyway rather than assert, because a leak here
-            // is a permanent, silent denial for a real peer.
-            self.release_chain_guard_state(now, evicted.guard_undo, evicted.guard_pin);
+            // Ruling 261: traced, then released.
+            self.release_evicted_chain(now, src, evicted);
         }
         match outcome.arrival {
             Arrival::Parked(id) => self.emit(EndpointOutput::IntroReady(id, src)),
@@ -960,5 +957,57 @@ impl<I: Identity> Endpoint<I> {
         if let Some(undo) = undo {
             self.guard.revert(undo);
         }
+    }
+
+    /// **[RATIFIED 2026/08/18 — ruling 261]** Dispose of an entry §6.3's
+    /// caps displaced: trace it under §18.2's `slither::policy`, then
+    /// release whatever endpoint state it held.
+    ///
+    /// # Why the trace, when the error already says `Evicted`
+    ///
+    /// The two answer different people and only one of them is
+    /// unconditional. `IntroError::Evicted` reaches the **application**, and
+    /// only if an application happens to hold that `Intro` and happens to
+    /// call a staged verb on it — most evictions are of chains nobody ever
+    /// asks about, and those were, before this, invisible twice over:
+    /// mislabelled in the one error that could surface and unrecorded
+    /// everywhere. This event is the **operator's**, it fires on every
+    /// eviction, and a *rate* of it is the thing worth alerting on: it says
+    /// the endpoint is at its intro-queue cap, which is a fact about load
+    /// and the single most useful thing to know during a flood.
+    ///
+    /// # Not §6.3's "silent"
+    ///
+    /// §6.3 makes **expiry** silent — *"Expiry is silent eviction at
+    /// `INTRO_TTL`"* — and says nothing of the kind about overflow. The
+    /// distinction is exactly the one ruling 261 is about, so the trace
+    /// lives here, on the overflow path, and `IntroQueue::expire` keeps its
+    /// *"Emits nothing"*.
+    ///
+    /// This extends §18.2's `slither::policy` row, which today lists guard
+    /// rejections, tie-break outcomes and the probe's three events;
+    /// eviction is an internal admission outcome of the same kind, but the
+    /// row does not name it and **the row has to say so** — a §18.2 list is
+    /// read as exhaustive (working rule 8). No target is renamed or dropped,
+    /// which is the operation §18.2 calls a protocol revision.
+    fn release_evicted_chain(
+        &mut self,
+        now: Instant,
+        arriving: SocketAddr,
+        evicted: IntroEntry<I>,
+    ) {
+        tracing::debug!(
+            target: "slither::policy",
+            event = "intro_evicted",
+            id = ?evicted.id,
+            evicted = %evicted.src,
+            %arriving,
+            "an intro-queue cap displaced a parked introduction before its TTL"
+        );
+        // Only unconsumed entries are evictable, and an unconsumed entry has
+        // neither a provisional guard write nor a pin — but release both
+        // anyway rather than assert, because a leak here is a permanent,
+        // silent denial for a real peer.
+        self.release_chain_guard_state(now, evicted.guard_undo, evicted.guard_pin);
     }
 }

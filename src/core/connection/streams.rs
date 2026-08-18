@@ -306,6 +306,41 @@ pub(crate) struct Streams {
     /// `ResetState` is terminated by the half being freed, which is exactly
     /// what has already happened here.
     retained_resets: BTreeMap<StreamRef, RetainedReset>,
+    /// **[RATIFIED 2026/08/18 — ruling 263]** Ruling 253's copy work from
+    /// halves that have since retired.
+    ///
+    /// # Why a **work** meter aggregates differently from a **state** one
+    ///
+    /// §10.6 draws the distinction itself — *"the mandate above bounds
+    /// state; this clause bounds work"* — and the two aggregate in opposite
+    /// ways. Freed memory really is gone, so summing the live halves is
+    /// right for [`reassembly_capacity`]. Work a peer has already made us
+    /// spend is **not handed back** by the retirement that peer can trigger,
+    /// so the same aggregation was wrong for
+    /// [`reassembly_copy_work`], which is what this field corrects: the
+    /// connection-level meter is monotone.
+    ///
+    /// # The failure direction is the unsafe one
+    ///
+    /// Retirement made the meter *under*-report. An Appendix B work-bound
+    /// test that happens to retire a half mid-workload read a **better**
+    /// ratio than the truth and passed on a build with the defect — working
+    /// rule 9's trap, arriving through the fixture rather than the
+    /// assertion. And the likeliest such workload retires on *every* unit of
+    /// work: §9.8's `claim_message` retires the receive half, so a
+    /// work-bound test written over messages — slither's headline API, and
+    /// S34's shape — measured approximately nothing.
+    ///
+    /// # What it is not evidence of
+    ///
+    /// Ruling 253 and §10.6 bound copy work **per stream**, and the
+    /// per-half meter is the instrument for that bound. This aggregates
+    /// one; §10.6 states no connection-level ceiling, and a growing total
+    /// here is not a defect.
+    ///
+    /// [`reassembly_capacity`]: Self::reassembly_capacity
+    /// [`reassembly_copy_work`]: Self::reassembly_copy_work
+    retired_copy_work: u64,
 }
 
 /// One §9.8 overflow reset, outliving the stream it names.
@@ -345,6 +380,7 @@ impl Streams {
             message_claim_pending: false,
             overflow_candidates: BTreeSet::new(),
             retained_resets: BTreeMap::new(),
+            retired_copy_work: 0,
         }
     }
 
@@ -361,19 +397,25 @@ impl Streams {
             .sum()
     }
 
-    /// Ruling 253's accounting, summed across every live receive half.
+    /// Ruling 253's accounting: the live receive halves **plus** every
+    /// retired one.
     ///
-    /// Unlike [`Streams::reassembly_capacity`] this is a **work** meter, not
-    /// a state one, so freeing a half takes its total with it: the sum is
-    /// over the halves that still exist, which is the same shape ruling 94's
-    /// accessor has and the same caveat — a workload that abandons streams
-    /// measures only the ones it kept.
+    /// **[AMENDED 2026/08/18 — ruling 263.]** This summed only the live
+    /// halves and carried ruling 94's caveat verbatim, which made it drop on
+    /// retirement. Unlike [`Streams::reassembly_capacity`] it is a **work**
+    /// meter, not a state one, and the two aggregate in opposite directions
+    /// — see [`retired_copy_work`], which is the half of this sum that
+    /// keeps it monotone.
+    ///
+    /// [`retired_copy_work`]: Self::retired_copy_work
     pub(crate) fn reassembly_copy_work(&self) -> u64 {
-        self.entries
-            .values()
-            .filter_map(|s| s.recv.as_ref())
-            .map(RecvHalf::copy_work)
-            .sum()
+        self.retired_copy_work
+            + self
+                .entries
+                .values()
+                .filter_map(|s| s.recv.as_ref())
+                .map(RecvHalf::copy_work)
+                .sum::<u64>()
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1501,6 +1543,13 @@ impl Streams {
         let Some(recv) = stream.recv.take() else {
             return;
         };
+        // **[RATIFIED 2026/08/18 — ruling 263]** This is the *only* line in
+        // the crate at which the connection-level copy-work sum could drop:
+        // the half is about to become a tombstone and be dropped, and its
+        // total would leave with it. Read before the move into
+        // `recv.tombstone()` below; `stream` borrows `self.entries` alone,
+        // so the sibling field is free to take the addition.
+        self.retired_copy_work += recv.copy_work();
         // §10.3's true-up is **absolute**: it advances this stream's
         // contribution *to* a value and never adds on top of the bytes reads
         // already counted.

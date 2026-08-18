@@ -300,11 +300,19 @@ pub use shell::{
 pub use hiss::noise::SessionId;
 
 // The three identifiers §16.4's surface names that a consumer must be able
-// to spell. They live inside the `pub(crate)` core, so they are re-exported
-// here to be publicly *reachable* — `WallClock::now()` returns a
-// [`Timestamp`], and a public signature naming an unreachable type is a
-// rustdoc break, not merely a lint.
-pub use crate::core::{ConnectionId, Dir, IntroId, StreamId, Timestamp};
+// to spell: [`Dir`], [`StreamId`] and [`Timestamp`]. They live inside the
+// `pub(crate)` core, so they are re-exported here to be publicly
+// *reachable* — `WallClock::now()` returns a [`Timestamp`], and a public
+// signature naming an unreachable type is a rustdoc break, not merely a
+// lint.
+//
+// **[RATIFIED 2026/08/18 — ruling 259(iii)]** `ConnectionId` and `IntroId`
+// were re-exported here too, which made the count wrong and the surface
+// dead: neither appears in any public signature and neither has a public
+// constructor or accessor, so nothing a consumer can write names them. The
+// re-export bought nothing and would have frozen two types under semver.
+// They stay `pub(crate)`; the comment now names the three it counts.
+pub use crate::core::{Dir, StreamId, Timestamp};
 
 /// The `hiss` slither was built against, re-exported so the version you
 /// must match is findable.

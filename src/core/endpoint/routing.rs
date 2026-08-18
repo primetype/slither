@@ -273,7 +273,11 @@ impl<I: Identity> Endpoint<I> {
     ) {
         let outcome = self.intros.arrive(now, src, sender_index, msg1);
         if let Some(evicted) = outcome.evicted {
-            self.release_chain_guard_state(now, evicted.guard_undo, evicted.guard_pin);
+            // Ruling 261: the demotion path evicts on exactly §6.3's two cap
+            // rules, so it is traced identically — an operator reading a
+            // rate of `intro_evicted` must see every eviction, not the
+            // subset that arrived through `park_initiation`.
+            self.release_evicted_chain(now, src, evicted);
         }
         let id = match outcome.arrival {
             Arrival::Parked(id) => {
