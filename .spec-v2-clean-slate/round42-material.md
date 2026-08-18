@@ -25,7 +25,23 @@ profiling, a fifth bucket the syscall instrumentation cannot see). Two
 rule-12 flags left open: the profile's sendto/recvfrom asymmetry does
 not reproduce in isolation, and the two sessions' conditions may not be
 comparable. Maintainer decision pending on which lever, if any, to
-pursue.]**
+pursue. RESIDUAL PROFILED 2026/08/18 (`round42-H`, post-ring, at
+`bc71246`): the ~6 µs residual does NOT exist as userspace code — the
+fresh decomposition is 63.1 % syscalls / 21.4 % AEAD / 15.5 %
+everything-else (≈2.19 µs, diffuse RangeSet/BTreeMap churn, no single
+fruit). The mystery moved INTO the syscall bucket: in-situ syscall time
+is 8.90 µs/data-dg, ~1.9× the isolated floor's 4.70 — a ~4.2 µs excess
+reproducing G's "sendto anomaly", now the largest open unknown (likely
+kernel in-situ behaviour under load; best addressed indirectly by
+sending fewer datagrams). The ring fix is profile-confirmed (memmove
+2.8 %, was 21–94 %). AEAD 2.78 µs matches the cryptoxide floor —
+cipher is floor-bound. **The TRUE ACK-lever value is ≈3.69 µs/data-dg**
+(both sides, build+seal+receive+open+process at the 1-per-2 cadence) —
+2.4× the floor-only bound and ≈1.9× quinn's entire non-floor budget;
+it also shrinks the in-situ syscall count, attacking the anomaly
+indirectly. The cadence is ratified §12.4; changing it is a ruling
+with recovery-behaviour acceptance (our ACKs feed the peer's RTT
+estimation and loss detection).]**
 
 1. **The O(window) ack-path drain** (ruling 269(iii), deferred by
    decision). `SendHalf`'s send buffer is a contiguous `Vec<u8>`;
