@@ -74,6 +74,9 @@
 //! that must not require `Send`, so a `Send` fixture would let a `Send`
 //! bound creep into the driver unnoticed.
 
+mod capture;
+pub use self::capture::{Capture, CapturedEvent};
+
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};

@@ -378,3 +378,33 @@ required-features = ["test-util"]
 [[test]]
 name = "story_flow"
 required-features = ["test-util"]
+
+# Gap slice C — G7's traced clauses (S25/ruling 49, S30/ruling 59). Drives
+# two endpoints over `testutil` and installs `testutil::Capture`, so
+# `test-util` like its neighbours.
+#
+# **[ruling 194]** Landed live rather than commented out, and this file is
+# the one exception to that rule's shape: a commented-out stanza is the same
+# thing as no stanza, and *no* stanza is exactly the failure ruling 194
+# records — cargo auto-discovers `tests/story_traced.rs` **without** its
+# `required-features` and the feature-less `cargo test` gate fails on
+# `unresolved import slither::testutil` rather than skipping the target.
+# Measured on this tree before the stanza was added, not assumed. The file
+# it names is committed in the same commit, so the manifest never parses
+# against a missing file.
+[[test]]
+name = "story_traced"
+required-features = ["test-util"]
+
+# Gap slice A (S8/S10/S24) and B (S22 clause 4) — both drive `testutil`
+# endpoints. Stanzas added by the integrator: working rule 15 makes this
+# manifest the integrator's file, and both authors reported the missing
+# stanza as a blocker rather than racing each other into one block
+# (ruling 194's auto-discovery trap, the slice-4b lesson).
+[[test]]
+name = "story_intro"
+required-features = ["test-util"]
+
+[[test]]
+name = "story_wrong_static"
+required-features = ["test-util"]
