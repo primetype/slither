@@ -8,10 +8,14 @@
 //! # Every write site is post-`ss`
 //!
 //! §17.1 has four write sites and all four sit **after** the proving `ss`,
-//! so **only a key-holder can write a guard entry**. Three are implemented:
-//! `authenticate()` on the staged path, §6.6 step 4's tie-break admit, and
-//! §6.7's winner-side record (by either of §6.6's two routes). §6.4's
-//! **re-homed** candidate admission is the one still outstanding.
+//! so **only a key-holder can write a guard entry**, and all four are now
+//! implemented: `authenticate()` on the staged path — which is also
+//! §6.4's **re-homed** candidate's check-and-record, since `accept()`'s
+//! LIVE arm (`staged.rs`) admits the replacement from that record paired
+//! with §17.4's replacement basis, rather than writing the guard a second
+//! time — §6.6 step 4's tie-break admit, and §6.7's winner-side record (by
+//! either of §6.6's two routes).
+//! `[corrected 2026/08/18 — ruling 264]`
 //! [`GuardEntry::exempt_until`] was shaped for the last two from the start,
 //! and ruling 91 spent it as predicted — one added call
 //! ([`TimestampGuard::extend_exemption`]), no migration.

@@ -14,10 +14,12 @@
 //! # `replacement_basis` is written here and read by §6.4
 //!
 //! §6.4's admission is its **only** reader. Its proven-LIVE replacement
-//! admission is still a later slice; §6.4's **PENDING** branch and §6.6's
+//! admission (the basis-timestamp comparison in `staged.rs`'s
+//! `accept()`) reads it directly; §6.4's **PENDING** branch and §6.6's
 //! internal tie-break landed with ruling 91, and the latter is why
 //! [`StaticMap::promote`] takes the basis as an argument rather than
 //! leaving whatever the dialled row was born with.
+//! `[corrected 2026/08/18 — ruling 264]`
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

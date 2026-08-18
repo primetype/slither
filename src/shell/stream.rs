@@ -795,12 +795,20 @@ impl<S: Handshake> RecvStream<S> {
                 // **The latch is re-checked here, and it has to be**
                 // (ruling 128: *"parking is never permitted on a dead
                 // connection"*). The core's own `lost` is not the same
-                // fact as this cell's `closed`: `Driver::stop` latches
-                // every cell — on an unwind as well as an ordinary exit —
-                // over cores that are still perfectly live and still
-                // answer `Ok(Some(0))`. Trusting the core's guard alone
-                // parks a reader that nothing will ever wake, which is the
-                // failure this whole rule exists to prevent.
+                // fact as this cell's `closed`: a peer CLOSE latches
+                // `cell.closed` at once (`publish`'s `ConnEvent::Closed`
+                // arm) but the core is released only later, by
+                // `release_dead`, after the `CLOSE_LINGER` drain — so for
+                // that window `cell.core` is still `Some` and still
+                // answers `Ok(Some(0))` over a connection `cell.closed`
+                // already names as dead. (`Driver::stop` is not this case:
+                // it nulls `cell.core` in the same call that latches, so a
+                // `poll_read` reaching this line afterwards is already
+                // impossible — see the `cell.core.as_mut()` check above.)
+                // Trusting the core's guard alone parks a reader that
+                // nothing will ever wake, which is the failure this whole
+                // rule exists to prevent.
+                // `[corrected 2026/08/18 — ruling 264]`
                 Ok(Some(0)) => match cell.closed.clone() {
                     Some(lost) => (Poll::Ready(Err(ReadError::ConnectionLost(lost))), false),
                     None => {

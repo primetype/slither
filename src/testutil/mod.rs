@@ -35,12 +35,38 @@
 //!   [`FlakyWire::send_to`].
 //! - No wall clock, no `SystemTime`, no thread identity, and no hash
 //!   iteration order anywhere in a decision path. Registration order is an
-//!   explicit counter and every map is ordered.
+//!   explicit counter and every map is ordered. **Scoped to the fabric's
+//!   own loss/delay/duplicate decisions** — it does not cover
+//!   `Config`'s `WallClock` (see below), which is a different clock this
+//!   module does not own.
 //!
 //! For anything asserting a *specific* outcome, prefer the index-based
 //! tools — [`FlakyPolicy::drop_at`] and [`FlakyPolicy::drop_first`] — over
 //! probabilistic loss. Probabilistic loss is reproducible under a seed but
 //! brittle: it moves when an unrelated send is added.
+//!
+//! # Two conventions worth knowing before writing a flow test
+//!
+//! **Never golden-pin a `SessionId`.** It derives from the handshake
+//! hash, which covers §5.3's initiation timestamp — real wall-clock time
+//! by default. `Endpoint::draw_timestamp` (`src/core/endpoint/mod.rs:368`)
+//! reads `self.config.clock().now()`, and `Config`'s default `WallClock`
+//! is `SystemClock` (`src/config.rs:81`) — real `SystemTime` — unless a
+//! test overrides it with `Config::with_clock` (`src/config.rs:190`).
+//! Neither `Network::seeded`, tokio's paused virtual clock, nor a fixed
+//! RNG seed touches this clock, so a test that captures
+//! [`Connection::session_id`](crate::shell::Connection::session_id)'s
+//! bytes and asserts them as a fixed constant will be flaky from the next
+//! run onward. Assert that two peers' session ids are **equal to each
+//! other**, or that a rekey changes one — never that it equals a fixed
+//! byte sequence.
+//!
+//! **A tapped datagram is not a delivered one.** [`Tap`] records
+//! **before** the loss draw — loss and duplication are applied *after*
+//! the tap (`Tap`'s own doc, below, states this precisely). A send that
+//! appears in a `Tap` may still be dropped, delayed, or duplicated before
+//! it reaches the peer; "tapped" answers "did this leave the wire",
+//! never "did this arrive".
 //!
 //! # Everything here is `!Send`, on purpose
 //!
@@ -180,8 +206,12 @@ impl SendFailure {
 
 /// How one [`FlakyWire`] mistreats the datagrams it sends.
 ///
-/// Every field is public, so a test may build one literally; the
-/// constructors below cover the shapes the spec's obligations ask for.
+/// One field (`failing`) is private, so a struct literal or functional
+/// update (`FlakyPolicy { .. }` or `{ .., ..FlakyPolicy::perfect() }`)
+/// does not compile outside this module. Build one with the constructors
+/// below, then set the public fields you need by assignment on the
+/// result (see `arm_drops` in `tests/story_reliability.rs` for the
+/// pattern). `[corrected 2026/08/18 — ruling 264]`
 #[derive(Clone, Debug)]
 pub struct FlakyPolicy {
     /// P(drop) per datagram, `0.0`–`1.0`.

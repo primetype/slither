@@ -868,6 +868,12 @@ impl<I: Identity> ShellState<I> {
     /// The driver is woken by the command each of those verbs sends
     /// afterwards, so it re-serves and re-reads the deadline regardless;
     /// nothing here is load-bearing for liveness.
+    ///
+    /// **Ruling 262 names this the surviving looping-and-popping arm**:
+    /// `driver.rs`'s two same-shaped destroy-arms were removed because a
+    /// popping verb was used only to read a value; this one is left
+    /// untouched because it actually **processes** what it pops (the
+    /// `debug_assert` above), not merely discards it.
     pub(crate) fn drain_endpoint(&mut self) {
         for _ in 0..HANDLE_DRAIN_BOUND {
             match self.endpoint.poll_output() {

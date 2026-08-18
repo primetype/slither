@@ -594,10 +594,12 @@ impl<I: Identity> Endpoint<I> {
     ///   responder. §6.6 calls this "a **different route to the same
     ///   comparison**", so both halves call the same functions §6.6's
     ///   internal route does — see [`routing`](super::routing).
-    /// * **LIVE** — still [`AcceptError::Stale`], and that one is a knowing
-    ///   boundary: §6.4's re-home walk and its proven-LIVE replacement
-    ///   admission are a later slice. What `Stale` preserves meanwhile is
-    ///   §16.1's one-session-per-peer invariant, which it cannot violate.
+    /// * **LIVE** — admitted when the candidate's timestamp exceeds the
+    ///   row's `replacement_basis` (see `accept()` below); refused as
+    ///   [`AcceptError::Stale`] otherwise. §16.1's one-session-per-peer
+    ///   invariant holds either way — the basis check is what makes the
+    ///   admission sound, not the refusal.
+    ///   `[corrected 2026/08/18 — ruling 264]`
     ///
     /// # The guard record, and its one exception
     ///

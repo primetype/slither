@@ -1,11 +1,12 @@
-//! §16.2's `Connection` handle — the subset slice 3 builds.
+//! §16.2's `Connection` handle.
 //!
-//! `close()`, ruling 46's `closed()`, the four accessors, slice 4's stream
-//! verbs, slice 5's `acked()`, slice 6's four sugar verbs, and slice 7's
-//! `notified()`, `set_persistent_keepalive()` and `persistent_keepalive()`.
-//! §16.2's surface is now complete; what remains for slice 8 is the
-//! composability layer (`AsyncRead`/`AsyncWrite`, the `Sink`/`Stream`
-//! adapters), which wraps these verbs rather than adding to them.
+//! `close()`, `closed()`, the four accessors, the stream verbs,
+//! `acked()`, the four sugar verbs (§9.8, §11), `notified()`,
+//! `set_persistent_keepalive()` and `persistent_keepalive()`. §16.2's
+//! surface is complete; the composability layer
+//! (`AsyncRead`/`AsyncWrite`, `Sink`/`Stream`, `tower::Service`) wraps
+//! these verbs from `src/compat/` rather than adding to them.
+//! `[corrected 2026/08/18 — ruling 264]`
 //!
 //! # Where the work happens
 //!
@@ -546,14 +547,14 @@ impl<S: Handshake> Connection<S> {
     /// core-internal condition and no public verb can return it (ruling
     /// 101).
     ///
-    /// # In slice 4 an exhausted bidi space parks for ever
+    /// # A freed bidi index returns the peer's allowance
     ///
     /// A bidi index is returned to the peer's allowance only when **both**
-    /// halves are freed, and the send half is freed on acknowledgement —
-    /// which needs §12's ACK processing, which this slice does not have. So
-    /// once the bidi limit is reached, `open_bi` never resumes. `open_uni`
-    /// has no such gap: a peer-opened uni stream read to end-of-stream is
+    /// halves are freed, and the send half is freed on acknowledgement
+    /// (§12's ACK processing, `Streams::on_ack_range`). `open_uni` has no
+    /// such dependency: a peer-opened uni stream read to end-of-stream is
     /// fully closed at once and grants its MAX_STREAMS_UNI.
+    /// `[corrected 2026/08/18 — ruling 264]`
     ///
     /// # Cancel-safety
     ///
