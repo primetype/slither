@@ -47,12 +47,13 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use slither::StreamId;
 use slither::constants::AMPLIFICATION_FACTOR;
+use slither::error::ConnectionLost;
+use slither::shell::Notification;
 use slither::testutil::{
     Pair, Spied, TestConnection, TestRecvStream, TestSendStream, addr_c, local, settle,
 };
-use slither::{ConnectionLost, Notification, StreamId};
-
 // ══════════════════════════════════════════════════════════════════════
 // harness
 //

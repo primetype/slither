@@ -289,14 +289,14 @@ async fn loopback_pair() -> (TestEndpoint, TestEndpoint, TestConnection, TestCon
 
     let id_a: TestIdentity = CountingIdentity::seeded([0xA1; 32]);
     let id_b: TestIdentity = CountingIdentity::seeded([0xB2; 32]);
-    let pk_b: TestPublicKey = *slither::Identity::public_static(&id_b);
+    let pk_b: TestPublicKey = *slither::identity::Identity::public_static(&id_b);
 
-    let ep_a: TestEndpoint = slither::Endpoint::builder()
+    let ep_a: TestEndpoint = slither::shell::Endpoint::builder()
         .identity(id_a)
         .wire(sock_a)
         .rng_seed([0x11; 32])
         .build();
-    let ep_b: TestEndpoint = slither::Endpoint::builder()
+    let ep_b: TestEndpoint = slither::shell::Endpoint::builder()
         .identity(id_b)
         .wire(sock_b)
         .rng_seed([0x22; 32])

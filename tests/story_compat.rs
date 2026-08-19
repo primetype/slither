@@ -46,9 +46,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter, ReadBuf};
 
 use slither::constants::DEAD_TIMEOUT;
+use slither::error::{ConnectionLost, ReadError, WriteError};
 use slither::testutil::{FlakyPolicy, Pair, TestRecvStream, addr_a, addr_b, local, settle};
-use slither::{ConnectionLost, ReadError, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 //

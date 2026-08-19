@@ -5,7 +5,7 @@
 //! answer with numbers: *where does a Noise-over-UDP userspace transport stand
 //! against the kernel's own reliable stream, on the same host, with the same
 //! CPU budget?* — and, since ruling 259(viii) landed
-//! [`Config::with_flow_windows`](slither::Config::with_flow_windows), *what
+//! [`Config::with_flow_windows`](slither::config::Config::with_flow_windows), *what
 //! does raising the flow-control windows actually buy on a path with delay?*
 //!
 //! # Read this before reading any number below
@@ -175,8 +175,7 @@ use std::time::{Duration, Instant};
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
 use slither::packet::ReferenceSuite;
-use slither::shell::wire::Wire;
-use slither::{Config, Connection, Endpoint, Identity, RecvStream, SendStream, SoftwareIdentity};
+use slither::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -1435,7 +1434,7 @@ fn scenario_establish(relay: &Relay) {
         let via = one_way(rtt_ms).map(|d| (relay, d));
         let mut slither_ms = Vec::with_capacity(samples);
         let mut tcp_ms = Vec::with_capacity(samples);
-        slither::block_on(async {
+        block_on(async {
             for i in 0..samples {
                 let d = slither_establish_once(via, i as u8).await;
                 slither_ms.push(d.as_secs_f64() * 1e3);
@@ -1480,8 +1479,7 @@ fn scenario_bulk(relay: &Relay, rtts: &[u64], tag: &'static str) {
     for &rtt_ms in rtts {
         let via = one_way(rtt_ms).map(|d| (relay, d));
         for windows in [WINDOWS_DEFAULT, WINDOWS_RAISED] {
-            let (samples, note) =
-                slither::block_on(slither_bulk(via, windows, 1, 0x30 ^ rtt_ms as u8));
+            let (samples, note) = block_on(slither_bulk(via, windows, 1, 0x30 ^ rtt_ms as u8));
             Row {
                 scenario: tag,
                 proto: "slither",
@@ -1495,7 +1493,7 @@ fn scenario_bulk(relay: &Relay, rtts: &[u64], tag: &'static str) {
             }
             .emit();
         }
-        let samples = slither::block_on(tcp_bulk(via, false));
+        let samples = block_on(tcp_bulk(via, false));
         Row {
             scenario: tag,
             proto: "tcp",
@@ -1518,7 +1516,7 @@ fn scenario_pingpong(relay: &Relay) {
     println!("# ping-pong — 64 B, unpipelined, TCP_NODELAY on");
     for rtt_ms in [0u64, 20] {
         let via = one_way(rtt_ms).map(|d| (relay, d));
-        let samples = slither::block_on(slither_pingpong(via));
+        let samples = block_on(slither_pingpong(via));
         Row {
             scenario: "pingpong",
             proto: "slither",
@@ -1531,7 +1529,7 @@ fn scenario_pingpong(relay: &Relay) {
             note: Some("datagram-path".into()),
         }
         .emit();
-        let samples = slither::block_on(tcp_pingpong(via));
+        let samples = block_on(tcp_pingpong(via));
         Row {
             scenario: "pingpong",
             proto: "tcp",
@@ -1553,7 +1551,7 @@ fn scenario_mux() {
     for windows in [WINDOWS_DEFAULT, WINDOWS_RAISED] {
         for streams in MUX_STREAMS {
             let (samples, note) =
-                slither::block_on(slither_bulk(None, windows, streams, 0x70 ^ streams as u8));
+                block_on(slither_bulk(None, windows, streams, 0x70 ^ streams as u8));
             Row {
                 scenario: "mux",
                 proto: "slither",
@@ -1590,7 +1588,7 @@ fn scenario_sweep(relay: &Relay, rtt_ms: u64, tag: &'static str) {
     println!("# {tag} — slither only, window ladder, one stream, rtt={rtt_ms} ms");
     let via = one_way(rtt_ms).map(|d| (relay, d));
     for (i, windows) in SWEEP.into_iter().enumerate() {
-        let (samples, note) = slither::block_on(slither_bulk(via, windows, 1, 0xC0 ^ i as u8));
+        let (samples, note) = block_on(slither_bulk(via, windows, 1, 0xC0 ^ i as u8));
         Row {
             scenario: tag,
             proto: "slither",

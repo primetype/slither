@@ -49,8 +49,8 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use slither::WriteError;
 use slither::constants::{MESSAGE_OVERFLOW, MESSAGE_RECV_MAX};
+use slither::error::WriteError;
 use slither::testutil::{
     Capture, CapturedEvent, ENETUNREACH, FlakyPolicy, Pair, TestSendStream, local, settle,
 };

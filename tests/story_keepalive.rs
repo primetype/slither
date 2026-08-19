@@ -209,13 +209,12 @@ use slither::testutil::{CountingIdentity, Network, Tap, settle};
 // `ConnectionLost::TimedOut` (§5.1).
 // ══════════════════════════════════════════════════════════════════════
 
-use slither::Notification;
-
+use slither::shell::Notification;
 type Suite = slither::packet::ReferenceSuite;
 type Id = CountingIdentity<Suite>;
 type Pk = PublicKeyOf<Id>;
-type Endpoint = slither::Endpoint<Id>;
-type Connection = slither::Connection<Suite>;
+type Endpoint = slither::shell::Endpoint<Id>;
+type Connection = slither::shell::Connection<Suite>;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)

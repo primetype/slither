@@ -78,9 +78,22 @@ of why.
   SVG diagrams); the crate docs how-first with a compile-tested quickstart
   and five new API examples; a runnable `examples/echo.rs`; the shell's
   module prose folded into the rendered `shell` page.
+- **`slither::prelude` replaces the flat crate root** (ruling 278). One
+  glob — `use slither::prelude::*;` — carries the golden path: `block_on`,
+  `Config`, `Identity`/`SoftwareIdentity`, `Wire`, the handles, the staged
+  ladder, the stream types, `Notification`, and hiss's `P256`/`ChaChaPoly`/
+  `Blake2b` so the same line covers a `channel!` declaration. The root now
+  keeps only the eight modules, `prelude`, `channel!`, `pub use hiss` and
+  the four signature-reachability types (`SessionId`, `Dir`, `StreamId`,
+  `Timestamp`); every other name has **one blessed spelling, at its
+  module** — `slither::error::ReadError`, `slither::config::WallClock`,
+  `slither::packet::Channel`. The ten error types stay module-only and are
+  deliberately not in the prelude. The prelude itself changes only by
+  ruling.
 - **Building an endpoint outside a `LocalSet` now panics with slither's
-  own message**, naming `slither::block_on` and the fix — previously
-  tokio's bare `spawn_local` message, which named no slither symbol.
+  own message**, naming `slither::prelude::block_on` and the fix —
+  previously tokio's bare `spawn_local` message, which named no slither
+  symbol.
 - **The lib compiles for `wasm32-wasip1`** (ruling 277), including
   `test-util`'s in-memory `FlakyWire`: `tokio/net` is now a
   target-conditional dependency (`cfg(not(target_family = "wasm"))`) and

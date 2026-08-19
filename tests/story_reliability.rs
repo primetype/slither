@@ -63,9 +63,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use slither::constants::{DEAD_TIMEOUT, MAX_PLAINTEXT, NO_ERROR};
+use slither::error::{ConnectionLost, WriteError};
 use slither::testutil::{FlakyPolicy, Pair, Tap, TestRecvStream, TestSendStream, local, settle};
-use slither::{ConnectionLost, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 // ══════════════════════════════════════════════════════════════════════

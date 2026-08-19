@@ -3,14 +3,14 @@
 //!
 //! Run it with `cargo run --example echo`.
 //!
-//! This uses `slither::block_on`, not `#[tokio::main]` — the driver task is
+//! This uses `block_on`, not `#[tokio::main]` — the driver task is
 //! `!Send`, so it needs a current-thread runtime with a `LocalSet`, and
 //! `block_on` sets that up for you.
-use hiss::noise::{Blake2b, ChaChaPoly, P256};
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
-use slither::identity::SoftwareIdentity;
-use slither::{Config, Endpoint, Identity};
+// One line for the whole golden path — the handles, the traits, and hiss's
+// three suite types the `channel!` declaration below names (ruling 278).
+use slither::prelude::*;
 
 // 1. Declare one crypto suite per module. IK is the only handshake pattern;
 //    the macro names the generated type `MySuite`.
@@ -27,7 +27,7 @@ fn rng() -> ChaCha20Rng {
 fn main() {
     // 2. block_on gives you the current-thread runtime plus the LocalSet
     //    the !Send driver needs.
-    slither::block_on(async {
+    block_on(async {
         // 3. Two identities. generate() mints a fresh static keypair.
         let dialler: SoftwareIdentity<MySuite> =
             SoftwareIdentity::generate(rng()).expect("generate dialler identity");

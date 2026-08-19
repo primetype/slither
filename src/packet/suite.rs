@@ -175,13 +175,17 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 /// Declare a crypto suite. §2.2.
 ///
 /// ```
-/// use hiss::noise::{Blake2b, ChaChaPoly, P256};
+/// use slither::prelude::*;
 ///
 /// slither::channel! {
 ///     /// My application's suite.
 ///     pub MySuite<P256, ChaChaPoly, Blake2b>;
 /// }
 /// ```
+///
+/// The prelude folds hiss's three suite types in, so that one line covers
+/// the declaration (ruling 278). **It does not remove the Cargo.toml
+/// requirement below** — the expansion names `::hiss` absolutely.
 ///
 /// The invocation stamps three items into the invoking module: the suite
 /// type you named, an `impl` of [`Channel`] for it, and a type called `IK`

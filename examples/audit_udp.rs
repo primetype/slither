@@ -26,7 +26,7 @@
 //!
 //! # Why there are five series and not two
 //!
-//! [`Connection::send_datagram`](slither::Connection::send_datagram) **is not
+//! [`Connection::send_datagram`](slither::shell::Connection::send_datagram) **is not
 //! `async` and performs no syscall**: it bound-checks the payload against
 //! §11.4, pushes into §11.3's send queue, marks the connection dirty, and
 //! returns. The `send_to` syscall happens later, on the driver's next turn.
@@ -56,7 +56,7 @@
 //! # Topology — deliberately D's, not a better one
 //!
 //! One process, **one current-thread runtime inside one `LocalSet`
-//! (`slither::block_on`), both endpoints on that single OS thread**, two real
+//! (`block_on`), both endpoints on that single OS thread**, two real
 //! `tokio::net::UdpSocket`s on `127.0.0.1:0`, real unpaused clock. That is
 //! what D measured and the anomaly is a property of that arrangement: when the
 //! one thread is not scheduled, *both* drivers stall together, which presents
@@ -98,8 +98,7 @@ use std::time::{Duration, Instant};
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
 use slither::packet::ReferenceSuite;
-use slither::shell::wire::Wire;
-use slither::{Connection, Endpoint, Identity, SoftwareIdentity};
+use slither::prelude::*;
 
 // ══════════════════════════════════════════════════════════════════════
 // SIZING
@@ -411,7 +410,7 @@ fn main() {
     );
     println!();
 
-    slither::block_on(async {
+    block_on(async {
         let (ep_a, ep_b, ca, cb, sends) = loopback_pair().await;
 
         // The peer: echo every datagram straight back. It shares the one

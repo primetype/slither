@@ -175,11 +175,9 @@ impl<I: Identity> Endpoint<I> {
     /// send one message, close.
     ///
     /// ```no_run
-    /// # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// # use slither::prelude::*;
     /// # use rand_chacha::ChaCha20Rng;
     /// # use rand_chacha::rand_core::SeedableRng;
-    /// # use slither::identity::SoftwareIdentity;
-    /// # use slither::{Config, Endpoint, Identity};
     /// # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
     /// # fn seeded() -> Result<ChaCha20Rng, Box<dyn std::error::Error>> {
     /// #     let mut seed = [0u8; 32];
@@ -193,7 +191,7 @@ impl<I: Identity> Endpoint<I> {
     /// // is where to send. slither never learns a static key from the wire.
     /// # let peer_key = *peer.public_static();
     /// # let peer_addr: std::net::SocketAddr = "203.0.113.7:9000".parse()?;
-    /// slither::block_on(async move {
+    /// block_on(async move {
     ///     // A `tokio::net::UdpSocket` is a `Wire` out of the box, and
     ///     // `block_on` is the current-thread runtime plus the `LocalSet`
     ///     // the `!Send` driver needs.
@@ -444,7 +442,7 @@ impl<I: Identity> Drop for Connecting<I> {
 ///
 /// [`build`](Self::build) calls `tokio::task::spawn_local`, which **panics
 /// outside a `LocalSet`** — with slither's own message, naming
-/// [`slither::block_on`](crate::block_on) and `LocalSet::run_until` (see
+/// [`block_on`](crate::compat::block_on) and `LocalSet::run_until` (see
 /// [`build`](Self::build)'s panics section). That is §16.3's architecture,
 /// not an implementation detail: the driver is a single `!Send` actor
 /// because a DH provider is not required to be `Send` — a hardware-backed
@@ -452,15 +450,16 @@ impl<I: Identity> Drop for Connecting<I> {
 /// required to be `Send` either.
 ///
 /// ```no_run
+/// # use slither::prelude::*;
 /// # async fn doc<I, W>(identity: I, wire: W)
 /// # where
-/// #     I: slither::Identity + 'static,
-/// #     W: slither::shell::wire::Wire + 'static,
+/// #     I: Identity + 'static,
+/// #     W: Wire + 'static,
 /// # {
 /// let local = tokio::task::LocalSet::new();
 /// local
 ///     .run_until(async move {
-///         let endpoint = slither::shell::Endpoint::builder()
+///         let endpoint = Endpoint::builder()
 ///             .identity(identity)
 ///             .wire(wire)
 ///             .build();
@@ -544,7 +543,7 @@ impl<I: Identity, W: Wire> EndpointBuilder<I, W> {
     /// neither is recoverable at the call site.
     ///
     /// The `LocalSet` case panics with **slither's own message**, which
-    /// names [`slither::block_on`](crate::block_on) and
+    /// names [`block_on`](crate::compat::block_on) and
     /// `tokio::task::LocalSet::run_until` as the two fixes: `spawn_local`'s
     /// own wording names tokio and no slither symbol, and a consumer who has
     /// just written `#[tokio::main]` needs to be told which of the two to
@@ -604,8 +603,9 @@ impl<I: Identity, W: Wire> EndpointBuilder<I, W> {
                  (a DH provider and a Wire are not required to be `Send`), so \
                  it is spawned with `tokio::task::spawn_local`, which needs a \
                  current-thread runtime with a `LocalSet` — `#[tokio::main]` \
-                 alone is not one. Wrap your code in `slither::block_on(async \
-                 {{ … }})`, or build the endpoint inside \
+                 alone is not one. Wrap your code in \
+                 `slither::prelude::block_on(async {{ … }})`, or build the \
+                 endpoint inside \
                  `tokio::task::LocalSet::new().run_until(…)`."
             );
         }
@@ -652,8 +652,8 @@ mod tests {
     /// absence: tokio's own text is *"`spawn_local` called from outside of a
     /// `task::LocalSet` or `runtime::LocalRuntime`"*, which contains none of
     /// the three strings below. Deleting the guard, or dropping any of
-    /// `slither::block_on` / `tokio::task::LocalSet` / `Endpoint::builder`
-    /// from its wording, turns this red.
+    /// `slither::prelude::block_on` / `tokio::task::LocalSet` /
+    /// `Endpoint::builder` from its wording, turns this red.
     #[test]
     fn build_outside_a_localset_panics_with_slithers_own_message() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -681,7 +681,7 @@ mod tests {
             .expect("a string panic payload");
 
         assert!(
-            message.contains("slither::block_on"),
+            message.contains("slither::prelude::block_on"),
             "the guard must name the fix; got: {message}"
         );
         assert!(

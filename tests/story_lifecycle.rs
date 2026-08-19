@@ -136,12 +136,12 @@ use slither::testutil::{CountingIdentity, DhCounter, Network, Tap};
 type Suite = slither::packet::ReferenceSuite;
 type Id = CountingIdentity<Suite>;
 type Pk = PublicKeyOf<Id>;
-type Endpoint = slither::Endpoint<Id>;
+type Endpoint = slither::shell::Endpoint<Id>;
 // §16.2 writes a bare `Connection`, but `core::Connection<C: Handshake>` is
 // suite-parameterised, so the shell's almost certainly is too. **This alias
 // is the single line to change** if it turns out to be `Connection<Id>`, or
 // genuinely bare: no test below names the type.
-type Connection = slither::Connection<Suite>;
+type Connection = slither::shell::Connection<Suite>;
 
 /// §15.3's graceful-close code. See G5.
 const NO_ERROR: u64 = 0x00;

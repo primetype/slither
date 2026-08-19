@@ -56,7 +56,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slither::shell::wire::Wire;
+use slither::prelude::*;
 use slither::testutil::FlakyWire;
 use tokio::time::Instant;
 

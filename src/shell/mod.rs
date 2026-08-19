@@ -40,7 +40,7 @@
 //!
 //! [`Endpoint::builder`]'s `build()` calls `tokio::task::spawn_local`, so
 //! the endpoint must be built inside a `tokio::task::LocalSet` on a
-//! current-thread runtime — [`slither::block_on`](crate::block_on) is that
+//! current-thread runtime — [`block_on`](crate::compat::block_on) is that
 //! runtime and that `LocalSet` in one call, and building outside one panics
 //! with a message that says so. **No `Send` bound may be added to this
 //! path.** §16.3 is explicit about why: a DH provider is not required to be

@@ -72,11 +72,10 @@ use tower::util::UnsyncBoxService;
 use tower::{Service, ServiceExt};
 
 use slither::compat::serve;
+use slither::error::{ConnectError, ConnectionLost};
 use slither::testutil::{
     Pair, TestBiStream, TestConnection, TestEndpoint, TestPublicKey, local, settle,
 };
-use slither::{ConnectError, ConnectionLost};
-
 /// The request type `Endpoint`'s dialling `Service` takes (`CONTRACT-8.md`
 /// §6.1). Named so the `poll_ready` assertion can be fully qualified — with
 /// one `Service` impl per type inference would manage, but a fully qualified

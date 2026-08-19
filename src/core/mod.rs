@@ -64,9 +64,12 @@ use crate::constants;
 use crate::error::ConnectError;
 use crate::packet::{Handshake, Msg1Payload};
 
-// `IntroId` is publicly reachable through the crate root: `WallClock` and
-// slice 3's `Intro` handle both name it, and a `pub(crate)` re-export here
-// would make that re-export illegal (E0365).
+// `IntroId` is named across the crate (the `Intro` handle's private field,
+// the driver's `pub(crate)` seams) but it is *not* publicly reachable:
+// ruling 259(iii) removed its crate-root re-export, and no public signature
+// names it. `pub` here is reach within the `pub(crate)` core, not public
+// API. (This comment claimed crate-root reachability until ruling 278's
+// sweep; it had been false since 259(iii).)
 pub use self::endpoint::IntroId;
 
 // Same reason as `packet`'s: the driver that consumes these is slice 3b.
@@ -76,8 +79,8 @@ pub(crate) use self::connection::{ConnEvent, ConnOutput, Connection, StreamRef, 
 // that minted a connection to the connection itself (ruling 259(viii)).
 pub(crate) use self::connection::flow::FlowWindows;
 // §9.1's two public types. They live in the `pub(crate)` core and are
-// re-exported from `lib.rs` beside `ConnectionId`/`IntroId`/`Timestamp`
-// (ruling 101).
+// re-exported from `lib.rs` beside `Timestamp` (ruling 101; ruling
+// 259(iii) trimmed the re-exported set to those three).
 pub use self::connection::{Dir, StreamId};
 // §16.5's named timers. Re-exported because the driver arms nothing itself
 // — it only announces `Timeout(next)` — but names them in its trace and in

@@ -795,7 +795,7 @@ impl<I: Identity> Endpoint<I> {
     ///
     /// Config-supplied (**ruling 82**), defaulting to `REKEY_EPOCH_MSGS`.
     /// The override is a **test-only** facility and
-    /// [`Config::with_epoch_size`](crate::Config::with_epoch_size) says so
+    /// [`Config::with_epoch_size`](crate::config::Config::with_epoch_size) says so
     /// in the terms §16.6 uses for the RNG seed; the ratchet itself is
     /// hiss's, and nothing in this crate inspects or drives an epoch.
     fn epoch_size(&self) -> NonZeroU64 {

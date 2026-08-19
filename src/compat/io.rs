@@ -103,7 +103,7 @@ fn write_kind(err: &WriteError) -> io::ErrorKind {
 /// consumer can reach:
 ///
 /// ```
-/// use slither::ReadError;
+/// use slither::error::ReadError;
 ///
 /// let e: std::io::Error = ReadError::Reset(7).into();
 /// assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);

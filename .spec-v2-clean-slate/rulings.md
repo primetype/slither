@@ -9268,3 +9268,35 @@ consumer's direct `hiss` dependency cannot be lifted from slither's side —
 prelude folds the three suite types so the *code* is one import line; the
 manifest line stays. A hiss-side change could lift it; that is hiss's
 ruling to make, not slither's.
+
+**[ADDENDUM, same day — the two edits 278's implementation forced on
+ratified text, and one scope extension.]** Both were flagged by the
+implementer and independently confirmed by a blind reviewer against the
+ruling texts themselves; neither was resolved silently.
+
+1. **Ruling 89's `SessionId` doc block was touched after all** — one
+   line, link target only: `[`Connection::session_id`]` resolved through
+   the root `pub use shell::Connection` this ruling removes, so the doc
+   gate (`RUSTDOCFLAGS=-D warnings`) fails on the byte-identical text.
+   Repaired to `[`Connection::session_id`](shell::Connection::session_id)`
+   — no rewording, no reflow. 278's "not touched by this ruling" promise
+   could not hold against 278's own decision; rule 4(a)'s shape, inside
+   the ruling's own sentence.
+2. **Ruling 276 §2 is amended: the LocalSet re-panic names
+   `slither::prelude::block_on`**, not `slither::block_on` — the old path
+   no longer resolves, and honouring 276's literal string would have the
+   panic name a non-existent symbol, defeating 276's own stated purpose
+   (give the victim a reason to open slither's docs). The pinning test,
+   `compat/rt.rs`'s `expect()`, the README Requirements paragraph and the
+   CHANGELOG bullet all carry the same substitution. Intent preserved:
+   the fix is named by a path that resolves.
+3. **Scope extension**: `tests/` (15 files) and `benches/throughput.rs`
+   imported the demoted root paths — 93 imports rewritten to module
+   paths (not the prelude glob: story tests name error types constantly,
+   and errors are module-only by this ruling). The integrator also
+   discharged two pre-existing false comments in `core/mod.rs` (259(iii)
+   residue: `IntroId` "publicly reachable through the crate root", and
+   Dir/StreamId "beside `ConnectionId`/`IntroId`/`Timestamp`"), and
+   annotated the one flat blind-author header naming the dead spelling
+   (`tests/story_mobility.rs`); the three conditional sibling headers
+   self-heal and stay verbatim as records.

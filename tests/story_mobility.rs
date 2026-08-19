@@ -63,15 +63,16 @@ use slither::constants::{
     DEAD_TIMEOUT, INIT_PACKET_LEN, KEEPALIVE_TIMEOUT, PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP,
     RESP_PACKET_LEN, SHELL_LATENESS_BOUND,
 };
+use slither::error::{
+    AcceptError, AuthError, ConnectError, ConnectionLost, IntroError, ReadError, WriteError,
+};
+use slither::identity::Identity;
+use slither::shell::Notification;
 use slither::testutil::{
     CountingIdentity, Network, Pair, Spied, TestConnection, TestEndpoint, TestPublicKey,
     TestRecvStream, TestSendStream, addr_c, local, settle,
 };
-use slither::{
-    AcceptError, AuthError, ConnectError, ConnectionLost, Identity, IntroError, Notification,
-    ReadError, StreamId, Timestamp, WriteError,
-};
-
+use slither::{StreamId, Timestamp};
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 //
@@ -82,6 +83,8 @@ use slither::{
 //
 // Slice-7 names used here and owned by `CONTRACT-7.md`:
 //   * `slither::Notification` + its three variants (§5.3)
+//     [ruling 278: the crate-root spelling is gone — it is
+//     `shell::Notification`, carried by the prelude]
 //   * `Connection::notified()` (§6)
 //   * `Connection::set_persistent_keepalive()` (§6)
 //   * `Connection::remote_address()` — exists; §6 makes it non-constant

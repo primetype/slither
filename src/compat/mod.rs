@@ -17,9 +17,10 @@
 //! # A `Connection` is a multiplexer, so the byte-oriented object is a stream
 //!
 //! That substitution is the whole of the mapping and the rest follows: the
-//! `AsyncRead`/`AsyncWrite` impls are on [`SendStream`](crate::SendStream),
-//! [`RecvStream`](crate::RecvStream) and [`BiStream`](crate::BiStream), never
-//! on a `Connection`.
+//! `AsyncRead`/`AsyncWrite` impls are on
+//! [`SendStream`](crate::shell::SendStream),
+//! [`RecvStream`](crate::shell::RecvStream) and
+//! [`BiStream`](crate::shell::BiStream), never on a `Connection`.
 //!
 //! # What is here
 //!
@@ -31,9 +32,10 @@
 //! | `codec` | `codec` | `Framed` constructors over a bidirectional stream |
 //! | `tower` | `tower` | the two `Service` shapes and `serve` |
 //!
-//! The adapter types are named from `slither::compat::*`; they are not
-//! re-exported at the crate root. [`block_on`] is the exception, because it
-//! is the first thing a consumer needs.
+//! The adapter types are named from `slither::compat::*`; they are **not**
+//! in [`slither::prelude`](crate::prelude), which carries the golden path and
+//! nothing else (ruling 278). [`block_on`] is the exception — it is in the
+//! prelude, because it is the first thing a consumer needs.
 //!
 //! # The three rules that bound every adapter here
 //!
@@ -62,7 +64,8 @@
 //!
 //! # Adapters borrow, with one accounted exception — **rulings 231, 239**
 //!
-//! Neither [`Connection`](crate::Connection) nor [`Endpoint`](crate::Endpoint)
+//! Neither [`Connection`](crate::shell::Connection) nor
+//! [`Endpoint`](crate::shell::Endpoint)
 //! is `Clone`, and a `Connection`'s last-handle drop performs
 //! `close(NO_ERROR, "")`, so an owning adapter would change when a
 //! connection ends. Every adapter here therefore carries a lifetime, and the

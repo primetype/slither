@@ -254,8 +254,9 @@ impl<S: Handshake> Connection<S> {
     /// call yields the same notification.
     ///
     /// ```no_run
-    /// # async fn example<S: slither::Handshake>(conn: &slither::Connection<S>) {
-    /// use slither::Notification;
+    /// use slither::prelude::*;
+    ///
+    /// # async fn example<S: slither::packet::Handshake>(conn: &Connection<S>) {
     ///
     /// while let Ok(notification) = conn.notified().await {
     ///     match notification {
@@ -705,11 +706,9 @@ impl<S: Handshake> Connection<S> {
     /// the acknowledgement, and closes.
     ///
     /// ```no_run
-    /// # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// # use slither::prelude::*;
     /// # use rand_chacha::ChaCha20Rng;
     /// # use rand_chacha::rand_core::SeedableRng;
-    /// # use slither::identity::SoftwareIdentity;
-    /// # use slither::{Config, Endpoint, Identity};
     /// # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
     /// # fn seeded() -> Result<ChaCha20Rng, Box<dyn std::error::Error>> {
     /// #     let mut seed = [0u8; 32];
@@ -719,7 +718,7 @@ impl<S: Handshake> Connection<S> {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let dialler: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(seeded()?)?;
     /// # let answerer: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(seeded()?)?;
-    /// slither::block_on(async move {
+    /// block_on(async move {
     /// #     let answerer_key = *answerer.public_static();
     /// #     let dial_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
     /// #     let ans_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;

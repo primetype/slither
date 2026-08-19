@@ -44,11 +44,11 @@
 use std::future::Future;
 use std::time::Duration;
 
-use slither::ConfigError;
+use slither::config::Config;
 use slither::constants::{INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA, MESSAGE_RECV_MAX};
+use slither::error::ConfigError;
+use slither::error::MessageError;
 use slither::testutil::{Pair, TestSendStream, local};
-use slither::{Config, MessageError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE — the same instruments `tests/story_streams.rs` uses, because
 // the measurement is the same one: `timeout` on the paused clock, one

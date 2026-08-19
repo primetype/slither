@@ -84,7 +84,7 @@ use std::pin::pin;
 use std::task::Poll;
 
 use cryptoxide::chacha20poly1305::ChaCha20Poly1305;
-use slither::Config;
+use slither::config::Config;
 use slither::constants::{
     AEAD_TAG_LEN, DATA_HEADER_LEN, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD, MAX_EPOCH_JUMP, PKT_DATA,
     PKT_HANDSHAKE_INIT, PKT_HANDSHAKE_RESP,

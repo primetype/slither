@@ -28,10 +28,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use slither::prelude::*;
 use slither::testutil::{
     CountingIdentity, DhCounter, Network, TestConnection, TestEndpoint, TestIdentity, TestPublicKey,
 };
-use slither::{Config, Identity};
 
 use crate::log::{Log, jstr};
 use crate::wire::{Faults, ObservedWire};
@@ -202,7 +202,7 @@ impl Side {
             faults,
             seed ^ ((salt as u64) << 32),
         );
-        let endpoint = slither::Endpoint::builder()
+        let endpoint = Endpoint::builder()
             .identity(identity)
             .wire(wire.clone())
             .config(Config::new())

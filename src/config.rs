@@ -268,7 +268,7 @@ impl Config {
     /// # Example
     ///
     /// ```
-    /// use slither::Config;
+    /// use slither::prelude::*;
     ///
     /// // 2 MiB per stream, 8 MiB per connection: ~9 MiB/s measured on one
     /// // stream at a 100 ms RTT (ruling 269). Size ≈ 2 × RTT × target

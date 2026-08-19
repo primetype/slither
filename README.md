@@ -52,7 +52,7 @@ majors in one graph give an unsatisfiable `CryptoRng` bound, not a version error
 
 **slither's driver is `!Send`.** It runs with `tokio::task::spawn_local` on a
 **current-thread** runtime inside a **`LocalSet`**, and no handle crosses a
-thread. `slither::block_on` is the one line that pays that tax.
+thread. `slither::prelude::block_on` is the one line that pays that tax.
 
 If your application uses `#[tokio::main]` — the multi-threaded runtime —
 `Endpoint::builder()…build()` **panics at runtime**; run slither on its own
@@ -63,8 +63,9 @@ drive the handshake.
 ## Quickstart
 
 ```rust
+use slither::prelude::*;                        // 0. the golden path, one line
 slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }   // 1. one suite
-slither::block_on(async {                       // 2. current-thread + LocalSet
+block_on(async {                                // 2. current-thread + LocalSet
     let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
     let my_key = me.public_static().clone();    // 3. hand this to the peer
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?; // it's a `Wire`

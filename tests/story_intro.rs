@@ -179,7 +179,7 @@ async fn advance_to(at: tokio::time::Instant) {
 }
 
 /// Write the whole buffer, looping over partial writes as §16.2 requires.
-async fn write_all(s: &mut slither::SendStream<Suite>, buf: &[u8], what: &str) {
+async fn write_all(s: &mut slither::shell::SendStream<Suite>, buf: &[u8], what: &str) {
     let mut done = 0usize;
     while done < buf.len() {
         let n = tokio::time::timeout(PATIENCE, s.write(&buf[done..]))
@@ -195,7 +195,7 @@ async fn write_all(s: &mut slither::SendStream<Suite>, buf: &[u8], what: &str) {
 }
 
 /// Read exactly `want.len()` bytes and assert they are `want`.
-async fn read_exact_eq(r: &mut slither::RecvStream<Suite>, want: &[u8], what: &str) {
+async fn read_exact_eq(r: &mut slither::shell::RecvStream<Suite>, want: &[u8], what: &str) {
     let mut got = Vec::new();
     let mut buf = [0u8; 256];
     while got.len() < want.len() {
@@ -811,7 +811,7 @@ fn s10_the_parked_mid_state_holds_the_published_memory_bound() {
     /// §17.5's own floor for a live mid-state — 0.5 KB.
     const FLOOR: usize = 512;
 
-    let shipping = size_of::<MidState<slither::SoftwareIdentity<Suite>>>();
+    let shipping = size_of::<MidState<slither::identity::SoftwareIdentity<Suite>>>();
     let counting = size_of::<MidState<Id>>();
 
     for (what, measured) in [

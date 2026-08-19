@@ -40,10 +40,10 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
 
+use slither::Dir;
 use slither::constants::{INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA};
+use slither::error::{ReadError, WriteError};
 use slither::testutil::{FlakyPolicy, Pair, TestRecvStream, TestSendStream, local, settle};
-use slither::{Dir, ReadError, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 //

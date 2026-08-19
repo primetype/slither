@@ -63,10 +63,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use slither::config::Config;
 use slither::constants::{INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA};
+use slither::error::{ConnectionLost, ReadError, WriteError};
 use slither::testutil::{FlakyPolicy, Pair, Tap, TestConnection, addr_a, local};
-use slither::{Config, ConnectionLost, ReadError, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 // ══════════════════════════════════════════════════════════════════════

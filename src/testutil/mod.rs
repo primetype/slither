@@ -1202,7 +1202,7 @@ impl Peer {
 ///         a.close(0, b"bye").await;
 ///         assert!(matches!(
 ///             b.closed().await,
-///             slither::ConnectionLost::PeerClosed { .. }
+///             slither::error::ConnectionLost::PeerClosed { .. }
 ///         ));
 ///     })
 ///     .await;

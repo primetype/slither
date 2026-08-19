@@ -26,21 +26,24 @@
 //! crate ([`channel!`]):
 //!
 //! ```
-//! use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! use slither::prelude::*;
 //!
 //! slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
 //! ```
+//!
+//! That one line is the whole import surface for what follows —
+//! [`prelude`] carries the golden path, hiss's three suite types included,
+//! and everything else keeps one spelling at its module
+//! (`slither::error::ReadError`, `slither::constants::NO_ERROR`).
 //!
 //! ## 1. Listen
 //!
 //! Bind a socket, build an endpoint, and answer whoever arrives.
 //!
 //! ```no_run
-//! # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! # use slither::prelude::*;
 //! # use rand_chacha::ChaCha20Rng;
 //! # use rand_chacha::rand_core::SeedableRng;
-//! # use slither::identity::SoftwareIdentity;
-//! # use slither::{Endpoint, Identity};
 //! # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
 //! # fn rng() -> ChaCha20Rng {
 //! #     let mut seed = [0u8; 32];
@@ -48,7 +51,7 @@
 //! #     ChaCha20Rng::from_seed(seed)
 //! # }
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # slither::block_on(async {
+//! # block_on(async {
 //! let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
 //! println!("my key: {:?}", me.public_static()); // the dialler needs this, out of band
 //! let sock = tokio::net::UdpSocket::bind("0.0.0.0:51820").await?;
@@ -72,11 +75,9 @@
 //! learns one from the wire.
 //!
 //! ```no_run
-//! # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! # use slither::prelude::*;
 //! # use rand_chacha::ChaCha20Rng;
 //! # use rand_chacha::rand_core::SeedableRng;
-//! # use slither::identity::SoftwareIdentity;
-//! # use slither::{Endpoint, Identity};
 //! # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
 //! # fn rng() -> ChaCha20Rng {
 //! #     let mut seed = [0u8; 32];
@@ -84,7 +85,7 @@
 //! #     ChaCha20Rng::from_seed(seed)
 //! # }
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # slither::block_on(async {
+//! # block_on(async {
 //! # let peer_key = *SoftwareIdentity::<MySuite>::generate(rng())?.public_static();
 //! let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
 //! let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -169,8 +170,9 @@
 //!
 //! 1. **Reconnecting is `close()` then dial, not `connect()` again.**
 //!    `connect()` to a static that already has a live connection returns
-//!    [`ConnectError::AlreadyConnected`] — §16.1 admits one session per
-//!    peer static, and the *existing* connection is what holds it. "Call
+//!    [`ConnectError::AlreadyConnected`](error::ConnectError::AlreadyConnected)
+//!    — §16.1 admits one session per peer static, and the *existing*
+//!    connection is what holds it. "Call
 //!    connect again" is the natural guess and it is wrong: it does not
 //!    replace the old connection, it does not repair a wedged one, and it
 //!    leaves the first connection completely untouched.
@@ -179,13 +181,14 @@
 //!    and only then dials:
 //!
 //!    ```no_run
+//!    # use slither::prelude::*;
 //!    # use std::net::SocketAddr;
-//!    # async fn reconnect<I: slither::Identity>(
-//!    #     endpoint: &slither::Endpoint<I>,
-//!    #     stale: slither::Connection<I::Suite>,
-//!    #     peer: slither::PublicKeyOf<I>,
+//!    # async fn reconnect<I: Identity>(
+//!    #     endpoint: &Endpoint<I>,
+//!    #     stale: Connection<I::Suite>,
+//!    #     peer: slither::identity::PublicKeyOf<I>,
 //!    #     addr: SocketAddr,
-//!    # ) -> Result<slither::Connection<I::Suite>, slither::ConnectError> {
+//!    # ) -> Result<Connection<I::Suite>, slither::error::ConnectError> {
 //!    // Wrong: the static is still LIVE, so this is `AlreadyConnected`
 //!    // and the wedged connection is still there afterwards.
 //!    //
@@ -223,9 +226,9 @@
 //!      spoofed victims. See [`Intro::source`](shell::Intro::source) and
 //!      [`Intro::sender_index`](shell::Intro::sender_index).
 //!    - **A *proven* static does not make the accusation true.**
-//!      [`AuthError::Replay`] is delivered after the `ss` has genuinely
-//!      proven the static, which is exactly what makes it look like
-//!      trustworthy evidence about that peer. It is not: one captured
+//!      [`AuthError::Replay`](error::AuthError::Replay) is delivered after
+//!      the `ss` has genuinely proven the static, which is exactly what
+//!      makes it look like trustworthy evidence about that peer. It is not: one captured
 //!      initiation lets a third party produce it at will, from any address,
 //!      against a peer that has done nothing. It reports *this initiation
 //!      is not fresh*, never *this peer misbehaved*.
@@ -233,9 +236,9 @@
 //!    A connection that has received **no authenticated packet since it was
 //!    installed** transmits *nothing at all* and is torn down at
 //!    install + `DEAD_TIMEOUT` (25 s) with
-//!    [`ConnectionLost::TimedOut`]. **Connecting ahead of need does not
-//!    keep a path warm**, and this is the single most surprising behaviour
-//!    for a new consumer.
+//!    [`ConnectionLost::TimedOut`](error::ConnectionLost::TimedOut).
+//!    **Connecting ahead of need does not keep a path warm**, and this is
+//!    the single most surprising behaviour for a new consumer.
 //!
 //!    What keeps a connection alive is not a knob. §7.5's keepalive dance
 //!    is **automatic for any connection that has carried traffic**: one
@@ -277,9 +280,9 @@
 //!      knows nothing about.** msg2 is never retransmitted — every
 //!      retransmit is a *completely fresh initiation* (§5.5) — so one
 //!      dropped msg2 leaves this side with a live, never-confirmed
-//!      connection while the peer re-offers a fresh [`Intro`] every
-//!      `RETRANSMIT_BASE` (~5 s) until it gives up at `HANDSHAKE_GIVEUP`
-//!      (90 s). **No error ever prompts the retry**: the first `accept()`
+//!      connection while the peer re-offers a fresh [`Intro`](shell::Intro)
+//!      every `RETRANSMIT_BASE` (~5 s) until it gives up at
+//!      `HANDSHAKE_GIVEUP` (90 s). **No error ever prompts the retry**: the first `accept()`
 //!      *succeeded*. Only the next one closes the gap.
 //!    - **A restarted peer is the same shape (§6.8).** Its reconnection
 //!      parks as an ordinary `Intro` against our still-live static, the
@@ -291,11 +294,13 @@
 //!    Admitting that fresh `Intro` **is** the replacement, by §6.4's §16.1
 //!    guard. Where the connection it displaces is one we **accepted** —
 //!    replacement basis `Some(t)`, and the new initiation's timestamp
-//!    strictly greater — the install fires [`ConnectionLost::Replaced`] on
-//!    the old connection and the new chain completes. Where it is one we
+//!    strictly greater — the install fires
+//!    [`ConnectionLost::Replaced`](error::ConnectionLost::Replaced) on the
+//!    old connection and the new chain completes. Where it is one we
 //!    **dialled**, the basis is `None`, no initiation can replace it,
-//!    [`AcceptError::Stale`] comes back and §6.8's restart instead resolves
-//!    at liveness, at most `DEAD_TIMEOUT` later. Either way the application
+//!    [`AcceptError::Stale`](error::AcceptError::Stale) comes back and
+//!    §6.8's restart instead resolves at liveness, at most `DEAD_TIMEOUT`
+//!    later. Either way the application
 //!    side of it is the one instruction: keep accepting.
 //!
 //! # The spec is the authority
@@ -308,15 +313,24 @@
 //!
 //! # Modules
 //!
+//! - [`prelude`] — the golden path in one glob: `use slither::prelude::*;`.
+//!   The root itself carries only [`hiss`], [`SessionId`], [`Dir`],
+//!   [`StreamId`] and [`Timestamp`]; every other name has exactly one
+//!   spelling, at its module (ruling 278).
 //! - [`identity`] — the static-key seam. A consumer implements
-//!   [`Identity`] to put its key behind hardware; [`SoftwareIdentity`] is
-//!   the in-memory default.
-//! - [`shell`] — the I/O shell: [`Endpoint`], [`Connection`], the staged
-//!   accept ladder, the stream handles, and [`shell::wire::Wire`] — the
-//!   datagram seam an application supplies.
+//!   [`Identity`](identity::Identity) to put its key behind hardware;
+//!   [`SoftwareIdentity`](identity::SoftwareIdentity) is the in-memory
+//!   default.
+//! - [`shell`] — the I/O shell: [`Endpoint`](shell::Endpoint),
+//!   [`Connection`](shell::Connection), the staged accept ladder, the
+//!   stream handles, and [`shell::wire::Wire`] — the datagram seam an
+//!   application supplies.
 //! - [`config`] — endpoint configuration and §16.5's injected wall clock.
 //! - [`error`] — the closed error taxonomy of §18.1, plus `ConfigError`.
-//!   Its ten types are re-exported at the crate root.
+//!   **Module-only** (ruling 278): its ten types are named
+//!   `slither::error::ReadError` and are deliberately not in the prelude —
+//!   bare-minimal code never spells one, since `?` into
+//!   `Box<dyn std::error::Error>` covers the quickstart.
 //! - [`packet`] — §2–§5's wire: the suite declaration, §6.1's handshake
 //!   ladder as a trait, the three headers, mac1 and §3.1's gate.
 //! - [`constants`] — every named constant the spec fixes, one home, with
@@ -342,6 +356,7 @@ pub mod constants;
 pub mod error;
 pub mod identity;
 pub mod packet;
+pub mod prelude;
 pub mod shell;
 pub(crate) mod varint;
 
@@ -361,30 +376,6 @@ pub(crate) mod core;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
 
-/// §16.11's `LocalSet` helper, re-exported at the crate root.
-///
-/// Every slither handle and the driver behind them are `!Send` by
-/// requirement (S21), so a consumer must run them on a current-thread
-/// runtime inside a [`tokio::task::LocalSet`]. This is the one line that
-/// pays that tax; see [`compat::block_on`] for the copy-pasteable example
-/// and for what it panics on.
-///
-/// The adapter **types** are not re-exported here — they are named from
-/// `slither::compat::*`. `block_on` is the exception because it is the first
-/// thing a consumer needs.
-pub use compat::block_on;
-pub use config::{Config, SystemClock, WallClock};
-pub use error::{
-    AcceptError, AuthError, ConfigError, ConnectError, ConnectionLost, DatagramError, IntroError,
-    MessageError, ReadError, WriteError,
-};
-pub use identity::{CurveOf, Identity, PrivateKeyOf, PublicKeyOf, SoftwareIdentity};
-pub use packet::{Channel, Handshake};
-pub use shell::{
-    BiStream, Claimed, Connecting, Connection, Endpoint, EndpointBuilder, Intro, Notification,
-    Proven, RecvStream, SendStream,
-};
-
 /// A completed session's channel binding — **hiss's type, re-exported**.
 ///
 /// **[RATIFIED 2026/08/15 — ruling 89]** `SessionId` is
@@ -402,7 +393,8 @@ pub use shell::{
 /// authentication comparison is the mistake this paragraph exists to
 /// prevent.
 ///
-/// Read it off a live connection with [`Connection::session_id`].
+/// Read it off a live connection with
+/// [`Connection::session_id`](shell::Connection::session_id).
 pub use hiss::noise::SessionId;
 
 // The three identifiers §16.4's surface names that a consumer must be able

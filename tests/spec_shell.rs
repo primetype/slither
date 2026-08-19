@@ -170,11 +170,11 @@ use slither::testutil::{
 type Suite = slither::packet::ReferenceSuite;
 type Id = CountingIdentity<Suite>;
 type Pk = PublicKeyOf<Id>;
-type Endpoint = slither::Endpoint<Id>;
+type Endpoint = slither::shell::Endpoint<Id>;
 // See the note on the same alias in `tests/story_lifecycle.rs`: §16.2 writes
 // a bare `Connection`, `core::Connection<C: Handshake>` is
 // suite-parameterised. One line to change; no test names the type.
-type Connection = slither::Connection<Suite>;
+type Connection = slither::shell::Connection<Suite>;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)

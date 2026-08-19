@@ -113,11 +113,10 @@ use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 use slither::constants::INITIAL_MAX_STREAM_DATA;
+use slither::error::{ConnectionLost, DatagramError, ReadError, WriteError};
+use slither::identity::Identity;
+use slither::shell::{Intro, Notification};
 use slither::testutil::{Pair, local, settle};
-use slither::{
-    ConnectionLost, DatagramError, Identity, Intro, Notification, ReadError, WriteError,
-};
-
 // ══════════════════════════════════════════════════════════════════════
 // Instruments
 // ══════════════════════════════════════════════════════════════════════
@@ -1152,7 +1151,7 @@ async fn incoming_uni_never_ends() {
 #[allow(dead_code)]
 mod adapter_item_types {
     use super::*;
-    use slither::Handshake;
+    use slither::packet::Handshake;
 
     fn is_stream_of<I, S: Stream<Item = I>>(_: S) {}
 
@@ -1163,10 +1162,10 @@ mod adapter_item_types {
         is_stream_of::<Result<Vec<u8>, ConnectionLost>, _>(d);
     }
     fn incoming_bi<S: Handshake>(i: slither::compat::IncomingBi<'_, S>) {
-        is_stream_of::<Result<slither::BiStream<S>, ConnectionLost>, _>(i);
+        is_stream_of::<Result<slither::shell::BiStream<S>, ConnectionLost>, _>(i);
     }
     fn incoming_uni<S: Handshake>(i: slither::compat::IncomingUni<'_, S>) {
-        is_stream_of::<Result<slither::RecvStream<S>, ConnectionLost>, _>(i);
+        is_stream_of::<Result<slither::shell::RecvStream<S>, ConnectionLost>, _>(i);
     }
     fn notifications<S: Handshake>(n: slither::compat::Notifications<'_, S>) {
         is_stream_of::<Result<Notification, ConnectionLost>, _>(n);

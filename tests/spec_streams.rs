@@ -66,9 +66,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use slither::constants::{INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA, INITIAL_MAX_STREAMS_UNI};
+use slither::error::{ConnectionLost, ReadError, WriteError};
 use slither::testutil::{Pair, TestBiStream, TestRecvStream, TestSendStream, local, settle};
-use slither::{ConnectionLost, ReadError, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE — identical in intent to the block in `tests/story_streams.rs`,
 // duplicated because each file in `tests/` is its own crate and this

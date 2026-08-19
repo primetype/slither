@@ -50,7 +50,7 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         // The demo's fast-forward, and the reason `poll_oneoff` is never
-        // reached. Not `slither::block_on`, which builds an unpaused
+        // reached. Not `slither::prelude::block_on`, which builds an unpaused
         // runtime — the shell it drives is identical either way.
         .start_paused(true)
         .build()

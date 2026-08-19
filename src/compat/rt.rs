@@ -12,14 +12,17 @@ use std::future::Future;
 /// Run `future` to completion on a current-thread runtime inside a
 /// [`LocalSet`](tokio::task::LocalSet).
 ///
-/// Re-exported at the crate root as [`slither::block_on`](crate::block_on).
+/// §16.11's `LocalSet` helper, and the one line that pays that tax. It is in
+/// [`slither::prelude`](crate::prelude), so `use slither::prelude::*;` brings
+/// it in; the adapter **types** in this module are not — they are named from
+/// `slither::compat::*`.
 ///
 /// **There is no `Send` bound on `F` or on `F::Output`, and that is the
 /// entire point.** `tokio::runtime::Runtime::block_on` alone is not enough:
 /// the endpoint's driver is spawned with [`tokio::task::spawn_local`], which
-/// panics outside a `LocalSet` — a panic [`EndpointBuilder::build`](crate::EndpointBuilder)
-/// intercepts and re-raises as slither's own message, naming this function
-/// as the remedy.
+/// panics outside a `LocalSet` — a panic
+/// [`EndpointBuilder::build`](crate::shell::EndpointBuilder) intercepts and
+/// re-raises as slither's own message, naming this function as the remedy.
 ///
 /// # Panics
 ///
@@ -39,19 +42,21 @@ use std::future::Future;
 /// # Example
 ///
 /// The whole shape, in one call: the endpoint built, a connection dialled, a
-/// [`BiStream`](crate::BiStream) written and its tail acknowledged.
+/// [`BiStream`](crate::shell::BiStream) written and its tail acknowledged.
 ///
 /// ```no_run
+/// use slither::prelude::*;
+///
 /// use std::net::SocketAddr;
 ///
-/// fn send_hello<I: slither::Identity + 'static>(
+/// fn send_hello<I: Identity + 'static>(
 ///     identity: I,
 ///     socket: tokio::net::UdpSocket,
-///     peer: slither::PublicKeyOf<I>,
+///     peer: slither::identity::PublicKeyOf<I>,
 ///     addr: SocketAddr,
 /// ) -> Result<(), Box<dyn std::error::Error>> {
-///     slither::block_on(async move {
-///         let endpoint = slither::Endpoint::builder()
+///     block_on(async move {
+///         let endpoint = Endpoint::builder()
 ///             .identity(identity)
 ///             .wire(socket)
 ///             .build();
@@ -76,7 +81,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("slither::block_on could not build a current-thread tokio runtime");
+        .expect("slither::prelude::block_on could not build a current-thread tokio runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, future)
 }

@@ -86,9 +86,8 @@ use std::time::Duration;
 use slither::constants::{
     DATAGRAM_SEND_QUEUE, INITIAL_MAX_DATA, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD, NO_ERROR,
 };
+use slither::error::{ConnectionLost, DatagramError};
 use slither::testutil::{FlakyPolicy, Pair, Tap, TestConnection, local, settle};
-use slither::{ConnectionLost, DatagramError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 //
@@ -1143,7 +1142,7 @@ async fn sd11_a_zero_length_datagram_is_a_datagram() {
 #[tokio::test(start_paused = true)]
 async fn sd12_a_dropped_datagram_then_ordinary_traffic_does_not_kill_the_driver() {
     local(async {
-        let pair = Pair::seeded_with(1, slither::Config::new());
+        let pair = Pair::seeded_with(1, slither::config::Config::new());
         let (ca, _cb) = pair.establish().await;
         settle().await;
 

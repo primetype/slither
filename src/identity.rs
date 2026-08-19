@@ -116,11 +116,10 @@ pub trait Identity {
     /// This is the one value a peer needs before it can dial you.
     ///
     /// ```
-    /// use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// use slither::prelude::*;
+    ///
     /// use rand_chacha::ChaCha20Rng;
     /// use rand_chacha::rand_core::SeedableRng;
-    /// use slither::Identity;
-    /// use slither::identity::SoftwareIdentity;
     ///
     /// slither::channel! {
     ///     pub MySuite<P256, ChaChaPoly, Blake2b>;
@@ -191,7 +190,7 @@ pub enum SoftwareIdentityError {
 /// ephemeral this identity ever produces, in both roles, through the
 /// sub-seed `open()` draws. Reproducibility is a **testing** property
 /// here, exactly as
-/// [`EndpointBuilder::rng_seed`](crate::EndpointBuilder::rng_seed) says it
+/// [`EndpointBuilder::rng_seed`](crate::shell::EndpointBuilder::rng_seed) says it
 /// is for §16.6's endpoint RNG — but that one defaults to OS entropy when
 /// the caller says nothing, and this one has no default to fall back to,
 /// because `R` is a constructor argument. The asymmetry is a trap: the
@@ -217,7 +216,7 @@ pub enum SoftwareIdentityError {
 /// algorithm and says nothing about where the seed came from.
 ///
 /// The production shape, which is also what
-/// [`EndpointBuilder::build`](crate::EndpointBuilder::build) does for the
+/// [`EndpointBuilder::build`](crate::shell::EndpointBuilder::build) does for the
 /// endpoint RNG:
 ///
 /// ```no_run
@@ -292,10 +291,10 @@ where
     /// `getrandom::fill` is the seed step.
     ///
     /// ```
-    /// use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// use slither::prelude::*;
+    ///
     /// use rand_chacha::ChaCha20Rng;
     /// use rand_chacha::rand_core::SeedableRng;
-    /// use slither::identity::SoftwareIdentity;
     ///
     /// // One suite per module (§2.2). The macro names the type; `IK` comes
     /// // with it, so two invocations in one module collide.

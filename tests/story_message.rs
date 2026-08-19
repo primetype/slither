@@ -56,9 +56,8 @@ use slither::constants::{
     INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA, INITIAL_WINDOW, KEEPALIVE_TIMEOUT, MAX_DATAGRAM,
     MESSAGE_OVERFLOW, MESSAGE_RECV_MAX, NO_ERROR,
 };
+use slither::error::{ConnectionLost, MessageError, WriteError};
 use slither::testutil::{Pair, Tap, TestRecvStream, TestSendStream, local, settle};
-use slither::{ConnectionLost, MessageError, WriteError};
-
 // ══════════════════════════════════════════════════════════════════════
 // FIXTURE
 //

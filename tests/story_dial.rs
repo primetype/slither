@@ -84,7 +84,7 @@ use slither::testutil::{CountingIdentity, DhCounter, Network, Tap};
 type Suite = slither::packet::ReferenceSuite;
 type Id = CountingIdentity<Suite>;
 type Pk = PublicKeyOf<Id>;
-type Endpoint = slither::Endpoint<Id>;
+type Endpoint = slither::shell::Endpoint<Id>;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)

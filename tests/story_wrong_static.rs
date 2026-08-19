@@ -113,8 +113,8 @@ const PKT_HANDSHAKE_INIT: u8 = 0x01;
 type Suite = slither::packet::ReferenceSuite;
 type Id = CountingIdentity<Suite>;
 type Pk = PublicKeyOf<Id>;
-type Endpoint = slither::Endpoint<Id>;
-type Connection = slither::Connection<Suite>;
+type Endpoint = slither::shell::Endpoint<Id>;
+type Connection = slither::shell::Connection<Suite>;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
