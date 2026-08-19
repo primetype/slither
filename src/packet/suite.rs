@@ -198,8 +198,13 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 /// ```toml
 /// [dependencies]
 /// slither = "0.2"
-/// hiss = "0.3"          # required: `slither::channel!` expands to `::hiss::…`
+/// hiss = { version = "0.3", default-features = false }   # required, see below
 /// ```
+///
+/// `default-features = false` matches what slither itself asks for:
+/// hiss's default `x25519-cryptoxide` backs a curve slither never
+/// touches, and enabling it here pulls that backend into your build for
+/// nothing.
 ///
 /// slither re-exports the version it was built against as
 /// [`slither::hiss`](crate::hiss) so you can check the two agree.

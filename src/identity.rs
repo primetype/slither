@@ -1,4 +1,8 @@
-//! The identity seam — the `I` in §16.4's `core::Endpoint<I: Identity>`.
+//! Your static keypair, and the seam that lets it live in hardware.
+//!
+//! [`SoftwareIdentity`] is the in-memory default; implementing
+//! [`Identity`] yourself puts the key behind a Secure Enclave or an HSM.
+//! It is the `I` in §16.4's `core::Endpoint<I: Identity>`.
 //!
 //! §16.4 parameterises the endpoint core over an identity because "the
 //! mid-state map is typed over `I::Provider`": a parked staged chain owns a
@@ -106,6 +110,36 @@ pub trait Identity {
     ///
     /// Cheap, cached and infallible: mac1 keying and every identity table
     /// read it, so it must not become a hardware round-trip.
+    ///
+    /// # Example
+    ///
+    /// This is the one value a peer needs before it can dial you.
+    ///
+    /// ```
+    /// use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// use rand_chacha::ChaCha20Rng;
+    /// use rand_chacha::rand_core::SeedableRng;
+    /// use slither::Identity;
+    /// use slither::identity::SoftwareIdentity;
+    ///
+    /// slither::channel! {
+    ///     pub MySuite<P256, ChaChaPoly, Blake2b>;
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut seed = [0u8; 32];
+    /// # getrandom::fill(&mut seed)?;
+    /// let id = SoftwareIdentity::<MySuite>::generate(ChaCha20Rng::from_seed(seed))?;
+    ///
+    /// // A P-256 public key is `Copy`, so this is a read, not a clone of
+    /// // anything secret. Publish it: it is what the peer passes as
+    /// // `Endpoint::connect`'s `remote_static`, and it must reach them over
+    /// // an out-of-band channel — slither never learns a key from the wire.
+    /// let key = *id.public_static();
+    /// # let _ = key;
+    /// # Ok(())
+    /// # }
+    /// ```
     fn public_static(&self) -> &PublicKeyOf<Self>;
 
     /// Mint the provider and static-key handle for **one** handshake.
@@ -249,7 +283,38 @@ where
     /// `rng` here does not degrade a property — it hands over the
     /// identity. See [the type's
     /// note](Self#r-must-be-seeded-from-os-entropy-in-production) for the
-    /// two-line recipe.
+    /// two-line recipe and the argument behind it.
+    ///
+    /// # Example
+    ///
+    /// The whole recipe, from OS entropy to an identity an endpoint can be
+    /// built on. `rand_core` 0.10 ships no `OsRng` of its own, so
+    /// `getrandom::fill` is the seed step.
+    ///
+    /// ```
+    /// use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// use rand_chacha::ChaCha20Rng;
+    /// use rand_chacha::rand_core::SeedableRng;
+    /// use slither::identity::SoftwareIdentity;
+    ///
+    /// // One suite per module (§2.2). The macro names the type; `IK` comes
+    /// // with it, so two invocations in one module collide.
+    /// slither::channel! {
+    ///     pub MySuite<P256, ChaChaPoly, Blake2b>;
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut seed = [0u8; 32];
+    /// getrandom::fill(&mut seed)?;
+    /// let rng = ChaCha20Rng::from_seed(seed);
+    ///
+    /// // `rng` is kept: it is the sub-seed source for every handshake
+    /// // ephemeral this identity will produce, not just for the static.
+    /// let identity = SoftwareIdentity::<MySuite>::generate(rng)?;
+    /// # let _ = identity;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn generate(mut rng: R) -> Result<Self, SoftwareIdentityError> {
         let mut scalar = [0u8; 32];
         loop {

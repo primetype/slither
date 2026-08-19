@@ -1,120 +1,133 @@
 # slither
 
-A WireGuard-shaped Noise-over-UDP packet layer — an authenticated, encrypted,
-**unreliable** datagram session between two peers — with a QUIC-shaped
-**reliable frame layer** (Leg 2, ratified) riding inside the sealed packets.
+<!-- ACTIVATES ON PUBLISH: no git remote exists at 721167a, so these badges 404
+     and crates.io cannot rewrite the docs/*.svg links until the repo is public.
+[![crates.io](https://img.shields.io/crates/v/slither.svg)](https://crates.io/crates/slither) [![docs.rs](https://docs.rs/slither/badge.svg)](https://docs.rs/slither) [![CI](https://github.com/primetype/slither/actions/workflows/check.yml/badge.svg)](https://github.com/primetype/slither/actions) -->
 
-slither borrows WireGuard's homework — a cheap mac1 DoS gate, fresh-ephemeral
-handshake retransmission, an anti-replay sliding window, endpoint roaming, and the
-keepalive/liveness/rekey timers — but the cryptography is Bubble's: the
-[`hiss`](https://crates.io/crates/hiss) Noise **IK** handshake over
-**P-256 / ChaCha20-Poly1305 / BLAKE2b** and its out-of-order datagram transport,
-with keyed **BLAKE2b** for mac1 taken from `cryptoxide` directly. It is the
-QUIC-style "framing over a Noise channel instead of TLS" direction, at the packet
-layer.
+**v0.2.0** · MSRV **1.96** (edition 2024) · `MIT OR Apache-2.0` ·
+`#![forbid(unsafe_code)]` · wire **ratified and frozen** ([`SPEC.md`](SPEC.md))
+· 1 100+ tests · Linux and macOS in CI · **not independently audited** —
+see [`SECURITY.md`](SECURITY.md).
 
-## Lineage
+Two peers exchange encrypted, reliable, unordered messages over UDP — plus
+streams and unreliable datagrams — authenticated by raw public keys. No
+certificates, no TLS, no PKI.
 
-- **WireGuard-lite** — the handshake shape (IK, an initiation timestamp, a mac1
-  cookie gate), the anti-replay window (RFC 6479), endpoint roaming, and the
-  timers are WireGuard's, adapted.
-- **QUIC-style frames** — the reliable frame layer (frames, ACK ranges, RFC
-  9002 loss detection + PTO — retransmit frames, never packets — and NewReno
-  congestion control) is **Leg 2**, riding ON TOP of this unreliable,
-  authenticated packet layer. Built and **ratified** in `SPEC.md` §§9, 14:
-  streams, reliable messages, unreliable datagrams and congestion control
-  all ship in v1. Pacing, ECN and alternate controllers (CUBIC/BBR) stay
-  reserved (§14.7).
+## Why slither
 
-## The protocol in one paragraph
+- **A peer is its public key.** No CA, no trust store, no certificate plumbing.
+- **A staged accept ladder** — your application inspects a *claimed* identity
+  and authorises it **before** the second Diffie-Hellman is spent; dropping the
+  handle is the silent reject.
+- **Connections roam** — an authenticated packet from a new address moves the
+  session there; nothing unauthenticated ever does.
+- **Drivable without a kernel** — two pure state machines behind one `Wire`
+  trait, so your tests run the real protocol in memory on a paused clock.
 
-The dialling peer runs the Noise IK handshake as the initiator (the responder's
-static is pre-known), retransmitting a **completely fresh initiation** — new
-ephemerals, index, and a strictly-greater timestamp, carried **encrypted** as
-msg1's Noise payload — every ~5 s until it establishes or gives up at 90 s. The responder verifies a keyed-BLAKE2b **mac1**
-before any curve work (the DoS gate), authenticates the initiator's static
-and checks a **per-static greatest-timestamp** replay guard, then replies —
-whether to *admit* that static at all is the application's call, made via
-the staged accept ladder (below), not a slither-held allow-list. Both sides convert the completed
-handshake into `hiss`'s datagram transport: every Data packet carries the
-hiss-owned monotonic counter in its 14-byte header (which is also the AEAD
-associated data), and the receiver runs a 128-bit sliding **replay window**. An
-authenticated packet from a new source **roams** the session to it; nothing
-unauthenticated ever does. Idle sessions exchange 10 s keepalives; a session
-that sends into 25 s of silence is declared dead; a session rekeys after
-65 536 (2¹⁶) messages in the current epoch (§7.7), not on a wall-clock timer.
+## When not to use it
 
-On top of that packet layer, the Leg 2 **frame layer** (ratified) makes
-`send` a **reliable, unordered, exactly-once message**: each message is a
-sequence-numbered DATA frame, ACKed via ranges built from the replay window,
-retransmitted (RFC 9002 packet/time thresholds + PTO) on fresh counters until
-acknowledged, and deduplicated on the receiver. Reliability lives within the
-connection — what a dead connection had not delivered is lost.
+- Need **NAT traversal or relay fallback**? Use [iroh](https://crates.io/crates/iroh).
+- Have **certificates**, want mainstream QUIC? Use [quinn](https://crates.io/crates/quinn).
+- Want the **Noise handshake alone**, no transport? Use [snow](https://crates.io/crates/snow).
 
-## Usage sketch
+## Install
 
-```rust,ignore
-use slither::{Config, Endpoint};
-use slither::identity::SoftwareIdentity;
-
-// Inside a tokio current-thread runtime + LocalSet (the actor is `!Send`):
-let identity = SoftwareIdentity::from_scalar(my_static_scalar, my_rng)?;
-let socket = tokio::net::UdpSocket::bind("0.0.0.0:51820").await?;
-let endpoint: Endpoint<_> = Endpoint::builder()
-    .identity(identity)
-    .wire(socket)
-    .config(Config::new())
-    .build();
-
-// Dial: connect() is sync (0 DH so far); the returned `Connecting` future
-// is what spends the 2 initiator DH and resolves once the handshake lands.
-let connection = endpoint.connect(peer_addr, peer_static)?.await?;
-connection.send_message(b"hello").await?;   // reliable, unordered, exactly-once
-
-// Accept: a staged ladder, so the app can inspect a claimed identity
-// before spending a DH on it. `accept()` is driven in a loop.
-while let Some(intro) = endpoint.accept().await {
-    let claimed = intro.read_identity().await?;      // 1 DH
-    if !my_allow_list.contains(claimed.claimed_static()) {
-        continue; // dropping `claimed` is the silent reject
-    }
-    let proven = claimed.authenticate().await?;       // 2 DH
-    let connection = proven.accept().await?;
-    // connection.recv_message().await, connection.notified().await, ...
-}
+```toml
+[dependencies]
+slither = "0.2"
+# `slither::channel!` expands to `::hiss::…`, so your crate needs hiss too.
+hiss = { version = "0.3", default-features = false }
+# slither's driver runs on YOUR runtime; these are the features it uses.
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+rand_chacha = "0.10"   # only for `SoftwareIdentity` — it takes an RNG you own
+getrandom = "0.4"      # …and something to seed it from
 ```
 
-There is no `examples/` directory in the tree today; if one is added, this
-section should link it rather than repeat the sketch inline.
+**Nothing is on by default**; `test-util`, `sink`, `codec` and `tower` are
+opt-in, and the table is on [docs.rs](https://docs.rs/slither). **`rand_core`
+must be the 0.10 line hiss names** (`hiss::rand_core` re-exports it): two
+majors in one graph give an unsatisfiable `CryptoRng` bound, not a version error.
+
+## Requirements
+
+**slither's driver is `!Send`.** It runs with `tokio::task::spawn_local` on a
+**current-thread** runtime inside a **`LocalSet`**, and no handle crosses a
+thread. `slither::block_on` is the one line that pays that tax.
+
+If your application uses `#[tokio::main]` — the multi-threaded runtime —
+`Endpoint::builder()…build()` **panics at runtime**; run slither on its own
+current-thread runtime and bridge with channels. This is deliberate: it lets a
+hardware-backed static key — an iOS Secure Enclave `SecKey`, not `Send` —
+drive the handshake.
+
+## Quickstart
+
+```rust
+slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }   // 1. one suite
+slither::block_on(async {                       // 2. current-thread + LocalSet
+    let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
+    let my_key = me.public_static().clone();    // 3. hand this to the peer
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?; // it's a `Wire`
+    let ep = Endpoint::builder().identity(me).wire(sock).build();
+    let conn = ep.connect(peer_addr, peer_key)?.await?;          // 4. dial …
+    conn.send_message(b"hello").await?;
+    // … or answer: accept() -> read_identity() -> authenticate() -> accept()
+});
+```
+
+![the staged accept ladder](docs/staged-accept.svg)
+
+**The full worked example is [`examples/echo.rs`](examples/echo.rs)** — two
+endpoints on UDP loopback, one message, clean close (`cargo run --example
+echo`). It is compiled by every `cargo test` run.
+
+## Limits
+
+- **No NAT traversal, no relays.** You supply reachable addresses.
+  `set_persistent_keepalive` holds a NAT binding open; it does not punch one.
+- **A reliable message is at most 262 144 B** (256 KiB); an unreliable datagram
+  payload at most **1 169 B**. Every wire datagram is **≤ 1 200 B**, never
+  fragmented.
+- **A connection carrying no traffic dies in 25 s, in silence.** Connecting
+  ahead of need does not keep a path warm.
+- **One session per peer static** — reconnecting is `close()` then dial; and
+  **messages and streams do not mix on one connection**.
+- **Reliability lives inside a connection**; what a dead connection had not
+  delivered is lost. No pacing, no ECN, no PMTUD; NewReno only.
+
+Each is stated in full, at its call site, under **Before you integrate** on
+[docs.rs](https://docs.rs/slither).
+
+## How it works
+
+![slither's architecture](docs/architecture.svg)
+
+slither borrows WireGuard's homework — a keyed-BLAKE2b mac1 DoS gate,
+fresh-ephemeral handshake retransmission, an RFC 6479 replay window, roaming
+and the keepalive/liveness/rekey timers — over
+[`hiss`](https://crates.io/crates/hiss)'s Noise **IK** (**P-256 /
+ChaCha20-Poly1305 / BLAKE2b**; no RustCrypto crates). Inside the sealed packets
+rides a QUIC-shaped frame layer: streams, messages, datagrams, RFC 9002 loss
+recovery and NewReno.
 
 ## Testability
 
-The socket sits behind a small `Wire` trait, so the whole protocol is drivable
-without a kernel. The tests run two endpoints over an in-memory
-`FlakyWire` (loss, reorder, duplication, delay, partitioning) on tokio's
-**paused clock**, so the 5 s / 10 s / 25 s / 90 s timers resolve in virtual
-time; one test uses a real UDP loopback socket (`tests/spec_shell.rs`).
+The socket sits behind a small `Wire` trait, so the suite runs two endpoints
+over an in-memory `FlakyWire` (loss, reorder, duplication, delay, partition,
+send failure) on tokio's **paused clock** — the 5 s / 10 s / 25 s / 90 s timers
+resolve in virtual time. Enable `test-util` to do the same in your own tests.
 
 ## Status
 
-**Leg 1 — the sealed packet layer:** every wire constant is **ratified**
-(2026/07/16) and frozen in [`SPEC.md`](SPEC.md) §§1–8. **Leg 2 — the reliable
-frame layer:** built and **ratified** (2026/07/17), every frame layout and
-constant frozen in [`SPEC.md`](SPEC.md) §9. slither is an **independent
-crate** with zero `bubble-*` dependencies — everything it needs resolves from
-crates.io.
+The wire is **ratified and frozen** (2026/08/14): every constant, header
+layout, frame type and timer lives in [`SPEC.md`](SPEC.md), and the code
+follows the spec, never the reverse — see [`CHANGELOG.md`](CHANGELOG.md). An
+**independent crate**: zero `bubble-*` deps, everything from crates.io.
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at
+your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in the work by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.

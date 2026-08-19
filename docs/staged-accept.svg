@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="210" viewBox="0 0 900 210" role="img"
+     aria-label="The staged accept ladder: Intro, then read_identity() gives Claimed, then authenticate() gives Proven, then accept() gives a Connection; dropping a handle is a silent reject.">
+  <title>slither's staged accept ladder</title>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="10" markerHeight="8"
+            markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#5b8def"/>
+    </marker>
+  </defs>
+  <g font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" fill="#7d8590">
+    <g fill="#5b8def" fill-opacity="0.08" stroke="#5b8def" stroke-width="1.5">
+      <rect x="20" y="40" width="120" height="36" rx="6"/>
+      <rect x="230" y="40" width="120" height="36" rx="6"/>
+      <rect x="440" y="40" width="120" height="36" rx="6"/>
+      <rect x="650" y="40" width="140" height="36" rx="6"/>
+    </g>
+    <g text-anchor="middle" font-size="12.5" font-weight="600">
+      <text x="80" y="63">Intro</text>
+      <text x="290" y="63">Claimed</text>
+      <text x="500" y="63">Proven</text>
+      <text x="720" y="63">Connection</text>
+    </g>
+    <g stroke="#5b8def" stroke-width="1.5" fill="none">
+      <path d="M146 58 L224 58" marker-end="url(#ah)"/>
+      <path d="M356 58 L434 58" marker-end="url(#ah)"/>
+      <path d="M566 58 L644 58" marker-end="url(#ah)"/>
+      <path d="M250 76 L250 90 L190 90 L190 170" marker-end="url(#ah)"/>
+    </g>
+    <g text-anchor="middle" font-size="10" fill-opacity="0.92">
+      <text x="185" y="48">read_identity()</text>
+      <text x="395" y="48">authenticate()</text>
+      <text x="605" y="48">accept()</text>
+    </g>
+    <g text-anchor="middle" font-size="10" fill-opacity="0.92">
+      <text x="80" y="95">0 DH</text>
+      <text x="185" y="95">+1 DH</text>
+      <text x="290" y="95">1 DH</text>
+      <text x="395" y="95">+1 DH</text>
+      <text x="500" y="95">2 DH</text>
+      <text x="605" y="95">+2 DH</text>
+    </g>
+    <g text-anchor="middle" font-size="10" fill-opacity="0.92">
+      <text x="80" y="120">a peer is offering.</text>
+      <text x="80" y="133">Nothing is proven.</text>
+      <text x="290" y="120">it says who it is.</text>
+      <text x="290" y="133">Still unproven — do not</text>
+      <text x="290" y="146">punish on this.</text>
+      <text x="500" y="120">the DH proved possession.</text>
+      <text x="500" y="133">Now decide.</text>
+      <text x="190" y="188">drop = silent reject</text>
+    </g>
+  </g>
+</svg>

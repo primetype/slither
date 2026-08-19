@@ -12,12 +12,126 @@
 //! climbed **in a loop**, not once per connection: `accept()` is drained
 //! for the lifetime of the endpoint, by diallers and responders alike
 //! (§6.5, documentation obligation #6).
+//! slither is `#![forbid(unsafe_code)]`; every Noise and curve operation
+//! goes through `hiss`, and no RustCrypto crate appears in the graph.
 //!
-//! **`SPEC.md` is the authority.** Every constant, header layout, frame
-//! type and timer in this crate is ratified there, and where the code and
-//! the spec disagree the spec is right. The module layout is deliberately
-//! one-to-one with the spec's sections so a reviewer can find the code for
-//! a section without searching.
+//! # Quickstart
+//!
+//! Two peers on one machine: the dialler sends one message, the answerer
+//! reads it, both close. The same program, with an echo back and comments,
+//! is `examples/echo.rs` in the repository — run it with
+//! `cargo run --example echo`.
+//!
+//! ```no_run
+//! use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! use rand_chacha::ChaCha20Rng;
+//! use rand_chacha::rand_core::SeedableRng;
+//! use slither::identity::SoftwareIdentity;
+//! use slither::{Config, Endpoint, Identity};
+//!
+//! // 1. Every consumer declares one crypto suite. IK is the only pattern,
+//! //    and one invocation per module (the generated type is named `IK`).
+//! slither::channel! {
+//!     /// This application's suite.
+//!     pub MySuite<P256, ChaChaPoly, Blake2b>;
+//! }
+//!
+//! fn rng() -> ChaCha20Rng {
+//!     let mut seed = [0u8; 32];
+//!     getrandom::fill(&mut seed).expect("OS entropy");
+//!     ChaCha20Rng::from_seed(seed)
+//! }
+//!
+//! fn main() {
+//!     // 2. `block_on` is the current-thread runtime + `LocalSet` the
+//!     //    `!Send` driver needs. Do NOT use `#[tokio::main]`.
+//!     slither::block_on(async {
+//!         // 3. Two identities. `generate` makes a fresh static keypair.
+//!         let dialler: SoftwareIdentity<MySuite> =
+//!             SoftwareIdentity::generate(rng()).unwrap();
+//!         let answerer: SoftwareIdentity<MySuite> =
+//!             SoftwareIdentity::generate(rng()).unwrap();
+//!         // 4. The key the dialler needs, handed over out of band.
+//!         let answerer_key = *answerer.public_static();
+//!
+//!         // 5. A `tokio::net::UdpSocket` is a `Wire` out of the box.
+//!         let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+//!         let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+//!         let answerer_addr = b.local_addr().unwrap();
+//!
+//!         let ep_a = Endpoint::builder()
+//!             .identity(dialler).wire(a).config(Config::new()).build();
+//!         let ep_b = Endpoint::builder()
+//!             .identity(answerer).wire(b).config(Config::new()).build();
+//!
+//!         // 6. Answering is a ladder, so the application can authorise a
+//!         //    *claimed* identity before the second DH is spent. Dropping
+//!         //    a rung is the silent reject. `accept()` is a LOOP for the
+//!         //    lifetime of the endpoint — see "Before you integrate" #6.
+//!         let answering = tokio::task::spawn_local(async move {
+//!             let intro = ep_b.accept().await.expect("endpoint alive");
+//!             let claimed = intro.read_identity().await.unwrap();  // +1 DH
+//!             let proven = claimed.authenticate().await.unwrap();  // +1 DH
+//!             let conn = proven.accept().await.unwrap();           // +2 DH
+//!             let msg = conn.recv_message().await.unwrap();
+//!             assert_eq!(msg, b"hello");
+//!             conn.close(slither::constants::NO_ERROR, b"done").await;
+//!         });
+//!
+//!         // 7. `connect()` is synchronous and spends 0 DH; awaiting the
+//!         //    `Connecting` future is what runs the handshake.
+//!         let conn = ep_a
+//!             .connect(answerer_addr, answerer_key)
+//!             .unwrap()
+//!             .await
+//!             .unwrap();
+//!         conn.send_message(b"hello").await.unwrap();
+//!         conn.acked().await.unwrap();
+//!         conn.close(slither::constants::NO_ERROR, b"done").await;
+//!         answering.await.unwrap();
+//!     });
+//! }
+//! ```
+//!
+//! # Install
+//!
+//! ```toml
+//! [dependencies]
+//! slither = "0.2"
+//! # `slither::channel!` expands to absolute `::hiss::…` paths, so your
+//! # crate must depend on hiss directly, on the same minor line.
+//! hiss = { version = "0.3", default-features = false }
+//! # slither's driver runs on your runtime; these are the features it uses.
+//! tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+//! rand_chacha = "0.10"   # only for `SoftwareIdentity`: it takes your RNG
+//! getrandom = "0.4"      # …and something to seed it from
+//! ```
+//!
+//! `rand_core` must be the **0.10** line hiss names — [`hiss::rand_core`]
+//! re-exports it. Two `rand_core` majors in one graph produce an
+//! unsatisfiable `CryptoRng` bound, not a version error. MSRV **1.96**.
+//!
+//! # Features
+//!
+//! Nothing is on by default.
+//!
+//! | Feature | What it adds |
+//! |---|---|
+//! | `test-util` | the `testutil` module, for driving slither in a downstream crate's tests |
+//! | `sink` | `Stream` / `Sink` adapters |
+//! | `codec` | `tokio_util::codec` support; implies `sink` |
+//! | `tower` | `tower::Service` shapes — **one bi stream per call** |
+//!
+//! **[RATIFIED 2026/08/16 — ruling 225]** The `tower` row read *"a
+//! `tower::Service` shape over the message verb"*, and that shape cannot
+//! work: slither has **no request/response correlation on the wire**, so a
+//! `Service` over §11 messages would need a request id the transport does
+//! not carry — slither would have to invent application framing above its
+//! own frame layer to find one. The correlation slither already has is a
+//! **stream**: `call()` opens one bi stream, `finish()` ends the request,
+//! EOF ends the response. `PLAN.md` §3.4 is the reasoned statement and it
+//! wins; this row and `Cargo.toml`'s comment were manifest text carrying no
+//! argument.
 //!
 //! # Shape
 //!
@@ -42,7 +156,7 @@
 //! endpoints over the in-memory `testutil` fabric on tokio's paused clock,
 //! with every timer resolving in virtual time.
 //!
-//! # The six documentation obligations
+//! # Before you integrate
 //!
 //! Six hazards have no code fix. A consumer meets each one by getting it
 //! wrong, so each is stated here as well as at its call site.
@@ -178,23 +292,29 @@
 //!    at liveness, at most `DEAD_TIMEOUT` later. Either way the application
 //!    side of it is the one instruction: keep accepting.
 //!
+//! # The spec is the authority
+//!
+//! **`SPEC.md` is the authority.** Every constant, header layout, frame
+//! type and timer in this crate is ratified there, and where the code and
+//! the spec disagree the spec is right. The module layout is deliberately
+//! one-to-one with the spec's sections so a reviewer can find the code for
+//! a section without searching.
+//!
 //! # Modules
 //!
-//! - [`constants`] — every named constant the spec fixes, one home, with
-//!   the derived ones re-derived as compile-time assertions.
+//! - [`identity`] — the static-key seam. A consumer implements
+//!   [`Identity`] to put its key behind hardware; [`SoftwareIdentity`] is
+//!   the in-memory default.
+//! - [`shell`] — the I/O shell: [`Endpoint`], [`Connection`], the staged
+//!   accept ladder, the stream handles, and [`shell::wire::Wire`] — the
+//!   datagram seam an application supplies.
+//! - [`config`] — endpoint configuration and §16.5's injected wall clock.
 //! - [`error`] — the closed error taxonomy of §18.1, plus `ConfigError`.
 //!   Its ten types are re-exported at the crate root.
 //! - [`packet`] — §2–§5's wire: the suite declaration, §6.1's handshake
 //!   ladder as a trait, the three headers, mac1 and §3.1's gate.
-//! - [`identity`] — the static-key seam. A consumer implements
-//!   [`Identity`] to put its key behind hardware; [`SoftwareIdentity`] is
-//!   the in-memory default.
-//! - [`config`] — endpoint configuration and §16.5's injected wall clock.
-//! - `core` — §16.4's two sans-io state machines. Crate-internal until the
-//!   driver that can drive them exists.
-//! - [`shell`] — the I/O shell. Slice by slice it grows the driver and the
-//!   handles; today it carries [`shell::wire::Wire`], the datagram seam an
-//!   application supplies.
+//! - [`constants`] — every named constant the spec fixes, one home, with
+//!   the derived ones re-derived as compile-time assertions.
 //! - [`compat`] — §16.11's composability surface: `AsyncRead`/`AsyncWrite`
 //!   on the stream handles and the two `io::Error` conversions (ungated),
 //!   plus `Stream`/`Sink`, `tokio_util::codec` and `tower::Service` faces
@@ -204,28 +324,8 @@
 //!   Attested surface (ruling 60), not a test convention: it is
 //!   deterministic under a caller-supplied seed, and renaming one of those
 //!   three types is a protocol revision.
-//!
-//! # Features
-//!
-//! Nothing is on by default.
-//!
-//! | Feature | What it adds |
-//! |---|---|
-//! | `test-util` | the `testutil` module, for driving slither in a downstream crate's tests |
-//! | `sink` | `Stream` / `Sink` adapters |
-//! | `codec` | `tokio_util::codec` support; implies `sink` |
-//! | `tower` | `tower::Service` shapes — **one bi stream per call** |
-//!
-//! **[RATIFIED 2026/08/16 — ruling 225]** The `tower` row read *"a
-//! `tower::Service` shape over the message verb"*, and that shape cannot
-//! work: slither has **no request/response correlation on the wire**, so a
-//! `Service` over §11 messages would need a request id the transport does
-//! not carry — slither would have to invent application framing above its
-//! own frame layer to find one. The correlation slither already has is a
-//! **stream**: `call()` opens one bi stream, `finish()` ends the request,
-//! EOF ends the response. `PLAN.md` §3.4 is the reasoned statement and it
-//! wins; this row and `Cargo.toml`'s comment were manifest text carrying no
-//! argument.
+//! - `core` — §16.4's two sans-io state machines. Crate-internal:
+//!   nothing outside the crate drives them directly.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -325,7 +425,7 @@ pub use crate::core::{Dir, StreamId, Timestamp};
 /// ```toml
 /// [dependencies]
 /// slither = "0.2"
-/// hiss = "0.3"
+/// hiss = { version = "0.3", default-features = false }
 /// ```
 ///
 /// **This re-export does not remove that requirement.** It exists so the

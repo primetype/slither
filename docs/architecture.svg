@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430" role="img"
+     aria-label="slither's architecture: two pure state machines under one !Send driver task, handles above them, optional compat adapters on top; the driver owns the Wire, which is a UDP socket or an in-memory FlakyWire.">
+  <title>slither's architecture</title>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="10" markerHeight="8"
+            markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#5b8def"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 8" refX="1" refY="4" markerWidth="10" markerHeight="8"
+            markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M10 0 L0 4 L10 8 Z" fill="#5b8def"/>
+    </marker>
+  </defs>
+  <g font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" fill="#7d8590">
+    <g fill="#5b8def" fill-opacity="0.08" stroke="#5b8def" stroke-width="1.5">
+      <rect x="210" y="36" width="350" height="54" rx="6"/>
+      <rect x="210" y="126" width="350" height="54" rx="6"/>
+      <rect x="210" y="216" width="350" height="54" rx="6"/>
+      <rect x="210" y="306" width="350" height="54" rx="6"/>
+      <rect x="795" y="110" width="120" height="32" rx="6"/>
+      <rect x="795" y="180" width="120" height="30" rx="6"/>
+    </g>
+    <g text-anchor="middle" font-size="12.5" font-weight="600">
+      <text x="385" y="68">core::Endpoint · core::Connection</text>
+      <text x="385" y="158">shell: one !Send driver task</text>
+      <text x="385" y="248">Endpoint · Connection · BiStream · …</text>
+      <text x="385" y="338">compat: AsyncRead/Write · Stream/Sink · Codec · tower</text>
+      <text x="855" y="131" font-size="12">Wire</text>
+      <text x="855" y="200" font-size="12">UDP socket</text>
+    </g>
+    <g font-size="10.5" fill-opacity="0.92">
+      <text x="574" y="67">pure state machines — no I/O, no clock</text>
+      <text x="574" y="157">owns the cores, owns the Wire</text>
+      <text x="574" y="247">your code holds these</text>
+      <text x="574" y="337">optional, feature-gated</text>
+    </g>
+    <g stroke="#5b8def" stroke-width="1.5" fill="none">
+      <path d="M44 124 L44 94" marker-end="url(#ah)"/>
+      <path d="M44 214 L44 184" marker-end="url(#ah)"/>
+      <path d="M855 148 L855 174" marker-start="url(#ahr)" marker-end="url(#ah)"/>
+      <line x1="560" y1="126" x2="795" y2="126" stroke-opacity="0.55"/>
+    </g>
+    <g font-size="10.5" fill-opacity="0.92">
+      <text x="58" y="113">poll_output() to Timeout</text>
+      <text x="58" y="203">handles</text>
+    </g>
+    <g text-anchor="middle" font-size="10" fill-opacity="0.92">
+      <text x="855" y="230">or FlakyWire, in memory,</text>
+      <text x="855" y="243">on a paused clock</text>
+    </g>
+  </g>
+</svg>

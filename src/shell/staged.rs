@@ -1,35 +1,13 @@
-//! §6.2's staged accept — `Intro` → `Claimed` → `Proven` → `Connection`.
+//! §6.2's staged accept — the [`Intro`], [`Claimed`] and [`Proven`] types.
 //!
-//! The ladder an application climbs one DH at a time, so it can look at a
-//! peer's *claimed* identity before spending a second DH proving it. Each
-//! stage's `async` verb is a driver round-trip, because §6.2 requires the DH
-//! cost to land on the driver task (§16.3, ruling 53).
+//! The reader-facing account of the ladder — what each rung costs, why
+//! dropping one *is* the rejection, and why a staged object is not a handle
+//! — is in [the shell module docs](super).
 //!
-//! ```text
-//! Intro     0 DH   source(), sender_index()
-//!   │ read_identity()   +1 DH  (es)
-//! Claimed   1 DH   claimed_static()          ← CLAIMED, not proven
-//!   │ authenticate()    +1 DH  (ss)          ← §17.1's guard admits here
-//! Proven    2 DH   peer_static(), timestamp()
-//!   │ accept()          +2 DH  (ee, se)
-//! Connection
-//! ```
-//!
-//! # Dropping is the rejection
-//!
-//! Dropping a staged object at **any** stage is the application's
-//! rejection, and the only rejection there is: slither keeps no record of it
-//! (§6.1, ruling 48) and the peer is told nothing. There is no `reject()`
-//! verb because there is nothing for one to do that `drop` does not.
-//!
-//! # A staged object is not a handle
-//!
-//! §16.3 is explicit: "a staged object's verb is a **round-trip to a driver
-//! it does not keep alive**". Holding an `Intro` while dropping every
-//! `Endpoint`, `Connecting` and `Connection` stops the driver, and the next
-//! verb resolves `EndpointDropped` — which is exactly why `IntroError`,
-//! `AuthError` and `AcceptError` each carry that variant while
-//! `ConnectError` does not (ruling 62).
+//! What is here is the round-trip mechanics: each verb sends a [`Command`]
+//! and awaits a [`oneshot`] reply, because §6.2 requires the DH cost to land
+//! on the driver task, and each stage consumes its predecessor so a parked
+//! chain cannot be forked.
 
 use std::net::SocketAddr;
 

@@ -17,7 +17,9 @@ use std::future::Future;
 /// **There is no `Send` bound on `F` or on `F::Output`, and that is the
 /// entire point.** `tokio::runtime::Runtime::block_on` alone is not enough:
 /// the endpoint's driver is spawned with [`tokio::task::spawn_local`], which
-/// panics outside a `LocalSet`.
+/// panics outside a `LocalSet` — a panic [`EndpointBuilder::build`](crate::EndpointBuilder)
+/// intercepts and re-raises as slither's own message, naming this function
+/// as the remedy.
 ///
 /// # Panics
 ///

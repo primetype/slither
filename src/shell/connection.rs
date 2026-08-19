@@ -1,22 +1,12 @@
 //! §16.2's `Connection` handle.
 //!
-//! `close()`, `closed()`, the four accessors, the stream verbs,
-//! `acked()`, the four sugar verbs (§9.8, §11), `notified()`,
-//! `set_persistent_keepalive()` and `persistent_keepalive()`. §16.2's
-//! surface is complete; the composability layer
-//! (`AsyncRead`/`AsyncWrite`, `Sink`/`Stream`, `tower::Service`) wraps
-//! these verbs from `src/compat/` rather than adding to them.
-//! `[corrected 2026/08/18 — ruling 264]`
+//! The verb inventory and where the work happens are in [the shell module
+//! docs](super); the composability layer that wraps these verbs is
+//! [`crate::compat`]. `[corrected 2026/08/18 — ruling 264]`
 //!
-//! # Where the work happens
-//!
-//! §16.3 (ruling 53) puts the connection data path on the **shared-cell**
-//! side of the seam: the handle borrows the connection's
-//! `Rc<RefCell<ConnCell>>`, calls the sans-io core directly — which seals
-//! synchronously (§16.7) — marks the cell dirty and wakes the driver, which
-//! drains `poll_output()` to `Timeout` and performs the I/O. Each verb is
-//! written **once**, as `poll_*(&self, cx, …) -> Poll<_>`; the `async fn`
-//! §16.2 declares is `poll_fn` over it.
+//! What is here is the shared-cell data path: every verb is written
+//! **once**, as `poll_*(&self, cx, …) -> Poll<_>`, and the `async fn` §16.2
+//! declares is `poll_fn` over it.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -707,6 +697,74 @@ impl<S: Handshake> Connection<S> {
     /// application awaits that acknowledgement — the idiom is
     /// `send_message(m).await; acked().await; close().await`.
     ///
+    /// # Example
+    ///
+    /// Two endpoints on the loopback. The answerer climbs §6.2's staged
+    /// ladder and claims the message with
+    /// [`recv_message`](Self::recv_message); the dialler sends it, waits for
+    /// the acknowledgement, and closes.
+    ///
+    /// ```no_run
+    /// # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+    /// # use rand_chacha::ChaCha20Rng;
+    /// # use rand_chacha::rand_core::SeedableRng;
+    /// # use slither::identity::SoftwareIdentity;
+    /// # use slither::{Config, Endpoint, Identity};
+    /// # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
+    /// # fn seeded() -> Result<ChaCha20Rng, Box<dyn std::error::Error>> {
+    /// #     let mut seed = [0u8; 32];
+    /// #     getrandom::fill(&mut seed)?;
+    /// #     Ok(ChaCha20Rng::from_seed(seed))
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dialler: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(seeded()?)?;
+    /// # let answerer: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(seeded()?)?;
+    /// slither::block_on(async move {
+    /// #     let answerer_key = *answerer.public_static();
+    /// #     let dial_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    /// #     let ans_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    /// #     let answerer_addr = ans_sock.local_addr()?;
+    ///     let dial_ep = Endpoint::builder()
+    ///         .identity(dialler)
+    ///         .wire(dial_sock)
+    ///         .config(Config::new())
+    ///         .build();
+    ///     let answer_ep = Endpoint::builder()
+    ///         .identity(answerer)
+    ///         .wire(ans_sock)
+    ///         .config(Config::new())
+    ///         .build();
+    ///
+    ///     // The answerer: one introduction up the ladder, one DH at a
+    ///     // time, then the message. A real server loops on `accept()`.
+    ///     let answering = tokio::task::spawn_local(async move {
+    ///         let intro = answer_ep.accept().await.expect("an introduction");
+    ///         let claimed = intro.read_identity().await.expect("+1 DH: es");
+    ///         let proven = claimed.authenticate().await.expect("+1 DH: ss");
+    ///         let conn = proven.accept().await.expect("+2 DH: ee, se");
+    ///
+    ///         let msg = conn.recv_message().await.expect("the message");
+    ///         assert_eq!(&msg[..], b"hello");
+    ///
+    ///         // Hold the session open until the dialler closes it. Dropping
+    ///         // the connection here would send a CLOSE that can beat the
+    ///         // acknowledgement the dialler is waiting on — and `acked()`
+    ///         // would then resolve `PeerClosed` instead of `Ok`.
+    ///         let _ = conn.closed().await;
+    ///     });
+    ///
+    ///     // The dialler: Appendix B's obligation, in three lines.
+    ///     let conn = dial_ep.connect(answerer_addr, answerer_key)?.await?;
+    ///     conn.send_message(b"hello").await?;
+    ///     conn.acked().await?;
+    ///     conn.close(slither::constants::NO_ERROR, b"done").await;
+    ///
+    ///     answering.await?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    ///
     /// Payloads above `MESSAGE_RECV_MAX` (262 144 B) are rejected here with
     /// [`MessageError::TooLarge`], **at the handle** and before the core is
     /// consulted: a larger sugar send could stall for ever against a
@@ -752,6 +810,9 @@ impl<S: Handshake> Connection<S> {
     ///
     /// `Ok(payload)` with an empty `Vec` is a delivered **empty message**,
     /// not an absence.
+    ///
+    /// The worked pair — an answerer claiming what a dialler sent — is the
+    /// example on [`send_message`](Self::send_message).
     ///
     /// # Mixing this with `accept_uni()` is a programming error
     ///

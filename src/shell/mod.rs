@@ -1,4 +1,8 @@
-//! The I/O shell — `SPEC.md` §16.
+//! Everything you call: [`Endpoint`], [`Connection`], the staged accept
+//! ladder and the stream handles.
+//!
+//! One `!Send` driver task owns the cores and the [`Wire`](wire::Wire).
+//! `SPEC.md` §16.
 //!
 //! The cores are sans-io state machines that never read a clock; the shell
 //! is the single `!Send` tokio actor that gives them a socket and a timer,
@@ -10,15 +14,72 @@
 //!            (0 DH)      (1 DH)    (2 DH)     (4 DH)
 //! ```
 //!
+//! # The four things in this module
+//!
+//! [`Endpoint`] is one socket's worth of protocol state, and the handle an
+//! application dials and accepts through. It is a **thin client over the
+//! driver** (§16.3): it owns no socket, sends nothing itself, and holds no
+//! second copy of the cores' state. [`EndpointBuilder`] is where the
+//! [`Wire`](wire::Wire) is supplied, and [`Connecting`] is an outbound
+//! attempt in flight.
+//!
+//! [`Intro`], [`Claimed`] and [`Proven`] are §6.2's staged accept ladder —
+//! the subject of its own section below.
+//!
+//! [`Connection`] is a live session: `close()`, `closed()`, the four
+//! accessors, the four stream verbs (`open_bi`, `open_uni`, `accept_bi`,
+//! `accept_uni`), `acked()`, the four sugar verbs of §9.8 and §11
+//! (`send_message`, `recv_message`, `send_datagram`, `recv_datagram`),
+//! `notified()`, `set_persistent_keepalive()` and `persistent_keepalive()`.
+//! §16.2's surface is complete.
+//!
+//! [`SendStream`], [`RecvStream`] and [`BiStream`] are §16.2's three stream
+//! handles.
+//!
 //! # A `LocalSet` is required
 //!
 //! [`Endpoint::builder`]'s `build()` calls `tokio::task::spawn_local`, so
 //! the endpoint must be built inside a `tokio::task::LocalSet` on a
-//! current-thread runtime. **No `Send` bound may be added to this path.**
-//! §16.3 is explicit about why: a DH provider is not required to be `Send`
-//! — an iOS Secure Enclave key is the story that forbids it — and neither
-//! is a [`Wire`](wire::Wire). The shell's types hold `Rc`s, so the
+//! current-thread runtime — [`slither::block_on`](crate::block_on) is that
+//! runtime and that `LocalSet` in one call, and building outside one panics
+//! with a message that says so. **No `Send` bound may be added to this
+//! path.** §16.3 is explicit about why: a DH provider is not required to be
+//! `Send` — an iOS Secure Enclave key is the story that forbids it — and
+//! neither is a [`Wire`](wire::Wire). The shell's types hold `Rc`s, so the
 //! invariant is enforced by the type system rather than by review.
+//!
+//! # The staged accept ladder — §6.2
+//!
+//! The ladder an application climbs **one DH at a time**, so it can look at
+//! a peer's *claimed* identity before spending a second DH proving it. Each
+//! stage's `async` verb is a driver round-trip, because §6.2 requires the DH
+//! cost to land on the driver task (§16.3, ruling 53).
+//!
+//! ```text
+//! Intro     0 DH   source(), sender_index()
+//!   │ read_identity()   +1 DH  (es)
+//! Claimed   1 DH   claimed_static()          ← CLAIMED, not proven
+//!   │ authenticate()    +1 DH  (ss)          ← §17.1's guard admits here
+//! Proven    2 DH   peer_static(), timestamp()
+//!   │ accept()          +2 DH  (ee, se)
+//! Connection
+//! ```
+//!
+//! ## Dropping is the rejection
+//!
+//! Dropping a staged object at **any** stage is the application's
+//! rejection, and the only rejection there is: slither keeps no record of it
+//! (§6.1, ruling 48) and the peer is told nothing. There is no `reject()`
+//! verb because there is nothing for one to do that `drop` does not.
+//!
+//! ## A staged object is not a handle
+//!
+//! §16.3 is explicit: "a staged object's verb is a **round-trip to a driver
+//! it does not keep alive**". Holding an [`Intro`] while dropping every
+//! [`Endpoint`], [`Connecting`] and [`Connection`] stops the driver, and the
+//! next verb resolves `EndpointDropped` — which is exactly why `IntroError`,
+//! `AuthError` and `AcceptError` each carry that variant while
+//! `ConnectError` does not (ruling 62).
 //!
 //! # The seam, in one paragraph (§16.3, ruling 53)
 //!
@@ -29,23 +90,31 @@
 //! DH**, so the handle calls it on the shared cell and answers §16.1's
 //! NONE/PENDING/LIVE test out of the endpoint core's **own** static map.
 //! Its second half, `start_attempt`, carries §6.1's two initiator DH and
-//! rides the command channel like every other DH-bearing verb. The
-//! connection data path and the four accessors share an `Rc<RefCell<_>>`
-//! with the driver; each data-path verb is written once as `poll_*`, and
-//! the `async fn` is `poll_fn` over it.
+//! rides the command channel like every other DH-bearing verb.
 //!
-//! # What is here, and what is not
+//! The connection data path, the stream handles and the four accessors sit
+//! on the **shared-cell** side: they share an `Rc<RefCell<_>>` with the
+//! driver, so a verb borrows that cell, calls the sans-io core directly —
+//! which seals synchronously (§16.7, ruling 114) — marks the cell dirty and
+//! wakes the driver, which drains `poll_output()` to `Timeout` and performs
+//! the I/O. **Nothing on that side is a driver round-trip, and the stream
+//! verbs do not await at all.** Each such verb is written **once**, as
+//! `poll_*`; the `async fn` §16.2 declares is `poll_fn` over it, and the
+//! `AsyncWrite` impl is the same function with its error mapped.
 //!
-//! Slice 3 builds `connect`/`accept`, the staged ladder, `close()`,
-//! `closed()` and the four accessors. Slice 4 adds §16.2's stream surface:
-//! `open_bi`/`open_uni`/`accept_bi`/`accept_uni` plus [`SendStream`],
-//! [`RecvStream`] and [`BiStream`]. §16.2's message, datagram, `acked()`,
-//! `notified()` and
-//! keepalive verbs arrive with the slices that define them and are **absent
-//! rather than stubbed**: in this crate an unimplemented verb is a claim
-//! about the protocol. `SendStream::acked()` is slice 5's (ruling 122b) —
-//! it needs `ConnEvent::StreamFinished`, which needs §12's ACK processing —
-//! and the `AsyncRead`/`AsyncWrite` impls are slice 8's (ruling 96).
+//! # What is not here
+//!
+//! The composability layer — [`AsyncRead`]/[`AsyncWrite`] (ruling 96),
+//! `Sink`/`Stream` and `tower::Service` — lives in [`crate::compat`], where
+//! it **wraps** these verbs rather than adding to them.
+//!
+//! Nothing in this module tree is stubbed. It is a standing rule here that
+//! an unimplemented verb is a claim about the protocol, so a verb slither
+//! does not implement is **absent** rather than present and returning an
+//! error.
+//!
+//! [`AsyncRead`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html
+//! [`AsyncWrite`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html
 
 pub mod wire;
 

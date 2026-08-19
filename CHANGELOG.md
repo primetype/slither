@@ -73,6 +73,14 @@ of why.
 - Peer admission moved from a `Config`-level allow-list to an
   application-driven decision mid-ladder (`Claimed::claimed_static()`).
 - `hiss` pinned to `0.3.2` (was `0.3.1`).
+- **Documentation overhaul** (round 44, ruling 276): the README rewritten
+  why-first (status block, install, requirements, quickstart, limits, two
+  SVG diagrams); the crate docs how-first with a compile-tested quickstart
+  and five new API examples; a runnable `examples/echo.rs`; the shell's
+  module prose folded into the rendered `shell` page.
+- **Building an endpoint outside a `LocalSet` now panics with slither's
+  own message**, naming `slither::block_on` and the fix — previously
+  tokio's bare `spawn_local` message, which named no slither symbol.
 
 ### Removed
 

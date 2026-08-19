@@ -1,30 +1,19 @@
 //! §16.2's three stream handles — `SendStream`, `RecvStream`, `BiStream`.
 //!
-//! # Where the work happens
+//! Where these sit in the shell, and what they cost, are in [the shell
+//! module docs](super); the [`AsyncRead`]/[`AsyncWrite`] impls over them are
+//! [`crate::compat::io`].
 //!
-//! §16.3 (ruling 53) puts the connection data path on the **shared-cell**
-//! side of the seam. A stream handle borrows the connection's
-//! `Rc<RefCell<ConnCell>>`, calls the sans-io core directly — which seals
-//! synchronously (§16.7, ruling 114) — marks the cell dirty and wakes the
-//! driver, which drains `poll_output()` to `Timeout` and performs the I/O.
-//! Nothing here is a driver round-trip and nothing here awaits.
+//! What is here is the shared-cell data path. Each verb is written
+//! **once**, as `poll_*(&mut self, cx, …) -> Poll<_>`; the `async fn` §16.2
+//! declares is `poll_fn` over it, and `AsyncWrite` is the same function with
+//! its error mapped. That is why the waker key is a **field** rather than a
+//! per-future `WakerSlot`: `AsyncWrite::poll_write(self: Pin<&mut Self>, cx,
+//! buf)` has no argument to carry one.
 //!
-//! Each data-path verb is written **once**, as
-//! `poll_*(&mut self, cx, …) -> Poll<_>`; the `async fn` §16.2 declares is
-//! `poll_fn` over it, and slice 8's `AsyncWrite` will be the same function
-//! with its error mapped. That is why the waker key is a **field** rather
-//! than a per-future `WakerSlot`: `AsyncWrite::poll_write(self: Pin<&mut
-//! Self>, cx, buf)` has no argument to carry one.
-//!
-//! # What is not here
-//!
-//! [`AsyncRead`]/[`AsyncWrite`] are slice 8 (ruling 96) — **absent rather
-//! than stubbed**, on this module tree's standing rule that an
-//! unimplemented verb is a claim about the protocol.
-//!
-//! [`SendStream::acked`] arrived here in slice 5, with §12's ACK
-//! processing: it resolves on `ConnEvent::StreamFinished`, which is §9.7's
-//! `DataRecvd`, which nothing before slice 5 could reach.
+//! [`SendStream::acked`] (ruling 122b) resolves on
+//! `ConnEvent::StreamFinished`, which is §9.7's `DataRecvd` — it needs §12's
+//! ACK processing, and nothing below that layer can reach it.
 //!
 //! [`AsyncRead`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html
 //! [`AsyncWrite`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html
