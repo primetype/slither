@@ -9212,3 +9212,59 @@ the demo build's first verification), and everything publish-day
 
 **No wire byte, constant, timer or behaviour moves.** The lib simply
 gains a target it compiles on.
+
+### 278 — the prelude replaces the flat root, and the prelude grows only by ruling
+
+**Context.** The demo build produced the first external implementation of
+`Wire` ever written, and its first event was a compile error on the import
+path — `Wire` was the one primary-integration item not re-exported at the
+root. The maintainer, released from schedule pressure, asked the better
+question: not "add one more root re-export" but "shouldn't a `prelude`
+carry the bare-minimal surface, keeping the root clean?" Measurement
+inverted the premise: the root was already flat — ~28 re-exported names
+(`lib.rs:375–441`) — so the real decision was whether the prelude
+*replaces* that surface or joins it. v0.2.0 being unpublished makes the
+restructure free exactly once.
+
+**Decided: prelude + slim root; errors stay module-only.**
+
+- **`slither::prelude`** carries the golden path and nothing else:
+  `block_on`, `Config`, `Identity`, `SoftwareIdentity`, `Wire`, the
+  handles (`Endpoint`, `EndpointBuilder`, `Connecting`, `Connection`),
+  the ladder (`Intro`, `Claimed`, `Proven`), the streams (`BiStream`,
+  `SendStream`, `RecvStream`), `Notification`, and — so one `use` line
+  covers the `channel!` declaration — hiss's `P256`, `ChaChaPoly`,
+  `Blake2b`. Every quickstart and example opens with
+  `use slither::prelude::*;`.
+- **The root keeps** the eight public modules, `prelude`, `channel!`
+  (macro-export places it there), `pub use hiss`, and the four
+  signature-reachability types whose **ratified comments name the root
+  and are not touched by this ruling**: `SessionId` (ruling 89) and
+  `Dir`/`StreamId`/`Timestamp` (ruling 259(iii), their only public path —
+  the core is `pub(crate)`).
+- **Everything else demotes to its module** (`slither::error::ReadError`,
+  `slither::config::WallClock`, `slither::packet::Channel`, …): one
+  blessed spelling per name. The ten error types stay module-only —
+  bare-minimal code never names them (`?` into `Box<dyn Error>` covers
+  the quickstart), and `slither::error::ReadError` at a match site reads
+  better than a glob-imported bare name.
+- **Growth policy: the prelude changes only by ruling.** A name added to
+  a glob-visible module can collide with downstream identifiers — an
+  API event, not a convenience edit.
+
+**Why a prelude at all, when tokio removed theirs:** tokio's was
+type-only, and for types a flat root serves. slither's minimal path needs
+**traits in scope** — `Identity` to call `public_static()`, `Wire` to
+implement a transport — which is the rayon/futures case, the one the
+pattern is actually for. Rejected: the additive prelude (every name gets
+two blessed paths, forever, and the root never gets cleaner — removals
+are breaking after publish); no prelude (leaves the trait-in-scope need
+unserved and the Wire finding a one-off patch).
+
+**Out of slither's reach, recorded so it is not re-proposed as new:** the
+consumer's direct `hiss` dependency cannot be lifted from slither's side —
+`channel!` wraps `hiss::noise!`, which emits absolute `::hiss::…` paths a
+`macro_rules` wrapper cannot rewrite (documented at `pub use hiss`). The
+prelude folds the three suite types so the *code* is one import line; the
+manifest line stays. A hiss-side change could lift it; that is hiss's
+ruling to make, not slither's.
