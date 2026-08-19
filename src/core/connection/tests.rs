@@ -1159,12 +1159,13 @@ mod liveness {
     /// Testing only the death leaves a build that dies immediately, or at
     /// any earlier instant, entirely green.
     ///
-    /// **Spec gap, deliberately not pinned here.** §7.4 states the death
-    /// condition as `now − last_authenticated_recv > DEAD_TIMEOUT` —
-    /// strictly greater — while §16.5 says an armed deadline `D` fires "no
-    /// earlier than `D`". The two disagree about the single instant
-    /// `install + DEAD_TIMEOUT`. This test asserts only the instants both
-    /// readings agree on. See `owed::LIVENESS_EXACT_INSTANT`.
+    /// **Spec gap, closed.** §7.4 once stated the death condition as
+    /// strictly `>` while §16.5 says an armed deadline fires "no earlier
+    /// than `D`" — disagreeing about the single instant
+    /// `install + DEAD_TIMEOUT`. Ruling 85 (2026/08/15) settled §7.4 at
+    /// `>=`; there is no contested instant. This test still asserts the
+    /// uncontested instants only — tightening it to the exact deadline is
+    /// available, not owed. See `owed::LIVENESS_EXACT_INSTANT`.
     #[test]
     fn a_half_open_session_is_reaped_in_silence_and_not_one_nanosecond_early() {
         let t = t0();
@@ -2166,9 +2167,11 @@ mod teardown {
     /// **exactly one** reply — and *at least* one, which is the half that
     /// separates the cap from "never replies".
     ///
-    /// The window starts at `t + 2 s` on purpose: §15.2 does not say
-    /// whether the local CLOSE itself starts the rate clock, and at two
-    /// seconds both readings agree. See `owed::CLOSE_RATE_CLOCK_ORIGIN`.
+    /// The window starts at `t + 2 s`, which predates ruling 83
+    /// (2026/08/15): §15.2 now states the opening CLOSE is not a reply and
+    /// the rate clock is unset at `close()`, so the offset is an inert
+    /// hedge, not a correctness requirement. Kept as-is; the exact-origin
+    /// pin lives with `owed::CLOSE_RATE_CLOCK_ORIGIN`'s discharge.
     #[test]
     fn the_linger_replies_at_most_once_per_second_under_a_flood() {
         let t = t0();
@@ -2583,7 +2586,8 @@ mod teardown {
 
     /// **Plan derivation, not a spec rule — recorded rather than pinned.**
     ///
-    /// `PLAN.md` U4 asks what a *closing* connection does with a
+    /// `.slices/03-skeleton/PLAN.md` U4 (this doc once wrote the bare
+    /// `PLAN.md`, which has no U-items) asks what a *closing* connection does with a
     /// structurally invalid frame stream. §15.2's retention list is
     /// exhaustive (seal capability, receive cipher states, replay window),
     /// so there is nothing left for most frames to be applied to, but the
@@ -3076,6 +3080,11 @@ mod owed {
     /// path, and §7.4's install pin is **unstated** for the constructor
     /// §16.4 gives `accept()`. Either `established` gains a `now`, or the
     /// spec says which instant the accept path pins to.
+    ///
+    /// **[DISCHARGED — ruling 275's sweep]** `Connection::established` now
+    /// takes `now: Instant` first (`connection/mod.rs`) and pins both clocks
+    /// through `install` → `Liveness::pinned_at_install` (`session.rs`).
+    /// §7.4's install pin is stated for the accept path.
     pub const ESTABLISHED_HAS_NO_INSTANT: () = ();
 
     /// **§7.4 and §16.5 disagree about one instant.**
@@ -3088,6 +3097,10 @@ mod owed {
     ///
     /// `liveness::a_half_open_session_is_reaped_in_silence_and_not_one_nanosecond_early`
     /// therefore asserts at `D − 1 ns` and `D + 1 ns` only.
+    ///
+    /// **[DISCHARGED — ruling 85, 2026/08/15]** §7.4's predicate became
+    /// `>=`, which is §16.5's "no earlier than `D`". There is no contested
+    /// instant; the exact deadline is now pinnable.
     pub const LIVENESS_EXACT_INSTANT: () = ();
 
     /// **Does the local CLOSE start the ≤ 1/s reply clock?**
@@ -3096,6 +3109,10 @@ mod owed {
     /// CLOSE per second" without saying whether the emitted CLOSE is itself
     /// the first item under the cap. `teardown`'s flood test starts two
     /// seconds after the close so that both readings agree.
+    ///
+    /// **[DISCHARGED — ruling 83, 2026/08/15]** §15.2 now states *"the
+    /// opening CLOSE is not a reply … the rate clock is unset at
+    /// `close()`"*. Pinned in `close.rs` and below.
     pub const CLOSE_RATE_CLOCK_ORIGIN: () = ();
 
     /// **`Retired { our_index }` before a session exists.**
@@ -3106,6 +3123,10 @@ mod owed {
     /// `connect()`-created connection that is closed before its install has
     /// none. §16.4 gives `Retired` no other shape and nothing says what it
     /// carries here.
+    ///
+    /// **[DISCHARGED — ruling 84]** Ruling 81's "any teardown before a
+    /// session exists" was withdrawn: the case is not constructible,
+    /// `Closed` is emitted alone, and no `Retired` is owed.
     pub const RETIRED_WITHOUT_A_SESSION: () = ();
 
     /// **A structural failure *while already closing*.**
@@ -3114,9 +3135,18 @@ mod owed {
     /// retains only the seal capability, the receive cipher states and the
     /// replay window. Whether a second violation re-signals (a second CLOSE
     /// with a different code, against the 1 Hz reply rule's intent) or is
-    /// ignored is `PLAN.md` U4's open question, not a spec rule.
+    /// ignored was `.slices/03-skeleton/PLAN.md` U4's open question (the
+    /// bare "`PLAN.md` U4" this doc once cited names no U-items, and
+    /// `PLAN-4b.md` defines a different U4).
     /// `teardown::a_violation_while_closing_neither_re_reports_nor_extends_the_linger`
     /// asserts only what both readings share.
+    ///
+    /// **[DISCHARGED — ruling 273, 2026/08/19]** Measured, then ruled:
+    /// the violation is **ignored** — `apply_post_mortem` applies no
+    /// frame, no second CLOSE, no new event; the only packet out is
+    /// §15.2's rate-capped linger reply, byte-identical to a benign
+    /// packet's. §8.2's consequence is now scoped to a live connection,
+    /// and at most one structural trace fires per connection, ever.
     pub const VIOLATION_WHILE_CLOSING: () = ();
 
     /// **§7.4's two seal paths — half of the pin is owed to slice 4.**
@@ -3129,6 +3159,13 @@ mod owed {
     /// frame, and arrives with slice 4.
     ///
     /// Do not let the absence of a red test here read as coverage.
+    ///
+    /// **[DISCHARGED elsewhere — slice 4 delivered the separator]** The
+    /// alias mutant now reddens 11 tests, including
+    /// `tests_streams::sealing::a_reset_stream_only_packet_does_not_mark_last_send`
+    /// and six in `tests_roam`. It still passes every test **in this
+    /// file**, so the warning above remains accurate about *this file* and
+    /// is no longer a gap in the crate.
     pub const SEAL_VERSUS_SEAL_QUIET: () = ();
 
     /// **§8.5's packing order is untestable with one frame.**
@@ -3137,6 +3174,11 @@ mod owed {
     /// DATAGRAM fill, then PING last" — slice 3a emits exactly one frame
     /// type, CLOSE, and never coalesces. The order, and the
     /// one-extends-to-end-frame rule, are owed by slices 4 and 5.
+    ///
+    /// **[DISCHARGED — ruling 275's sweep]** Slices 4–5 landed it:
+    /// extends-to-end and control-before-fill in `tests_streams.rs`
+    /// (`mod packing`), PING-last in `tests_contested.rs`, ACK-first in
+    /// `tests_ack.rs`.
     pub const PACKING_ORDER: () = ();
 
     /// **An over-MTU Data packet.**
@@ -3147,5 +3189,10 @@ mod owed {
     /// authenticated Data packet longer than `MAX_DATAGRAM` does, and no
     /// test here pins one, because either answer (silent drop, or open and
     /// parse) is defensible from the text.
+    ///
+    /// **[DISCHARGED — ruling 65]** §3.1's table has a `PKT_DATA` row
+    /// (`30 ≤ len ≤ MAX_DATAGRAM`) and §3.5 states the silent drop. The
+    /// drop is pre-AEAD (`packet/mod.rs`), so an *authenticated* oversize
+    /// Data packet is unreachable. Two-sided pin in `packet/tests.rs`.
     pub const OVERSIZE_DATA_PACKET: () = ();
 }

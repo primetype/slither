@@ -11,7 +11,14 @@
 >
 > **Amended after ratification. None of it has been released** — v0.2 is
 > unpublished and `bubble-engine` is the only consumer — which is the
-> standing reason each amendment was affordable:
+> standing reason each amendment was affordable. *Appendix B's bullets are
+> unnumbered and are cited by their bold title (ruling 274). The
+> `O13`/`O53a`/`O53b` ids that rulings 260, 268 and 270 used were the
+> round-41 audit's private numbering (`audit/G-obligations-trend.md`,
+> never committed and no longer extant), positional over Appendix B as of
+> ratification; they resolve to the **post-mortem pin**, the
+> **ACK-loss-burst simulation**, and the **window-constants throughput
+> sanity check** respectively.*
 >
 > | Ruling | Where | What moved |
 > |---|---|---|
@@ -31,16 +38,20 @@
 > | 256 | §7.7, Appendix B | retention is not reach: the previous-epoch key delivers only within `REPLAY_WINDOW` counters of the boundary — one part in 32 — and the straggler pins must be built below it |
 > | 258 | §7.3, §8.5, §12.4, §14.5 | what rides the contested probe's packet: coalescing is all-or-nothing over the owed set; the owed ACK rides behind, not aboard; no fill — the 18 B bound is the exemption's proof; §8.5's collision sentence scoped to the PTO probe |
 > | 259 | §10.2, §16.2, §16.4, §16.11 | ruling 248's listings: `SendCreditAvailable` enters both `ConnEvent` lists with the counting rule; `join` is fallible in §16.11 as ruling 120 ratified; (viii)'s config-raisable receive windows enter §10.2 (2026/08/18) |
-> | 260 | Appendix B | O53a discharged by measurement (spurious ≤ 1.55 %, envelope 2.5 %); O53b's quinn bar ruled untestable, the no-stall clause pinned in virtual time |
+> | 260 | Appendix B | Appendix B's **ACK-loss-burst simulation** discharged by measurement (spurious ≤ 1.55 %, envelope 2.5 %); the **window-constants throughput sanity check**'s quinn bar ruled untestable, its no-stall clause pinned in virtual time |
 > | 261 | §6.3, §18.1, §18.2 | `IntroError::Evicted` splits cap-pressure from TTL; the eviction events enter `slither::policy` |
 > | 262 | §16.4 | the cores expose `next_deadline(&self)`: the deadline is read, never popped — the driver's destroy-arms disappear (a reentrant inline-executor consumer could reach them and silently lose a datagram in release) |
 > | 264 | §6.3, §16.4 | the NAT'd-population clause on the per-source cap, and the `Identity` seam defined where its bound is used |
 > | 265 | §7.5, §13.6, §16.5, Appendix B | neither keepalive deadline is announced while §7.3's budget or a pending mark holds it, and a vetoed keepalive announces the death clock — the measured immortal-park ends in death or recovery; §16.5's "both wait" was two timers and is four |
 > | 267 | §6.1 | `authenticate()` is idempotent on a `Proven` chain — same peer, same timestamp, 0 DH; the symmetric clause `read_identity()` already had |
-> | 268 | Appendix B | O13's flush parenthetical becomes admission-driven — the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
+> | 268 | Appendix B | Appendix B's **post-mortem pin** obligation — its flush parenthetical becomes admission-driven: the authenticate-then-drop flood it named mints no entries, by mitigation (i)'s own design |
 > | 269 | §10.2 | the window-limited cap is ≈ window/(2 × RTT) — §10.3's half-window re-grant is the factor; the 259(viii) clause read window/RTT until the benchmark measured it (`bench-vs-tcp-2026-08.md`) |
-> | 270 | §10.2 kinds, §10.5, §10.6, §17.5, Appendix B | the reassembly ceiling derives from the advertised credit — max(`REASSEMBLY_CHUNKS_MAX`, W/`REASSEMBLY_MIN_CONFORMING_FRAME`+1); a conforming full-frame sender inside its credit can no longer be killed by loss; the flood still dies 512× above the ceiling; O53b's gate recorded run |
+> | 270 | §10.2 kinds, §10.5, §10.6, §17.5, Appendix B | the reassembly ceiling derives from the advertised credit — max(`REASSEMBLY_CHUNKS_MAX`, W/`REASSEMBLY_MIN_CONFORMING_FRAME`+1); a conforming full-frame sender inside its credit can no longer be killed by loss; the flood still dies 512× above the ceiling; the **window-constants throughput sanity check**'s gate recorded run |
 | 271 | §12.4, §16.5 | the ACK emission point: due stays every-2nd, emission coalesces to the receive-drain boundary (at most one per drain per `ACK_COALESCE_MAX` — 32, new, named; gap the sole exception); §16.5's drain-before-deadline order becomes normative. **No wire byte moves; the wire mix does**: ACK-only datagrams 33.6 % → 3.4 %, bulk ~88 → 108–115 MiB/s default, 129–135 raised |
+| 272 | §6.3, §17.5 | the stage-0 per-entry figure becomes the measured ≈ 484 B / ≈ 496 KB at the cap (was ≈ 220 B / ≈ 225 KB — a stated construction whose scope excluded the entry's own fields); pinned by a core unit test |
+| 273 | §8.2 | the structural-failure consequence is scoped to a live connection: while closing/draining a violation is ignored entirely, and at most one structural trace fires per connection — what the code always did, now a rule |
+| 274 | amendment table | rulings 260/268/270's `O13`/`O53a`/`O53b` were dangling pointers into a never-committed audit file; the rows now cite Appendix B by bold title, with the provenance recorded above |
+| 275 | §18.2, STORIES.md §S22 | WARN ratified as the level of §18.2's failure events; S22's anchor line gains §4, §6.1 (clause 4's whole mechanism was unanchored); the `mod owed` registry discharged and the SECV5-5/6/8 pins written |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -1290,9 +1301,17 @@ no record of it (ruling 48, §6.1).
 | `INTRO_TTL` | **15 s** after the entry's last refresh | ≈ 3 retransmit intervals; the flood hold-cost bound |
 
 The accept queue parks **stage-0 state only** — the raw 196-byte msg1 plus
-the source address (≈ 220 B per entry; worst case ≈ 225 KB at the default
-cap) — with one bounded exception: an eager-demoted entry carries its
-already-paid mid-state (§6.5 step 3). The bound is post-mac1 — a higher bar
+the source address and the entry's book-keeping. **[AMENDED 2026/08/19 —
+ruling 272]** This sentence read *"≈ 220 B per entry; worst case ≈ 225 KB
+at the default cap"*, an estimate whose stated construction ("msg1 plus
+the source address" — which really is ≈ 220 B) silently excluded seven
+further `IntroEntry` fields, dominated by a 96 B chain-state slot reserved
+inline in every entry including the parked ones that never use it. The
+measured figure at the ratifying commit is **≈ 484 B per entry** (288 B
+struct + the 196 B msg1 heap allocation, map-slot overhead excluded), i.e.
+**≈ 496 KB at the default cap** — pinned by a core unit test. One bounded
+exception stands: an eager-demoted entry carries its already-paid
+mid-state (§6.5 step 3). The bound is post-mac1 — a higher bar
 than WireGuard's pre-mac1 4096-slot ring.
 
 **[RATIFIED 2026/08/14]** The flood posture below — evict-oldest overflow,
@@ -3392,7 +3411,18 @@ strictly distinguished:
   `slither::frames`, and the connection emits CLOSE with
   `PROTOCOL_VIOLATION` (the existing `0x01`, §15.3) and enters the
   closing state (§15.2), surfacing
-  `ConnectionLost::ProtocolViolation { code }` (§18.1). The reasoning is
+  `ConnectionLost::ProtocolViolation { code }` (§18.1).
+  **[AMENDED 2026/08/19 — ruling 273]** This consequence is scoped to a
+  **live** connection. While closing or draining, a structural failure is
+  ignored entirely — no second CLOSE, no additional trace, no further
+  event; the packet's arrival is answered, if at all, only by §15.2's
+  rate-capped linger reply, byte-identical to a benign packet's. Two
+  facts force the scope: §15.2's retention list is exhaustive and keeps
+  no frame-apply machinery, and the semantic violation class is
+  unreachable while closing by construction, since post-mortem
+  processing applies no frame. A corollary the scope buys: **at most one
+  structural trace fires per connection, ever** — which is the answer to
+  "one trace per what?". The reasoning is
   population, not tidiness: after the AEAD tag verifies, corruption is
   excluded (2⁻¹²⁸) and version skew is excluded by design (one version,
   no negotiation — §1.1), so a structurally invalid frame stream is a
@@ -7023,7 +7053,7 @@ policy:
 
 | State | Ceiling | Worst case |
 |---|---|---|
-| stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 220 B raw bytes each, ≈ 225 KB |
+| stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 484 B each — 288 B struct + 196 B msg1 heap, measured (ruling 272; the pre-272 ≈ 220 B counted the raw bytes alone) — ≈ 496 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
 | established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by §10.6's ceiling — `REASSEMBLY_CHUNKS_MAX` at the ratified window and `window / REASSEMBLY_MIN_CONFORMING_FRAME + 1` above it (ruling 270), ~40 B per stored range: ~40 KiB against 256 KiB of credit at the ratified window, ~320 KiB against 8 MiB at a raised one — under 4 % either way, which is what makes the credit term the dominant term rather than a 25–50× underestimate — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
@@ -7192,7 +7222,12 @@ ruling 44.)
 | `slither::io` | `Wire::send_to` failures, against the connection whose datagram it was, with the destination address and the underlying `io::Error` — a trace obligation and nothing more: the protocol never acts on a send failure (§16.3, §7.4). **[RATIFIED 2026/08/15 — ruling 79]** Also **`Identity::open()` failures**, with the provider's own error and the verb that met it, behind the `Local` variants of §18.1 (rulings 72, 78) |
 
 The targets are operator-visible contract: renaming or dropping one is a
-protocol revision.
+protocol revision. **[RATIFIED 2026/08/19 — ruling 275]** The failure
+events these rows carry — `io`'s `send_to` and `open()` failures,
+`frames`' violation CLOSEs and the message-overflow reset — emit at
+**WARN**: below INFO they would be filtered out of an ordinary production
+subscriber, defeating the post-mortem the rows exist for. Counters and
+non-failure events may sit lower.
 
 **[RATIFIED 2026/08/14 — ruling 49]** `slither::io` exists to make one
 specific post-mortem answerable. A

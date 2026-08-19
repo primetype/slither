@@ -354,7 +354,9 @@ The story that forces the architecture.
   different suite, or a wrong static, fails the handshake and installs
   nothing. An unknown version byte is dropped silently — there is no
   negotiation, ever.
-- **Anchor:** §1.1, §2, §3.1. **Paused clock:** yes.
+- **Anchor:** §1.1, §2, §3.1; §4, §6.1 (clause 4 — added by ruling 275:
+  the wrong-static clause's entire mechanism is mac1, which the original
+  anchors stop exactly short of). **Paused clock:** yes.
 
 ### S23 — a long-lived connection rekeys itself without the user noticing
 

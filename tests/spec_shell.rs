@@ -50,15 +50,16 @@
 //!   file cannot discharge it. Ruling 83 (the opening CLOSE is not a reply,
 //!   so the 1 Hz clock starts at the first *reply*) is unreachable for the
 //!   same reason and is **not** depended on by any test in this file.
-//! * **G7 — the *traced* half of ruling 49 needs a dev-dependency that
-//!   does not exist.** §16.3 makes it a MUST that a failing `send_to` is
-//!   traced against the connection under §18.2's operator contract, and
-//!   Appendix B asks the test to assert "a `slither::io` trace was emitted
-//!   **per failed send** carrying the destination address". `tracing` is a
-//!   dependency; `tracing-subscriber` (or any capturing layer) is not in
-//!   `[dev-dependencies]`, so nothing here can observe an event. Reported
-//!   rather than worked around: adding a dev-dependency is the
-//!   orchestrator's call, not a test author's.
+//! * **G7 — CLOSED by the gap slice (`tests/story_traced.rs`), and its
+//!   stated cause was wrong.** This entry read "needs a dev-dependency
+//!   that does not exist" and "adding a dev-dependency is the
+//!   orchestrator's call". Neither held: `tracing` alone exposes
+//!   `Subscriber`, `field::Visit` and `subscriber::set_default`, and
+//!   `testutil::capture` closes the gap in ~150 lines with **no change to
+//!   the dependency graph**. The original author was right to report
+//!   rather than work around; the diagnosis just named the wrong missing
+//!   piece. §16.3's MUST is now asserted per failed send, from both
+//!   sides, in `story_traced.rs`.
 //! * **G8 — "traffic resumes when the seam heals" needs data frames.**
 //!   Slice 4. Named in `.slices/03-skeleton/PLAN.md` §5.2 already.
 //! * **G9 — §16.2's `accept() -> Option<Intro>` says "`None` = endpoint

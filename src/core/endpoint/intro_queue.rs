@@ -193,8 +193,10 @@ pub(crate) struct IntroQueue<I: Identity> {
     /// # Bounded, and bounded by the thing it describes
     ///
     /// It holds at most `cap` ids — an `IntroId` is 8 bytes, so the record
-    /// is under 4 % of the ~225 KB of entries the same `cap` already
-    /// permits, and **it cannot grow without the queue growing with it**. A
+    /// is under 2 % of the ~496 KB of entries the same `cap` already
+    /// permits (the measured stage-0 figure, ruling 272; the argument only
+    /// strengthens against the real number), and **it cannot grow without
+    /// the queue growing with it**. A
     /// per-id tombstone set with no ceiling is the shape this deliberately
     /// is not: the application may hold an `Intro` for an evicted chain
     /// indefinitely, so an exact record is unbounded, and an unbounded

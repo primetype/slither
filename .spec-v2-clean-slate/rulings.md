@@ -8916,3 +8916,122 @@ appendix) does **not** gain `ACK_COALESCE_MAX`: the amendment names it,
 so the premise — invented by the implementation, absent from the spec —
 is false post-271; the implementer's sweep row said "gains a member"
 about the pre-amendment state.
+
+
+### 272 — the stage-0 figure becomes the measured number
+
+**Ruling: §6.3's and §17.5's stage-0 per-entry memory figure is amended
+from ≈ 220 B / ≈ 225 KB-at-cap to the measured ≈ 484 B / ≈ 496 KB
+(288 B struct + the 196 B msg1 heap allocation; map-slot overhead
+excluded and said so). Pinned by a core unit test on `size_of` —
+`IntroEntry` is `pub(crate)`, so the pin lives in the endpoint core's
+tests. The mid-state row is untouched: the story's own 784 B figure
+measures 768–776 B and holds.**
+
+Found by gap-slice author A writing S10's memory-bound test
+(`round43-A`): the story's published mid-state figure verified clean,
+and the *unstoried* row beside it was 2.2× under reality. Working rule
+8's shape exactly — a stated construction ("msg1 plus the source
+address", which really is ≈ 220 B) whose scope silently excluded seven
+further fields, dominated by a 96 B `ChainState` reserved inline in
+every entry including the 1024 a flood parks at the unit variant. The
+maintainer chose record-honesty over optimization: the figures now
+state what is, and boxing `ChainState` (worth ~96 KB at a saturated
+cap) stays available as a deliberate slice if it ever matters. §17.5's
+table exists "so an application can size its accept policy"; a sizing
+table 2.2× under is worse than none.
+
+### 273 — §8.2's consequence is scoped to a live connection
+
+**Ruling: the structural-failure consequence — CLOSE with
+`PROTOCOL_VIOLATION`, the trace, `ConnectionLost::ProtocolViolation` —
+applies on a live connection. While closing or draining a structural
+violation is ignored entirely: no second CLOSE, no additional trace, no
+event. Corollary, now stated: at most one structural trace fires per
+connection, ever — which closes U9's "one per what?" by construction.
+Zero code change: this is what `apply_post_mortem` always did.**
+
+Measured before ruled (measurer D, `round43-D` §1.2): a scratch
+core-level test drove a closing connection into a second structural
+violation — the violation is ignored, and the only packet out is
+§15.2's ordinary rate-capped linger reply carrying the original CLOSE
+verbatim, byte-identical to what a benign packet produces at the same
+instant (the control that settles it). On §8.2's literal text the code
+was wrong; on §15.2's exhaustive retention list the code was right —
+working rule 3's shape, and the prose-vs-rule tiebreak lands on the
+statement the retention proof depends on. The B2 variant (keep the
+trace while closing) was drafted and declined: its observability gain
+is small — the first structural trace already fired if the violation
+caused the close — while its warn!-per-packet flood from an
+authenticated dying peer re-opens the question B1 closes. The `owed`
+registry entry discharges against this ruling with the measurement
+quoted.
+
+### 274 — the O-citations resolve by title, and the provenance is written down
+
+**Ruling: rulings 260, 268 and 270's amendment-table rows cite Appendix
+B by each obligation's bold title — the **post-mortem pin**, the
+**ACK-loss-burst simulation**, the **window-constants throughput sanity
+check** — and the table's preamble records where `O13`/`O53a`/`O53b`
+came from. Appendix B stays unnumbered: its own convention for "this
+obligation needs a durable name" is an inline tag on the bullets that
+need one (the SECV5-N tags), not a numbering of all 65.**
+
+Not drift — dangling pointers (measurer D, `round43-D` §2, correcting
+the brief's premise under rule 5): the O-ids were never in SPEC.md in
+any revision; they were the round-41 audit's private numbering from
+`audit/G-obligations-trend.md`, a file absent from the tree, from
+`git ls-files`, and from all reachable history — and the audit's own
+triage note says the ids "do not appear in SPEC.md". A RATIFIED
+document cited three identifiers from a document that does not exist;
+nobody outside round 41 could have resolved them. Rulings 260/268/270's
+own texts and `tests/spec_ack_burst.rs` keep their O-labels unchanged —
+historical labels with a documented resolution. Titles over numbers
+because titles survive insertion: the triage note's own line references
+were ~280 lines stale after one round while every bold title still
+resolved on first grep.
+
+### 275 — the hygiene bundle: the registry, the anchors, the level, the SECV5 pins
+
+**Ruling, four parts. (i) `mod owed`'s seven answered entries are
+discharged in place — doc bodies kept as the record of why each
+question was asked, the discharge line naming the ruling or slice that
+answered it; entry 6 (`SEAL_VERSUS_SEAL_QUIET`) is worded as
+"discharged elsewhere", because its literal sentence is still true of
+its own file and writing "stale" into the registry would have been
+false. The two stale doc comments rulings 83/85 left behind and the two
+dangling `PLAN.md U4` citations are fixed; G7's wrong stated cause is
+corrected in place. (ii) STORIES.md S22's anchor line gains §4, §6.1 —
+clause 4's entire mechanism was unanchored, and a test author working
+from the anchors alone would never open §4 (author B's find). (iii)
+§18.2 ratifies WARN as the level of its failure events — all four emit
+sites measured at `warn!` before ratifying; author C had asserted the
+level beyond the ratified text and flagged it (its C4), and the
+ratification converts that silent assumption into a rule. (iv) The
+SECV5-5/6/8 pins are written: SECV5-8's test was found undischarged by
+measurer D — every existing bidirectional-block test blackholes
+permanently, which any build survives including one whose passive
+keepalive re-fires each interval, so the one-shot property was never
+separated (rule 9's definition of a bound that is not a test);
+SECV5-5's repeatability and SECV5-6's between-timestamp accept gain
+their missing assertions; the three traceability tags land at the
+discharge sites.**
+
+The gap slice around these rulings (`round43-{A..D}`, integrated at
+`f703283`) closed the seven story-coverage gaps the completeness audit
+found — S8's shell half and the story's literal Claimed clause, S10's
+flood and memory bound, S22 clause 4 against a live responder (the
+slice-1→2 hand-forward that was never received), S24's 15 s timer on an
+armed deadline, and S25/S30's traced clauses via a hand-rolled scoped
+`tracing` Subscriber with no dependency added. 29 separating mutants
+ran across the three authors. Two findings worth the record beyond the
+rulings above: author A measured that under the drop-the-intro-term
+mutant zero of the 226 pre-existing integration tests go red — an
+endpoint that never arms its intro expiry was invisible to every
+kernel-free flow test in the crate, the ruling-265 shape one timer
+family over, now pinned; and author B established that a wrong static
+and a switched-off peer are deliberately indistinguishable to the
+application (§4.3: mac1's key is public data, any observable difference
+is an oracle) — the story's "fails the handshake" is true of the
+outcome and imprecise about the locus, recorded here so the next reader
+does not re-derive it.
