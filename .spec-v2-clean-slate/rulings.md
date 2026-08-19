@@ -9157,3 +9157,58 @@ checked at `endpoint.rs:481`, not assumed). Doctests 16→17 featureless,
 19→20 all-features; suites 924/0, 1137/0, 1139/0 release on the
 follow-up commit. The lesson for the record: a dual-theme compromise
 palette is a defect, not a constraint — pair the themes instead.
+
+## Release prep (2026/08/19)
+
+### 277 — wasm is a compile target, not a wire: the two-hunk gating, the demo, and the swept clause
+
+**Context.** The maintainer opened release prep with a wondering: could a
+demo app on a GitHub page demonstrate slither? A browser cannot send UDP,
+so the only honest shape is the one the architecture was built for — two
+endpoints in one tab over the in-memory `FlakyWire`, faults on sliders.
+An isolated-worktree agent measured the paths **by execution, not
+assessment** (`release-prep-wasm-demo.md`): the real shell — `block_on`,
+the `spawn_local` driver, `Endpoint`/`Connection` handles — ran the full
+protocol compiled for `wasm32-wasip1` under a preview1 WASI host,
+including the IK handshake through injected loss (the ratified 5 s
+ladder: 10.1 s real time) and the same handshake under the paused clock
+(9.8 ms wall). tokio's supported-on-wasm feature set was settled from
+tokio's own source: `sync, macros, io-util, rt, time` — the shell's needs
+minus `net`, which never compiles there.
+
+**Decided (three questions, all recommended options adopted):**
+
+1. **The demo is built, in-repo**: a `demo/` directory with its own
+   crate, excluded from the package tarball (nothing ships to crates.io),
+   deployed by a GitHub Pages workflow. Shape B — driving the cores from
+   JS on `wasm32-unknown-unknown` — was rejected on three measured facts:
+   the cores are `pub(crate)`; `std::time::Instant` cannot be minted
+   soundly there (only `now()` is unimplemented, and the workaround rests
+   on a private std internal); and even tokio's paused clock seeds its
+   base from `Instant::now()` (`tokio/src/time/clock.rs:302`).
+2. **The two-hunk gating is adopted**: `tokio/net` moves under
+   `[target.'cfg(not(target_family = "wasm"))'.dependencies]`, and the
+   `impl Wire for tokio::net::UdpSocket` takes the matching `#[cfg]`.
+   Cargo unions base and target features, so **native builds resolve
+   identically** — measured before adoption (`cargo check --all-features
+   --all-targets` green on the probe). The semver-visible fact — an impl
+   that exists everywhere except wasm — is exactly why this is a ruling
+   and not a housekeeping edit. A `wasm` CI job (`cargo check --target
+   wasm32-wasip1 --features test-util`, lib-only: tests and examples
+   legitimately need `net`) pins it from regressing.
+3. **`lib.rs`'s core-privacy rationale is swept, not the privacy.** The
+   comment's first clause — "nothing outside the crate can drive them
+   until the driver lands" — was discharged rounds ago when the driver
+   landed; rule 4(a)'s shape, one sentence ageing at two rates. The
+   rationale now rests solely on the still-true half: §16.6's
+   caller-chosen RNG seed is security-relevant, and that seam stays
+   unpublished while the crate is unaudited. The cores remain
+   `pub(crate)`.
+
+**Not decided here, on purpose:** the browser-shim step (the preview1 ABI
+was verified under `node:wasi`; `browser_wasi_shim` in a real browser is
+the demo build's first verification), and everything publish-day
+(`release-prep-audit.md`'s checklist stands).
+
+**No wire byte, constant, timer or behaviour moves.** The lib simply
+gains a target it compiles on.

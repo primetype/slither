@@ -81,11 +81,18 @@ of why.
 - **Building an endpoint outside a `LocalSet` now panics with slither's
   own message**, naming `slither::block_on` and the fix — previously
   tokio's bare `spawn_local` message, which named no slither symbol.
+- **The lib compiles for `wasm32-wasip1`** (ruling 277), including
+  `test-util`'s in-memory `FlakyWire`: `tokio/net` is now a
+  target-conditional dependency (`cfg(not(target_family = "wasm"))`) and
+  the `impl Wire for tokio::net::UdpSocket` carries the same `cfg`, so it
+  exists everywhere except wasm. Native builds resolve identically —
+  cargo unions base and target features. There is no UDP in wasm; the
+  `Wire` seam is how a wasm host supplies its own transport.
 
 ### Removed
 
-- `examples/udp_loopback.rs` — not present in the current tree; either
-  restore it against the new API or drop the README's reference to it.
+- `examples/udp_loopback.rs` — the v0.1 example was deleted with the
+  v0.1 wire (slice 0); `examples/echo.rs` (round 44) is its replacement.
 
 ## [Unreleased]
 

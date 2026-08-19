@@ -345,12 +345,12 @@ pub mod packet;
 pub mod shell;
 pub(crate) mod varint;
 
-// §16.4's two cores. `pub(crate)` in this slice, deliberately: nothing
-// outside the crate can drive them until the driver lands, so publishing
-// the surface now would freeze an unusable one under semver — and §16.6
-// makes a build that accepts a caller-chosen RNG seed "security-relevant",
-// a decision that belongs to the slice with an opinion about the public
-// surface. Promotion later is additive; demotion is breaking.
+// §16.4's two cores. `pub(crate)` deliberately, as an API position — not a
+// slice artefact (ruling 277 swept this comment's original "until the
+// driver lands" clause; the driver landed): §16.6 makes a build that
+// accepts a caller-chosen RNG seed "security-relevant", and that seam
+// stays unpublished while the crate is unaudited. Promotion later is
+// additive; demotion is breaking.
 //
 // NOTE for every file in this crate: a crate-level `mod core` makes a bare
 // `use core::…` ambiguous against the `core` crate in the extern prelude.

@@ -120,13 +120,16 @@ cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = [
 packtool = "0.6"
 
 # The async runtime pieces the shell actor needs: `rt` for
-# `tokio::task::spawn_local`, `net` for the `tokio::net::UdpSocket` behind the
-# `Wire` trait, `time` for the retransmit / keepalive / liveness / recovery
-# timers, `sync` for the command channels and oneshots that connect the `!Send`
-# actor to its handles, and `macros` for the `select!` the actor's event loop is
-# built on. slither provides no runtime of its own; the actor runs on the
-# consumer's current-thread runtime inside a `LocalSet`.
-tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+# `tokio::task::spawn_local`, `time` for the retransmit / keepalive / liveness
+# / recovery timers, `sync` for the command channels and oneshots that connect
+# the `!Send` actor to its handles, and `macros` for the `select!` the actor's
+# event loop is built on. slither provides no runtime of its own; the actor
+# runs on the consumer's current-thread runtime inside a `LocalSet`.
+# `net` — for the `tokio::net::UdpSocket` behind the `Wire` trait — is
+# target-gated below (ruling 277): tokio's `net` never compiles on wasm, and
+# these five are exactly tokio's supported-on-wasm set minus `io-util`. Cargo
+# unions base and target features, so native builds resolve identically.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 
 # Typed, structured errors for the public surface (SPEC.md §18.1's taxonomy).
 # A library, so `thiserror`, not `anyhow`.
@@ -177,6 +180,14 @@ tokio-util = { version = "0.7", default-features = false, features = ["codec"], 
 # stream; `finish()` ends the request and EOF the response. No `Rpc`
 # (ruling 230) — see `src/compat/tower.rs`'s module doc.
 tower-service = { version = "0.3", optional = true }
+
+# Ruling 277: the one target-conditional dependency. On wasm there is no UDP
+# socket for the `Wire` impl to wrap and tokio's `net` feature is a hard
+# compile error, so `net` applies everywhere EXCEPT wasm — which makes the
+# lib (and `test-util`'s in-memory `FlakyWire`) compile for wasm32-wasip1.
+# The CI `wasm` job in check.yml pins this from regressing.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["net"] }
 
 [dev-dependencies]
 # NOT a new crate — `cryptoxide` is already a dependency above (mac1's keyed

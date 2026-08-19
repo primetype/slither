@@ -73,6 +73,11 @@ pub trait Wire {
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
 
+// Ruling 277: target-gated, not feature-gated — on wasm there is no UDP
+// socket to wrap and tokio's `net` feature does not compile at all, so the
+// impl (and the `net` dependency, see Cargo.toml) exists everywhere except
+// wasm. The native surface is byte-identical.
+#[cfg(not(target_family = "wasm"))]
 impl Wire for tokio::net::UdpSocket {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
         tokio::net::UdpSocket::send_to(self, buf, addr).await

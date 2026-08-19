@@ -43,6 +43,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features --all-targets
 
+  wasm:
+    # Ruling 277: the lib — including `test-util`'s in-memory FlakyWire —
+    # compiles for wasm32-wasip1 (tokio/net is target-gated, the UdpSocket
+    # Wire impl cfg'd out on wasm). Lib-only on purpose: tests and examples
+    # legitimately need tokio/net, so no `--all-targets` here.
+    name: wasm32-wasip1 (lib · test-util)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-wasip1
+      - run: cargo check --target wasm32-wasip1 --features test-util
+
   clippy-doc:
     # One OS is enough here: slither has no target-gated code (the Apple
     # backend lives in hiss); the Test workflow still runs a macOS leg for
