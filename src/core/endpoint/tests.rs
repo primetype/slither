@@ -2013,6 +2013,16 @@ fn ordinary_ordering(
 /// reverting here too. That deletes §6.7's winner-side record by the staged
 /// route while leaving it intact by the internal route — the two routes
 /// disagreeing, which §6.6 step 2 says can never happen.
+///
+/// **Appendix B's no-record-on-`Stale`, SECV5-6** (`SPEC.md` §6.4): both
+/// halves — the winner's exception in (a), the ordinary revert in (b). The
+/// basis-refused `accept()` arm is covered by `endpoint::routing`'s
+/// `a_dialled_live_rows_stale_reverts_its_record_and_marks_contested`; the
+/// *"a timestamp **between** the two is still admitted"* clause is asserted
+/// on the `reject()` path at `core::tests`'
+/// `authenticate_then_reject_restores_a_prior_value` and on the
+/// basis-refused `accept()` path at `core::tests`'
+/// `a_basis_refused_accept_restores_a_prior_value` (ruling 275).
 #[test]
 fn the_pending_branch_winner_returns_stale_and_is_the_one_stale_that_keeps_its_record() {
     let now = t0();

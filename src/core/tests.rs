@@ -1059,6 +1059,86 @@ fn the_dedup_key_is_the_full_socket_addr_not_the_source_ip() {
     assert!(b.present(a1) && b.present(a2));
 }
 
+// ── what a slot costs ──────────────────────────────────────────────────
+
+/// **[RATIFIED 2026/08/19 — ruling 272]** §6.3/§17.5's stage-0 figure, as a
+/// measurement rather than an estimate.
+///
+/// §6.3 read *"the raw 196-byte msg1 plus the source address (≈ 220 B per
+/// entry; worst case ≈ 225 KB at the default cap)"*, §17.5's honesty table
+/// read *"≈ 220 B raw bytes each, ≈ 225 KB"*, and §5's DH table priced a
+/// slot at *"≈ 220 B"*. Ruling 272 amends all three to **≈ 484 B** — 288 B
+/// of `IntroEntry` inline plus the 196 B `msg1` on the heap — because the
+/// old figure counted the message and the address and nothing else, while
+/// the entry has carried §6.1's ladder state, §17.1's guard undo, ruling
+/// 77's pin kind and ruling 69's age key since slice 2a. At
+/// `INTRO_QUEUE_CAP` that is ≈ 0.47 MiB, not ≈ 225 KB: the old number was
+/// 2.2× under, and it is the number §17.5's flood budget is stated in.
+///
+/// # Why bounds and not equality
+///
+/// An exact `assert_eq!` on `size_of` is a test of the *layout*, and the
+/// layout is the compiler's to choose: field order, niche packing and a
+/// platform's `Instant` (16 B here, 8 B where it is a bare counter) all
+/// move the number without moving the fact. Bounds keep the fact and drop
+/// the layout — but only if each side separates something (working rule 9),
+/// so each is chosen against a build it must fail on:
+///
+/// * **Lower, 256 B.** The superseded *"≈ 220 B per entry"* was the whole
+///   entry, message included. 256 B of *inline* alone refutes it, with
+///   32 B of slack — four words, more than any padding decision can move —
+///   so a tree that quietly reverted to the old shape goes red here rather
+///   than in a spec review.
+/// * **Upper, 320 B.** Keeps the whole entry under 512 B, which is what
+///   ruling 272's ≈ 0.47 MiB at `INTRO_QUEUE_CAP` rests on. The regression
+///   it separates is the one §6.3 already names as its *"one bounded
+///   exception"* — an eager-demoted entry carrying its already-paid
+///   mid-state — measured in Appendix A at **784 B** for the reference
+///   suite. Storing that inline for every entry, rather than for the
+///   bounded exception, would take a slot past 1 KB and §17.5's budget past
+///   1 MiB, and it is the single most plausible way this figure moves.
+///
+/// # The heap half is exact, and pinned elsewhere
+///
+/// `msg1` holds *"the newest msg1, verbatim"*, and §3.1 is exact for the
+/// two handshake types (ruling 65): nothing but an `INIT_PACKET_LEN`
+/// datagram reaches the queue at all, which is
+/// [`only_an_exactly_sized_init_reaches_the_queue`]'s three-sided boundary.
+/// So the heap half needs no bound — it is 196 B or the entry does not
+/// exist — and it is written as a literal here so ruling 272's arithmetic
+/// can be read off this test without leaving it.
+#[test]
+fn a_stage_zero_slot_costs_ruling_272s_figure_not_the_superseded_220_bytes() {
+    const MSG1_HEAP: usize = 196;
+    assert_eq!(
+        MSG1_HEAP, INIT_PACKET_LEN,
+        "§3.1's exact msg1 is the heap half of ruling 272's figure"
+    );
+
+    let inline = size_of::<endpoint::intro_queue::IntroEntry<Id>>();
+    assert!(
+        (256..=320).contains(&inline),
+        "ruling 272 measured `IntroEntry` at 288 B inline; this tree says \
+         {inline} B, which is outside the band the ruling's ≈ 484 B per \
+         entry and ≈ 0.47 MiB at INTRO_QUEUE_CAP are stated over. Below \
+         256 B the superseded ≈ 220 B whole-entry figure is back; above \
+         320 B a slot has passed 512 B and §17.5's flood budget needs \
+         re-ruling, not re-expecting (CLAUDE.md: a red here is \"this needs \
+         a ruling\")"
+    );
+
+    let per_entry = inline + MSG1_HEAP;
+    assert!(
+        per_entry > 2 * 220,
+        "ruling 272's whole point is that ≈ 220 B was 2.2x under: {per_entry} B"
+    );
+    assert!(
+        per_entry * INTRO_QUEUE_CAP < 1 << 20,
+        "§17.5's worst case must stay inside a MiB: {} B at the default cap",
+        per_entry * INTRO_QUEUE_CAP
+    );
+}
+
 // ── the caps ───────────────────────────────────────────────────────────
 
 /// `INTRO_QUEUE_CAP` = **1024**, endpoint-wide, asserted at, below and
@@ -1981,6 +2061,140 @@ fn authenticate_then_reject_restores_a_prior_value() {
     );
 }
 
+/// **Appendix B's no-record-on-`Stale`, SECV5-6** (§6.4's ordering clause,
+/// `SPEC.md:7472`), on the arm the suite did not reach:
+///
+/// > an `accept()` refused by the basis rule leaves the guard
+/// > byte-identical to its pre-call contents, so a later genuine initiation
+/// > with a timestamp between the two is still admitted
+///
+/// [`authenticate_then_reject_restores_a_prior_value`] pins the
+/// *between-the-two* clause on the **`reject()`** path.
+/// `endpoint::routing`'s
+/// `a_dialled_live_rows_stale_reverts_its_record_and_marks_contested` pins
+/// the basis-refused **`accept()`** path — but only its *empty* case, where
+/// the pre-call contents were `None` and "restored" and "deleted" give the
+/// same answer. The two refusals reach `discard_chain` by different arms
+/// (`reject()` through the staged teardown, the basis refusal through
+/// §6.4's `None` branch), so a core that reverted correctly on one and
+/// deleted on the other is separated by neither test. This is that case:
+/// a **pre-existing** record, and a refusal taken by the basis rule.
+///
+/// # How the shape is reached
+///
+/// §6.4's `None` basis is *"we dialled this connection"*, and §16.1 forbids
+/// a dial while the static is LIVE — so the record has to be laid down by a
+/// chain whose connection is then **retired**, which frees the static
+/// without touching the guard (§17.1 pins entries against eviction, not
+/// against outliving their connection). The dial is completed against a
+/// **second endpoint holding the same static**: `b` is left holding the
+/// pending its own `msg1_train` minted, and §6.4's PENDING branch would
+/// answer the dial with a tie-break instead of a msg2.
+///
+/// # The broken implementation this catches
+///
+/// One that empties the entry on a basis refusal instead of reverting it —
+/// exactly the defect [`authenticate_then_reject_restores_a_prior_value`]
+/// exists to catch on the other arm, and with the same cost: `train[0]` is
+/// a replay that must stay refused, and a core that deleted the record
+/// admits it. Asserted three ways, because the record alone would not
+/// distinguish "restored" from "never written": the value itself, the
+/// replay that must still be refused, and the between-timestamp that must
+/// still be admitted.
+#[test]
+fn a_basis_refused_accept_restores_a_prior_value() {
+    let t = t0();
+    let (mut a, mut b) = pair(t);
+    // `b`'s static on a second endpoint, so the dial below is answered by a
+    // clean responder rather than by §6.4's PENDING tie-break.
+    let mut b2 = Ep::new(t, 9, 0x33, v4(3, 3), default_config());
+    let train = msg1_train(&mut b, t, &a, 3);
+
+    // (1) A committed record at train[0] — accepted, so it is not
+    //     provisional — and then the connection is retired, which frees the
+    //     static for a dial and must leave the record where it is.
+    let (id0, admitted) = ladder_to_proven(&mut a, t, v4(42, 1), &train[0]);
+    let ts0 = admitted.expect("first admission");
+    let (conn0, _c) = a.ep.accept(t, id0).expect("a fresh static accepts");
+    let msg2 = a.drain().one_transmit().1;
+    let (our_index, _theirs) = resp_indices(&msg2);
+    a.ep.handle_connection_event(t, conn0, ToEndpoint::Retired { our_index });
+    let _ = a.drain();
+    assert_eq!(
+        a.ep.greatest(b.canonical()),
+        Some(ts0),
+        "§17.1: a retired connection releases its pin, not its record — \
+         without this the test below would be about an empty guard again"
+    );
+
+    // (2) The same static, now **dialled** and completed: §17.4 says a msg2
+    //     completion teaches us no timestamp of the peer's, so the basis is
+    //     `Some(None)` — the value §6.4 refuses every candidate against.
+    let (conn1, d) = a.connect(t, b2.addr, &b2.public_static);
+    let msg1 = d.one_transmit().1;
+    let id = b2.feed(t, a.addr, &msg1).one_intro().0;
+    b2.ep.read_identity(t, id).expect("a real msg1 is readable");
+    let _ = b2.drain();
+    b2.ep.authenticate(t, id).expect("authenticates");
+    let _ = b2.drain();
+    b2.ep.accept(t, id).expect("b2 holds no row for a");
+    let resp = b2.drain().one_transmit().1;
+    assert_eq!(
+        a.feed(t, b2.addr, &resp).installs(),
+        vec![conn1],
+        "the dial must complete, or the basis below is PENDING and the \
+         refusal is §6.4's tie-break rather than the basis rule"
+    );
+    assert_eq!(
+        a.ep.replacement_basis(b.canonical()),
+        Some(None),
+        "§17.4: a completed dial writes a LIVE row with a `None` basis"
+    );
+
+    // (3) A genuine, strictly newer initiation: the guard admits it and
+    //     `authenticate()` writes it provisionally over `ts0`.
+    let (id2, high) = ladder_to_proven(&mut a, t, v4(42, 2), &train[2]);
+    let ts2 = high.expect("train[2] is strictly greater than train[0]");
+    assert_eq!(
+        a.ep.greatest(b.canonical()),
+        Some(ts2),
+        "`authenticate()` writes provisionally — that write is what the \
+         refusal must undo"
+    );
+
+    // (4) …and `accept()` refuses it by the **basis** rule, not by
+    //     `reject()` and not by the guard.
+    assert!(
+        matches!(a.ep.accept(t, id2), Err(AcceptError::Stale)),
+        "§6.4: a `None` basis refuses every candidate, however new"
+    );
+    let _ = a.drain();
+
+    // (5) "byte-identical to its pre-call contents": `Some(ts0)`. Not
+    //     `None` (deleted) and not `Some(ts2)` (kept).
+    assert_eq!(
+        a.ep.greatest(b.canonical()),
+        Some(ts0),
+        "§17.1 mitigation (i) on the basis-refused accept arm: the \
+         pre-existing entry REVERTS, it is not emptied"
+    );
+
+    // (6) And behaviourally, both sides of that value.
+    let (_id, replay) = ladder_to_proven(&mut a, t, v4(42, 3), &train[0]);
+    assert!(
+        matches!(replay, Err(AuthError::Replay)),
+        "the revert removed the pre-existing entry instead of restoring it, \
+         so a replay of the recorded initiation is admitted again: {replay:?}"
+    );
+    let (_id, middle) = ladder_to_proven(&mut a, t, v4(42, 4), &train[1]);
+    assert!(
+        middle.is_ok(),
+        "SECV5-6: a later genuine initiation with a timestamp BETWEEN the \
+         two must still be admitted — the refused chain's record survived: \
+         {middle:?}"
+    );
+}
+
 /// **Regression — the two-pin sibling of
 /// [`authenticate_then_reject_leaves_the_guard_empty`].**
 ///
@@ -2191,6 +2405,12 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
 /// own outbound timestamp against the dialled static would refuse the
 /// peer's genuine, older initiation. A `connect()` that writes a guard
 /// entry is a defect.
+///
+/// Appendix B's **dialled-only static** (SECV5-5, `SPEC.md:7477`): this is
+/// its *"the guard holds **no** entry"* half; the refusal half — the
+/// vacuous pass, the `Stale`, the revert and the repeatability — is
+/// `endpoint::routing`'s
+/// `a_dialled_live_rows_stale_reverts_its_record_and_marks_contested`.
 #[test]
 fn a_dialled_static_holds_no_guard_entry() {
     let t = t0();

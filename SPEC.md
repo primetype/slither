@@ -2004,7 +2004,7 @@ paid by us in every row. Stimulus 196 B (HandshakeInit); msg2 107 B.
 | Packet class | Our cost beyond the mac1 hash |
 |---|---|
 | mac1-invalid garbage / wrong key / wrong suite | 0 |
-| mac1-valid, src ∉ hint set, `Intro` left or dropped unprobed | **0 DH**, one bounded queue slot (≈ 220 B) |
+| mac1-valid, src ∉ hint set, `Intro` left or dropped unprobed | **0 DH**, one bounded queue slot (≈ 484 B — ruling 272's measured figure; this row read ≈ 220 B, the raw-bytes estimate) |
 | mac1-valid, src ∉ hint set, application probes identity then drops | 1 DH — an application-chosen spend |
 | mac1-valid, src spoofed into the hint set (a dialled address of an in-flight connect), claimed static unknown | **1 DH** — the `es` paid once at the eager read and carried through the demotion (§6.5 step 3) |
 | forged claim of a pending-outbound static | 2 DH (`es` + `ss`), dies at the tail tag with the pending untouched (§6.7); a forged claim of any other static is an application-chosen spend (the staged rows above) |

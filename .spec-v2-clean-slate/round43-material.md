@@ -27,8 +27,21 @@ pointers into a never-committed file), 275 (the bundle: owed registry
 discharged, S22 anchors, WARN ratified, SECV5-5/6/8 pins).
 
 **Evidence:** `round43-A-intro-author.md`, `round43-B-wrong-static-author.md`,
-`round43-C-traced-author.md`, `round43-D-hygiene-measurer.md`, plus the
-SECV5 author's report (round43-E, landed with its commit).
+`round43-C-traced-author.md`, `round43-D-hygiene-measurer.md`,
+`round43-E-secv5-author.md`.
+
+**The SECV5 landing (round43-E), three notes worth the record:** (i) its
+independent rule-4 sweep found a third site carrying the superseded
+stage-0 figure — §6.5's DoS cost-table row — which the integrator's own
+sweep had accidentally excluded by a grep filter; both are amended. (ii)
+Its O1: SECV5-8's wording "drop both directions' keepalive" over-states
+the datagram count — measured, a bidirectional block drops ONE, because
+§7.5's predicate is a receive and the follower's keepalive is armed by
+the leader's arriving; recorded as K3 in story_keepalive.rs's header.
+(iii) Its O2: measurer D's proposed separating build for SECV5-5 did not
+separate (a pre-existing assertion already reds it) — right conclusion,
+wrong argument, the rule-12 shape; the corrected characterisation (the
+packet being SPENT on first use) is what the new block separates.
 
 **Carried onward:**
 - ChainState boxing (~96 KB at a saturated cap) — available as a

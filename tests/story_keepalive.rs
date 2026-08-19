@@ -142,6 +142,25 @@
 //!   the one this slice introduces. No test in this file depends on the
 //!   PING's class — `s11_a_none_basis_refusal…`'s survival window is
 //!   `2 × KEEPALIVE_TIMEOUT`, inside `DEAD_TIMEOUT` under either reading.
+//! * **K3 — Appendix B's SECV5-8 says *"drop both directions' keepalive in
+//!   the same interval"*, and on this build a bidirectional block drops
+//!   **one** keepalive, because the second is never armed.** §7.5's passive
+//!   predicate is *"has received since it last sent"*, so in the steady
+//!   dance one peer's timer fires on its own and the other's keepalive is
+//!   caused by that keepalive **arriving**. Cutting both directions cuts
+//!   the arming as well as the delivery: measured on `Network::sends`
+//!   (which counts before the policy decision), an unblocked tick costs 2
+//!   sends, a one-directional block still costs 2, and a bidirectional
+//!   block costs **1**. The obligation's stimulus and its assertion are
+//!   both exactly as written — one interval with neither direction
+//!   carrying, both sides `TimedOut` — and its stated reason (*"neither can
+//!   re-fire the one-shot passive rule"*) is if anything stronger than it
+//!   claims: one peer cannot re-fire, and the other cannot fire at all. It
+//!   is the count of dropped datagrams that the phrasing over-states. No
+//!   test here depends on which reading is meant; the measurement is
+//!   written into
+//!   `s5_both_directions_losing_one_keepalive_kills_both_sides_even_after_the_path_heals`
+//!   so a reader is not left to infer it.
 
 #![allow(clippy::items_after_statements)]
 
@@ -928,6 +947,206 @@ async fn s5_a_rejected_interval_does_not_enable_a_beacon_that_was_off() {
             )
             .await;
             assert_eq!(lost, ConnectionLost::TimedOut);
+        })
+        .await;
+}
+
+/// **Appendix B SECV5-8 (`SPEC.md:7643`) — a *simultaneous bidirectional*
+/// keepalive loss over one interval kills both sides, and the **heal** is
+/// what makes that a test.**
+///
+/// The tag is a parenthetical inside §7.4's "liveness anchor" bullet
+/// (`SPEC.md:7625`), not a bullet of its own:
+///
+/// > an idle keepalive-sustained connection lives indefinitely **while the
+/// > dance survives the path** — at 2 × `KEEPALIVE_TIMEOUT` + 5 s one
+/// > keepalive lost **in one direction** is tolerated, while a
+/// > *simultaneous bidirectional* loss over a single interval ends the
+/// > connection at 25 s (SECV5-8 — drop both directions' keepalive in the
+/// > same interval and assert both sides fire `TimedOut`, since neither can
+/// > re-fire the one-shot passive rule and keepalives are never
+/// > retransmitted)
+///
+/// # Why the path is healed before the deaths are asserted (working rule 9)
+///
+/// A permanent bidirectional blackhole is **not** a test of this. It kills
+/// the connection on *any* build, including one whose passive keepalive
+/// re-fires every interval: with no path, an immortally-armed keepalive
+/// reaches nobody either. The two permanent blocks in `story_compat`'s S31
+/// pair (`s31_shutdown_resolves_in_error_when_the_connection_dies_first`,
+/// `s31_flush_is_a_no_op_and_never_delivery_confirmation`) have exactly
+/// that shape and separate nothing here.
+///
+/// What SECV5-8 is *about* is the **one-shot** property: §7.5's passive
+/// rule is armed by an authenticated receive and disarmed by the marking
+/// send it produces, so a keepalive that is dropped buys no second attempt
+/// — and §7.4 never retransmits one. That is observable only if the path
+/// comes back. So the shape is: block both directions, let each side spend
+/// its one keepalive into the blackhole, **heal**, and assert the silence
+/// that follows is fatal to both.
+///
+/// # The broken implementation this catches
+///
+/// A build that does not clear §7.5's predicate on a marking send —
+/// `Liveness::on_send`'s `received_since_marking_send = false`
+/// (`src/core/connection/session.rs`, ruling 195). Its keepalive re-arms
+/// every `KEEPALIVE_TIMEOUT` off a receive long past, so the moment the
+/// path returns the dance restarts from nothing and **both** connections
+/// live for ever. Every assertion before the deaths passes on that build:
+/// it dances the same before the block, it is swallowed the same during it.
+/// The heal, and only the heal, separates them.
+///
+/// # What "both directions' keepalive" is, **measured** on this build
+///
+/// The obligation's phrasing suggests two independently-timed keepalives to
+/// drop. The dance is not shaped that way, and the difference is worth
+/// stating because it decides what may be asserted. Driving the fixture and
+/// reading `Network::sends` — which counts *before* any policy decision, so
+/// a blackholed send is still counted — gives, per 10 s tick:
+///
+/// ```text
+/// unblocked           t = 10 s   a+1 b+1   sends+2
+/// a→b blocked only    t = 30 s   a+0 b+1   sends+2
+/// both blocked        t = 30 s   a+0 b+0   sends+1
+/// ```
+///
+/// So the two sides are a **chain**, not two clocks: one peer's timer fires
+/// on its own, and the other's keepalive is armed by *receiving* it — with
+/// both directions down, the second peer never even attempts one. That is
+/// the same fact SECV5-8 rests on, read from the other end: §7.5's
+/// predicate is a receive, so cutting the path cuts the arming, not just
+/// the delivery. What the interval loses is therefore the whole dance in
+/// both directions, which is what the assertions below say and all they
+/// say — `sends` grew (an attempt was made and swallowed) while the tap,
+/// which sits *below* `block_path`, did not (nothing crossed either way).
+///
+/// *Reported, not resolved (working rule 3): see K3 in this file's header.*
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn s5_both_directions_losing_one_keepalive_kills_both_sides_even_after_the_path_heals() {
+    let net = Network::new();
+    let tap = net.tap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = Node::spawn(&net, 1, 7071);
+            let b = Node::spawn(&net, 2, 7072);
+            let (ca, cb) = establish(&a, &b).await;
+
+            // One exchange starts §7.5's dance (ruling 39: it does not
+            // bootstrap from the install alone).
+            ca.send_datagram(b"start the dance").expect("send_datagram");
+            let got = tokio::time::timeout(Duration::from_secs(1), cb.recv_datagram())
+                .await
+                .expect("the exchange must cross the fabric")
+                .expect("recv_datagram");
+            assert_eq!(got, b"start the dance");
+
+            settle().await;
+            let a_dancing_from = sent_from(&tap, a.addr);
+            let b_dancing_from = sent_from(&tap, b.addr);
+
+            // Two full intervals of the dance, so both sides are demonstrably
+            // on the cadence before anything is taken away.
+            alive_through(
+                KEEPALIVE_TIMEOUT * 2 + Duration::from_secs(1),
+                &ca,
+                "§7.5: one exchange self-sustains an otherwise idle link",
+            )
+            .await;
+            let a_danced = sent_from(&tap, a.addr) - a_dancing_from;
+            let b_danced = sent_from(&tap, b.addr) - b_dancing_from;
+            assert!(
+                a_danced >= 2 && b_danced >= 2,
+                "the precondition is that BOTH sides owe a keepalive on the \
+                 10 s cadence — a {a_danced}/{b_danced} split over two \
+                 intervals is a one-sided dance, and blocking it would not \
+                 be a *bidirectional* loss at all"
+            );
+
+            // ── the single interval, lost in both directions ──────────────
+            settle().await;
+            let block_at = Instant::now();
+            let tap_a_at_block = sent_from(&tap, a.addr);
+            let tap_b_at_block = sent_from(&tap, b.addr);
+            let sends_at_block = net.sends();
+            net.block_path(a.addr, b.addr);
+            net.block_path(b.addr, a.addr);
+
+            alive_through(
+                KEEPALIVE_TIMEOUT + Duration::from_secs(1),
+                &ca,
+                "§7.4: the death clock is DEAD_TIMEOUT from the last \
+                 authenticated receive — one lost interval is not yet fatal",
+            )
+            .await;
+            let mut b_still = pin!(cb.closed());
+            assert!(
+                poll_once(b_still.as_mut()).await.is_pending(),
+                "the responder must not die a whole DEAD_TIMEOUT early either"
+            );
+
+            assert_eq!(
+                (sent_from(&tap, a.addr), sent_from(&tap, b.addr)),
+                (tap_a_at_block, tap_b_at_block),
+                "the blackhole is not blackholing: the tap sits below \
+                 block_path, so anything it carried in this window crossed \
+                 the path the test believes is down"
+            );
+            assert!(
+                net.sends() > sends_at_block,
+                "no keepalive was even attempted while the path was down, so \
+                 the interval lost nothing and every assertion below is \
+                 vacuous. Network::sends counts before the policy decision, \
+                 so this is the loss being real ({} sends in {:?})",
+                net.sends() - sends_at_block,
+                Instant::now() - block_at
+            );
+
+            // ── the path comes back, and finds nothing to carry ───────────
+            net.heal_path(a.addr, b.addr);
+            net.heal_path(b.addr, a.addr);
+            let tap_a_at_heal = sent_from(&tap, a.addr);
+            let tap_b_at_heal = sent_from(&tap, b.addr);
+
+            let lost_a = dies_within(
+                DEAD_TIMEOUT,
+                &ca,
+                "§7.5: the passive rule is one-shot — the keepalive that was \
+                 swallowed disarmed it, and a healed path cannot re-arm what \
+                 only a receive can",
+            )
+            .await;
+            assert_eq!(lost_a, ConnectionLost::TimedOut);
+
+            let lost_b = dies_within(
+                DEAD_TIMEOUT,
+                &cb,
+                "SECV5-8 asks for BOTH sides: a build that reaps only the \
+                 dialler leaves the responder's half of a dead pair alive",
+            )
+            .await;
+            assert_eq!(lost_b, ConnectionLost::TimedOut);
+
+            let elapsed = Instant::now() - block_at;
+            assert!(
+                elapsed <= DEAD_TIMEOUT + SHELL_LATENESS_BOUND,
+                "§7.4: the loss ends the connection at 25 s, measured from \
+                 the last authenticated receive — which is no later than the \
+                 block. {elapsed:?} means the death clock was re-armed by \
+                 something after it"
+            );
+
+            // The one-shot property, read directly off the healed path: an
+            // open wire carried nothing at all between the heal and the two
+            // deaths. §5.1's verdict transmits nothing either, so this stays
+            // exact rather than approximate.
+            assert_eq!(
+                (sent_from(&tap, a.addr), sent_from(&tap, b.addr)),
+                (tap_a_at_heal, tap_b_at_heal),
+                "the healed path carried a keepalive: §7.5's passive rule \
+                 re-fired without a receive to arm it, which is the exact \
+                 build SECV5-8 exists to separate"
+            );
         })
         .await;
 }

@@ -1375,6 +1375,15 @@ mod tests {
     /// Reaching it needs the initiation to be captured **before** the dial
     /// completes: once `third` has accepted us, §16.1 forbids it a dial of
     /// its own, so there is no later moment at which it could mint one.
+    ///
+    /// **Appendix B's dialled-only static, SECV5-5** (`SPEC.md:7477`): the
+    /// captured initiation passes §17.1's guard vacuously and the `None`
+    /// basis leaves the live connection untouched. All four clauses are
+    /// here — the vacuous pass, the `Stale`, the revert, and, in the second
+    /// half below, the obligation's *"surfaces **repeatably** — more than
+    /// once from a single captured packet"*. The *"holds **no** entry"*
+    /// clause is the guard-side half, at `core::tests`'
+    /// `a_dialled_static_holds_no_guard_entry`.
     #[test]
     fn a_dialled_live_rows_stale_reverts_its_record_and_marks_contested() {
         let t = t0();
@@ -1409,9 +1418,10 @@ mod tests {
         // The captured initiation surfaces, authenticates, and is refused.
         let drained = large.feed(t, addr(8, 4010), &captured);
         let (id2, _) = drained.intros[0];
-        large.ep.authenticate(t, id2).expect("authenticates");
-        assert!(
-            large.ep.greatest(third.canonical()).is_some(),
+        let (_pk, captured_ts) = large.ep.authenticate(t, id2).expect("authenticates");
+        assert_eq!(
+            large.ep.greatest(third.canonical()),
+            Some(captured_ts),
             "`authenticate()` writes provisionally, and that is what must be reverted"
         );
         assert!(
@@ -1438,6 +1448,58 @@ mod tests {
             after.replaced.is_empty(),
             "a refusal replaces nothing: {:?}",
             after.replaced
+        );
+
+        // **Appendix B SECV5-5, the *repeatably* clause.** The obligation is
+        // that the captured initiation *"surfaces as an `Intro`
+        // **repeatably** — … more than once from a single captured packet"*,
+        // and one feed cannot say that. The same `captured`, from a second
+        // source port so §6.3's dedup key differs — the same address would
+        // take the byte-replacement path, which surfaces no second `Intro`
+        // by design — must climb the whole ladder again and be refused
+        // again, the guard passing it vacuously because the refusal above
+        // put the record back.
+        //
+        // **The build this separates, measured.** Not one that *fails to
+        // revert*: that build leaves `greatest()` at the candidate's
+        // timestamp and the assertion twenty lines up already catches it.
+        // The one that slips is a core that **spends the bytes** — records
+        // the torn-down chain's msg1 and refuses to authenticate it again —
+        // which leaves every assertion above green and dies here.
+        let again = large.feed(t, addr(8, 4011), &captured);
+        let (id3, _) = again.intros[0];
+        large
+            .ep
+            .authenticate(t, id3)
+            .expect("the same bytes authenticate a second time");
+        assert_eq!(
+            large.ep.greatest(third.canonical()),
+            Some(captured_ts),
+            "the second surfacing wrote the same provisional record as the first"
+        );
+        assert!(
+            matches!(large.ep.accept(t, id3), Err(AcceptError::Stale)),
+            "§6.4: the `None` basis is not spent by having refused once"
+        );
+        assert_eq!(
+            large.ep.greatest(third.canonical()),
+            None,
+            "§17.1 mitigation (i) applies to the second refusal exactly as to the first"
+        );
+        let after2 = large.drain();
+        assert_eq!(
+            after2.contested,
+            vec![dialled],
+            "ruling 36: the endpoint signals every refusal of an admitted \
+             candidate; ruling 41's *second refusal is a no-op* is the \
+             connection core's, and this is the signal it no-ops on"
+        );
+        assert!(
+            after2.failed.is_empty() && after2.replaced.is_empty(),
+            "the live connection must be untouched every time, because the \
+             basis is `None`: {:?} / {:?}",
+            after2.failed,
+            after2.replaced
         );
         let _ = small;
     }
