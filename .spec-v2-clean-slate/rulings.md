@@ -9035,3 +9035,105 @@ application (§4.3: mac1's key is public data, any observable difference
 is an oracle) — the story's "fails the handshake" is true of the
 outcome and imprecise about the locus, recorded here so the next reader
 does not re-derive it.
+
+## Round 44 — the documentation round (2026/08/19)
+
+### 276 — simple to use, simple to onboard: the five documentation decisions
+
+**Context.** The maintainer opened round 44 with a goal, not a defect:
+the README should carry the *why*, `lib.rs` the *how*, in short
+paragraphs with step-by-step examples, for two audiences — a developer
+in a hurry, and an AI ranking dependencies. Three persona agents
+measured the distance. The hurried-developer probe got a two-endpoint
+demo **compiling and running on the first attempt** — and lost 30–50
+minutes of discovery order on the way, because no entry page assembles
+the five facts the path needs (`channel!`, `generate()`,
+`public_static()`, the tokio features, `slither::block_on`). Its worst
+moment was verified by experiment: `#[tokio::main]` plus
+`Endpoint::builder()…build()` panicked with tokio's bare `spawn_local`
+message, which names no slither symbol and so gives its victim no
+reason to open slither's docs. The AI-ranker simulation placed slither
+**5th of 6** on "encrypted peer-to-peer UDP transport with reliable
+messages" — behind iroh, quinn, libp2p and snow, ahead of boringtun —
+while judging it the second-best technical fit; the eliminating filter
+was trust *presentation* (0.2.0, no badges, no audit statement, no test
+count on any ranked page), and snow outranked slither by *admitting*
+non-audit where slither stayed silent. The docs.rs audit found the
+staged-accept ladder's fullest documentation structurally unrenderable
+(six shell submodules are private `mod`, so their `//!` never renders)
+and zero end-to-end examples anywhere in the rendered surface.
+
+**The five decisions, all as recommended by the fix-plan agent:**
+
+1. **The shell's prose folds into `shell/mod.rs`'s public `//!`; the
+   submodules stay private.** Lands the DH-annotated ladder zero clicks
+   from the `shell` page. The alternative — `pub mod staged;` and
+   friends — would freeze four module paths under semver and give
+   `Intro` a third rendered address, to put the same prose two clicks
+   deeper.
+2. **`EndpointBuilder::build()` gains a slither-authored LocalSet
+   panic.** `catch_unwind` around the one `spawn_local` call (which is
+   directly in `build()` — the probe's report believed it was deeper,
+   and the plan's rule-11 check corrected it); the re-panic names
+   `slither::block_on` and `LocalSet::run_until`. No tokio predicate
+   for "inside a LocalSet" exists, and a runtime-flavour check would
+   falsely reject the valid LocalSet-on-multi-thread configuration, so
+   catching is the only honest mechanism. Under `panic = "abort"` the
+   guard degrades to today's message, which the doc states. Pinned by
+   `build_outside_a_localset_panics_with_slithers_own_message`, which
+   asserts on three strings tokio's own message does not contain.
+3. **README's "When not to use it" names iroh, quinn and snow.** Each
+   bullet names a capability slither deliberately lacks and the crate
+   that has it; nothing claims anything about the rivals' quality, so
+   nothing goes stale unless slither itself changes. An anonymous
+   scoping line converts an unknown into a smaller unknown; a named one
+   converts it into a decision.
+4. **The status block states "not independently audited"**, linking
+   SECURITY.md. The ranker evidence is direct: candour clears the trust
+   gate that silence fails.
+5. **`Cargo.toml`'s `description` leads with capability** (187 chars,
+   ASCII): the crates.io search-results pass shows ~40 tokens and
+   eliminates before any page is fetched, which makes the description
+   the highest-leverage string in the crate. The old text named
+   WireGuard, Noise and QUIC before any capability.
+
+**Held, per the harmful-list:** no llms.txt / AI.md mirror (a fourth
+home for facts that already drifted once in three homes), no obligation
+duplication into README (two copies of a safety rule that can disagree
+are worse than one that is hard to find), no second feature table
+(ruling 225's split), no benchmark claims in README, no comparison
+table for now (P9 — most of its value is in the when-not-to bullets at
+a fifth of the cost; revisit after publish).
+
+**Corrections the round banked.** *(a)* README claimed "There is no
+`examples/` directory" — false since the round-41 harnesses; rule 4's
+shape, in the README's own self-instruction to fix it. *(b)*
+`shell/mod.rs` and `stream.rs` still said `AsyncRead`/`AsyncWrite` are
+"slice 8's — absent rather than stubbed", false since `compat/io.rs`
+shipped them ungated; ruling 264 had corrected the same claim in
+`connection.rs` and its sweep missed the two neighbours — the writer
+declined to carry the stale clause forward and flagged it (rule 5), and
+the integrator confirmed against the code (rule 11). *(c)* The
+AI-ranker's drafted status block claimed Windows CI; the matrix is
+ubuntu + macos. Caught by the orchestrator before the plan, from the
+workflow files. *(d)* The echo example corrected the fix-plan once, in
+the direction §6 anticipated ("where the two differ, the example is
+right"): an answerer-side `acked()` races the dialler's post-receive
+`close()` and errors `PeerClosed`; delivery on the receiving side is
+proven by `recv_message` alone. *(e)* The plan's SVG sizing rule ("no
+fixed pixel width") named the wrong mechanism — a `viewBox`-only SVG
+has no intrinsic size and renders at the 300×150 default in GitHub's
+`<img>`; the writer flagged the contradiction rather than resolving it,
+and the integrator applied explicit `width`/`height` + `viewBox`, which
+is what actually scales under GitHub's `max-width: 100%`.
+
+**Landed at `d039a28`** — README 133 lines why-first; `lib.rs`
+how-first with the featureless quickstart doctest; `examples/echo.rs`
+(89 lines, runs green, prints the out-of-band key handover); five new
+API doc examples (doctests 11→16 featureless, 14→19 all-features);
+`docs/architecture.svg` + `docs/staged-accept.svg`; the CHANGELOG rows.
+All nine gates green: 923/0 featureless, 1136/0 all-features, 1138/0
+release, wire pins byte-identical, MSRV 1.96, deny clean. Suite grew
+1130→1136 (+5 doctests, +1 guard pin). The ruled content
+moved and did not change: the six obligations (now headed "Before you
+integrate") byte-identical, the three RATIFIED blocks verbatim.
