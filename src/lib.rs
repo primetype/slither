@@ -21,6 +21,16 @@
 //! is the full program — both halves in one process, with an echo back —
 //! run it with `cargo run --example echo`.
 //!
+//! Both start from the same one-time declaration: a crypto suite, which
+//! every slither type is generic over. Declare it once, anywhere in your
+//! crate ([`channel!`]):
+//!
+//! ```
+//! use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//!
+//! slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
+//! ```
+//!
 //! ## 1. Listen
 //!
 //! Bind a socket, build an endpoint, and answer whoever arrives.
