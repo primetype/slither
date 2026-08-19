@@ -24,6 +24,11 @@ exclude = [
     # not — SPEC.md is what ships.
     "/.spec-v2-clean-slate", "/.spec-v2-pipeline", "/.slices",
     "/PLAN.md", "/STORIES.md",
+    # The browser demo (ruling 277): its own unpublished crate plus a static
+    # page, depending on slither by path. It is not a workspace member and
+    # must never be a `.crate` payload — a path dependency would not resolve
+    # for a consumer, and the vendored WASI shim is not slither's to ship.
+    "/demo",
 ]
 
 # A library only. Two sans-io cores (`core::Endpoint`, `core::Connection` —

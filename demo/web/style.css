@@ -1,0 +1,393 @@
+/* The palette is docs/architecture.svg's, so the page and the diagrams in
+   the README look like one project:
+     light  fill #ddeafd · stroke #0969da · text #24292f · notes #57606a
+     dark   fill #1e293b · stroke #58a6ff · text #e6edf3 · notes #9198a1 */
+
+:root {
+  --bg: #ffffff;
+  --panel: #f6f8fa;
+  --fill: #ddeafd;
+  --stroke: #0969da;
+  --text: #24292f;
+  --note: #57606a;
+  --line: #d0d7de;
+  --bad: #cf222e;
+  --warn: #9a6700;
+  --good: #1a7f37;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --fill: #1e293b;
+    --stroke: #58a6ff;
+    --text: #e6edf3;
+    --note: #9198a1;
+    --line: #30363d;
+    --bad: #f85149;
+    --warn: #d29922;
+    --good: #3fb950;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 1.25rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.5;
+  font-size: 15px;
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+header {
+  padding: 2rem 0 1rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 1.25rem;
+}
+
+h1 {
+  font-size: 1.6rem;
+  margin: 0 0 0.35rem;
+  font-weight: 600;
+}
+
+h1 code {
+  font-family: var(--mono);
+  font-size: 1.5rem;
+}
+
+.claim {
+  margin: 0;
+  color: var(--note);
+  max-width: 68ch;
+}
+
+.claim strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+a {
+  color: var(--stroke);
+}
+
+h2 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--note);
+  margin: 0 0 0.6rem;
+  font-weight: 600;
+}
+
+/* ── controls ─────────────────────────────────────────────────────── */
+
+.controls {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.4fr);
+  gap: 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+@media (max-width: 860px) {
+  .controls {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.9rem 1rem 1rem;
+}
+
+.scenarios {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+button {
+  font: inherit;
+  font-size: 0.88rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.32rem 0.7rem;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--stroke);
+}
+
+button[aria-pressed="true"] {
+  background: var(--fill);
+  border-color: var(--stroke);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.blurb {
+  margin: 0.7rem 0 0;
+  color: var(--note);
+  font-size: 0.86rem;
+  min-height: 2.6em;
+}
+
+.sliders {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.45rem 0.7rem;
+  align-items: center;
+}
+
+.sliders label {
+  font-size: 0.86rem;
+  white-space: nowrap;
+}
+
+.sliders output {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--note);
+  min-width: 4.2ch;
+  text-align: right;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--stroke);
+}
+
+input[type="text"],
+input[type="number"] {
+  font: inherit;
+  font-size: 0.86rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.22rem 0.45rem;
+  width: 100%;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.55rem;
+}
+
+.row label {
+  font-size: 0.86rem;
+  white-space: nowrap;
+}
+
+/* ── stage ────────────────────────────────────────────────────────── */
+
+.stage {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.peers {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 1px solid var(--line);
+}
+
+.peer {
+  padding: 0.7rem 1rem;
+}
+
+.peer + .peer {
+  border-left: 1px solid var(--line);
+  text-align: right;
+}
+
+.peer .who {
+  font-weight: 600;
+}
+
+.peer .addr {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--note);
+}
+
+.ladder {
+  display: flex;
+  gap: 0.3rem;
+  margin-top: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.peer + .peer .ladder {
+  justify-content: flex-end;
+}
+
+.badge {
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+  color: var(--note);
+}
+
+.badge.on {
+  background: var(--fill);
+  border-color: var(--stroke);
+  color: var(--text);
+}
+
+.badge.dead {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+}
+
+/* ── transport ────────────────────────────────────────────────────── */
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.8rem;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.transport input[type="range"] {
+  flex: 1 1 220px;
+}
+
+.clock {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--note);
+  white-space: nowrap;
+}
+
+.clock b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ── counters ─────────────────────────────────────────────────────── */
+
+.counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 0.6rem;
+  margin: 1.25rem 0;
+}
+
+.metric {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+}
+
+.metric .v {
+  font-family: var(--mono);
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.metric .k {
+  font-size: 0.72rem;
+  color: var(--note);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ── log ──────────────────────────────────────────────────────────── */
+
+.log {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.65;
+  max-height: 17rem;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  background: var(--panel);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log div {
+  color: var(--note);
+}
+
+.log div.now {
+  color: var(--text);
+  background: var(--fill);
+  border-radius: 3px;
+}
+
+.log .t {
+  color: var(--note);
+  display: inline-block;
+  min-width: 9ch;
+}
+
+.log .lost {
+  color: var(--bad);
+}
+.log .warn {
+  color: var(--warn);
+}
+.log .good {
+  color: var(--good);
+}
+
+footer {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--note);
+  font-size: 0.84rem;
+}
+
+footer p {
+  max-width: 76ch;
+}
+
+.status {
+  font-size: 0.84rem;
+  color: var(--note);
+  margin: 0.6rem 0 0;
+  min-height: 1.5em;
+}
+
+.status.err {
+  color: var(--bad);
+}

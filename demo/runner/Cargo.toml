@@ -1,0 +1,49 @@
+# The slither browser demo's Rust half.
+#
+# NOT a workspace member and NOT published: slither's own `Cargo.toml`
+# lists `/demo` in `exclude`, so nothing here reaches crates.io. It exists
+# only to be compiled for `wasm32-wasip1` and run inside a Web Worker.
+#
+# One invocation = one scenario. Parameters arrive on argv (WASI
+# `args_get`), the timeline leaves as JSON lines on stdout (`fd_write`),
+# and the process exits. There is no interactive steering: GitHub Pages
+# serves no COOP/COEP headers, so `SharedArrayBuffer` — and therefore
+# `Atomics.wait`, the only way to block a Worker on input — is unavailable.
+[package]
+name = "slither-demo-runner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "slither-demo"
+path = "src/main.rs"
+
+[dependencies]
+# `test-util` is what exposes `slither::testutil` — the in-memory
+# `Network`/`FlakyWire` fabric §16.10 requires. Ruling 277 is what makes
+# this path dependency compile for wasm at all.
+slither = { path = "../..", features = ["test-util"] }
+
+# `test-util` here is TOKIO's, for `start_paused(true)`. It is a different
+# feature from slither's identically-named one, and both are needed.
+# `rt` + `macros` for `LocalSet` / `spawn_local` / `select!`, `time` for
+# the virtual clock. Deliberately no `net`: it does not compile on wasm,
+# which is the entire point of ruling 277.
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+
+# §18.2's five trace targets are read by the subscriber in `trace.rs`.
+tracing = "0.1"
+
+# No serde, and no rand: the event log is a few hand-written JSON writers
+# and the fault draws are one SplitMix64, because a demo shipped to a
+# browser pays for every byte of wasm it carries.
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

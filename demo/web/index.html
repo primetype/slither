@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>slither in your browser</title>
+    <meta
+      name="description"
+      content="The slither encrypted UDP transport, compiled to WebAssembly and run against itself over its own in-memory test network."
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>slither, running in this tab</h1>
+        <p class="claim">
+          Two <strong>slither</strong> endpoints — the real protocol,
+          compiled to WebAssembly — handshaking and talking to each other
+          inside a Web&nbsp;Worker, over slither's own in-memory test
+          network. <strong>Browsers cannot send UDP</strong>, so nothing
+          here touches a socket; the fabric underneath is the same
+          kernel-free one every slither flow test runs on, which is rather
+          the point. Timers run on a paused clock, so a
+          twenty-five-second protocol timeout resolves in milliseconds.
+          <a href="https://github.com/primetype/slither">Source</a>.
+        </p>
+      </header>
+
+      <section class="controls">
+        <div class="panel">
+          <h2>Scenario</h2>
+          <div class="scenarios" id="scenarios" role="group">
+            <button data-scenario="clean" aria-pressed="true">Clean run</button>
+            <button data-scenario="lossy" aria-pressed="false">
+              Lossy handshake
+            </button>
+            <button data-scenario="duplicate" aria-pressed="false">
+              Duplication
+            </button>
+            <button data-scenario="partition" aria-pressed="false">
+              Partition
+            </button>
+          </div>
+          <p class="blurb" id="blurb"></p>
+          <p class="status" id="status">Loading WebAssembly…</p>
+        </div>
+
+        <div class="panel">
+          <h2>The network</h2>
+          <div class="sliders">
+            <label for="loss">Loss</label>
+            <input
+              type="range"
+              id="loss"
+              min="0"
+              max="80"
+              step="1"
+              value="0"
+            />
+            <output for="loss" id="loss-out">0%</output>
+
+            <label for="duplicate">Duplication</label>
+            <input
+              type="range"
+              id="duplicate"
+              min="0"
+              max="80"
+              step="1"
+              value="0"
+            />
+            <output for="duplicate" id="duplicate-out">0%</output>
+
+            <label for="delay">Delay</label>
+            <input
+              type="range"
+              id="delay"
+              min="0"
+              max="400"
+              step="5"
+              value="0"
+            />
+            <output for="delay" id="delay-out">0 ms</output>
+
+            <label for="jitter">Jitter</label>
+            <input
+              type="range"
+              id="jitter"
+              min="0"
+              max="400"
+              step="5"
+              value="0"
+            />
+            <output for="jitter" id="jitter-out">0 ms</output>
+          </div>
+          <div class="row">
+            <label for="seed">Seed</label>
+            <input type="number" id="seed" value="6" min="0" step="1" />
+            <button id="reseed" title="Draw a new seed">Shuffle</button>
+          </div>
+          <div class="row">
+            <label for="message">Message</label>
+            <input
+              type="text"
+              id="message"
+              maxlength="120"
+              value="hello from WebAssembly"
+            />
+          </div>
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="peers">
+          <div class="peer">
+            <div class="who">A — the dialler</div>
+            <div class="addr" id="addr-a">10.0.0.1:4001</div>
+            <div class="ladder" id="ladder-a">
+              <span class="badge" data-stage="dial">dial</span>
+              <span class="badge" data-stage="established">connection</span>
+            </div>
+          </div>
+          <div class="peer">
+            <div class="who">B — the responder</div>
+            <div class="addr" id="addr-b">10.0.0.2:4002</div>
+            <div class="ladder" id="ladder-b">
+              <span class="badge" data-stage="intro">intro</span>
+              <span class="badge" data-stage="claimed">claimed</span>
+              <span class="badge" data-stage="proven">proven</span>
+              <span class="badge" data-stage="connection">connection</span>
+            </div>
+          </div>
+        </div>
+
+        <canvas id="canvas" height="520" aria-label="A sequence diagram of the datagrams between the two endpoints, drawn as the run replays."></canvas>
+
+        <div class="transport">
+          <button id="play">Play</button>
+          <input
+            type="range"
+            id="scrub"
+            min="0"
+            max="1000"
+            step="1"
+            value="1000"
+            aria-label="Scrub the recorded run"
+          />
+          <label for="speed" class="clock">Speed</label>
+          <select id="speed">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+          <span class="clock">
+            protocol time <b id="vtime">0.000 s</b>
+          </span>
+        </div>
+      </section>
+
+      <section class="counters" id="counters">
+        <div class="metric">
+          <div class="v" id="m-datagrams">0</div>
+          <div class="k">datagrams sent</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-lost">0</div>
+          <div class="k">lost in flight</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-dup">0</div>
+          <div class="k">duplicated</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-dh">0 / 0</div>
+          <div class="k">DH ops · a / b</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-retx">0</div>
+          <div class="k">handshake retries</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-virtual">0 s</div>
+          <div class="k">protocol time</div>
+        </div>
+        <div class="metric">
+          <div class="v" id="m-wall">0 ms</div>
+          <div class="k">wall time in wasm</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Event log</h2>
+        <div class="log" id="log"></div>
+      </section>
+
+      <footer>
+        <p>
+          <b>What is real:</b> the handshake, the packet layer, the replay
+          window, the retransmission ladder, the frame layer, the timers,
+          and both endpoints' state machines. All of it is the published
+          crate, compiled unchanged for <code>wasm32-wasip1</code>.
+        </p>
+        <p>
+          <b>What is not:</b> the network. A browser tab has no UDP socket,
+          so the two endpoints exchange datagrams through slither's
+          in-memory fabric, and this page's loss, duplication and delay
+          controls are a simulator sitting behind the crate's public
+          <code>Wire</code> trait. Positions and flight times in the
+          diagram are a drawing convention — the axis is where time is
+          reported, and it is the paused clock's <em>virtual</em> time, not
+          your browser's.
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

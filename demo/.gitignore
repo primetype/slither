@@ -1,0 +1,10 @@
+# The runner is its own crate outside the root `/target`, and `_site` is
+# assembled by build.sh from `web/` plus the compiled wasm.
+/runner/target
+/_site
+
+# There is no npm here on purpose: `web/vendor/` holds the WASI shim's
+# published files themselves, so a visitor executes the bytes in this
+# repository and the page depends on no registry at build or run time.
+node_modules
+package-lock.json

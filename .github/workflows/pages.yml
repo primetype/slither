@@ -1,0 +1,98 @@
+name: Pages
+
+# The browser demo (ruling 277). Builds `demo/runner` for wasm32-wasip1,
+# assembles `demo/_site/` from the static page plus that one `.wasm`, and
+# publishes it to GitHub Pages.
+#
+# Deliberately NOT part of the `Check` → `Test` pipeline and deliberately
+# not a release gate: nothing here is published to crates.io (`/demo` is in
+# slither's `exclude`), the runner is not a workspace member, and a demo
+# that fails to build must never be able to block a release. It does run
+# the demo's own verification first, so a broken page is not deployed —
+# the failure just stays inside this workflow.
+#
+# The site is entirely self-contained: no CDN, no external fetch. The WASI
+# shim is vendored under `demo/web/vendor/` with its licences, and
+# `check-web.mjs` fails the build if anything starts reaching off-site.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "demo/**"
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a queued run supersedes an older one but never
+# cancels a deployment already in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: demo/runner
+          key: pages-wasm32-wasip1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: cargo test (the runner's own units)
+        working-directory: demo/runner
+        run: cargo test
+
+      - name: build the runner for wasm32-wasip1
+        working-directory: demo/runner
+        run: cargo build --release --target wasm32-wasip1
+
+      # Everything below runs against the artefact that is about to ship.
+      - name: static checks on the page
+        run: node demo/verify/check-web.mjs
+
+      - name: every scenario, through the vendored shim
+        run: node demo/verify/run-vendored-shim.mjs
+
+      - name: the page's own logic, against a stub DOM
+        run: node demo/verify/render-smoke.mjs
+
+      - name: assemble _site
+        run: ./demo/build.sh
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/_site
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
