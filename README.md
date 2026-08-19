@@ -75,7 +75,10 @@ slither::block_on(async {                       // 2. current-thread + LocalSet
 });
 ```
 
-![the staged accept ladder](docs/staged-accept.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/staged-accept-dark.svg">
+  <img src="docs/staged-accept.svg" alt="the staged accept ladder" width="900">
+</picture>
 
 **The full worked example is [`examples/echo.rs`](examples/echo.rs)** — two
 endpoints on UDP loopback, one message, clean close (`cargo run --example
@@ -100,7 +103,10 @@ Each is stated in full, at its call site, under **Before you integrate** on
 
 ## How it works
 
-![slither's architecture](docs/architecture.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img src="docs/architecture.svg" alt="slither's architecture" width="900">
+</picture>
 
 slither borrows WireGuard's homework — a keyed-BLAKE2b mac1 DoS gate,
 fresh-ephemeral handshake retransmission, an RFC 6479 replay window, roaming

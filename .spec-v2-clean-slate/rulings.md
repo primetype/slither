@@ -9137,3 +9137,23 @@ release, wire pins byte-identical, MSRV 1.96, deny clean. Suite grew
 1130→1136 (+5 doctests, +1 guard pin). The ruled content
 moved and did not change: the six obligations (now headed "Before you
 integrate") byte-identical, the three RATIFIED blocks verbatim.
+
+**Follow-up (same day, maintainer feedback on the rendered result).**
+Two corrections ordered from screenshots. *(a)* The architecture diagram
+"is not showing very easily": the plan's single mid-tone palette — one
+colour set asked to survive both GitHub themes — was the culprit, washed
+out in each. Superseded by theme-paired SVGs (light + dark twins,
+selected by a `<picture>`/`prefers-color-scheme` block; crates.io's
+sanitizer degrades to the light `<img>`), labels 21 px / annotations
+15 px on a tighter canvas, content parity proven by text-node multiset
+(14/14 and 21/21 labels). One forced layout change: at 21 px the side
+annotations no longer fit beside the bands in 900 units, so each moved
+inside its band. *(b)* The quickstart was "too complicated" — one
+doctest showing both halves. Split into **## 1. Listen** and
+**## 2. Dial**, one half each, every setup line hidden behind `# ` in
+the hiss style, so the visible lines are only the protocol story;
+`Config::new()` dropped from the chain (the builder defaults to it —
+checked at `endpoint.rs:481`, not assumed). Doctests 16→17 featureless,
+19→20 all-features; suites 924/0, 1137/0, 1139/0 release on the
+follow-up commit. The lesson for the record: a dual-theme compromise
+palette is a defect, not a constraint — pair the themes instead.

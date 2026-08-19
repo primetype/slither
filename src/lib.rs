@@ -17,80 +17,76 @@
 //!
 //! # Quickstart
 //!
-//! Two peers on one machine: the dialler sends one message, the answerer
-//! reads it, both close. The same program, with an echo back and comments,
-//! is `examples/echo.rs` in the repository — run it with
-//! `cargo run --example echo`.
+//! Two halves, taken one at a time. `examples/echo.rs` in the repository
+//! is the full program — both halves in one process, with an echo back —
+//! run it with `cargo run --example echo`.
+//!
+//! ## 1. Listen
+//!
+//! Bind a socket, build an endpoint, and answer whoever arrives.
 //!
 //! ```no_run
-//! use hiss::noise::{Blake2b, ChaChaPoly, P256};
-//! use rand_chacha::ChaCha20Rng;
-//! use rand_chacha::rand_core::SeedableRng;
-//! use slither::identity::SoftwareIdentity;
-//! use slither::{Config, Endpoint, Identity};
-//!
-//! // 1. Every consumer declares one crypto suite. IK is the only pattern,
-//! //    and one invocation per module (the generated type is named `IK`).
-//! slither::channel! {
-//!     /// This application's suite.
-//!     pub MySuite<P256, ChaChaPoly, Blake2b>;
+//! # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! # use rand_chacha::ChaCha20Rng;
+//! # use rand_chacha::rand_core::SeedableRng;
+//! # use slither::identity::SoftwareIdentity;
+//! # use slither::{Endpoint, Identity};
+//! # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
+//! # fn rng() -> ChaCha20Rng {
+//! #     let mut seed = [0u8; 32];
+//! #     getrandom::fill(&mut seed).expect("OS entropy");
+//! #     ChaCha20Rng::from_seed(seed)
+//! # }
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # slither::block_on(async {
+//! let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
+//! println!("my key: {:?}", me.public_static()); // the dialler needs this, out of band
+//! let sock = tokio::net::UdpSocket::bind("0.0.0.0:51820").await?;
+//! let ep = Endpoint::builder().identity(me).wire(sock).build();
+//! // Answering is a ladder: inspect the claim, then let the peer prove it.
+//! // accept() is a loop for the endpoint's lifetime.
+//! while let Some(intro) = ep.accept().await {
+//!     let claimed = intro.read_identity().await?;   // 1 DH — still just a claim
+//!     let conn = claimed.authenticate().await?      // proven ...
+//!         .accept().await?;                          // ... and connected
+//!     println!("got: {:?}", conn.recv_message().await?);
 //! }
+//! # Ok(())
+//! # })
+//! # }
+//! ```
 //!
-//! fn rng() -> ChaCha20Rng {
-//!     let mut seed = [0u8; 32];
-//!     getrandom::fill(&mut seed).expect("OS entropy");
-//!     ChaCha20Rng::from_seed(seed)
-//! }
+//! ## 2. Dial
 //!
-//! fn main() {
-//!     // 2. `block_on` is the current-thread runtime + `LocalSet` the
-//!     //    `!Send` driver needs. Do NOT use `#[tokio::main]`.
-//!     slither::block_on(async {
-//!         // 3. Two identities. `generate` makes a fresh static keypair.
-//!         let dialler: SoftwareIdentity<MySuite> =
-//!             SoftwareIdentity::generate(rng()).unwrap();
-//!         let answerer: SoftwareIdentity<MySuite> =
-//!             SoftwareIdentity::generate(rng()).unwrap();
-//!         // 4. The key the dialler needs, handed over out of band.
-//!         let answerer_key = *answerer.public_static();
+//! The answerer's static key reached you out of band — slither never
+//! learns one from the wire.
 //!
-//!         // 5. A `tokio::net::UdpSocket` is a `Wire` out of the box.
-//!         let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-//!         let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-//!         let answerer_addr = b.local_addr().unwrap();
-//!
-//!         let ep_a = Endpoint::builder()
-//!             .identity(dialler).wire(a).config(Config::new()).build();
-//!         let ep_b = Endpoint::builder()
-//!             .identity(answerer).wire(b).config(Config::new()).build();
-//!
-//!         // 6. Answering is a ladder, so the application can authorise a
-//!         //    *claimed* identity before the second DH is spent. Dropping
-//!         //    a rung is the silent reject. `accept()` is a LOOP for the
-//!         //    lifetime of the endpoint — see "Before you integrate" #6.
-//!         let answering = tokio::task::spawn_local(async move {
-//!             let intro = ep_b.accept().await.expect("endpoint alive");
-//!             let claimed = intro.read_identity().await.unwrap();  // +1 DH
-//!             let proven = claimed.authenticate().await.unwrap();  // +1 DH
-//!             let conn = proven.accept().await.unwrap();           // +2 DH
-//!             let msg = conn.recv_message().await.unwrap();
-//!             assert_eq!(msg, b"hello");
-//!             conn.close(slither::constants::NO_ERROR, b"done").await;
-//!         });
-//!
-//!         // 7. `connect()` is synchronous and spends 0 DH; awaiting the
-//!         //    `Connecting` future is what runs the handshake.
-//!         let conn = ep_a
-//!             .connect(answerer_addr, answerer_key)
-//!             .unwrap()
-//!             .await
-//!             .unwrap();
-//!         conn.send_message(b"hello").await.unwrap();
-//!         conn.acked().await.unwrap();
-//!         conn.close(slither::constants::NO_ERROR, b"done").await;
-//!         answering.await.unwrap();
-//!     });
-//! }
+//! ```no_run
+//! # use hiss::noise::{Blake2b, ChaChaPoly, P256};
+//! # use rand_chacha::ChaCha20Rng;
+//! # use rand_chacha::rand_core::SeedableRng;
+//! # use slither::identity::SoftwareIdentity;
+//! # use slither::{Endpoint, Identity};
+//! # slither::channel! { pub MySuite<P256, ChaChaPoly, Blake2b>; }
+//! # fn rng() -> ChaCha20Rng {
+//! #     let mut seed = [0u8; 32];
+//! #     getrandom::fill(&mut seed).expect("OS entropy");
+//! #     ChaCha20Rng::from_seed(seed)
+//! # }
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # slither::block_on(async {
+//! # let peer_key = *SoftwareIdentity::<MySuite>::generate(rng())?.public_static();
+//! let me: SoftwareIdentity<MySuite> = SoftwareIdentity::generate(rng())?;
+//! let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+//! let ep = Endpoint::builder().identity(me).wire(sock).build();
+//! // connect() spends no DH; awaiting Connecting runs the handshake.
+//! let conn = ep.connect("203.0.113.7:51820".parse()?, peer_key)?.await?;
+//! conn.send_message(b"hello").await?;
+//! conn.acked().await?;                              // the peer has it
+//! conn.close(slither::constants::NO_ERROR, b"done").await;
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! # Install
