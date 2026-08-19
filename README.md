@@ -1,7 +1,7 @@
 # slither
 
-<!-- ACTIVATES ON PUBLISH: no git remote exists at 721167a, so these badges 404
-     and crates.io cannot rewrite the docs/*.svg links until the repo is public.
+<!-- ACTIVATES ON PUBLISH: until the repo is public these badges 404 and
+     crates.io cannot rewrite the docs/*.svg links.
 [![crates.io](https://img.shields.io/crates/v/slither.svg)](https://crates.io/crates/slither) [![docs.rs](https://docs.rs/slither/badge.svg)](https://docs.rs/slither) [![CI](https://github.com/primetype/slither/actions/workflows/check.yml/badge.svg)](https://github.com/primetype/slither/actions) -->
 
 **v0.2.0** · MSRV **1.96** (edition 2024) · `MIT OR Apache-2.0` ·

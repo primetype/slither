@@ -46,3 +46,24 @@ jobs:
           key: ${{ matrix.features.flags }}
       - name: "cargo test (${{ matrix.features.label }})"
         run: cargo test ${{ matrix.features.flags }}
+
+  test-release:
+    # The release-profile leg of the gate table. Not a duplicate of the
+    # matrix above: two tests are `#[ignore]`d in debug because they are
+    # slow there (ruling 251) and run ONLY under `--release` — one of them
+    # is S23, a story-acceptance test. Without this job they never run in
+    # CI at all. One OS is enough: the release profile exercises the
+    # optimizer, not the kernel; the debug matrix covers both kernels.
+    name: "test (release · all features)"
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-all-features
+      - name: cargo test --release (all features)
+        run: cargo test --release --all-features

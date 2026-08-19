@@ -31,6 +31,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  build:
+    # The gate table's first row, verbatim. Clippy type-checks every target
+    # but does not codegen, and `cargo test` codegens without `--all-targets`
+    # — this is the one job that proves the row as written.
+    name: build (all features, all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features --all-targets
+
   clippy-doc:
     # One OS is enough here: slither has no target-gated code (the Apple
     # backend lives in hiss); the Test workflow still runs a macOS leg for

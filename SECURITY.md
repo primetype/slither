@@ -10,6 +10,14 @@ per-pattern Noise properties, side-channel posture and validated test
 vectors, see **hiss's `SECURITY.md`** — everything Noise-level is inherited
 from there.
 
+## Audit status
+
+**slither has not been independently audited.** The design borrows
+deliberately from audited and widely deployed protocols — WireGuard's
+handshake shape and timers, QUIC's recovery — but this implementation has
+received no third-party security review, and the borrowed pedigree does not
+transfer. Weigh that when deciding what to protect with it.
+
 ## Reporting a vulnerability
 
 **Please report security issues privately. Do not open a public issue or PR
