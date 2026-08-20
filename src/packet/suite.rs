@@ -9,10 +9,24 @@
 //! policy.
 //!
 //! **There is no suite identifier on the wire.** Endpoints are
-//! monomorphic per suite; a mismatched-suite packet dies silently at the
-//! length gate or at mac1 — the same fate as garbage. The version byte
-//! does not encode the suite, and nothing here ever asks "which suite is
-//! this".
+//! monomorphic per suite; a mismatched-suite packet dies silently — at
+//! the length gate or at mac1 when the curves differ, at the first AEAD
+//! open for a same-curve sibling suite (§2.2, amended by ruling 279). The
+//! version byte does not encode the suite, and nothing here ever asks
+//! "which suite is this".
+//!
+//! **Offered suites (ruling 279).** The reference suite is
+//! `P256 / ChaChaPoly / Blake2b`; `P256 / AesGcm / Blake2b` is offered
+//! alongside it, declared the same way. Choose knowing the hardware:
+//! cryptoxide's AES fast path exists on `aarch64` with
+//! `target_feature="aes"` — on by default on Apple targets, opt-in via
+//! `-C target-feature=+aes` on `aarch64-unknown-linux-gnu` — and measured
+//! 1.63× the reference suite's end-to-end stream throughput there.
+//! Everywhere else (x86-64, where cryptoxide 0.6.x has no hardware path;
+//! wasm, which never will) AES-GCM runs a constant-time software fallback
+//! and ChaChaPoly is the right choice — which is why it remains the
+//! reference. The two suites share every wire length (`PK` = 65,
+//! `TAG` = 16), and mismatched deployments fail closed (§2.2).
 //!
 //! Everything the suite varies is listed by §2.3 and is confined to the
 //! four derived sizes below. The three packet headers, `MAX_DATAGRAM`,

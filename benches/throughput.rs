@@ -9,6 +9,32 @@
 //! | `loopback/*` | real `tokio::net::UdpSocket` on `127.0.0.1`, real syscalls, real timers | **the honest end-to-end number** |
 //! | `inmem/*` | `testutil::Network`, no kernel at all | isolating protocol CPU from the socket |
 //!
+//! # Two crypto suites, side by side
+//!
+//! The arms that carry bulk traffic, the unreliable datagram path and the
+//! handshake each run **twice** — once over the reference suite
+//! `P256 / ChaChaPoly / Blake2b` and once over `P256 / AesGcm / Blake2b`,
+//! declared locally with `slither::channel!`. The suffix in the arm name
+//! says which: `inmem/stream[chacha]` beside `inmem/stream[aesgcm]`.
+//!
+//! **Nothing on the wire moves between them.** Both suites are P-256
+//! (`PK = 65`) and both AEADs tag 16 bytes, so §2.3's four derived sizes —
+//! `MSG1_LEN`, `MSG2_LEN`, `INIT_PACKET_LEN`, `RESP_PACKET_LEN` — come out
+//! identical, and so does `MAX_DATAGRAM_PAYLOAD`. The two arms of a pair
+//! therefore move the same payload in the same number of packets, and the
+//! only difference between them is which AEAD seals each one. That is what
+//! makes the ratio readable as a cipher cost rather than as a wire change.
+//!
+//! `inmem/handshake` is the exception to "only the AEAD differs" — its
+//! four DH operations are P-256 on both sides and dominate the sample, so
+//! the cipher reaches it only through msg1/msg2's three small AEAD calls
+//! and two key expansions. Expect no cipher signal there at all; see that
+//! benchmark's own doc for why its numbers cannot currently carry one.
+//!
+//! On `aarch64` — and on any x86-64 with AES-NI — `AesGcm` runs on
+//! hardware AES and PMULL instructions and `ChaChaPoly` does not, so read
+//! the ratio as a statement about *this* machine's instruction set.
+//!
 //! # Read `inmem/*` as a floor, not a ceiling
 //!
 //! `testutil::FlakyWire` is a *test* fixture and it is not free: `send_to`
@@ -51,15 +77,72 @@
 //! while also doing the *peer's* receive work. It is not comparable to a
 //! two-process iperf number and should not be quoted as one.
 
+use std::io;
+use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use hiss::noise::P256;
+use slither::config::Config;
 use slither::constants::MAX_DATAGRAM_PAYLOAD;
-use slither::testutil::{
-    CountingIdentity, FlakyPolicy, Pair, TestConnection, TestEndpoint, TestIdentity, TestPublicKey,
-    TestRecvStream, TestSendStream,
-};
+use slither::identity::{Identity, PublicKeyOf};
+use slither::packet::{Handshake, ReferenceSuite};
+use slither::shell::wire::Wire;
+use slither::shell::{Connection, Endpoint, RecvStream, SendStream};
+use slither::testutil::{CountingIdentity, FlakyPolicy, FlakyWire, Network, Pair, addr_a, addr_b};
 use tokio::runtime::Runtime;
 use tokio::task::LocalSet;
+
+// ══════════════════════════════════════════════════════════════════════
+// THE SECOND SUITE
+// ══════════════════════════════════════════════════════════════════════
+
+/// The AES-GCM suite, in a module of its own.
+///
+/// `slither::channel!` stamps a `hiss::noise!` state machine called `IK`
+/// into the invoking module and takes the identifier as the pattern's
+/// `NAME`, so **one invocation per module** — slither's own
+/// `ReferenceSuite` already occupies that name inside the library, and a
+/// second declaration here would collide with itself if this file ever
+/// grew a third suite.
+///
+/// `AesGcm` joined `slither::prelude` by ruling 279 (this bench predates
+/// it by an hour — it originally named the type through `hiss` directly,
+/// under ruling 278's then-closed list), so it now uses the prelude, the
+/// one blessed spelling.
+mod aes_suite {
+    use slither::prelude::{AesGcm, Blake2b, P256};
+
+    slither::channel! {
+        /// `Noise_IK_P256_AESGCM_BLAKE2b` — §12.4's AEAD in place of
+        /// §12.3's, everything else held still.
+        pub BenchAesSuite<P256, AesGcm, Blake2b>;
+    }
+}
+
+use aes_suite::BenchAesSuite;
+
+/// A suite this benchmark can build a fixture over.
+///
+/// The `Curve = P256` bound is not a preference: `testutil::CountingIdentity`
+/// wraps a `SoftwareIdentity` whose provider is `DhProvider<P256>`, so
+/// P-256 is the only curve the fixture identity can carry, and it is
+/// exactly the bound `CountingIdentity`'s own `Identity` impl states.
+/// Varying the *cipher* is what this benchmark is for.
+///
+/// `'static` is the spawned driver task's bound, not a `Send` one: the
+/// endpoint builder's `build()` needs `I: 'static` because `spawn_local`
+/// does.
+trait BenchSuite: Handshake<Curve = P256> + 'static {}
+
+impl<S: Handshake<Curve = P256> + 'static> BenchSuite for S {}
+
+/// The suite's Noise protocol name, for the reports — measured off the
+/// suite rather than restated, so a note can never disagree with the
+/// handshake that actually ran.
+fn protocol_name<S: slither::packet::Channel>() -> &'static str {
+    <S as slither::packet::Channel>::PROTOCOL_NAME
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // SIZING
@@ -222,7 +305,7 @@ impl Report {
 // ══════════════════════════════════════════════════════════════════════
 
 /// Write every byte of `buf`, looping over partial writes.
-async fn write_all(tx: &mut TestSendStream, buf: &[u8]) {
+async fn write_all<S: Handshake>(tx: &mut SendStream<S>, buf: &[u8]) {
     let mut off = 0;
     while off < buf.len() {
         let n = tx.write(&buf[off..]).await.expect("stream write");
@@ -249,7 +332,11 @@ async fn write_all(tx: &mut TestSendStream, buf: &[u8]) {
 /// a full poll-and-wake cycle per **kilobyte**. Those two builds differ by
 /// a factor of fifty in wakeups and are indistinguishable from the MiB/s
 /// figure alone.
-async fn read_exactly(rx: &mut TestRecvStream, want: usize, scratch: &mut [u8]) -> usize {
+async fn read_exactly<S: Handshake>(
+    rx: &mut RecvStream<S>,
+    want: usize,
+    scratch: &mut [u8],
+) -> usize {
     let mut got = 0;
     let mut reads = 0;
     while got < want {
@@ -273,12 +360,145 @@ fn payload(len: usize) -> Vec<u8> {
 // FIXTURES
 // ══════════════════════════════════════════════════════════════════════
 
+/// The fixture identity, over whichever suite is being measured.
+type BenchIdentity<S> = CountingIdentity<S>;
+
+/// The fixture endpoint handle.
+type BenchEndpoint<S> = Endpoint<BenchIdentity<S>>;
+
+/// A cheap shared handle on one [`FlakyWire`], so a `BenchPair` can hand
+/// the wire to the endpoint builder — which takes it **by value** — and
+/// still hold one itself.
+///
+/// This is `testutil::SharedWire` rewritten. It has to be: `SharedWire`'s
+/// only field is private and it has no public constructor from a
+/// `FlakyWire`, so the only way to obtain one is `Pair`, which pins the
+/// reference suite. Forwarding is all it does, so the in-memory arms pay
+/// exactly the one `Rc` deref per datagram that `Pair` pays and the two
+/// fabrics stay comparable.
+#[derive(Clone)]
+struct BenchWire(Rc<FlakyWire>);
+
+impl Wire for BenchWire {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, addr).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+}
+
+/// Two endpoints on one in-memory `testutil::Network` — `testutil::Pair`,
+/// generic over the suite.
+///
+/// # Why it is rewritten rather than reused
+///
+/// `Pair` is not generic. Its `Peer` holds a `TestEndpoint`, which is
+/// `Endpoint<CountingIdentity<ReferenceSuite>>`, so every field on the path
+/// pins the reference suite. `CountingIdentity<S>` itself **is** already
+/// generic, and everything else `Pair::seeded` does is public API, so the
+/// second suite is reachable from outside `testutil` — at the cost of this
+/// one struct.
+///
+/// Structurally it mirrors `Pair::seeded` line for line: one `Network`
+/// seeded from `seed`, two endpoints at `addr_a()` / `addr_b()`, identity
+/// seeds derived from `(seed, salt)` and RNG seeds from `(seed, !salt)`,
+/// both on `Config::new()`. That matters for fairness — the two suites'
+/// arms differ in the cipher and in nothing else.
+struct BenchPair<S: BenchSuite> {
+    /// The fabric. `tap()` lives here.
+    net: Network,
+    /// The dialler.
+    a: BenchEndpoint<S>,
+    /// The responder.
+    b: BenchEndpoint<S>,
+    /// The responder's address and static, i.e. what `a` dials.
+    addr_b: SocketAddr,
+    pk_b: PublicKeyOf<BenchIdentity<S>>,
+}
+
+/// One 32-byte seed from a network seed and a per-endpoint salt — the same
+/// derivation `testutil::derive_seed` performs, which is private.
+fn bench_seed(seed: u64, salt: u8) -> [u8; 32] {
+    let mut out = [salt; 32];
+    out[..8].copy_from_slice(&seed.to_le_bytes());
+    out
+}
+
+impl<S: BenchSuite> BenchPair<S> {
+    /// # Panics
+    ///
+    /// Outside a `tokio::task::LocalSet`.
+    fn seeded(seed: u64) -> Self {
+        let net = Network::seeded(seed);
+        let (a, _) = Self::spawn(&net, addr_a(), seed, 0xA1);
+        let (b, pk_b) = Self::spawn(&net, addr_b(), seed, 0xB2);
+        BenchPair {
+            net,
+            a,
+            b,
+            addr_b: addr_b(),
+            pk_b,
+        }
+    }
+
+    fn spawn(
+        net: &Network,
+        addr: SocketAddr,
+        seed: u64,
+        salt: u8,
+    ) -> (BenchEndpoint<S>, PublicKeyOf<BenchIdentity<S>>) {
+        let wire = BenchWire(Rc::new(net.endpoint(addr)));
+        let identity: BenchIdentity<S> = CountingIdentity::seeded(bench_seed(seed, salt));
+        let public_static = *Identity::public_static(&identity);
+        let endpoint = Endpoint::builder()
+            .identity(identity)
+            .wire(wire)
+            .config(Config::new())
+            .rng_seed(bench_seed(seed, salt ^ 0xFF))
+            .build();
+        (endpoint, public_static)
+    }
+
+    /// Dial `a` → `b` and climb §6.2's staged accept, returning both
+    /// connections.
+    ///
+    /// The single-ladder shape rather than `Pair::establish`'s loop: that
+    /// loop exists so a **lost msg2** can be re-offered as a fresh `Intro`
+    /// (§5.5, ruling 252), and this fabric runs `FlakyPolicy::perfect()`
+    /// throughout — on a loss-free wire `Pair::establish` also runs exactly
+    /// one ladder. It is the same shape `loopback_pair` uses for the same
+    /// reason.
+    async fn establish(&self) -> (Connection<S>, Connection<S>) {
+        let dial = async {
+            self.a
+                .connect(self.addr_b, self.pk_b)
+                .expect("connect")
+                .await
+                .expect("the dial completed")
+        };
+        let accept = async {
+            let intro = self.b.accept().await.expect("an introduction");
+            let claimed = intro.read_identity().await.expect("read_identity");
+            let proven = claimed.authenticate().await.expect("authenticate");
+            proven.accept().await.expect("accept")
+        };
+        tokio::join!(dial, accept)
+    }
+}
+
 /// Establish one connection over real UDP on the loopback interface.
 ///
 /// Uses `testutil::CountingIdentity` rather than `SoftwareIdentity` only to
 /// avoid naming an RNG type in this file; the counter is a `Cell` increment
 /// and does not move the measurement.
-async fn loopback_pair() -> (TestEndpoint, TestEndpoint, TestConnection, TestConnection) {
+async fn loopback_pair<S: BenchSuite>() -> (
+    BenchEndpoint<S>,
+    BenchEndpoint<S>,
+    Connection<S>,
+    Connection<S>,
+) {
     let sock_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind a");
@@ -287,16 +507,16 @@ async fn loopback_pair() -> (TestEndpoint, TestEndpoint, TestConnection, TestCon
         .expect("bind b");
     let addr_b = sock_b.local_addr().expect("local_addr b");
 
-    let id_a: TestIdentity = CountingIdentity::seeded([0xA1; 32]);
-    let id_b: TestIdentity = CountingIdentity::seeded([0xB2; 32]);
-    let pk_b: TestPublicKey = *slither::identity::Identity::public_static(&id_b);
+    let id_a: BenchIdentity<S> = CountingIdentity::seeded([0xA1; 32]);
+    let id_b: BenchIdentity<S> = CountingIdentity::seeded([0xB2; 32]);
+    let pk_b: PublicKeyOf<BenchIdentity<S>> = *Identity::public_static(&id_b);
 
-    let ep_a: TestEndpoint = slither::shell::Endpoint::builder()
+    let ep_a: BenchEndpoint<S> = Endpoint::builder()
         .identity(id_a)
         .wire(sock_a)
         .rng_seed([0x11; 32])
         .build();
-    let ep_b: TestEndpoint = slither::shell::Endpoint::builder()
+    let ep_b: BenchEndpoint<S> = Endpoint::builder()
         .identity(id_b)
         .wire(sock_b)
         .rng_seed([0x22; 32])
@@ -330,10 +550,10 @@ async fn loopback_pair() -> (TestEndpoint, TestEndpoint, TestConnection, TestCon
 /// byte is required: `open_bi` allocates the id locally, and the peer only
 /// learns the stream exists when a frame carrying it arrives, so
 /// `accept_bi` would otherwise never resolve.
-async fn one_way_stream(
-    ca: &TestConnection,
-    cb: &TestConnection,
-) -> (TestSendStream, TestRecvStream) {
+async fn one_way_stream<S: Handshake>(
+    ca: &Connection<S>,
+    cb: &Connection<S>,
+) -> (SendStream<S>, RecvStream<S>) {
     let bi_a = ca.open_bi().await.expect("open_bi");
     let (mut tx, _unused_rx) = bi_a.split();
     tx.write(b"\0").await.expect("priming write");
@@ -353,9 +573,9 @@ async fn one_way_stream(
 /// of one connection on one thread, and a sequential shape would deadlock
 /// the moment the transfer exceeded the flow-control window — which
 /// `SAMPLE_BYTES` is chosen to guarantee.
-async fn stream_sample(
-    tx: &mut TestSendStream,
-    rx: &mut TestRecvStream,
+async fn stream_sample<S: Handshake>(
+    tx: &mut SendStream<S>,
+    rx: &mut RecvStream<S>,
     chunk: &[u8],
     bytes: usize,
 ) -> (Duration, usize) {
@@ -379,10 +599,10 @@ async fn stream_sample(
 // ══════════════════════════════════════════════════════════════════════
 
 /// Bulk stream transfer over real UDP on `127.0.0.1`. **The headline.**
-fn bench_loopback_stream(rt: &Runtime) -> Report {
+fn bench_loopback_stream<S: BenchSuite>(rt: &Runtime, name: &'static str) -> Report {
     let ls = LocalSet::new();
     let (samples, reads) = ls.block_on(rt, async {
-        let (_ep_a, _ep_b, ca, cb) = loopback_pair().await;
+        let (_ep_a, _ep_b, ca, cb) = loopback_pair::<S>().await;
         let (mut tx, mut rx) = one_way_stream(&ca, &cb).await;
         let chunk = payload(CHUNK);
 
@@ -402,22 +622,23 @@ fn bench_loopback_stream(rt: &Runtime) -> Report {
     });
 
     Report {
-        name: "loopback/stream        one bi stream, real UDP syscalls",
+        name,
         bytes_per_sample: SAMPLE_BYTES as u64,
         ops_per_sample: None,
         samples,
         note: Some(format!(
-            "mean read fill {:.0} B over {reads} read calls; both endpoints share one thread",
+            "{}; mean read fill {:.0} B over {reads} read calls; both endpoints share one thread",
+            protocol_name::<S>(),
             (SAMPLE_BYTES * SAMPLES) as f64 / reads as f64,
         )),
     }
 }
 
 /// The same transfer over the kernel-free fixture.
-fn bench_inmem_stream(rt: &Runtime) -> Report {
+fn bench_inmem_stream<S: BenchSuite>(rt: &Runtime, name: &'static str) -> Report {
     let ls = LocalSet::new();
     let (samples, reads) = ls.block_on(rt, async {
-        let pair = Pair::seeded(0x5117_4E00);
+        let pair = BenchPair::<S>::seeded(0x5117_4E00);
         let tap = pair.net.tap();
         let (ca, cb) = pair.establish().await;
         let (mut tx, mut rx) = one_way_stream(&ca, &cb).await;
@@ -441,12 +662,13 @@ fn bench_inmem_stream(rt: &Runtime) -> Report {
     });
 
     Report {
-        name: "inmem/stream           one bi stream, no kernel",
+        name,
         bytes_per_sample: SAMPLE_BYTES as u64,
         ops_per_sample: None,
         samples,
         note: Some(format!(
-            "mean read fill {:.0} B; includes two Vec allocs + copies per datagram the fixture adds",
+            "{}; mean read fill {:.0} B; includes two Vec allocs + copies per datagram the fixture adds",
+            protocol_name::<S>(),
             (SAMPLE_BYTES * SAMPLES) as f64 / reads as f64,
         )),
     }
@@ -505,7 +727,7 @@ fn bench_inmem_streams_parallel(rt: &Runtime) -> Report {
     });
 
     Report {
-        name: "inmem/streams×4        four bi streams, same total bytes",
+        name: "inmem/streams×4[chacha]   four bi streams, same total bytes",
         bytes_per_sample: SAMPLE_BYTES as u64,
         ops_per_sample: None,
         samples,
@@ -564,7 +786,7 @@ fn bench_inmem_stream_rtt(rt: &Runtime) -> Report {
     let measured = (RTT_SAMPLE_BYTES as f64 / (1024.0 * 1024.0)) / best.as_secs_f64();
 
     Report {
-        name: "inmem/stream@rtt       one bi stream, 20 ms injected RTT",
+        name: "inmem/stream@rtt[chacha]  one bi stream, 20 ms injected RTT",
         bytes_per_sample: RTT_SAMPLE_BYTES as u64,
         ops_per_sample: None,
         samples,
@@ -581,10 +803,10 @@ fn bench_inmem_stream_rtt(rt: &Runtime) -> Report {
 /// path lossy by design and both queues are 64 deep, so a dropped datagram
 /// is correct behaviour and an `unwrap` on the receiver would turn it into
 /// a hang.
-fn bench_inmem_datagram(rt: &Runtime) -> Report {
+fn bench_inmem_datagram<S: BenchSuite>(rt: &Runtime, name: &'static str) -> Report {
     let ls = LocalSet::new();
     let (samples, delivered) = ls.block_on(rt, async {
-        let pair = Pair::seeded(0x0A7A_6100);
+        let pair = BenchPair::<S>::seeded(0x0A7A_6100);
         let tap = pair.net.tap();
         let (ca, cb) = pair.establish().await;
         let msg = payload(MAX_DATAGRAM_PAYLOAD);
@@ -636,14 +858,15 @@ fn bench_inmem_datagram(rt: &Runtime) -> Report {
     let attempted = (DATAGRAM_COUNT * SAMPLES) as u64;
     let ratio = delivered as f64 / attempted as f64 * 100.0;
     Report {
-        name: "inmem/datagram         unreliable, 1169-byte payloads",
+        name,
         // Count what actually arrived, per sample. Counting what was sent
         // would inflate the rate by exactly the loss.
         bytes_per_sample: (delivered / SAMPLES.max(1) as u64) * MAX_DATAGRAM_PAYLOAD as u64,
         ops_per_sample: None,
         samples,
         note: Some(format!(
-            "{delivered}/{attempted} delivered ({ratio:.1}%) — throughput counts arrivals, not sends"
+            "{}; {delivered}/{attempted} delivered ({ratio:.1}%) — throughput counts arrivals, not sends",
+            protocol_name::<S>(),
         )),
     }
 }
@@ -681,7 +904,7 @@ fn bench_inmem_message(rt: &Runtime) -> Report {
     });
 
     Report {
-        name: "inmem/message          single-shot, 16 KiB each",
+        name: "inmem/message[chacha]     single-shot, 16 KiB each",
         bytes_per_sample: (MESSAGE_COUNT * MESSAGE_BYTES) as u64,
         ops_per_sample: None,
         samples,
@@ -695,10 +918,32 @@ fn bench_inmem_message(rt: &Runtime) -> Report {
 /// **What is inside the measurement**: two endpoint constructions (each
 /// derives a P-256 static keypair, so two scalar multiplications), two
 /// driver spawns, and the four-DH ladder itself. The keypair derivations
-/// are real work this benchmark cannot separate out through the public API
-/// — `Pair::seeded` is the only public two-endpoint constructor — so read
+/// are real work this benchmark does not separate out — the fixture builds
+/// both endpoints per connection, exactly as `Pair::seeded` does — so read
 /// this as *connection setup*, not as the ladder alone.
-fn bench_inmem_handshake(rt: &Runtime) -> Report {
+///
+/// # Do not read a suite comparison off this arm
+///
+/// Both suites are P-256, so the DH cost is identical and only msg1/msg2's
+/// three AEAD operations and their key expansions move — a fraction of a
+/// percent of the sample. What the arm actually resolves is **noise**, and
+/// it resolves rather a lot of it: on an M4 Max a single isolated run
+/// spreads 3.1 ms (best) to 7.4 ms (worst) *inside one arm*, and across
+/// runs the best-case figure moves by more than 2×.
+///
+/// The trap that follows from that is worth naming, because it looked like
+/// a result. With both suites in one process the second arm came out about
+/// 2× slower than the first, five runs running, which reads exactly like
+/// "AES-GCM handshakes cost double". It is positional: **swapping the two
+/// registry entries swapped which suite was slow**, and run in isolation
+/// the two are indistinguishable (best 3.1–3.6 ms either way). A
+/// per-sample `LocalSet` was tried as a fix on the theory that 192
+/// dropped drivers were accumulating; it changed nothing, so that
+/// mechanism is *not* the cause and the shape here is the original one.
+///
+/// Until the cause is found, quote this arm as an order-of-magnitude cost
+/// of connection setup and nothing finer.
+fn bench_inmem_handshake<S: BenchSuite>(rt: &Runtime, name: &'static str) -> Report {
     let ls = LocalSet::new();
     let samples = ls.block_on(rt, async {
         let mut out = Vec::with_capacity(SAMPLES);
@@ -709,7 +954,7 @@ fn bench_inmem_handshake(rt: &Runtime) -> Report {
                 // give identical statics, and S3's supersession rule would
                 // then make every connection after the first tear down its
                 // predecessor — measuring supersession, not handshaking.
-                let pair = Pair::seeded(0x4144_0000 + (sample * HANDSHAKES + i) as u64);
+                let pair = BenchPair::<S>::seeded(0x4144_0000 + (sample * HANDSHAKES + i) as u64);
                 let (ca, cb) = pair.establish().await;
                 drop((ca, cb, pair));
             }
@@ -721,17 +966,77 @@ fn bench_inmem_handshake(rt: &Runtime) -> Report {
     });
 
     Report {
-        name: "inmem/handshake        endpoint setup + full 4-DH ladder",
+        name,
         bytes_per_sample: 0,
         ops_per_sample: Some((HANDSHAKES as u64, "conn")),
         samples,
-        note: Some("includes two P-256 static keypair derivations per connection".into()),
+        note: Some(format!(
+            "{}; includes two P-256 static keypair derivations per connection",
+            protocol_name::<S>(),
+        )),
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════════════
+
+/// One registry entry per (arm, suite): the monomorphic wrapper the table
+/// below stores as a plain `fn` pointer.
+///
+/// A generic benchmark cannot be a `fn(&Runtime) -> Report` until it is
+/// instantiated, and a closure that instantiated it inline would have to
+/// coerce to a higher-ranked `fn` pointer — which is exactly the shape
+/// closure lifetime inference is worst at. These are the instantiations,
+/// written out, one line of body each. The `&'static str` each one passes
+/// is the report's name: `Report::name` stays a `&'static str`, so the
+/// suite tag is baked in here rather than formatted at run time.
+macro_rules! arm {
+    ($wrapper:ident = $bench:ident::<$suite:ty>($label:expr)) => {
+        fn $wrapper(rt: &Runtime) -> Report {
+            $bench::<$suite>(rt, $label)
+        }
+    };
+}
+
+arm!(
+    loopback_stream_chacha = bench_loopback_stream::<ReferenceSuite>(
+        "loopback/stream[chacha]   one bi stream, real UDP syscalls"
+    )
+);
+arm!(
+    loopback_stream_aesgcm = bench_loopback_stream::<BenchAesSuite>(
+        "loopback/stream[aesgcm]   one bi stream, real UDP syscalls"
+    )
+);
+arm!(
+    inmem_stream_chacha =
+        bench_inmem_stream::<ReferenceSuite>("inmem/stream[chacha]      one bi stream, no kernel")
+);
+arm!(
+    inmem_stream_aesgcm =
+        bench_inmem_stream::<BenchAesSuite>("inmem/stream[aesgcm]      one bi stream, no kernel")
+);
+arm!(
+    inmem_datagram_chacha = bench_inmem_datagram::<ReferenceSuite>(
+        "inmem/datagram[chacha]    unreliable, 1169-byte payloads"
+    )
+);
+arm!(
+    inmem_datagram_aesgcm = bench_inmem_datagram::<BenchAesSuite>(
+        "inmem/datagram[aesgcm]    unreliable, 1169-byte payloads"
+    )
+);
+arm!(
+    inmem_handshake_chacha = bench_inmem_handshake::<ReferenceSuite>(
+        "inmem/handshake[chacha]   endpoint setup + full 4-DH ladder"
+    )
+);
+arm!(
+    inmem_handshake_aesgcm = bench_inmem_handshake::<BenchAesSuite>(
+        "inmem/handshake[aesgcm]   endpoint setup + full 4-DH ladder"
+    )
+);
 
 fn main() {
     let filter = std::env::args()
@@ -747,15 +1052,26 @@ fn main() {
         .build()
         .expect("current-thread runtime");
 
+    // Suite pairs are adjacent so the comparison reads straight down the
+    // output. The filter is a substring over the key, so `-- inmem/stream`
+    // still selects both suites of that arm and `-- aesgcm` selects every
+    // AES arm across the fabrics.
     #[allow(clippy::type_complexity)]
     let all: Vec<(&str, fn(&Runtime) -> Report)> = vec![
-        ("loopback/stream", bench_loopback_stream),
-        ("inmem/stream", bench_inmem_stream),
-        ("inmem/streams-parallel", bench_inmem_streams_parallel),
-        ("inmem/stream@rtt", bench_inmem_stream_rtt),
-        ("inmem/datagram", bench_inmem_datagram),
-        ("inmem/message", bench_inmem_message),
-        ("inmem/handshake", bench_inmem_handshake),
+        ("loopback/stream[chacha]", loopback_stream_chacha),
+        ("loopback/stream[aesgcm]", loopback_stream_aesgcm),
+        ("inmem/stream[chacha]", inmem_stream_chacha),
+        ("inmem/stream[aesgcm]", inmem_stream_aesgcm),
+        (
+            "inmem/streams-parallel[chacha]",
+            bench_inmem_streams_parallel,
+        ),
+        ("inmem/stream@rtt[chacha]", bench_inmem_stream_rtt),
+        ("inmem/datagram[chacha]", inmem_datagram_chacha),
+        ("inmem/datagram[aesgcm]", inmem_datagram_aesgcm),
+        ("inmem/message[chacha]", bench_inmem_message),
+        ("inmem/handshake[chacha]", inmem_handshake_chacha),
+        ("inmem/handshake[aesgcm]", inmem_handshake_aesgcm),
     ];
 
     let selected: Vec<_> = all

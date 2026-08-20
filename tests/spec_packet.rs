@@ -181,3 +181,62 @@ fn a_second_curve_derives_different_sizes() {
     assert_eq!(<Third as Channel>::INIT_PACKET_LEN, 130);
     assert_eq!(<Third as Channel>::RESP_PACKET_LEN, 74);
 }
+
+/// The offered same-curve sibling suite — `P256 / AesGcm / Blake2b`,
+/// ruling 279 — declared exactly as a consumer would declare it, in a
+/// module of its own like the other non-reference suites above.
+mod aes_suite {
+    slither::channel! {
+        pub OfferedAes<hiss::curve::p256::P256, hiss::noise::cipher::AesGcm, hiss::noise::hash::Blake2b>;
+    }
+}
+
+/// Ruling 279's pins for the offered suite: the protocol name, and the
+/// fact that every §2.3 size **equals** the reference suite's — `PK` = 65
+/// is shared and `TAG` = 16 on every suite (ruling 68), so nothing is
+/// left to differ. The equality is the factual basis of §2.2 as amended:
+/// a same-curve sibling's packet *cannot* die at the length gate, because
+/// there is no length to distinguish it by — it dies at the first AEAD
+/// open instead. The broken build this catches: a `channel!` expansion
+/// (or a hiss `AesGcm`) whose tag or point arithmetic drifted from the
+/// reference suite's would silently reopen the length gate and falsify
+/// the amended claim.
+#[test]
+fn the_offered_aes_suite_is_pinned_and_length_identical() {
+    use aes_suite::OfferedAes;
+
+    assert_eq!(
+        <OfferedAes as Channel>::PROTOCOL_NAME,
+        "Noise_IK_P256_AESGCM_BLAKE2b"
+    );
+    assert_ne!(
+        <OfferedAes as Channel>::PROTOCOL_NAME,
+        <ReferenceSuite as Channel>::PROTOCOL_NAME
+    );
+
+    // The same-curve sibling property, both as literals (independent of
+    // the reference pins above) and as equalities (the §2.2 basis).
+    assert_eq!(<OfferedAes as Channel>::STATIC_PUBLIC_LEN, 65);
+    assert_eq!(<OfferedAes as Channel>::AEAD_TAG_LEN, 16);
+    assert_eq!(<OfferedAes as Channel>::MSG1_LEN, 174);
+    assert_eq!(<OfferedAes as Channel>::MSG2_LEN, 81);
+    assert_eq!(<OfferedAes as Channel>::INIT_PACKET_LEN, 196);
+    assert_eq!(<OfferedAes as Channel>::RESP_PACKET_LEN, 107);
+
+    assert_eq!(
+        <OfferedAes as Channel>::MSG1_LEN,
+        <ReferenceSuite as Channel>::MSG1_LEN
+    );
+    assert_eq!(
+        <OfferedAes as Channel>::MSG2_LEN,
+        <ReferenceSuite as Channel>::MSG2_LEN
+    );
+    assert_eq!(
+        <OfferedAes as Channel>::INIT_PACKET_LEN,
+        <ReferenceSuite as Channel>::INIT_PACKET_LEN
+    );
+    assert_eq!(
+        <OfferedAes as Channel>::RESP_PACKET_LEN,
+        <ReferenceSuite as Channel>::RESP_PACKET_LEN
+    );
+}

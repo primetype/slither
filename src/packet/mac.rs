@@ -17,9 +17,11 @@
 //! HandshakeResp the initiator's.
 //!
 //! mac1 is verified **before any curve or DH work** (§4.2) — a garbage
-//! flood, a wrong-key packet or a mismatched-suite packet dies at one
-//! keyed hash and never reaches the DH provider. Data packets carry no
-//! mac1 at all (§3.4).
+//! flood, a wrong-key packet or a wrong-curve-suite packet dies at one
+//! keyed hash and never reaches the DH provider. A same-curve sibling
+//! suite's packet is mac1-valid — the key preimage above carries no suite
+//! — and prices as §6.9's mac1-valid rows (§4.2, amended by ruling 279).
+//! Data packets carry no mac1 at all (§3.4).
 //!
 //! # The one raw primitive
 //!

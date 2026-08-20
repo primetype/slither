@@ -4,14 +4,14 @@ version = "0.2.0"
 edition = "2024"
 # Tracks the hiss MSRV (edition 2024, MSRV 1.96) — same policy: a recent
 # stable, floored at `stable - 3`, bumped in lockstep with the `msrv` CI job.
-# Verified against hiss 0.3.2's own Cargo.toml.
+# Verified against hiss 0.4.0's own Cargo.toml.
 rust-version = "1.96"
 authors = ["Nicolas Di Prima <nicolas@primetype.co.uk>"]
 license = "MIT OR Apache-2.0"
 description = "Encrypted peer-to-peer UDP transport: reliable messages, streams and datagrams, authenticated by raw public keys - no certificates, no TLS. WireGuard-shaped handshake, QUIC-shaped frames."
 readme = "README.md"
 repository = "https://github.com/primetype/slither"
-homepage = "https://github.com/primetype/slither"
+homepage = "https://primetype.co.uk/slither/"
 documentation = "https://docs.rs/slither"
 keywords = ["noise", "udp", "wireguard", "quic", "datagram"]
 categories = ["cryptography", "network-programming"]
@@ -103,17 +103,17 @@ tower = ["dep:tower-service"]
 # `EphemeralOnly` provider, and `SessionId`. `default-features = false` keeps
 # hiss to the P-256 surface slither names — the `x25519-cryptoxide` default backs
 # a curve slither never touches.
-hiss = { version = "0.3.2", default-features = false }
+hiss = { version = "0.4.0", default-features = false }
 
 # Keyed BLAKE2b for mac1 ONLY (the day-one DoS gate: the raw primitive that keys a
 # cheap tag off the recipient's public static so a garbage flood is dropped before
 # any curve/DH work). Taken from cryptoxide DIRECTLY per the raw-primitive rule —
 # NOT via `hiss::noise::*` — and pinned to EXACTLY the range hiss uses
-# (`>=0.6.0, <0.7`, verified against hiss 0.3.2's Cargo.toml). `default-features =
+# (`>=0.6.3, <0.7`, verified against hiss 0.4.0's Cargo.toml). `default-features =
 # false, features = ["blake2"]` is the minimal surface: only the
 # `Blake2b`/keyed-`Blake2b` primitive, none of cryptoxide's other ciphers or KDFs.
 # No RustCrypto for any slither cryptography.
-cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = ["blake2"] }
+cryptoxide = { version = ">=0.6.3, <0.7", default-features = false, features = ["blake2"] }
 
 # The fixed-size, const-`SIZE`-pinned wire headers (`InitHeader`/`RespHeader`/
 # `DataHeader`). Each header is a `#[derive(Packed)]` struct whose multi-byte
@@ -146,7 +146,7 @@ thiserror = "2"
 # requirement) and draws the uniform jitter (≤ 333 ms) from the same stream.
 # NOT a crypto crate in the Bubble sense — it carries no key material and
 # performs no slither cryptography; every Noise/curve operation flows through
-# `hiss`. Pinned to the `rand_core` 0.10 line hiss 0.3.2's public bounds name
+# `hiss`. Pinned to the `rand_core` 0.10 line hiss 0.4.0's public bounds name
 # (`hiss::rand_core` re-exports it): an RNG handed to `EphemeralOnly::new` must
 # implement the SAME rand_core's `CryptoRng`.
 rand_chacha = "0.10"
@@ -201,7 +201,7 @@ tokio = { version = "1", features = ["net"] }
 # 251): today those features reach the build only by unification from hiss's
 # own list, and a hiss feature change would otherwise break the pin with a
 # "configured out" error that reads like a version problem.
-cryptoxide = { version = ">=0.6.0, <0.7", default-features = false, features = ["chacha", "poly1305"] }
+cryptoxide = { version = ">=0.6.3, <0.7", default-features = false, features = ["chacha", "poly1305"] }
 
 # NOT a new crate — `tokio` is already a dependency above. This dev-only entry adds
 # `test-util` (the PAUSED CLOCK the timer tests drive: every timer in SPEC.md
@@ -218,7 +218,7 @@ tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "net",
 # be declared in the test profile, whose `PK` differs from P-256's, and the four
 # derivations checked against a second data point. No runtime dependency, no
 # version change, no wire byte.
-hiss = { version = "0.3.2", features = ["x25519-cryptoxide"] }
+hiss = { version = "0.4.0", features = ["x25519-cryptoxide"] }
 
 # Slice 8, S33 only. NOT the library dependency — that is `tower-service`, the
 # bare trait, and ruling 225 keeps it that way. S33's acceptance asserts that
@@ -423,4 +423,11 @@ required-features = ["test-util"]
 
 [[test]]
 name = "story_wrong_static"
+required-features = ["test-util"]
+
+# Ruling 279's story coverage: the offered AES suite establishes and
+# carries traffic, and the same-curve mismatch dies at the probe, where
+# amended §2.2 says — not at mac1, which the old text claimed.
+[[test]]
+name = "story_suite"
 required-features = ["test-util"]

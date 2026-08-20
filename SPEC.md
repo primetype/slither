@@ -587,8 +587,16 @@ wire.** Endpoints are monomorphic per suite: the shell type is
 `core::Endpoint<I: Identity>` are the same parameterisation viewed from the
 shell and the core (`I`'s provider is the suite's DH provider; those
 sections elide the parameters). A
-mismatched-suite packet dies silently at the length gate or at mac1 — the
-same fate as garbage. The version byte does not encode the suite.
+mismatched-suite packet dies silently: at the length gate or at mac1 when
+the suites differ in curve — the same fate as garbage — and, for a
+same-curve sibling suite (`P256 / AesGcm / Blake2b` against the reference
+suite, the first such pair), at msg1's first AEAD open on the staged
+ladder: the lengths coincide (§2.3 — `PK` is the only per-suite quantity)
+and §4.1's mac1 key carries no suite, so both gates pass and §6.9's
+mac1-valid rows price the spend. Either way nothing installs. The version
+byte does not encode the suite. **[AMENDED 2026/08/20 — ruling 279: the
+pre-DH death was stated for every suite pair and is true only when the
+curves differ.]**
 
 ### 2.3 Per-suite derived sizes
 
@@ -833,9 +841,12 @@ on a HandshakeResp the recipient is the initiator.
 ### 4.2 Verification order
 
 mac1 is verified **before any curve or DH work**. A garbage flood, a
-wrong-key packet, or a mismatched-suite packet dies at one keyed hash and
-never reaches the DH provider. This is the floor of the staged-accept cost
-ladder (§6.2).
+wrong-key packet, or a wrong-curve-suite packet dies at one keyed hash and
+never reaches the DH provider; a same-curve sibling suite's packet is
+mac1-valid — §4.1's key preimage carries no suite — and costs what §6.9
+prices for any mac1-valid initiation from a knower of the static (§2.2).
+This is the floor of the staged-accept cost
+ladder (§6.2). **[AMENDED 2026/08/20 — ruling 279]**
 
 ### 4.3 What mac1 is not
 
@@ -855,7 +866,9 @@ from `cryptoxide` directly), and WireGuard's fixed-BLAKE2s sets the
 precedent; making it follow the suite Hash would demand a keyed-hash mode
 from every hiss Hash and buy nothing. Together with the no-suite-byte rule
 (§2.2) this forecloses any future multi-suite endpoint on one socket —
-mismatched suites die as garbage, which is acceptable for
+mismatched suites die silently (pre-DH when the curves differ; at the
+first AEAD open for a same-curve sibling, §2.2 — **[AMENDED 2026/08/20 —
+ruling 279]**), which is acceptable for
 mutually-configured peers. The keying encoding is the canonical encoding
 (§2.4): a generic formulation inheriting `AsRef` silently would have been a
 trap under a frozen wire; here it is a deliberate ruling, and the resulting
@@ -2003,7 +2016,7 @@ paid by us in every row. Stimulus 196 B (HandshakeInit); msg2 107 B.
 
 | Packet class | Our cost beyond the mac1 hash |
 |---|---|
-| mac1-invalid garbage / wrong key / wrong suite | 0 |
+| mac1-invalid garbage / wrong key / wrong suite (curve differs — a same-curve sibling suite is mac1-valid and prices as the rows below; ruling 279) | 0 |
 | mac1-valid, src ∉ hint set, `Intro` left or dropped unprobed | **0 DH**, one bounded queue slot (≈ 484 B — ruling 272's measured figure; this row read ≈ 220 B, the raw-bytes estimate) |
 | mac1-valid, src ∉ hint set, application probes identity then drops | 1 DH — an application-chosen spend |
 | mac1-valid, src spoofed into the hint set (a dialled address of an in-flight connect), claimed static unknown | **1 DH** — the `es` paid once at the eager read and carried through the demotion (§6.5 step 3) |

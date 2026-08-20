@@ -24,11 +24,14 @@
 //! `slither::error::ReadError` at a match site reads better than a
 //! glob-imported bare name.
 //!
-//! # The three hiss types
+//! # The hiss types
 //!
-//! [`P256`], [`ChaChaPoly`] and [`Blake2b`] are hiss's, folded in so the
-//! one `use` line also covers the [`channel!`](crate::channel) suite
-//! declaration. **Your crate must still depend on `hiss` directly** — the
+//! [`P256`], [`ChaChaPoly`], [`AesGcm`] and [`Blake2b`] are hiss's,
+//! folded in so the one `use` line also covers the
+//! [`channel!`](crate::channel) suite declaration. `ChaChaPoly` is the
+//! reference suite's cipher and the portable default; `AesGcm` is the
+//! offered alternative for targets whose hardware carries it — see
+//! [`packet::suite`](crate::packet::suite) for the platform reality. **Your crate must still depend on `hiss` directly** — the
 //! macro expands to absolute `::hiss::…` paths, which this re-export does
 //! not satisfy; see [`slither::hiss`](crate::hiss) for why.
 //!
@@ -37,7 +40,8 @@
 //! **[RATIFIED 2026/08/19 — ruling 278]** This module changes only by
 //! ruling. A name added to a glob-visible module can collide with a
 //! downstream identifier, so an addition here is an API event, not a
-//! convenience edit.
+//! convenience edit. *(Exercised 2026/08/20 — ruling 279 added
+//! [`AesGcm`].)*
 
 pub use crate::compat::block_on;
 pub use crate::config::Config;
@@ -47,4 +51,4 @@ pub use crate::shell::{
     BiStream, Claimed, Connecting, Connection, Endpoint, EndpointBuilder, Intro, Notification,
     Proven, RecvStream, SendStream,
 };
-pub use hiss::noise::{Blake2b, ChaChaPoly, P256};
+pub use hiss::noise::{AesGcm, Blake2b, ChaChaPoly, P256};

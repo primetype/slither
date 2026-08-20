@@ -133,8 +133,10 @@ pub(crate) enum Inbound<'a> {
 /// Generic over the suite because `INIT_PACKET_LEN` and `RESP_PACKET_LEN`
 /// are per-suite (§2.3) while the headers and caps are not. The gate never
 /// asks "which suite is this" — there is no suite byte to ask with. It
-/// asks "is this the length my suite says it is", and a mismatched-suite
-/// packet dies here or at mac1, the same fate as garbage (§2.2).
+/// asks "is this the length my suite says it is", and a wrong-curve-suite
+/// packet dies here or at mac1, the same fate as garbage; a same-curve
+/// sibling suite's packet passes both and dies at the first AEAD open on
+/// the staged ladder (§2.2, amended by ruling 279).
 ///
 /// **Unattested name** — §3.1 names no function.
 ///

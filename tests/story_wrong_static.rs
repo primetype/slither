@@ -44,6 +44,10 @@
 //! flood, a **wrong-key packet**, or a mismatched-suite packet dies at one
 //! keyed hash and never reaches the DH provider."*
 //!
+//! *(Quoted as ratified. Ruling 279 later re-scoped the mismatched-suite
+//! clause — a same-curve sibling suite is mac1-valid — leaving the
+//! wrong-key case this file pins unchanged.)*
+//!
 //! §6.1's stage table: *"bad mac1 — all silent, **before the queue**"*.
 //!
 //! So the responder's side of "installs nothing" is total and *negative*:

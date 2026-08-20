@@ -223,8 +223,10 @@ fn handshake_length_is_exact_not_a_minimum() {
     );
 }
 
-/// §2.2: "A mismatched-suite packet dies silently at the length gate or at
-/// mac1 — the same fate as garbage." This test is `classify`-only, so it
+/// §2.2 (as amended by ruling 279): a mismatched-suite packet dies at the
+/// length gate or at mac1 *when the suites differ in curve* — the branch
+/// this test pins; a same-curve sibling passes both gates and dies at the
+/// first AEAD open instead. This test is `classify`-only, so it
 /// stays independent of any live second `Channel` even though one is now
 /// available (Q-O2 was in fact adopted — see
 /// `tests/spec_packet.rs`'s `a_second_curve_derives_different_sizes`,
