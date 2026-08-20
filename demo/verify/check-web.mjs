@@ -69,8 +69,12 @@ for (const [name, text] of sources) {
 
 function collect(where, ref) {
   if (/^(https?:)?\/\//.test(ref)) {
-    // The one allowed absolute URL is the repo link in the page's prose.
-    if (where === "index.html" && /github\.com/.test(ref)) return;
+    // The allowed absolute URLs are the page's prose links to the repo,
+    // the rendered docs and the crate — widened from github.com-only on
+    // publish day (the hero's Docs/Crate links, previously deferred).
+    if (where === "index.html" && /github\.com|docs\.rs|crates\.io/.test(ref)) {
+      return;
+    }
     fail(`${where} reaches an external host: ${ref}`);
     return;
   }

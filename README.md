@@ -1,8 +1,6 @@
 # slither
 
-<!-- ACTIVATES ON PUBLISH: until the repo is public these badges 404 and
-     crates.io cannot rewrite the docs/*.svg links.
-[![crates.io](https://img.shields.io/crates/v/slither.svg)](https://crates.io/crates/slither) [![docs.rs](https://docs.rs/slither/badge.svg)](https://docs.rs/slither) [![CI](https://github.com/primetype/slither/actions/workflows/check.yml/badge.svg)](https://github.com/primetype/slither/actions) -->
+[![crates.io](https://img.shields.io/crates/v/slither.svg)](https://crates.io/crates/slither) [![docs.rs](https://docs.rs/slither/badge.svg)](https://docs.rs/slither) [![CI](https://github.com/primetype/slither/actions/workflows/check.yml/badge.svg)](https://github.com/primetype/slither/actions)
 
 <img src="docs/courier-banner.svg" alt="Slither — encrypted UDP transport. Sealed datagrams, ordered streams, and connections that change address mid-journey." width="900">
 
@@ -30,7 +28,7 @@ certificates, no TLS, no PKI.
 
 - Need **NAT traversal or relay fallback**? Use [iroh](https://crates.io/crates/iroh).
 - Have **certificates**, want mainstream QUIC? Use [quinn](https://crates.io/crates/quinn).
-- Want the **Noise handshake alone**, no transport? Use [snow](https://crates.io/crates/snow).
+- Want the **Noise handshake alone**, no transport? Use [hiss](https://crates.io/crates/hiss) — it is what slither is built on.
 
 ## Install
 
@@ -38,7 +36,7 @@ certificates, no TLS, no PKI.
 [dependencies]
 slither = "0.2"
 # `slither::channel!` expands to `::hiss::…`, so your crate needs hiss too.
-hiss = { version = "0.3", default-features = false }
+hiss = { version = "0.4", default-features = false }
 # slither's driver runs on YOUR runtime; these are the features it uses.
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 rand_chacha = "0.10"   # only for `SoftwareIdentity` — it takes an RNG you own
@@ -115,7 +113,9 @@ slither borrows WireGuard's homework — a keyed-BLAKE2b mac1 DoS gate,
 fresh-ephemeral handshake retransmission, an RFC 6479 replay window, roaming
 and the keepalive/liveness/rekey timers — over
 [`hiss`](https://crates.io/crates/hiss)'s Noise **IK** (**P-256 /
-ChaCha20-Poly1305 / BLAKE2b**; no RustCrypto crates). Inside the sealed packets
+ChaCha20-Poly1305 / BLAKE2b** by reference; an **AES-256-GCM** sibling suite
+is offered where the hardware carries it — 1.63× measured on Apple Silicon;
+no RustCrypto crates). Inside the sealed packets
 rides a QUIC-shaped frame layer: streams, messages, datagrams, RFC 9002 loss
 recovery and NewReno.
 

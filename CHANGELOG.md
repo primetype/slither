@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-08-18
+## [0.2.0] - 2026-08-20
 
 A clean rewrite against `SPEC.md`, now **ratified** as slither's v1
 wire (80 rulings across ten rounds, `cd12ed7`). Replaces the
@@ -46,6 +46,17 @@ kept by the maintainers outside the repository.
   hardware-backed static key (no `Send` bound anywhere on the driver
   path), a pluggable crypto suite with fail-closed mismatches, and
   silent long-lived rekeying (message-count epochs, §7.7).
+- **A second offered cipher suite** (ruling 279):
+  `P256 / AesGcm / Blake2b` — Noise §12.4 AES-256-GCM via hiss 0.4.0,
+  `AesGcm` re-exported in the prelude, declared with `channel!` like any
+  suite. Same wire lengths as the reference suite in every packet;
+  measured **1.63×** the reference's end-to-end stream throughput where
+  the hardware carries AES (aarch64 with `target_feature="aes"` — Apple
+  Silicon by default). The reference suite is unchanged: ChaCha20-Poly1305
+  stays the portable default, fast and constant-time on every target
+  (x86-64 and wasm have no cryptoxide AES hardware path today).
+  `benches/throughput.rs` runs both suites; mismatched same-curve
+  deployments fail closed at the identity probe (§2.2 as amended).
 - **F. Operational** — the whole protocol drivable without a kernel
   (`testutil::FlakyWire` on tokio's paused clock), a caller-supplied
   `Wire` with explicable send failures, and clean teardown on dropping
@@ -72,7 +83,10 @@ kept by the maintainers outside the repository.
   `notified()`/`closed()` plus the staged-accept ladder.
 - Peer admission moved from a `Config`-level allow-list to an
   application-driven decision mid-ladder (`Claimed::claimed_static()`).
-- `hiss` pinned to `0.3.2` (was `0.3.1`).
+- `hiss` pinned to `0.4.0` (was `0.3.1`), `cryptoxide` floor moved to
+  `0.6.3` in lockstep. Your crate's **own** `hiss` dependency (the
+  `channel!` expansion needs it) must sit on the same `0.4` line — two
+  hiss majors in one graph will not type-check.
 - **Documentation overhaul** (round 44, ruling 276): the README rewritten
   why-first (status block, install, requirements, quickstart, limits, two
   SVG diagrams); the crate docs how-first with a compile-tested quickstart
@@ -82,7 +96,7 @@ kept by the maintainers outside the repository.
   glob — `use slither::prelude::*;` — carries the golden path: `block_on`,
   `Config`, `Identity`/`SoftwareIdentity`, `Wire`, the handles, the staged
   ladder, the stream types, `Notification`, and hiss's `P256`/`ChaChaPoly`/
-  `Blake2b` so the same line covers a `channel!` declaration. The root now
+  `AesGcm`/`Blake2b` so the same line covers a `channel!` declaration. The root now
   keeps only the eight modules, `prelude`, `channel!`, `pub use hiss` and
   the four signature-reachability types (`SessionId`, `Dir`, `StreamId`,
   `Timestamp`); every other name has **one blessed spelling, at its
