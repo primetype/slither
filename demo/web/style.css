@@ -1,35 +1,41 @@
-/* The palette is docs/architecture.svg's, so the page and the diagrams in
-   the README look like one project:
-     light  fill #ddeafd · stroke #0969da · text #24292f · notes #57606a
-     dark   fill #1e293b · stroke #58a6ff · text #e6edf3 · notes #9198a1 */
+/* The Courier — slither's brand world (decided 2026-08-20; the ratified
+   direction sheet is the source of truth). Warm paper over green-black:
+     parcel #FBF6EC · surface #FFFDF6 · sand #F0DCB8 · teal #2F8F90
+     depot #10332F · postmark #5E7A73 · apricot #F2A65A (one accent per view)
+   The functional colours (--bad/--warn/--good) are semantic, not brand.
+   NOTE: docs/architecture.svg and docs/staged-accept.svg still wear the
+   GitHub palette this file used to mirror; restyling them is a separate,
+   deliberate pass. app.js reads these custom properties for the canvas. */
 
 :root {
-  --bg: #ffffff;
-  --panel: #f6f8fa;
-  --fill: #ddeafd;
-  --stroke: #0969da;
-  --text: #24292f;
-  --note: #57606a;
-  --line: #d0d7de;
-  --bad: #cf222e;
-  --warn: #9a6700;
-  --good: #1a7f37;
+  --bg: #fbf6ec;
+  --panel: #fffdf6;
+  --fill: #f0dcb8;
+  --stroke: #2f8f90;
+  --text: #10332f;
+  --note: #5e7a73;
+  --line: #e7dcc7;
+  --bad: #c0452f;
+  --warn: #b4691e;
+  --good: #2e7d46;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --display: ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold",
+    "Trebuchet MS", system-ui, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --fill: #1e293b;
-    --stroke: #58a6ff;
-    --text: #e6edf3;
-    --note: #9198a1;
-    --line: #30363d;
-    --bad: #f85149;
-    --warn: #d29922;
-    --good: #3fb950;
+    --bg: #0c2723;
+    --panel: #10332f;
+    --fill: #1b4a44;
+    --stroke: #4fb3b4;
+    --text: #f0e9da;
+    --note: #8fb6ae;
+    --line: #24544d;
+    --bad: #f07862;
+    --warn: #f2a65a;
+    --good: #7fc98b;
   }
 }
 
@@ -61,7 +67,16 @@ header {
 h1 {
   font-size: 1.6rem;
   margin: 0 0 0.35rem;
-  font-weight: 600;
+  font-weight: 700;
+  font-family: var(--display);
+  letter-spacing: -0.015em;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+h1 .mark {
+  flex: none;
 }
 
 h1 code {
@@ -111,7 +126,7 @@ h2 {
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 14px;
   padding: 0.9rem 1rem 1rem;
 }
 
@@ -123,11 +138,13 @@ h2 {
 
 button {
   font: inherit;
+  font-family: var(--display);
+  font-weight: 600;
   font-size: 0.88rem;
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 10px;
   padding: 0.32rem 0.7rem;
   cursor: pointer;
 }
@@ -182,7 +199,7 @@ input[type="number"] {
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 10px;
   padding: 0.22rem 0.45rem;
   width: 100%;
 }
@@ -203,7 +220,7 @@ input[type="number"] {
 
 .stage {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 14px;
   overflow: hidden;
   background: var(--panel);
 }
@@ -224,7 +241,8 @@ input[type="number"] {
 }
 
 .peer .who {
-  font-weight: 600;
+  font-weight: 700;
+  font-family: var(--display);
 }
 
 .peer .addr {
@@ -310,7 +328,7 @@ canvas {
 .metric {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 14px;
   padding: 0.55rem 0.7rem;
 }
 
@@ -336,7 +354,7 @@ canvas {
   max-height: 17rem;
   overflow-y: auto;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 14px;
   padding: 0.6rem 0.8rem;
   background: var(--panel);
   white-space: pre-wrap;
@@ -379,6 +397,23 @@ footer {
 
 footer p {
   max-width: 76ch;
+}
+
+.brandline {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--display);
+  font-size: 0.84rem;
+}
+
+.brandline b {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.brandline svg {
+  flex: none;
 }
 
 .status {

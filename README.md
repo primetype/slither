@@ -4,6 +4,8 @@
      crates.io cannot rewrite the docs/*.svg links.
 [![crates.io](https://img.shields.io/crates/v/slither.svg)](https://crates.io/crates/slither) [![docs.rs](https://docs.rs/slither/badge.svg)](https://docs.rs/slither) [![CI](https://github.com/primetype/slither/actions/workflows/check.yml/badge.svg)](https://github.com/primetype/slither/actions) -->
 
+<img src="docs/courier-banner.svg" alt="Slither — encrypted UDP transport. Sealed datagrams, ordered streams, and connections that change address mid-journey." width="900">
+
 **v0.2.0** · MSRV **1.96** (edition 2024) · `MIT OR Apache-2.0` ·
 `#![forbid(unsafe_code)]` · wire **ratified and frozen** ([`SPEC.md`](SPEC.md))
 · 1 100+ tests · Linux and macOS in CI · **not independently audited** —

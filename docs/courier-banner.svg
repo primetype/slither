@@ -1,0 +1,24 @@
+<svg width="1200" height="250" viewBox="0 0 1200 250" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="Slither — encrypted UDP transport. Sealed datagrams, ordered streams, and connections that change address mid-journey.">
+  <!-- The Courier brand banner (self-colored: one artwork for both GitHub themes).
+       Brand source: the ratified Courier direction sheet; mascot tail is the
+       blunt-tip cut decided 2026-08-20. -->
+  <rect width="1200" height="250" rx="22" fill="#10332F"/>
+  <g transform="translate(52,22) scale(1.02)">
+    <path d="M76 138 C60 140.5 44 154 31 162.5 C24 166.8 24 172 29.5 173.7 C47 174.3 64 174.2 78 174 Z" fill="#2F8F90"/>
+    <path d="M76 156 C104 161 128 158 144 142 C162 124 158 96 152 78" fill="none" stroke="#2F8F90" stroke-width="36" stroke-linecap="round"/>
+    <path d="M72 169.5 C98 173 122 168 138 152 C158 135 168 106 162 88" fill="none" stroke="#F0DCB8" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="150" cy="56" r="29" fill="#2F8F90"/>
+    <path d="M135.08 45.4 A5.2 7 0 1 0 142.92 45.4 Z" fill="#10332F"/>
+    <path d="M159.08 45.4 A5.2 7 0 1 0 166.92 45.4 Z" fill="#10332F"/>
+    <path d="M148 66 Q155 73.5 162 66" fill="none" stroke="#10332F" stroke-width="3.4" stroke-linecap="round"/>
+  </g>
+  <text x="292" y="118" font-family="ui-rounded,'SF Pro Rounded','Arial Rounded MT Bold',system-ui,sans-serif"
+        font-size="74" font-weight="700" letter-spacing="-2.5" fill="#FBF6EC">Slither</text>
+  <text x="295" y="163" font-family="system-ui,-apple-system,'Segoe UI',sans-serif"
+        font-size="24" font-weight="600" fill="#A9C8C1">Encrypted UDP transport. Sealed datagrams, ordered streams,</text>
+  <text x="295" y="196" font-family="system-ui,-apple-system,'Segoe UI',sans-serif"
+        font-size="24" font-weight="600" fill="#A9C8C1">and connections that change address mid-journey.</text>
+  <text x="1148" y="196" text-anchor="end" font-family="system-ui,-apple-system,'Segoe UI',sans-serif"
+        font-size="17" font-weight="700" letter-spacing="2.5" fill="#5E8C84">BY PRIMETYPE</text>
+</svg>

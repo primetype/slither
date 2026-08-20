@@ -3,17 +3,54 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>slither in your browser</title>
+    <title>Slither, running in this tab</title>
     <meta
       name="description"
       content="The slither encrypted UDP transport, compiled to WebAssembly and run against itself over its own in-memory test network."
     />
+    <!-- Social cards. Absolute URLs on purpose: crawlers do not resolve
+         relative og:image paths reliably, and the host is where GitHub
+         Pages serves this site. og.png is rendered from
+         demo/assets/og.html by demo/assets/render-og.sh. (These are
+         content= attributes, not fetches: the page itself still reaches
+         no external host, which demo/verify/check-web.mjs enforces.) -->
+    <meta property="og:title" content="Slither, running in this tab" />
+    <meta
+      property="og:description"
+      content="Two slither endpoints — the real protocol, compiled to WebAssembly — handshaking and talking inside a Web Worker, on a paused clock."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://primetype.co.uk/slither/" />
+    <meta property="og:image" content="https://primetype.co.uk/slither/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://primetype.co.uk/slither/og.png" />
+
+    <!-- The Courier head roundel, simplified for tab size. -->
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='32' fill='%232F8F90'/%3E%3CclipPath id='c'%3E%3Ccircle cx='32' cy='32' r='32'/%3E%3C/clipPath%3E%3Cg clip-path='url(%23c)'%3E%3Ccircle cx='32' cy='76' r='27' fill='%23F0DCB8'/%3E%3C/g%3E%3Ccircle cx='22' cy='26' r='6.5' fill='%2310332F'/%3E%3Ccircle cx='42' cy='26' r='6.5' fill='%2310332F'/%3E%3C/svg%3E"
+    />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FBF6EC" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0C2723" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <main>
       <header>
-        <h1>slither, running in this tab</h1>
+        <h1>
+          <svg class="mark" width="34" height="34" viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="32" fill="#2F8F90"/>
+            <clipPath id="rh"><circle cx="32" cy="32" r="32"/></clipPath>
+            <g clip-path="url(#rh)"><circle cx="32" cy="74" r="26" fill="#F0DCB8"/></g>
+            <path d="M16.71 20 A5.7 7.6 0 1 0 25.29 20 Z" fill="#10332F"/>
+            <path d="M38.71 20 A5.7 7.6 0 1 0 47.29 20 Z" fill="#10332F"/>
+            <path d="M26 39 Q32 44.5 38 39" fill="none" stroke="#10332F" stroke-width="2.8" stroke-linecap="round"/>
+          </svg>
+          <span>Slither, running in this tab</span>
+        </h1>
         <p class="claim">
           Two <strong>slither</strong> endpoints — the real protocol,
           compiled to WebAssembly — handshaking and talking to each other
@@ -211,6 +248,16 @@
           diagram are a drawing convention — the axis is where time is
           reported, and it is the paused clock's <em>virtual</em> time, not
           your browser's.
+        </p>
+        <p class="brandline">
+          <svg width="18" height="18" viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="32" fill="#2F8F90"/>
+            <clipPath id="rf"><circle cx="32" cy="32" r="32"/></clipPath>
+            <g clip-path="url(#rf)"><circle cx="32" cy="76" r="27" fill="#F0DCB8"/></g>
+            <circle cx="22" cy="26" r="6.5" fill="#10332F"/>
+            <circle cx="42" cy="26" r="6.5" fill="#10332F"/>
+          </svg>
+          <b>Slither</b> · a primetype crate · unaudited · pre-1.0
         </p>
       </footer>
     </main>
