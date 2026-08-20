@@ -3,9 +3,9 @@
      parcel #FBF6EC · surface #FFFDF6 · sand #F0DCB8 · teal #2F8F90
      depot #10332F · postmark #5E7A73 · apricot #F2A65A (one accent per view)
    The functional colours (--bad/--warn/--good) are semantic, not brand.
-   NOTE: docs/architecture.svg and docs/staged-accept.svg still wear the
-   GitHub palette this file used to mirror; restyling them is a separate,
-   deliberate pass. app.js reads these custom properties for the canvas. */
+   docs/architecture.svg and docs/staged-accept.svg (and their -dark
+   twins) wear the same palette, so the README and the demo read as one
+   project. app.js reads these custom properties for the canvas. */
 
 :root {
   --bg: #fbf6ec;

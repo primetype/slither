@@ -5,38 +5,38 @@
   <defs>
     <marker id="ah" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="10" markerHeight="8"
             markerUnits="userSpaceOnUse" orient="auto">
-      <path d="M0 0 L10 4 L0 8 Z" fill="#58a6ff"/>
+      <path d="M0 0 L10 4 L0 8 Z" fill="#4FB3B4"/>
     </marker>
     <marker id="ahr" viewBox="0 0 10 8" refX="1" refY="4" markerWidth="10" markerHeight="8"
             markerUnits="userSpaceOnUse" orient="auto">
-      <path d="M10 0 L0 4 L10 8 Z" fill="#58a6ff"/>
+      <path d="M10 0 L0 4 L10 8 Z" fill="#4FB3B4"/>
     </marker>
   </defs>
   <g font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
-    <g fill="#1e293b" stroke="#58a6ff" stroke-width="2">
+    <g fill="#1B4A44" stroke="#4FB3B4" stroke-width="2">
       <rect x="24" y="14" width="116" height="52" rx="8"/>
       <rect x="257" y="14" width="116" height="52" rx="8"/>
       <rect x="490" y="14" width="116" height="52" rx="8"/>
       <rect x="721" y="14" width="156" height="52" rx="8"/>
     </g>
-    <g text-anchor="middle" font-size="21" font-weight="600" fill="#e6edf3">
+    <g text-anchor="middle" font-size="21" font-weight="600" fill="#F0E9DA">
       <text x="82" y="48">Intro</text>
       <text x="315" y="48">Claimed</text>
       <text x="548" y="48">Proven</text>
       <text x="799" y="48">Connection</text>
     </g>
-    <g stroke="#58a6ff" stroke-width="2" fill="none">
+    <g stroke="#4FB3B4" stroke-width="2" fill="none">
       <path d="M146 40 L251 40" marker-end="url(#ah)"/>
       <path d="M379 40 L484 40" marker-end="url(#ah)"/>
       <path d="M612 40 L715 40" marker-end="url(#ah)"/>
       <path d="M277 66 L277 98 L175 98 L175 168" marker-end="url(#ah)"/>
     </g>
-    <g text-anchor="middle" font-size="15" fill="#9198a1">
+    <g text-anchor="middle" font-size="15" fill="#8FB6AE">
       <text x="198" y="30">read_identity()</text>
       <text x="432" y="30">authenticate()</text>
       <text x="663" y="30">accept()</text>
     </g>
-    <g text-anchor="middle" font-size="15" fill="#9198a1">
+    <g text-anchor="middle" font-size="15" fill="#8FB6AE">
       <text x="82" y="88">0 DH</text>
       <text x="198" y="88">+1 DH</text>
       <text x="315" y="88">1 DH</text>
@@ -44,7 +44,7 @@
       <text x="548" y="88">2 DH</text>
       <text x="663" y="88">+2 DH</text>
     </g>
-    <g text-anchor="middle" font-size="15" fill="#9198a1">
+    <g text-anchor="middle" font-size="15" fill="#8FB6AE">
       <text x="82" y="116">a peer is offering.</text>
       <text x="82" y="135">Nothing is proven.</text>
       <text x="315" y="116">it says who it is.</text>
