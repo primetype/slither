@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-20
+
+### Fixed
+
+- **Dark-mode diagrams on the crates.io page.** crates.io rewrites a
+  README's relative `<img src>` to the repository's raw URL but leaves
+  `<picture><source srcset>` untouched, so 0.2.0's two dark-theme SVG
+  variants resolved against the crate page's own URL and 404'd for
+  dark-mode readers. The two `srcset` URLs are now absolute, in the same
+  `raw/HEAD` form crates.io generates for the light halves. No code
+  change.
+
 ## [0.2.0] - 2026-08-20
 
 A clean rewrite against `SPEC.md`, now **ratified** as slither's v1

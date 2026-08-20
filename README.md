@@ -77,7 +77,10 @@ block_on(async {                                // 2. current-thread + LocalSet
 ```
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/staged-accept-dark.svg">
+  <!-- Absolute on purpose: crates.io rewrites relative <img src> to the
+       repo's raw URL but leaves <source srcset> untouched, so a relative
+       path here 404s on the crate page in dark mode (v0.2.0 shipped that). -->
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/primetype/slither/raw/HEAD/docs/staged-accept-dark.svg">
   <img src="docs/staged-accept.svg" alt="the staged accept ladder" width="900">
 </picture>
 
@@ -105,7 +108,7 @@ Each is stated in full, at its call site, under **Before you integrate** on
 ## How it works
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/primetype/slither/raw/HEAD/docs/architecture-dark.svg">
   <img src="docs/architecture.svg" alt="slither's architecture" width="900">
 </picture>
 
