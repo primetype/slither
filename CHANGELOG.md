@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 A clean rewrite against `SPEC.md`, now **ratified** as slither's v1
 wire (80 rulings across ten rounds, `cd12ed7`). Replaces the
 pre-rewrite design described below in its entirety — different object
-model, different handle API, different timers. See `SPEC.md` and
-`.spec-v2-clean-slate/rulings.md` for the specification and the record
-of why.
+model, different handle API, different timers. See `SPEC.md` for the
+specification; the ruling-by-ruling design record (280+ decisions) is
+kept by the maintainers outside the repository.
 
 ### Added
 

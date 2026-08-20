@@ -11,6 +11,16 @@ Do not change a ratified constant, a header layout, a frame type, or a
 timer without an explicit ratification decision from the maintainer,
 recorded in `.spec-v2-clean-slate/rulings.md`.
 
+**The record directories are untracked** (maintainer decision,
+2026-08-20): `.spec-v2-clean-slate/`, `.spec-v2-pipeline/` and
+`.slices/` live on the maintainer's machine and in git history before
+the removal commit, ignored by git ever since. `rulings.md` is still
+written to — the rule above stands — but a **worktree-isolated agent
+cut from a commit cannot see any of it**: a brief that needs ruling or
+evidence text must quote it inline. Doc comments in `src/` and `tests/`
+citing `.slices/...` paths are historical provenance, valid on the
+maintainer's machine and at pre-removal commits.
+
 **`rulings.md` is the record of *why*.** The spec states what the
 protocol is; the rulings state what was rejected and for what reason. If
 you are about to propose something, check there first — many attractive

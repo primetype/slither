@@ -8,3 +8,11 @@
 # Not committed (hiss convention): every CI/gate run re-resolves from the
 # index, so a break inside a semver-compatible range surfaces immediately.
 Cargo.lock
+# The wire-v2 design record (rulings, frozen drafts, slice briefs, review
+# evidence) — untracked by maintainer decision 2026-08-20. It stays on the
+# maintainer's machine and in pre-removal git history; the crate never
+# shipped it (Cargo.toml `exclude`). Consequence: worktree-isolated agents
+# cannot see these files — a brief that needs ruling text must quote it.
+/.slices
+/.spec-v2-pipeline
+/.spec-v2-clean-slate
