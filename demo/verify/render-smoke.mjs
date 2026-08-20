@@ -246,6 +246,12 @@ await import("../web/app.js");
 // Let boot()'s fetch + compile resolve.
 for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 0));
 
+// The page deliberately does not auto-run on ready (the first run used to
+// scroll the page out from under the reader), so the smoke presses Play
+// exactly as a user would.
+el("play").dispatch("click");
+for (let i = 0; i < 40; i++) await new Promise((r) => setTimeout(r, 0));
+
 let frames = 0;
 let thrown = null;
 for (let i = 0; i < 300 && !thrown; i++) {

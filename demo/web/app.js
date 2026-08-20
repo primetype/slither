@@ -123,8 +123,10 @@ async function boot() {
 function onWorkerMessage(ev) {
   const msg = ev.data;
   if (msg.type === "ready") {
-    setStatus("");
-    run();
+    // Deliberately no auto-run: a run scrolls the event log, and on a
+    // fresh load that yanked the page down under the reader. The first
+    // run waits for the user — Play, a scenario, or any knob.
+    setStatus("Ready — press Play, or pick a scenario.");
     return;
   }
   if (msg.type === "failed") {
@@ -552,7 +554,20 @@ function renderLog(idx) {
     kids[i].classList.toggle("now", i === idx);
   }
   if (idx >= 0 && kids[idx]) {
-    kids[idx].scrollIntoView({ block: "nearest" });
+    // Scroll the log's own box only. scrollIntoView({block:"nearest"})
+    // also scrolls every scrollable *ancestor* — the page included —
+    // which dragged the viewport down to the log during playback.
+    // (render-smoke's stub DOM has no layout; the guard skips it there.)
+    const row = kids[idx];
+    if (
+      typeof row.getBoundingClientRect === "function" &&
+      typeof log.getBoundingClientRect === "function"
+    ) {
+      const lr = log.getBoundingClientRect();
+      const rr = row.getBoundingClientRect();
+      if (rr.top < lr.top) log.scrollTop += rr.top - lr.top;
+      else if (rr.bottom > lr.bottom) log.scrollTop += rr.bottom - lr.bottom;
+    }
   }
 }
 
@@ -633,7 +648,20 @@ function wireControls() {
     run();
   });
 
+  // The hero's "Watch it run in this tab" scrolls here — that click IS
+  // the user asking for a run, so it also starts the first one. (Optional
+  // chaining: render-smoke's stub document has no querySelector.)
+  document.querySelector?.(".hero .btn")?.addEventListener("click", () => {
+    if (events.length === 0) run();
+  });
+
   $("play").addEventListener("click", () => {
+    if (events.length === 0) {
+      // Nothing recorded yet (the page never auto-runs): the first press
+      // records and plays.
+      run();
+      return;
+    }
     if (head >= contentHeight) head = 0;
     playing = !playing;
     lastFrame = performance.now();
