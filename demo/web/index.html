@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Slither, running in this tab</title>
+    <title>Slither — encrypted UDP transport</title>
     <meta
       name="description"
       content="The slither encrypted UDP transport, compiled to WebAssembly and run against itself over its own in-memory test network."
@@ -14,10 +14,10 @@
          demo/assets/og.html by demo/assets/render-og.sh. (These are
          content= attributes, not fetches: the page itself still reaches
          no external host, which demo/verify/check-web.mjs enforces.) -->
-    <meta property="og:title" content="Slither, running in this tab" />
+    <meta property="og:title" content="Slither — encrypted UDP transport" />
     <meta
       property="og:description"
-      content="Two slither endpoints — the real protocol, compiled to WebAssembly — handshaking and talking inside a Web Worker, on a paused clock."
+      content="Sealed on dispatch, delivered in order — and it finds you when you move. The real protocol runs in this tab, on WebAssembly."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://primetype.co.uk/slither/" />
@@ -39,9 +39,52 @@
   </head>
   <body>
     <main>
-      <header>
-        <h1>
-          <svg class="mark" width="34" height="34" viewBox="0 0 64 64" aria-hidden="true">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">encrypted udp transport &middot; by primetype</p>
+          <h1>Slither</h1>
+          <p class="tagline">Sealed on dispatch, delivered in order &mdash; and it finds you when you move.</p>
+          <p class="lede">
+            Two peers exchange encrypted, reliable, unordered messages over
+            UDP &mdash; plus streams and datagrams &mdash; authenticated by raw public
+            keys. No certificates, no TLS, no PKI. A Noise&nbsp;IK handshake
+            on the way in, QUIC-shaped streams once you are through, and a
+            connection that keeps working when your address changes.
+          </p>
+          <p class="chips">
+            <span>a peer is its public key</span>
+            <span>reject an identity before the DH is spent</span>
+            <span>connections roam</span>
+            <span>drivable without a kernel</span>
+          </p>
+          <p class="cta">
+            <a class="btn" href="#demo">Watch it run in this tab &darr;</a>
+            <a class="src" href="https://github.com/primetype/slither">Source</a>
+            <!-- ON PUBLISH: add Docs (docs rs) and Crates links here. They
+                 404 until the crate ships, and check-web.mjs's external-host
+                 rule (which scans this file as raw text, comments included)
+                 allows only github.com — widening its allowlist is a
+                 deliberate publish-day decision. -->
+          </p>
+          <p class="hero-caveat">unaudited &middot; pre-1.0</p>
+        </div>
+        <div class="hero-art">
+          <svg viewBox="0 0 200 188" role="img" aria-label="The Courier, slither's mascot: a calm snake in an upright, attentive pose.">
+            <ellipse cx="86" cy="180" rx="72" ry="7.5" fill="#10332F" opacity="0.10"/>
+            <path d="M76 138 C60 140.5 44 154 31 162.5 C24 166.8 24 172 29.5 173.7 C47 174.3 64 174.2 78 174 Z" fill="#2F8F90"/>
+            <path d="M76 156 C104 161 128 158 144 142 C162 124 158 96 152 78" fill="none" stroke="#2F8F90" stroke-width="36" stroke-linecap="round"/>
+            <path d="M72 169.5 C98 173 122 168 138 152 C158 135 168 106 162 88" fill="none" stroke="#F0DCB8" stroke-width="9" stroke-linecap="round"/>
+            <circle cx="150" cy="56" r="29" fill="#2F8F90"/>
+            <path d="M135.08 45.4 A5.2 7 0 1 0 142.92 45.4 Z" fill="#10332F"/>
+            <path d="M159.08 45.4 A5.2 7 0 1 0 166.92 45.4 Z" fill="#10332F"/>
+            <path d="M148 66 Q155 73.5 162 66" fill="none" stroke="#10332F" stroke-width="3.4" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </section>
+
+      <header id="demo">
+        <h2 class="demo-h">
+          <svg class="mark" width="30" height="30" viewBox="0 0 64 64" aria-hidden="true">
             <circle cx="32" cy="32" r="32" fill="#2F8F90"/>
             <clipPath id="rh"><circle cx="32" cy="32" r="32"/></clipPath>
             <g clip-path="url(#rh)"><circle cx="32" cy="74" r="26" fill="#F0DCB8"/></g>
@@ -49,8 +92,8 @@
             <path d="M38.71 20 A5.7 7.6 0 1 0 47.29 20 Z" fill="#10332F"/>
             <path d="M26 39 Q32 44.5 38 39" fill="none" stroke="#10332F" stroke-width="2.8" stroke-linecap="round"/>
           </svg>
-          <span>Slither, running in this tab</span>
-        </h1>
+          <span>Running in this tab</span>
+        </h2>
         <p class="claim">
           Two <strong>slither</strong> endpoints — the real protocol,
           compiled to WebAssembly — handshaking and talking to each other
