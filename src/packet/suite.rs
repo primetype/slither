@@ -225,7 +225,7 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 ///
 /// ```toml
 /// [dependencies]
-/// slither = "0.2"
+/// slither = "0.3"
 /// hiss = { version = "0.4", default-features = false }   # required, see below
 /// ```
 ///

@@ -104,10 +104,10 @@
 //!
 //! ```toml
 //! [dependencies]
-//! slither = "0.2"
+//! slither = "0.3"
 //! # `slither::channel!` expands to absolute `::hiss::…` paths, so your
 //! # crate must depend on hiss directly, on the same minor line.
-//! hiss = { version = "0.3", default-features = false }
+//! hiss = { version = "0.4", default-features = false }
 //! # slither's driver runs on your runtime; these are the features it uses.
 //! tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 //! rand_chacha = "0.10"   # only for `SoftwareIdentity`: it takes your RNG
@@ -425,8 +425,8 @@ pub use crate::core::{Dir, StreamId, Timestamp};
 ///
 /// ```toml
 /// [dependencies]
-/// slither = "0.2"
-/// hiss = { version = "0.3", default-features = false }
+/// slither = "0.3"
+/// hiss = { version = "0.4", default-features = false }
 /// ```
 ///
 /// **This re-export does not remove that requirement.** It exists so the

@@ -34,7 +34,7 @@ certificates, no TLS, no PKI.
 
 ```toml
 [dependencies]
-slither = "0.2"
+slither = "0.3"
 # `slither::channel!` expands to `::hiss::…`, so your crate needs hiss too.
 hiss = { version = "0.4", default-features = false }
 # slither's driver runs on YOUR runtime; these are the features it uses.
