@@ -26,11 +26,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dialler is rejected at **1 DH**, with the peer named, against the 2 DH
   a lookup at the `psk` token would cost.
 
-  **`IK` consumers are untouched.** `connect()` and `authenticate()` are
-  now defined on `impl` blocks bounded `Handshake<Psk = ()>`, so every
-  existing call site compiles byte-identically — and a psk suite gets
-  only the explicit `_with` form, with no PSK-shaped default to fall
-  into. `hiss::psk::Psk` joins the prelude.
+  **`IK` call sites on a concrete suite are untouched.** `connect()` and
+  `authenticate()` are now defined on `impl` blocks bounded
+  `Handshake<Psk = ()>`, so an ordinary consumer — one that declares a
+  suite with `channel!` and dials with it — compiles byte-identically,
+  while a psk suite gets only the explicit `_with` form with no
+  PSK-shaped default to fall into. `hiss::psk::Psk` joins the prelude.
+  Code **generic over the suite** does need a bound; see Breaking below.
+
+### Breaking
+
+- **Code generic over the suite must add `Handshake<Psk = ()>`.** The
+  bound that keeps a pairing suite away from the no-PSK verbs is visible
+  to any caller that is itself generic:
+
+  ```rust
+  // still compiles unchanged — the ordinary case
+  fn dial(ep: &Endpoint<SoftwareIdentity<MySuite>>, ..) { ep.connect(a, k) }
+
+  // needs the bound now
+  fn dial<I: Identity>(ep: &Endpoint<I>, ..)
+  where
+      I::Suite: slither::packet::Handshake<Psk = ()>,   // <- added
+  { ep.connect(a, k) }
+  ```
+
+  The same applies to `Claimed::authenticate()` and to the
+  `tower::Service` impl on `Endpoint<I>`, which is now defined only for
+  `Psk = ()` — a tower request is *(address, peer static)* and has no
+  slot for a per-peer key.
+
+- **`packet::Handshake` gained a required associated type `Psk`, and
+  `write_msg1`/`complete` each take a `psk: &Self::Psk`.** The trait is
+  documented *"Implemented by `channel!`, never by hand"* but it is not
+  sealed, so a manual implementor breaks. Nothing in slither implements
+  it by hand; `channel!` and `channel_psk!` stamp it.
 
   **Not a wire change for `IK`, and no wire byte for `IKpsk1` either.** A
   `psk` token mixes a key and emits nothing, so §2.3's derivation holds
