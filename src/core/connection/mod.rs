@@ -378,6 +378,23 @@ impl<C: Handshake> Connection<C> {
         // `Amplification::set_floor` existed for is gone.
         let challenge = conn.draw_challenge();
         conn.amplification = Amplification::arm(challenge, constants::INIT_PACKET_LEN as u64);
+        // §18.2's `slither::roam` row carries "the challenge drawn and
+        // sent at **each** arming". There are two armings: this one, on
+        // the accept path, and §7.3's roam re-home — and only the second
+        // was visible, so the budget an operator most often wants to
+        // reason about was armed silently.
+        //
+        // **The value is deliberately not logged**, here or at the send
+        // below. It is the secret an unvalidated peer must echo to lift
+        // §7.3's 3× cap; a challenge in a log file is a validation anyone
+        // with read access can forge. §18.2 asks for the event, and the
+        // event is what an operator needs — a rate, not a value.
+        tracing::debug!(
+            target: "slither::roam",
+            event = "path_challenge_armed",
+            arming = "accept",
+            "the amplification budget is armed and a PATH_CHALLENGE is drawn"
+        );
         // **[A2]** The msg2 that provoked this arming has **already gone**
         // to this address: the endpoint emitted `RESP_PACKET_LEN` bytes to
         // it (`endpoint/staged.rs`, `endpoint/routing.rs`) before this
@@ -2827,6 +2844,17 @@ impl<C: Handshake> Connection<C> {
             && let Some(value) = self.amplification.outstanding_challenge()
             && packing.path_challenge(value)
         {
+            // The "sent" half of §18.2's `slither::roam` row. Emitted
+            // **inside** the `packing` success, so it says the frame
+            // reached the plaintext rather than that one was wanted: a
+            // challenge that did not fit is not a challenge that was
+            // sent. The value is withheld for the reason given at the
+            // accept-path arming.
+            tracing::debug!(
+                target: "slither::roam",
+                event = "path_challenge_sent",
+                "a PATH_CHALLENGE was packed for an unvalidated address"
+            );
             packed.challenge = true;
         }
         packed

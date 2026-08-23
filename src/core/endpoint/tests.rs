@@ -2541,3 +2541,140 @@ fn a_minted_but_unattempted_pending_still_yields_one_connection_for_one_static()
 // §6.5's "applications that dial SHOULD also drain accept()" and the
 //   both-NAT-rewritten double failure at HANDSHAKE_GIVEUP are shell-level
 //   and paused-clock, not core-level.
+
+/// §18.2's `slither::policy` row carries **guard rejections** — and the
+/// staged path's was silent.
+///
+/// The row lists "guard rejections" and "internal tie-break outcomes" as
+/// **separate** items. The tie-break's has always been visible
+/// (`tiebreak_replay`, `routing.rs`); this one — the ordinary,
+/// application-driven refusal of a replayed initiation, and by far the
+/// commoner route — emitted nothing, so the same §17.1 verdict was traced
+/// or not depending on which path the packet took. An operator counting
+/// replays saw only the half that crossed a dial.
+///
+/// **Mutation caught:** deleting the `tracing::debug!` at
+/// `staged.rs`'s guard check. Every other assertion about that branch is
+/// about the returned [`AuthError::Replay`], which a build emitting
+/// nothing satisfies perfectly — this is `story_traced.rs`'s G7 argument
+/// applied to a second obligation.
+#[test]
+fn the_staged_guard_rejection_is_traced_under_policy() {
+    use crate::testutil::Capture;
+
+    let now = t0();
+    let (mut local, mut peer) = sides(now, true);
+
+    // §5.5 rule 2 makes the retransmit's timestamp strictly greater, so
+    // `first` is the older of the two.
+    let first = real_msg1(&mut peer, now, &local);
+    let second = {
+        let d = peer.timeout(now + past_retransmit());
+        let (_, data) = d.one_transmit();
+        data
+    };
+    assert_ne!(first, second, "fixture check: two distinct initiations");
+
+    // The NEWER one, admitted on the staged path — this is what records
+    // the peer's greatest timestamp.
+    let d = local.feed(now, v4(9, 1), &second);
+    let (newer, _) = d.one_intro();
+    local.ep.read_identity(now, newer).expect("readable");
+    let _ = local.drain();
+    local
+        .ep
+        .authenticate(now, newer, &())
+        .expect("the newer initiation authenticates");
+    let _ = local.drain();
+    assert_eq!(
+        local.greatest(peer.canonical()),
+        Some(peer.nth_timestamp(2)),
+        "fixture check: the newer initiation is recorded, so the older one \
+         below is a genuine replay rather than a first sighting"
+    );
+
+    // Now the OLDER one, from a fresh source so it parks as its own chain.
+    let capture = Capture::install();
+    let d = local.feed(now, v4(9, 2), &first);
+    let (older, _) = d.one_intro();
+    local.ep.read_identity(now, older).expect("readable");
+    let _ = local.drain();
+    let outcome = local.ep.authenticate(now, older, &());
+    let _ = local.drain();
+
+    assert_eq!(
+        outcome,
+        Err(AuthError::Replay),
+        "fixture check: the older initiation must die at §17.1's guard, or \
+         the assertions below are measuring a path that never ran"
+    );
+
+    let traced = capture.with_target("slither::policy");
+    let replays: Vec<_> = traced
+        .iter()
+        .filter(|e| e.field("event") == Some("guard_replay"))
+        .collect();
+    assert_eq!(
+        replays.len(),
+        1,
+        "§18.2's `slither::policy` row carries guard rejections, and the \
+         staged path must emit one per rejection. Captured on this target: \
+         {traced:?}"
+    );
+}
+
+/// §18.2's `slither::roam` row carries *"the challenge drawn and sent at
+/// **each** arming"* — and the accept-path arming was silent.
+///
+/// There are two armings. §7.3's roam re-home was visible (as the
+/// re-home event); this one — every accepted connection, the commoner of
+/// the two — emitted nothing, so an operator reading the target saw
+/// budgets arm only when a peer moved.
+///
+/// **The challenge value is deliberately absent from the event**, and
+/// that is asserted here rather than left to habit: it is the secret an
+/// unvalidated peer must echo to lift §7.3's 3× cap, so a challenge in a
+/// log file is a validation anyone with read access can forge. §18.2 asks
+/// for the event, and the event — a rate — is what the operator needs.
+///
+/// **Mutation caught:** deleting the emit; or "helpfully" adding the
+/// eight bytes to it.
+#[test]
+fn the_accept_path_arming_is_traced_under_roam_without_the_challenge() {
+    use crate::testutil::Capture;
+
+    let t = t0();
+    let (mut b, mut a) = sides(t, true);
+    let msg1 = real_msg1(&mut a, t, &b);
+
+    let capture = Capture::install();
+    let id = b.feed(t, a.addr, &msg1).one_intro().0;
+    b.ep.read_identity(t, id).expect("readable");
+    let _ = b.drain();
+    b.ep.authenticate(t, id, &()).expect("authenticates");
+    let _ = b.drain();
+    let _ = b.ep.accept(t, id).expect("a fresh static accepts");
+    let _ = b.drain();
+
+    let armed: Vec<_> = capture
+        .with_target("slither::roam")
+        .into_iter()
+        .filter(|e| e.field("event") == Some("path_challenge_armed"))
+        .collect();
+    assert_eq!(
+        armed.len(),
+        1,
+        "§18.2's `slither::roam` row carries the challenge drawn at each          arming, and an accept arms exactly one budget"
+    );
+    assert_eq!(
+        armed[0].field("arming"),
+        Some("accept"),
+        "the two armings must be tellable apart"
+    );
+    for (name, value) in &armed[0].fields {
+        assert!(
+            !(value.len() >= 16 && value.chars().all(|c| c.is_ascii_hexdigit())),
+            "the field `{name}` looks like the challenge itself ({value}).              §7.3's budget is lifted by echoing that value: a log that              carries it hands the validation to anyone who can read the log"
+        );
+    }
+}

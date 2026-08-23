@@ -527,6 +527,21 @@ impl<I: Identity> Endpoint<I> {
         let key = claimed.as_ref().to_vec();
 
         if !self.guard.admits(&key, timestamp) {
+            // §18.2's `slither::policy` row lists **guard rejections**
+            // separately from the internal tie-break's outcomes, and this
+            // is that item: the ordinary, application-driven refusal of a
+            // replayed initiation. Its tie-break sibling
+            // (`routing.rs`'s `tiebreak_replay`) has always been visible;
+            // this path was not, so the same §17.1 verdict was traced or
+            // silent depending on which route the packet took — and the
+            // staged route is the common one. Same target, same level,
+            // same shape.
+            tracing::debug!(
+                target: "slither::policy",
+                event = "guard_replay",
+                ?id,
+                "an authenticated initiation failed §17.1's timestamp guard"
+            );
             // Mitigation (iii): recency refreshes on a successful record,
             // **never** on a failed check. Nothing is written here.
             self.discard_chain(now, id);

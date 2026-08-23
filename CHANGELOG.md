@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §2.2 and Appendix A are amended in the same change; the Deferred
   table's `PSK patterns` row is discharged.
 
+- **Three trace events §18.2 already promised.** An audit of all 28 emit
+  sites against §18.2's rows found two rows carrying an obligation the
+  code did not meet. `slither::policy` lists *guard rejections* separately
+  from *internal tie-break outcomes*: the tie-break's was emitted, the
+  **staged path's was not**, so the same §17.1 replay verdict was traced
+  or silent depending on which route the packet took — and the staged
+  route is the ordinary one. Now `guard_replay`. `slither::roam` promises
+  *"the challenge drawn and sent at **each** arming"*: the accept-path
+  arming emitted nothing and the **send** was traced nowhere at all. Now
+  `path_challenge_armed` and `path_challenge_sent`.
+
+  **The challenge value is withheld from both**, and the tests assert its
+  absence: it is the secret that lifts §7.3's 3× amplification cap, so a
+  challenge in a log file is a validation anyone with read access can
+  forge. No new target, no new row, no level change — `slither` still
+  emits nothing at INFO or ERROR — and no behaviour change.
+
 ### Changed
 
 - **hiss `0.4.0` → `0.4.1`.** Purely additive; `cryptoxide`

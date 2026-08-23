@@ -450,6 +450,17 @@ impl<I: Identity> Endpoint<I> {
                      `Pending`, and `mint_pending` writes that row and the \
                      pending together"
                 );
+                // Unreachable, and traced anyway: a `debug_assert` is
+                // absent from the build an operator is running, and this
+                // is a **drop** — §6.6's one internal admission path
+                // declining without answering. A silent one would be
+                // indistinguishable from the peer never having dialled.
+                tracing::debug!(
+                    target: "slither::policy",
+                    event = "tiebreak_no_pending",
+                    %src,
+                    "§6.6 found no pending for the dial its probed set named"
+                );
                 return;
             };
             <I::Suite as Handshake>::complete(mid, &pending.psk)

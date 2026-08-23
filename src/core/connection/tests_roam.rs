@@ -1098,3 +1098,63 @@ fn a_marking_send_in_the_same_evaluation_suppresses_the_keepalive() {
         "the marking send made `R > S` false, which is what the keepalive was for"
     );
 }
+
+/// §18.2's `slither::roam` row carries *"the challenge drawn and **sent**
+/// at each arming"* — the sent half, which emitted nothing.
+///
+/// Emitted **inside** the packing success rather than beside it, so the
+/// event says the frame reached the plaintext: a challenge that did not
+/// fit is not a challenge that was sent. §7.3's budget is exactly the
+/// condition under which it might not fit, which is what makes the
+/// distinction worth having.
+///
+/// The value is withheld for the reason given on the accept-path arming's
+/// test (`endpoint/tests.rs`): it is the secret that lifts the 3× cap.
+///
+/// **Mutation caught:** deleting the emit, or hoisting it out of the
+/// `&&`-chain so it fires whenever a challenge is merely *outstanding* —
+/// which on a held budget is every pump, and would report a flood of
+/// sends that never happened.
+#[test]
+fn a_packed_path_challenge_is_traced_under_roam() {
+    use crate::testutil::Capture;
+
+    let capture = Capture::install();
+    let mut solo = Solo::installed_at(origin());
+    let now = origin() + Duration::from_millis(10);
+    // Roam: this arms the budget against the new anchor and owes it a
+    // challenge.
+    let _ = solo.deliver_from(now, c_addr(), &[]);
+
+    let sent_before = capture
+        .with_target("slither::roam")
+        .into_iter()
+        .filter(|e| e.field("event") == Some("path_challenge_sent"))
+        .count();
+    assert_eq!(
+        sent_before, 0,
+        "arming owes a challenge; it does not send one. A build that traces          at the arming would report a send before any frame was packed"
+    );
+
+    let r = solo.conn.open(crate::core::Dir::Uni).expect("a uni stream");
+    solo.conn
+        .write(now, r, &[7u8; 4_000])
+        .expect("the write is admitted into send state");
+    solo.conn.flush(now);
+    let d = drain(&mut solo.conn);
+    assert!(
+        !d.transmits().is_empty(),
+        "fixture check: nothing was pumped, so nothing could carry a challenge"
+    );
+
+    let sent: Vec<_> = capture
+        .with_target("slither::roam")
+        .into_iter()
+        .filter(|e| e.field("event") == Some("path_challenge_sent"))
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "§18.2: the challenge sent at this arming must be traced, exactly          once — it is packed once and the budget owes one"
+    );
+}
