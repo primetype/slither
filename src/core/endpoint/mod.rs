@@ -129,6 +129,16 @@ struct Pending<I: Identity> {
     /// [`ConnectError::Local`], not [`ConnectError::TimedOut`]; see
     /// [`build_attempt`](Endpoint::build_attempt).
     attempted: bool,
+    /// The pre-shared key this dial was asked for — `()` on an `IK`
+    /// suite (ruling 280).
+    ///
+    /// Held for the pending's whole life rather than consumed by the
+    /// first attempt, because **every retransmit rebuilds msg1** on a
+    /// fresh ephemeral (§5.5) and therefore re-mixes it. It is also what
+    /// §6.6's internal tie-break reads: that path completes an inbound
+    /// initiation from the very peer this dial names, with no application
+    /// in the loop to be asked.
+    psk: crate::identity::PskOf<I>,
     /// Whether this pending actually took a §17.1 pin.
     ///
     /// A pin **never creates an entry**, so a dial to a static nobody has
@@ -435,6 +445,7 @@ impl<I: Identity> Endpoint<I> {
         now: Instant,
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
+        psk: crate::identity::PskOf<I>,
     ) -> Result<(ConnectionId, Connection<I::Suite>), ConnectError> {
         let key = remote_static.as_ref().to_vec();
         if self.statics.get(&key).is_some() {
@@ -451,6 +462,7 @@ impl<I: Identity> Endpoint<I> {
             remote_static,
             remote_static_bytes: key.clone(),
             peer_mac1,
+            psk,
             sender_index: None,
             state: None,
             next_retransmit: now,
@@ -564,21 +576,25 @@ impl<I: Identity> Endpoint<I> {
         );
         // Also local: this is our own static's DH under hiss, not anything
         // the peer contributed — nothing has been received at this point.
-        let (msg1, sent) =
-            match <I::Suite as Handshake>::write_msg1(state, our_key, &timestamp.encode()) {
-                Ok(written) => written,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "slither::io",
-                        verb = "connect",
-                        stage = "Handshake::write_msg1",
-                        conn = ?pending.conn,
-                        %error,
-                        "msg1 would not write on our static"
-                    );
-                    return;
-                }
-            };
+        let (msg1, sent) = match <I::Suite as Handshake>::write_msg1(
+            state,
+            our_key,
+            &pending.psk,
+            &timestamp.encode(),
+        ) {
+            Ok(written) => written,
+            Err(error) => {
+                tracing::warn!(
+                    target: "slither::io",
+                    verb = "connect",
+                    stage = "Handshake::write_msg1",
+                    conn = ?pending.conn,
+                    %error,
+                    "msg1 would not write on our static"
+                );
+                return;
+            }
+        };
 
         let data = handshake::frame_init(sender_index, &msg1, &pending.peer_mac1);
         pending.attempted = true;

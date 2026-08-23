@@ -1148,13 +1148,13 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
                     .read_identity(now(), id);
                 drop(reply.send(result));
             }
-            Command::Authenticate(id, reply) => {
+            Command::Authenticate(id, psk, reply) => {
                 let result = self
                     .shell
                     .state
                     .borrow_mut()
                     .endpoint
-                    .authenticate(now(), id);
+                    .authenticate(now(), id, &psk);
                 drop(reply.send(result));
             }
             Command::AcceptChain(id, remote_static, reply) => {

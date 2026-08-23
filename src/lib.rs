@@ -188,7 +188,10 @@
 //!    #     stale: Connection<I::Suite>,
 //!    #     peer: slither::identity::PublicKeyOf<I>,
 //!    #     addr: SocketAddr,
-//!    # ) -> Result<Connection<I::Suite>, slither::error::ConnectError> {
+//!    # ) -> Result<Connection<I::Suite>, slither::error::ConnectError>
+//!    # where
+//!    #     I::Suite: slither::packet::Handshake<Psk = ()>,
+//!    # {
 //!    // Wrong: the static is still LIVE, so this is `AlreadyConnected`
 //!    // and the wedged connection is still there afterwards.
 //!    //

@@ -57,6 +57,11 @@ pub(crate) mod endpoint;
 #[cfg(test)]
 mod tests;
 
+/// §6.1's ladder over `IKpsk1` — ruling 280. Its own module because the
+/// harness in [`tests`] is monomorphic in `ReferenceSuite`.
+#[cfg(test)]
+mod psk_tests;
+
 use std::net::SocketAddr;
 use std::time::Instant;
 

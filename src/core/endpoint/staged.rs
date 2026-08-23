@@ -421,6 +421,7 @@ impl<I: Identity> Endpoint<I> {
         &mut self,
         now: Instant,
         id: IntroId,
+        psk: &crate::identity::PskOf<I>,
     ) -> Result<(PublicKeyOf<I>, Timestamp), AuthError> {
         if matches!(
             self.intros.get(id).map(|entry| &entry.state),
@@ -506,9 +507,17 @@ impl<I: Identity> Endpoint<I> {
             }
         };
 
-        let Ok((payload, read)) = <I::Suite as Handshake>::complete(*mid) else {
+        let Ok((payload, read)) = <I::Suite as Handshake>::complete(*mid, psk) else {
             // §6.1: a tail-tag failure is `HandshakeFailed`. It is a
             // security signal and carries no detail, deliberately.
+            //
+            // On a psk suite a **wrong PSK lands here too**, and that is
+            // the intended shape rather than a conflation: §18.1 gives the
+            // application one undetailed security verdict, and "you are
+            // not who you claim" and "you do not hold the pairing secret"
+            // are the same answer to the same question. Neither costs more
+            // than §6.1's 2 DH, and a stranger who supplies no PSK at all
+            // never reaches this line — it drops at 1 DH (ruling 280).
             self.discard_chain(now, id);
             return Err(AuthError::HandshakeFailed);
         };

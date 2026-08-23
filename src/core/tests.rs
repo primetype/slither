@@ -270,7 +270,7 @@ impl Ep {
         // two tasks; a dial is still the two of them, in this order.
         let (id, _conn) = self
             .ep
-            .mint_pending(now, remote, *peer)
+            .mint_pending(now, remote, *peer, ())
             .expect("connect should succeed");
         self.ep.start_attempt(now, id);
         (id, self.drain())
@@ -470,7 +470,7 @@ fn the_drain_always_terminates_in_timeout() {
     // the staged verbs, and reject()
     let _ = b.ep.read_identity(t, intro);
     let _ = b.drain();
-    let _ = b.ep.authenticate(t, intro);
+    let _ = b.ep.authenticate(t, intro, &());
     let _ = b.drain();
     let _ = b.ep.accept(t, intro);
     let _ = b.drain();
@@ -717,7 +717,9 @@ fn authenticate_costs_two_dh_cumulative() {
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
 
-    let (peer, _ts) = b.ep.authenticate(t, id).expect("a real msg1 authenticates");
+    let (peer, _ts) =
+        b.ep.authenticate(t, id, &())
+            .expect("a real msg1 authenticates");
     let _ = b.drain();
     assert_eq!(b.dhs.get(), 2, "cumulative cost at Proven is 2");
     assert_eq!(peer.as_ref(), a.canonical(), "the proven static");
@@ -734,7 +736,7 @@ fn reject_at_proven_costs_two_dh_and_installs_nothing() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
 
     b.ep.reject(t, id);
@@ -763,7 +765,7 @@ fn accept_fast_path_costs_four_dh() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
 
     let (_conn, _core) = b.ep.accept(t, id).expect("a fresh static accepts");
@@ -838,7 +840,7 @@ fn a_completed_dial_costs_four_dh_end_to_end() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -1804,7 +1806,7 @@ fn a_consumed_chain_expires_fifteen_seconds_after_its_initiation() {
 
     // And the verbs on it say so.
     assert!(matches!(
-        b.ep.authenticate(t + INTRO_TTL, id),
+        b.ep.authenticate(t + INTRO_TTL, id, &()),
         Err(AuthError::Expired)
     ));
 }
@@ -1826,7 +1828,7 @@ fn the_staged_verbs_on_an_expired_id_report_expired() {
     ));
     let _ = b.drain();
     assert!(matches!(
-        b.ep.authenticate(after, id),
+        b.ep.authenticate(after, id, &()),
         Err(AuthError::Expired)
     ));
     let _ = b.drain();
@@ -1895,7 +1897,7 @@ fn an_established_index_still_routes_while_the_queue_is_saturated() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     let (conn, _core) = b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -1959,7 +1961,7 @@ fn ladder_to_proven(
     b.ep.read_identity(now, id)
         .expect("a real msg1 is readable");
     let _ = b.drain();
-    let r = b.ep.authenticate(now, id).map(|(_pk, ts)| ts);
+    let r = b.ep.authenticate(now, id, &()).map(|(_pk, ts)| ts);
     let _ = b.drain();
     (id, r)
 }
@@ -2135,7 +2137,7 @@ fn a_basis_refused_accept_restores_a_prior_value() {
     let id = b2.feed(t, a.addr, &msg1).one_intro().0;
     b2.ep.read_identity(t, id).expect("a real msg1 is readable");
     let _ = b2.drain();
-    b2.ep.authenticate(t, id).expect("authenticates");
+    b2.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b2.drain();
     b2.ep.accept(t, id).expect("b2 holds no row for a");
     let resp = b2.drain().one_transmit().1;
@@ -2356,7 +2358,7 @@ fn cancelling_a_dial_does_not_release_a_pin_it_never_took() {
     // a live dial. Both leave this test's shape — a dial and a staged
     // mid-state coexisting on one static — exactly as it was.
     let chain = a.feed(at, v4(2, 3), &inbound).one_intro().0;
-    let admitted = a.ep.authenticate(at, chain).map(|(_pk, ts)| ts);
+    let admitted = a.ep.authenticate(at, chain, &()).map(|(_pk, ts)| ts);
     let _ = a.drain();
     let ts = admitted.expect("we hold no entry for a static we dialled, so this passes vacuously");
     assert_eq!(a.ep.greatest(b.canonical()), Some(ts));
@@ -2435,7 +2437,7 @@ fn a_dialled_static_holds_no_guard_entry() {
     // check — the whole subject of this test — runs either way.
     let msg1_from_b = real_msg1(&mut b, t, &a);
     let id = a.feed(t, v4(2, 3), &msg1_from_b).one_intro().0;
-    let r = a.ep.authenticate(t, id).map(|(_pk, ts)| ts);
+    let r = a.ep.authenticate(t, id, &()).map(|(_pk, ts)| ts);
     let _ = a.drain();
     assert!(
         r.is_ok(),
@@ -2679,7 +2681,7 @@ fn accept_on_a_live_static_replaces_it_against_a_newer_basis() {
     assert_eq!(disp, Disposition::Done, "the retired index routes nowhere");
     assert!(
         matches!(
-            b.ep.mint_pending(t, a.addr, a.public_static),
+            b.ep.mint_pending(t, a.addr, a.public_static, ()),
             Err(ConnectError::AlreadyConnected)
         ),
         "§16.1: the static is the replacement's, and the old `Retired` did not release it"
@@ -2698,7 +2700,7 @@ fn connect_to_a_static_with_a_live_connection_is_already_connected() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -2708,7 +2710,7 @@ fn connect_to_a_static_with_a_live_connection_is_already_connected() {
     let peer = b.public_static;
     assert!(
         matches!(
-            a.ep.mint_pending(t, b.addr, peer),
+            a.ep.mint_pending(t, b.addr, peer, ()),
             Err(ConnectError::AlreadyConnected)
         ),
         "a second connect() to a live static succeeded"
@@ -2756,7 +2758,7 @@ fn genuine_msg2(b: &mut Ep, now: Instant, src: SocketAddr, msg1: &[u8]) -> Vec<u
     b.ep.read_identity(now, id)
         .expect("a real msg1 is readable");
     let _ = b.drain();
-    b.ep.authenticate(now, id).expect("authenticates");
+    b.ep.authenticate(now, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(now, id).expect("a fresh static accepts");
     let (to, data) = b.drain().one_transmit();
@@ -3001,7 +3003,7 @@ fn msg2_from_a_different_address_still_completes() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -3026,7 +3028,7 @@ fn completion_installs_exactly_once() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -3254,7 +3256,7 @@ fn the_responder_answers_the_msg1_source_address() {
     let id = b.feed(t, spoofed, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
 
@@ -3279,7 +3281,7 @@ fn the_response_header_answers_the_initiators_index() {
     let id = b.feed(t, a.addr, &msg1).one_intro().0;
     b.ep.read_identity(t, id).expect("readable");
     let _ = b.drain();
-    b.ep.authenticate(t, id).expect("authenticates");
+    b.ep.authenticate(t, id, &()).expect("authenticates");
     let _ = b.drain();
     b.ep.accept(t, id).expect("accepts");
     let msg2 = b.drain().one_transmit().1;
@@ -3339,7 +3341,7 @@ fn retired_cancels_the_pending_and_frees_the_static_for_an_immediate_redial() {
 
     // And the static is free.
     assert!(
-        a.ep.mint_pending(t, b.addr, peer).is_ok(),
+        a.ep.mint_pending(t, b.addr, peer, ()).is_ok(),
         "a redial after cancellation returned AlreadyConnected (S29)"
     );
 }

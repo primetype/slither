@@ -166,7 +166,19 @@ impl<I: Identity> Endpoint<I> {
             }
         }
     }
+}
 
+/// §16.2's `connect()`, defined **only where the suite's pattern has no
+/// pre-shared key** — every [`channel!`](crate::channel) suite.
+///
+/// A [`channel_psk!`](crate::channel_psk) suite gets
+/// [`connect_with`](Endpoint::connect_with) instead, and gets it as the
+/// only dial: the bound is what makes "there is no PSK-shaped default to
+/// fall into" a compile error rather than a convention (ruling 280).
+impl<I: Identity> Endpoint<I>
+where
+    I::Suite: crate::packet::Handshake<Psk = ()>,
+{
     /// Dial `remote_static` at `remote` (§5.5).
     ///
     /// # Example
@@ -266,6 +278,46 @@ impl<I: Identity> Endpoint<I> {
         remote: SocketAddr,
         remote_static: PublicKeyOf<I>,
     ) -> Result<Connecting<I>, ConnectError> {
+        self.connect_with(remote, remote_static, ())
+    }
+}
+
+impl<I: Identity> Endpoint<I> {
+    /// [`connect`](Endpoint::connect), naming the pre-shared key.
+    ///
+    /// Available on **every** suite; on an `IK` one the key is `()` and
+    /// `connect` is the same call with it elided. On a
+    /// [`channel_psk!`](crate::channel_psk) suite this is the *only* dial —
+    /// `connect` is defined only where `Psk = ()`, so there is no
+    /// PSK-shaped default to fall into (ruling 280).
+    ///
+    /// Every word of [`connect`](Endpoint::connect)'s documentation applies
+    /// unchanged, including the two that matter most: **a connection you
+    /// are not using dies**, and a `Connecting` dropped before it resolves
+    /// cancels the dial synchronously.
+    ///
+    /// # The key is held for the dial's whole life
+    ///
+    /// §5.5 rebuilds msg1 on a **fresh ephemeral** every retransmit, so the
+    /// PSK is re-mixed each time; it is released when the pending is, on
+    /// success, give-up or cancel. It is also the key §6.6's internal
+    /// tie-break completes with, should this peer's own initiation cross
+    /// ours — that path has no application in the loop to ask, and the key
+    /// this call named is the right one by construction.
+    ///
+    /// # A wrong key is not a distinguishable outcome
+    ///
+    /// The peer answers a bad PSK the way it answers a bad identity: msg1's
+    /// tail tag fails and nothing is sent. From here that is silence, and
+    /// the dial ends at [`ConnectError::TimedOut`] like any unanswered
+    /// handshake. There is no "wrong PSK" error, deliberately — §18.1 gives
+    /// an unauthenticated peer no oracle.
+    pub fn connect_with(
+        &self,
+        remote: SocketAddr,
+        remote_static: PublicKeyOf<I>,
+        psk: crate::identity::PskOf<I>,
+    ) -> Result<Connecting<I>, ConnectError> {
         let (id, core) = {
             let mut state = self.shell.state.borrow_mut();
             if state.driver_stopped {
@@ -277,7 +329,7 @@ impl<I: Identity> Endpoint<I> {
             }
             let minted = state
                 .endpoint
-                .mint_pending(now(), remote, remote_static.clone())?;
+                .mint_pending(now(), remote, remote_static.clone(), psk)?;
             // §16.4: every mutating core call is followed by a drain. This
             // one emits nothing; see `ShellState::drain_endpoint`.
             state.drain_endpoint();

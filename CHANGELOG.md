@@ -5,6 +5,55 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A second Noise pattern: `IKpsk1`, via `channel_psk!`.** slither's
+  `channel!` stamps `IK`; the new macro stamps the same
+  `<Curve, Cipher, Hash>` triple over a token block differing only by a
+  **trailing `psk`** on msg1. It exists for the one requirement the
+  `known` set cannot serve: admitting a **stranger** under a secret
+  carried out of band — an in-person pairing ceremony, a QR across a
+  table.
+
+  The pre-shared key is supplied at the two staged points and never held
+  by the endpoint: `Endpoint::connect_with(addr, static, psk)` on the
+  dial, and `Claimed::authenticate_with(psk)` at §6.1's stage 2. So a
+  responder selects the key **using the claimed static it has already
+  paid one `es` for**. That ordering is why the pattern is `IKpsk1` and
+  not a psk0 shape, and it is what makes the cost right: an unenrolled
+  dialler is rejected at **1 DH**, with the peer named, against the 2 DH
+  a lookup at the `psk` token would cost.
+
+  **`IK` consumers are untouched.** `connect()` and `authenticate()` are
+  now defined on `impl` blocks bounded `Handshake<Psk = ()>`, so every
+  existing call site compiles byte-identically — and a psk suite gets
+  only the explicit `_with` form, with no PSK-shaped default to fall
+  into. `hiss::psk::Psk` joins the prelude.
+
+  **Not a wire change for `IK`, and no wire byte for `IKpsk1` either.** A
+  `psk` token mixes a key and emits nothing, so §2.3's derivation holds
+  as written and all four sizes — `IK_MSG1_LEN` 174, `IK_MSG2_LEN` 81,
+  `INIT_PACKET_LEN` 196, `RESP_PACKET_LEN` 107 — are identical to the
+  reference suite's. The separation is the protocol **name**:
+  `Noise_IKpsk1_P256_ChaChaPoly_BLAKE2b` seeds a different initial
+  handshake hash, and a packet crossing between the two suites dies at
+  msg1's first AEAD open having spent 1 DH — precisely §2.2's same-curve
+  sibling case, which needs no new analysis.
+
+  Requires **hiss 0.4.1**, whose staged read admits a trailing `psk`
+  (`read_message_1_intro` + `complete(&psk)` on `IKpsk1`). `SPEC.md`
+  §2.2 and Appendix A are amended in the same change; the Deferred
+  table's `PSK patterns` row is discharged.
+
+### Changed
+
+- **hiss `0.4.0` → `0.4.1`.** Purely additive; `cryptoxide`
+  (`>=0.6.3, <0.7`), `rand_core` (0.10) and the 1.96 MSRV are unchanged,
+  verified against 0.4.1's own manifest. Pulls `hiss-macros` 0.3.3,
+  which emits the staged trailing-`psk` surface.
+
 ## [0.2.1] - 2026-08-20
 
 ### Fixed

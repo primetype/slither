@@ -890,13 +890,13 @@ mod transport_tests {
         let state =
             <Suite as Handshake>::initiator(ip, constants::PROLOGUE, *responder.public_static());
         let (msg1, state) =
-            <Suite as Handshake>::write_msg1(state, ik, &[0u8; constants::MSG1_PAYLOAD_LEN])
+            <Suite as Handshake>::write_msg1(state, ik, &(), &[0u8; constants::MSG1_PAYLOAD_LEN])
                 .expect("msg1");
 
         let (rp, rk) = responder.open().expect("software identity opens");
         let r = <Suite as Handshake>::responder(rp, constants::PROLOGUE, rk).expect("responder");
         let (_claimed, mid) = <Suite as Handshake>::read_msg1_intro(r, &msg1).expect("intro");
-        let (_payload, read) = <Suite as Handshake>::complete(mid).expect("complete");
+        let (_payload, read) = <Suite as Handshake>::complete(mid, &()).expect("complete");
         let (msg2, r_transport) = <Suite as Handshake>::write_msg2(read).expect("msg2");
         let i_transport = <Suite as Handshake>::read_msg2(state, &msg2).expect("read msg2");
 

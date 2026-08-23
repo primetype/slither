@@ -349,9 +349,13 @@ fn handshake(epoch: NonZeroU64) -> (EstablishedSession<Suite>, Peer) {
     let (bp, bsk) = b.open().expect("identity opens");
 
     let init = <Suite as Handshake>::initiator(ap, PROLOGUE, b_pub);
-    let (msg1, sent) =
-        <Suite as Handshake>::write_msg1(init, ask, &[0u8; crate::constants::MSG1_PAYLOAD_LEN])
-            .expect("msg1");
+    let (msg1, sent) = <Suite as Handshake>::write_msg1(
+        init,
+        ask,
+        &(),
+        &[0u8; crate::constants::MSG1_PAYLOAD_LEN],
+    )
+    .expect("msg1");
 
     let resp = <Suite as Handshake>::responder(bp, PROLOGUE, bsk).expect("responder");
     let (claimed, mid) = <Suite as Handshake>::read_msg1_intro(resp, &msg1).expect("msg1 intro");
@@ -360,7 +364,7 @@ fn handshake(epoch: NonZeroU64) -> (EstablishedSession<Suite>, Peer) {
         a_pub.as_ref(),
         "the claimed static is the initiator's"
     );
-    let (_payload, read) = <Suite as Handshake>::complete(mid).expect("complete");
+    let (_payload, read) = <Suite as Handshake>::complete(mid, &()).expect("complete");
     let (msg2, b_transport) = <Suite as Handshake>::write_msg2(read).expect("msg2");
     let a_transport = <Suite as Handshake>::read_msg2(sent, &msg2).expect("read msg2");
 

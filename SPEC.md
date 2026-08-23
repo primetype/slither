@@ -574,9 +574,35 @@ wire respects it.
 IK invocation with a caller-chosen `<Curve, Cipher, Hash>` triple plus the
 `Channel`/`Protocol` implementation. The IK token block and the handshake
 payload declaration (`[12]` on msg1; msg2 declares no payload — §5.2) are
-hardcoded in the macro; **IK is the only pattern**. The reference suite is
+hardcoded in the macro. The reference suite is
 **`P256 / ChaChaPoly / Blake2b`**, and its Noise protocol name —
 `Noise_IK_P256_ChaChaPoly_BLAKE2b` — is pinned by test.
+
+**There are exactly two patterns: `IK` and `IKpsk1`.** `channel_psk!` is the
+second stamp — the same triple, the same hardcoded `[12]` payload, and a
+token block differing only by a **trailing `psk`** on msg1
+(`-> e, es, s, ss, psk [12]`). It exists for one requirement the `known` set
+cannot serve: admitting a **stranger** under a secret carried out of band, an
+in-person pairing ceremony being the motivating case. The pre-shared key is
+supplied at the two staged points — the dial and §6.1's stage 2 — never held
+by the endpoint, so a responder selects it **using the claimed static it has
+just paid one `es` for**. That ordering is the whole reason the pattern is
+`IKpsk1` and not a psk0 shape: the identity is revealed *before* the `psk`
+token, so an unenrolled stranger is rejected at **1 DH**, with the peer named,
+rather than the 2 DH a lookup at the `psk` token would cost.
+
+Three things about the second pattern are consequences rather than choices.
+Its `psk` token **puts no bytes on the wire**, so §2.3's derivation holds for
+it exactly as written and all four sizes equal the reference suite's. Its
+protocol name is `Noise_IKpsk1_<curve>_<cipher>_<hash>` — a different name
+seeding a different initial handshake hash, which is the only separation the
+two patterns get and the only one they need. And **endpoints remain
+monomorphic per suite**: a psk channel is a *separate endpoint*, on its own
+port, never a second pattern multiplexed onto one socket — which is also what
+makes "stop presenting the pairing window" a lifetime rather than a flag.
+**[AMENDED 2026/08/23 — ruling 280: `IK is the only pattern` is lifted; hiss
+0.4.1's trailing-`psk` staged read is the capability the Deferred row was
+waiting on.]**
 
 Wire-visible consequences of the suite are the handshake message sizes
 (point encodings) and, in principle, the AEAD tag size; everything above
@@ -7293,7 +7319,6 @@ its future home.
 | per-peer `ss` precomputation | needs a hiss seam or a bounded memoising provider; re-opens the DH-cost table (§6.1) |
 | persistence | nothing in this specification survives a process restart by design (§5.4: restart is a replacement or a fresh accept, never a merge) |
 | reflector / mDNS / probe ping-pong | discovery and hole-punching; packet types would come from the reserved space (§3.1) |
-| PSK patterns | IK is the only pattern (§2.2) |
 | bubble integration | slither stays independent: zero `bubble-*` dependencies |
 
 ## Appendix A — hiss dependencies *(RECONCILED 2026/08/14; non-normative)*
@@ -7304,9 +7329,16 @@ appendix was written against 0.3.1 as a list of *requests*; it is
 reconciled here against the **shipped** API, verified by reading the
 hiss tree rather than taking the delivery report. A.1 was the one hard
 gate; A.2's interim is superseded; A.3 resolved to documentation and
-was delivered as executable pins. The dependency line stays
-`hiss = "0.3"`; the floor rises to `0.3.2` when slither's code first
-calls the staged read.
+was delivered as executable pins.
+
+**[AMENDED 2026/08/23 — ruling 280.]** The dependency floor is
+**`hiss = "0.4.1"`**, and this sentence previously read *"the dependency
+line stays `hiss = "0.3"`; the floor rises to `0.3.2` when slither's
+code first calls the staged read."* It rose twice since: to 0.4.0 for
+`AesGcm` (ruling 279) and to 0.4.1 for the trailing-`psk` staged read
+this appendix's *Qualifying scope* paragraph now describes. `Cargo.toml`
+is the authority for the pin; this appendix is non-normative and records
+only what the gates were reconciled against.
 
 **A.1 The split msg1 read — SHIPPED.** The API as built:
 
@@ -7345,14 +7377,27 @@ from the message-size const** rather than re-derived independently
 (`codegen.rs:475-492`), so the tail and the size cannot drift apart.
 
 *Qualifying scope* is narrower than "IK": the staged pair is generated
-for **the first message whose token sequence ends `…, s, ss`** (a
-declared payload may follow) — `split_read_on`, `codegen.rs:1068-1070`.
-That includes IKpsk0 and excludes IKpsk1, whose trailing `psk` would
-require the PSK re-supplied mid-read and so break the mid-state's
-"nothing re-supplied later" contract; the `_with` lookup closure already
-serves per-peer PSK selection there. One-way patterns (X, Xpsk0) also
-qualify, and there `complete()` yields the transport directly — no
-slither impact.
+for **the first message whose token sequence ends `…, s, ss`,
+optionally followed by a `psk`** (a declared payload may follow) —
+`split_read_on`, `codegen.rs:1068-1070`. That includes IKpsk0 **and
+IKpsk1**. One-way patterns (X, Xpsk0) also qualify, and there
+`complete()` yields the transport directly — no slither impact.
+**[AMENDED 2026/08/23 — ruling 280.]** This paragraph previously read
+*"excludes IKpsk1, whose trailing `psk` would require the PSK re-supplied
+mid-read and so break the mid-state's 'nothing re-supplied later'
+contract; the `_with` lookup closure already serves per-peer PSK
+selection there."* hiss 0.4.1 reverses **both** halves, and the rationale
+is amended with the token. On the first: the contract was stated too
+broadly. What the mechanism actually depends on is that **no bytes of
+`message` are re-supplied** — that is what keeps the mid-state
+self-contained and the input buffer unborrowed — and a `psk` is not
+message bytes, so `complete(&psk)` takes it without touching the
+property. On the second: `read_message_1_with`'s lookup closure is
+emitted **at** the `psk` token, which is *after* the proving `ss`, so
+rejecting an unenrolled stranger through it costs **2 DH**. Staged, the
+claimed identity arrives after **1 DH** and the PSK is chosen only if
+that identity survives. It did not "already serve" the requirement; it
+served it at twice the price. That is what §2.2's second pattern climbs.
 
 *The DH ladder is pinned by test*, not merely documented: a counting
 provider asserts `dhs == 1` after `intro` and `dhs == 2` cumulatively

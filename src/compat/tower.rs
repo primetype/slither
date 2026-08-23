@@ -69,7 +69,21 @@ use crate::shell::{BiStream, Connecting, Connection, Endpoint, WakerSlot};
 /// [`Connecting`] it returns owns everything it needs: it borrows nothing
 /// from `&self`, so the future can outlive the `&mut self` that `call` is
 /// given.
-impl<I: Identity> Service<(SocketAddr, PublicKeyOf<I>)> for Endpoint<I> {
+///
+/// # Only for suites whose pattern has no pre-shared key
+///
+/// The request type is *(address, peer static)*, and there is nowhere in it
+/// to put a per-peer PSK. That is a fact about `Service`, not an oversight:
+/// widening the request to a triple would change this impl's shape for every
+/// `IK` consumer to carry a `()`, and a
+/// [`channel_psk!`](crate::channel_psk) endpoint's dial is
+/// [`Endpoint::connect_with`] — a verb with an argument tower has no slot
+/// for. A psk suite composes with tower at the *stream* layer below, which
+/// takes an established connection and never dials (ruling 280).
+impl<I: Identity> Service<(SocketAddr, PublicKeyOf<I>)> for Endpoint<I>
+where
+    I::Suite: Handshake<Psk = ()>,
+{
     type Response = Connection<I::Suite>;
     type Error = ConnectError;
     type Future = Connect<I>;

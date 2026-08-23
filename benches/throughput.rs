@@ -133,9 +133,14 @@ use aes_suite::BenchAesSuite;
 /// `'static` is the spawned driver task's bound, not a `Send` one: the
 /// endpoint builder's `build()` needs `I: 'static` because `spawn_local`
 /// does.
-trait BenchSuite: Handshake<Curve = P256> + 'static {}
+///
+/// `Psk = ()` restricts this to `channel!` suites. The fixture dials with
+/// `connect()` and admits with `authenticate()`, both of which carry that
+/// bound; a `channel_psk!` suite would need a key threaded through the
+/// fixture, and the pattern is not what this benchmark varies (ruling 280).
+trait BenchSuite: Handshake<Curve = P256, Psk = ()> + 'static {}
 
-impl<S: Handshake<Curve = P256> + 'static> BenchSuite for S {}
+impl<S: Handshake<Curve = P256, Psk = ()> + 'static> BenchSuite for S {}
 
 /// The suite's Noise protocol name, for the reports — measured off the
 /// suite rather than restated, so a note can never disagree with the

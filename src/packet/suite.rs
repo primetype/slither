@@ -183,10 +183,10 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// `channel!`
+// `channel!` and `channel_psk!`
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Declare a crypto suite. §2.2.
+/// Declare a crypto suite over the **`IK`** pattern. §2.2.
 ///
 /// ```
 /// use slither::prelude::*;
@@ -202,10 +202,20 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 /// requirement below** — the expansion names `::hiss` absolutely.
 ///
 /// The invocation stamps three items into the invoking module: the suite
-/// type you named, an `impl` of [`Channel`] for it, and a type called `IK`
-/// — the `hiss::noise!` state machine for the handshake. The IK token
-/// block and msg1's 12-byte payload are hardcoded here: **IK is the only
-/// pattern**, and there is no pattern parameter to pass.
+/// type you named, `impl`s of [`Channel`] and [`Handshake`] for it, and a
+/// type called `IK` — the `hiss::noise!` state machine for the handshake.
+/// The token block and msg1's 12-byte payload are hardcoded here; there is
+/// no pattern parameter to pass.
+///
+/// # The other pattern
+///
+/// [`channel_psk!`](crate::channel_psk) stamps the same suite over
+/// **`IKpsk1`** — msg1 gains a trailing `psk` token — for admitting a peer
+/// under a secret carried out of band rather than by a `known` set. §2.2
+/// covers when each applies; a psk suite's endpoint is a *separate*
+/// endpoint, never a second pattern on one socket.
+///
+/// [`Handshake`]: crate::packet::Handshake
 ///
 /// # Your crate must depend on `hiss`
 ///
@@ -216,7 +226,7 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 /// ```toml
 /// [dependencies]
 /// slither = "0.2"
-/// hiss = { version = "0.3", default-features = false }   # required, see below
+/// hiss = { version = "0.4", default-features = false }   # required, see below
 /// ```
 ///
 /// `default-features = false` matches what slither itself asks for:
@@ -235,9 +245,11 @@ const fn append(out: &mut [u8; PROTOCOL_NAME_CAP], mut len: usize, src: &[u8]) -
 /// The generated state machine must be named `IK`, because
 /// `hiss::noise!` uses the declared identifier as the pattern's `NAME`
 /// and that string seeds the initial handshake hash. Two invocations in
-/// one module therefore collide on `IK`; put each suite in its own
-/// module. §2.2 forecloses two suites on one socket anyway — endpoints
-/// are monomorphic per suite and there is no suite byte to switch on.
+/// one module therefore collide on `IK` — and a `channel!` beside a
+/// [`channel_psk!`](crate::channel_psk) does **not** collide, since the
+/// latter stamps `IKpsk1`. Put each suite in its own module. §2.2
+/// forecloses two suites on one socket anyway — endpoints are monomorphic
+/// per suite and there is no suite byte to switch on.
 #[macro_export]
 macro_rules! channel {
     (
@@ -245,9 +257,8 @@ macro_rules! channel {
         $vis:vis $name:ident < $curve:ty, $cipher:ty, $hash:ty > ;
     ) => {
         ::hiss::noise! {
-            /// The IK handshake for this suite (§2.2 — IK is the only
-            /// pattern), carrying §5.2's 12-byte timestamp payload on
-            /// msg1 and no payload on msg2.
+            /// The IK handshake for this suite (§2.2), carrying §5.2's
+            /// 12-byte timestamp payload on msg1 and no payload on msg2.
             $vis IK<$curve, $cipher, $hash> {
                 <- s
                 ...
@@ -256,6 +267,126 @@ macro_rules! channel {
             }
         }
 
+        $crate::__channel_impl! {
+            $(#[$meta])*
+            $vis $name < $curve, $cipher, $hash >;
+            kind          = no_psk;
+            psk_ty        = ();
+            machine       = IK;
+            initiator     = IKInitiatorMsg1;
+            initiator_sent= IKInitiatorMsg2;
+            responder     = IKResponderMsg1;
+            intro         = IKResponderMsg1Intro;
+            responder_read= IKResponderMsg2;
+        }
+    };
+}
+
+/// Declare a crypto suite over the **`IKpsk1`** pattern — msg1's token
+/// block gains a trailing `psk`. §2.2.
+///
+/// ```
+/// use slither::prelude::*;
+///
+/// slither::channel_psk! {
+///     /// The suite my in-person pairing window speaks.
+///     pub PairingSuite<P256, ChaChaPoly, Blake2b>;
+/// }
+/// ```
+///
+/// Identical to [`channel!`](crate::channel) in every respect below —
+/// same triple, same hardcoded `[12]` payload, same Cargo.toml
+/// requirement, same one-invocation-per-module rule — except that the
+/// stamped state machine is named `IKpsk1` and
+/// [`Handshake::Psk`](crate::packet::Handshake::Psk) is
+/// [`hiss::psk::Psk`] instead of `()`.
+///
+/// # What the pattern buys
+///
+/// A pre-shared key established out of band (a QR shown across a table is
+/// the motivating case) admits a peer the `known` set cannot: a
+/// **stranger**. The `psk` token sits **after** msg1's `s`, so the staged
+/// ladder still reveals the claimed static at 1 DH and the key is selected
+/// with the peer already named — an unenrolled dialler is rejected having
+/// cost the responder **one `es`**, and never the proving `ss`.
+///
+/// # What changes at the call sites
+///
+/// A suite stamped here has `Psk = hiss::psk::Psk`, so §16.2's
+/// `connect()` and §6.2's `authenticate()` — which are defined only for
+/// `Psk = ()` — are **not available** on its endpoint. Use
+/// `connect_with(addr, static, psk)` and `authenticate_with(psk)`. That is
+/// deliberate: there is no PSK-shaped default to fall into (ruling 280).
+///
+/// # The wire separates itself
+///
+/// The pattern name seeds the Noise protocol name, so this suite speaks
+/// `Noise_IKpsk1_<curve>_<cipher>_<hash>` — a different string, and
+/// therefore a different initial handshake hash, from the `IK` suite over
+/// the same triple. The `psk` token puts **no bytes on the wire**: all
+/// four of §2.3's sizes are identical to that suite's, and a packet
+/// crossing between them dies at msg1's first AEAD open having spent 1 DH
+/// (§2.2, §6.9).
+#[macro_export]
+macro_rules! channel_psk {
+    (
+        $(#[$meta:meta])*
+        $vis:vis $name:ident < $curve:ty, $cipher:ty, $hash:ty > ;
+    ) => {
+        ::hiss::noise! {
+            /// The IKpsk1 handshake for this suite (§2.2), carrying §5.2's
+            /// 12-byte timestamp payload on msg1 and no payload on msg2.
+            /// The trailing `psk` puts no bytes on the wire.
+            $vis IKpsk1<$curve, $cipher, $hash> {
+                <- s
+                ...
+                -> e, es, s, ss, psk [12]
+                <- e, ee, se
+            }
+        }
+
+        $crate::__channel_impl! {
+            $(#[$meta])*
+            $vis $name < $curve, $cipher, $hash >;
+            kind          = psk;
+            psk_ty        = ::hiss::psk::Psk;
+            machine       = IKpsk1;
+            initiator     = IKpsk1InitiatorMsg1;
+            initiator_sent= IKpsk1InitiatorMsg2;
+            responder     = IKpsk1ResponderMsg1;
+            intro         = IKpsk1ResponderMsg1Intro;
+            responder_read= IKpsk1ResponderMsg2;
+        }
+    };
+}
+
+/// The shared body of [`channel!`](crate::channel) and
+/// [`channel_psk!`](crate::channel_psk). Not public API.
+///
+/// # Why the state type names are passed in
+///
+/// `hiss::noise!` names its per-state types `{Pattern}{Role}Msg{n}[Intro]`
+/// (Appendix A), so this body needs `IKInitiatorMsg1` for one caller and
+/// `IKpsk1InitiatorMsg1` for the other. `macro_rules` **cannot concatenate
+/// identifiers** — there is no stable `concat_idents!` — so the five names
+/// are spelled out at each call site rather than built from `machine`.
+/// They are mechanical, and the `const _` assertions at the bottom of this
+/// expansion fail the build if a caller ever spells one wrong.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __channel_impl {
+    (
+        $(#[$meta:meta])*
+        $vis:vis $name:ident < $curve:ty, $cipher:ty, $hash:ty >;
+        kind          = $kind:ident;
+        psk_ty        = $psk_ty:ty;
+        machine       = $mach:ident;
+        initiator     = $init:ident;
+        initiator_sent= $init_sent:ident;
+        responder     = $resp:ident;
+        intro         = $intro:ident;
+        responder_read= $resp_read:ident;
+    ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
         $vis struct $name;
@@ -268,7 +399,7 @@ macro_rules! channel {
             const PROTOCOL_NAME: &'static str = {
                 const RAW: ([u8; $crate::packet::suite::PROTOCOL_NAME_CAP], usize) =
                     $crate::packet::suite::protocol_name(
-                        <IK as ::hiss::noise::Pattern>::NAME,
+                        <$mach as ::hiss::noise::Pattern>::NAME,
                         <$curve as ::hiss::curve::Curve>::NAME,
                         <$cipher as ::hiss::noise::Cipher>::NAME,
                         <$hash as ::hiss::noise::Hash>::NAME,
@@ -292,6 +423,12 @@ macro_rules! channel {
             // AS the derivation — instead of writing literals and
             // asserting them against it — means a suite cannot be declared
             // whose sizes disagree with the formula.
+            //
+            // The formula is pattern-independent, and that is a fact about
+            // the wire rather than an omission: a `psk` token mixes a key
+            // and emits nothing, so IKpsk1's four sizes equal IK's over
+            // the same triple. The `const _` pins below check that against
+            // hiss's own computed sizes for whichever machine was stamped.
             const MSG1_LEN: usize = Self::STATIC_PUBLIC_LEN
                 + (Self::STATIC_PUBLIC_LEN + Self::AEAD_TAG_LEN)
                 + ($crate::constants::MSG1_PAYLOAD_LEN + Self::AEAD_TAG_LEN);
@@ -308,56 +445,59 @@ macro_rules! channel {
         // `core::Endpoint<I>` can call it. `hiss::noise!` generates its
         // transitions as INHERENT methods on per-state types, which no
         // generic caller can name; this block is the only place those
-        // names are written down, and it is mechanical — every identifier
-        // below is `IK` plus hiss's fixed `{Role}Msg{n}[Intro]` suffix.
+        // names are written down.
         //
         // Purely additive: no item of the `Channel` impl above moves, so
         // slice 1's frozen wire tests are untouched.
         impl $crate::packet::Handshake for $name {
-            type Initiator<P: ::hiss::provider::DhProvider<$curve>> = IKInitiatorMsg1<P>;
-            type InitiatorSent<P: ::hiss::provider::DhProvider<$curve>> = IKInitiatorMsg2<P>;
-            type Responder<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg1<P>;
-            type Msg1Intro<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg1Intro<P>;
-            type ResponderRead<P: ::hiss::provider::DhProvider<$curve>> = IKResponderMsg2<P>;
+            type Initiator<P: ::hiss::provider::DhProvider<$curve>> = $init<P>;
+            type InitiatorSent<P: ::hiss::provider::DhProvider<$curve>> = $init_sent<P>;
+            type Responder<P: ::hiss::provider::DhProvider<$curve>> = $resp<P>;
+            type Msg1Intro<P: ::hiss::provider::DhProvider<$curve>> = $intro<P>;
+            type ResponderRead<P: ::hiss::provider::DhProvider<$curve>> = $resp_read<P>;
 
-            type Transport = ::hiss::noise::Transport<IK>;
-            type Seal = ::hiss::noise::DatagramSend<IK>;
-            type Open = ::hiss::noise::DatagramRecv<IK>;
+            type Psk = $psk_ty;
+
+            type Transport = ::hiss::noise::Transport<$mach>;
+            type Seal = ::hiss::noise::DatagramSend<$mach>;
+            type Open = ::hiss::noise::DatagramRecv<$mach>;
 
             fn initiator<P: ::hiss::provider::DhProvider<$curve>>(
                 provider: P,
                 prologue: &[u8],
                 remote_static: <$curve as ::hiss::curve::Curve>::PublicKey,
-            ) -> IKInitiatorMsg1<P> {
-                IK::initiator(provider, prologue, remote_static)
+            ) -> $init<P> {
+                $mach::initiator(provider, prologue, remote_static)
             }
 
             fn write_msg1<P: ::hiss::provider::DhProvider<$curve>>(
-                state: IKInitiatorMsg1<P>,
+                state: $init<P>,
                 static_key: <P as ::hiss::provider::CryptoKeyProvider<$curve>>::PrivateKey,
+                psk: &Self::Psk,
                 payload: &[u8; $crate::constants::MSG1_PAYLOAD_LEN],
             ) -> ::core::result::Result<
-                (::std::vec::Vec<u8>, IKInitiatorMsg2<P>),
+                (::std::vec::Vec<u8>, $init_sent<P>),
                 ::hiss::noise::HandshakeError,
             > {
-                let (bytes, next) = state.write_message_1(static_key, payload)?;
+                let (bytes, next) =
+                    $crate::__channel_write_msg1!($kind, state, static_key, psk, payload)?;
                 ::core::result::Result::Ok((bytes.to_vec(), next))
             }
 
             fn read_msg2<P: ::hiss::provider::DhProvider<$curve>>(
-                state: IKInitiatorMsg2<P>,
+                state: $init_sent<P>,
                 msg2: &[u8],
             ) -> ::core::result::Result<
-                ::hiss::noise::Transport<IK>,
+                ::hiss::noise::Transport<$mach>,
                 ::hiss::noise::HandshakeError,
             > {
-                // §3.1's gate admits only an exactly-`RESP_PACKET_LEN`
-                // response, so this conversion cannot fail for anything
-                // the core routes here. It is written as an error rather
-                // than an `unwrap` because a panic reachable from a
-                // received packet is the wrong failure for a transport.
-                let exact: &[u8; IK::MSG2_SIZE] = match ::core::convert::TryFrom::try_from(msg2) {
-                    ::core::result::Result::Ok(m) => m,
+                // hiss takes a fixed-size array; §3.1's length gate has
+                // already guaranteed the size for anything that reaches
+                // here, so this conversion cannot fail in practice — but
+                // it is a `TryFrom`, and the honest error is the one hiss
+                // would give for a truncated message.
+                let exact: &[u8; $mach::MSG2_SIZE] = match ::core::convert::TryFrom::try_from(msg2) {
+                    ::core::result::Result::Ok(exact) => exact,
                     ::core::result::Result::Err(_) => {
                         return ::core::result::Result::Err(
                             ::hiss::noise::HandshakeError::MessageTooShort,
@@ -371,22 +511,22 @@ macro_rules! channel {
                 provider: P,
                 prologue: &[u8],
                 static_key: <P as ::hiss::provider::CryptoKeyProvider<$curve>>::PrivateKey,
-            ) -> ::core::result::Result<IKResponderMsg1<P>, ::hiss::noise::HandshakeError> {
-                IK::responder(provider, prologue, static_key)
+            ) -> ::core::result::Result<$resp<P>, ::hiss::noise::HandshakeError> {
+                $mach::responder(provider, prologue, static_key)
             }
 
             fn read_msg1_intro<P: ::hiss::provider::DhProvider<$curve>>(
-                state: IKResponderMsg1<P>,
+                state: $resp<P>,
                 msg1: &[u8],
             ) -> ::core::result::Result<
                 (
                     <$curve as ::hiss::curve::Curve>::PublicKey,
-                    IKResponderMsg1Intro<P>,
+                    $intro<P>,
                 ),
                 ::hiss::noise::HandshakeError,
             > {
-                let exact: &[u8; IK::MSG1_SIZE] = match ::core::convert::TryFrom::try_from(msg1) {
-                    ::core::result::Result::Ok(m) => m,
+                let exact: &[u8; $mach::MSG1_SIZE] = match ::core::convert::TryFrom::try_from(msg1) {
+                    ::core::result::Result::Ok(exact) => exact,
                     ::core::result::Result::Err(_) => {
                         return ::core::result::Result::Err(
                             ::hiss::noise::HandshakeError::MessageTooShort,
@@ -397,21 +537,22 @@ macro_rules! channel {
             }
 
             fn complete<P: ::hiss::provider::DhProvider<$curve>>(
-                mid: IKResponderMsg1Intro<P>,
+                mid: $intro<P>,
+                psk: &Self::Psk,
             ) -> ::core::result::Result<
                 (
                     [u8; $crate::constants::MSG1_PAYLOAD_LEN],
-                    IKResponderMsg2<P>,
+                    $resp_read<P>,
                 ),
                 ::hiss::noise::HandshakeError,
             > {
-                mid.complete()
+                $crate::__channel_complete!($kind, mid, psk)
             }
 
             fn write_msg2<P: ::hiss::provider::DhProvider<$curve>>(
-                state: IKResponderMsg2<P>,
+                state: $resp_read<P>,
             ) -> ::core::result::Result<
-                (::std::vec::Vec<u8>, ::hiss::noise::Transport<IK>),
+                (::std::vec::Vec<u8>, ::hiss::noise::Transport<$mach>),
                 ::hiss::noise::HandshakeError,
             > {
                 let (bytes, transport) = state.write_message_2()?;
@@ -419,27 +560,27 @@ macro_rules! channel {
             }
 
             fn into_datagram(
-                transport: ::hiss::noise::Transport<IK>,
+                transport: ::hiss::noise::Transport<$mach>,
                 epoch_size: ::core::num::NonZeroU64,
             ) -> (
-                ::hiss::noise::DatagramSend<IK>,
-                ::hiss::noise::DatagramRecv<IK>,
+                ::hiss::noise::DatagramSend<$mach>,
+                ::hiss::noise::DatagramRecv<$mach>,
             ) {
                 transport.into_datagram_with_epoch(epoch_size)
             }
 
-            fn next_counter(seal: &::hiss::noise::DatagramSend<IK>) -> u64 {
+            fn next_counter(seal: &::hiss::noise::DatagramSend<$mach>) -> u64 {
                 seal.next_counter()
             }
 
             fn session_id(
-                seal: &::hiss::noise::DatagramSend<IK>,
+                seal: &::hiss::noise::DatagramSend<$mach>,
             ) -> &::hiss::noise::SessionId {
                 seal.session_id()
             }
 
             fn seal(
-                seal: &mut ::hiss::noise::DatagramSend<IK>,
+                seal: &mut ::hiss::noise::DatagramSend<$mach>,
                 ad: &[u8],
                 plaintext: &[u8],
                 out: &mut [u8],
@@ -448,7 +589,7 @@ macro_rules! channel {
             }
 
             fn open(
-                open: &mut ::hiss::noise::DatagramRecv<IK>,
+                open: &mut ::hiss::noise::DatagramRecv<$mach>,
                 counter: u64,
                 ad: &[u8],
                 ciphertext: &[u8],
@@ -459,21 +600,25 @@ macro_rules! channel {
         }
 
         // slither's §2.3 arithmetic against hiss's own computed sizes, for
-        // EVERY suite the macro stamps. Two things ride on this pair:
+        // EVERY suite either macro stamps. Three things ride on this pair:
         //
         //  * a hiss change to the point encoding or the tag size turns the
         //    BUILD red in every suite, not one golden test in one suite;
         //  * `MSG1_PAYLOAD_LEN` is spelled `[12]` in the token block above
         //    because `hiss::noise!` takes a literal there. This is what
         //    ties that literal to `constants::MSG1_PAYLOAD_LEN`: disagree,
-        //    and `MSG1_LEN` no longer equals `IK::MSG1_SIZE`.
+        //    and `MSG1_LEN` no longer equals the machine's `MSG1_SIZE`;
+        //  * on a `channel_psk!` suite it is also what pins "the `psk`
+        //    token puts no bytes on the wire" — the derivation above has
+        //    no psk term at all, so if hiss ever gave one a wire cost,
+        //    this equality would fail.
         const _: () = assert!(
-            <$name as $crate::packet::Channel>::MSG1_LEN == IK::MSG1_SIZE,
-            "slither's §2.3 MSG1_LEN disagrees with hiss's computed IK::MSG1_SIZE"
+            <$name as $crate::packet::Channel>::MSG1_LEN == $mach::MSG1_SIZE,
+            "slither's §2.3 MSG1_LEN disagrees with hiss's computed MSG1_SIZE"
         );
         const _: () = assert!(
-            <$name as $crate::packet::Channel>::MSG2_LEN == IK::MSG2_SIZE,
-            "slither's §2.3 MSG2_LEN disagrees with hiss's computed IK::MSG2_SIZE"
+            <$name as $crate::packet::Channel>::MSG2_LEN == $mach::MSG2_SIZE,
+            "slither's §2.3 MSG2_LEN disagrees with hiss's computed MSG2_SIZE"
         );
 
         // §3.5: neither handshake packet may fragment.
@@ -485,6 +630,45 @@ macro_rules! channel {
             <$name as $crate::packet::Channel>::RESP_PACKET_LEN
                 <= $crate::constants::MAX_DATAGRAM
         );
+    };
+}
+
+/// `write_message_1`'s per-pattern argument list. Not public API.
+///
+/// The `IK` arm drops `$psk` on the floor — it is `&()`. The `psk` arm
+/// passes it **before** the payload, which is hiss's own order: the
+/// generated parameter list is built per token, and a declared payload's
+/// tail is appended last.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __channel_write_msg1 {
+    (no_psk, $state:expr, $key:expr, $psk:expr, $payload:expr) => {{
+        // Not merely a discard: the annotation makes `kind = no_psk`
+        // *mean* `Psk = ()` at compile time, so a caller that paired
+        // `no_psk` with a real key type fails the build here rather than
+        // silently ignoring a PSK it was handed.
+        let _: &() = $psk;
+        $state.write_message_1($key, $payload)
+    }};
+    (psk, $state:expr, $key:expr, $psk:expr, $payload:expr) => {
+        $state.write_message_1($key, $psk, $payload)
+    };
+}
+
+/// The mid-state's `complete()` per pattern. Not public API.
+///
+/// On `IKpsk1` this is where the pre-shared key is mixed — after the
+/// claimed static is already in hand, which is the ordering the whole
+/// pattern exists for.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __channel_complete {
+    (no_psk, $mid:expr, $psk:expr) => {{
+        let _: &() = $psk;
+        $mid.complete()
+    }};
+    (psk, $mid:expr, $psk:expr) => {
+        $mid.complete($psk)
     };
 }
 

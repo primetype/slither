@@ -54,7 +54,10 @@ use std::future::Future;
 ///     socket: tokio::net::UdpSocket,
 ///     peer: slither::identity::PublicKeyOf<I>,
 ///     addr: SocketAddr,
-/// ) -> Result<(), Box<dyn std::error::Error>> {
+/// ) -> Result<(), Box<dyn std::error::Error>>
+/// where
+///     I::Suite: slither::packet::Handshake<Psk = ()>,
+/// {
 ///     block_on(async move {
 ///         let endpoint = Endpoint::builder()
 ///             .identity(identity)

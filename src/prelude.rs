@@ -26,8 +26,8 @@
 //!
 //! # The hiss types
 //!
-//! [`P256`], [`ChaChaPoly`], [`AesGcm`] and [`Blake2b`] are hiss's,
-//! folded in so the one `use` line also covers the
+//! [`P256`], [`ChaChaPoly`], [`AesGcm`], [`Blake2b`] and [`Psk`] are
+//! hiss's, folded in so the one `use` line also covers the
 //! [`channel!`](crate::channel) suite declaration. `ChaChaPoly` is the
 //! reference suite's cipher and the portable default; `AesGcm` is the
 //! offered alternative for targets whose hardware carries it — see
@@ -41,7 +41,15 @@
 //! ruling. A name added to a glob-visible module can collide with a
 //! downstream identifier, so an addition here is an API event, not a
 //! convenience edit. *(Exercised 2026/08/20 — ruling 279 added
-//! [`AesGcm`].)*
+//! [`AesGcm`]; 2026/08/23 — ruling 280 added [`Psk`].)*
+//!
+//! [`Psk`] is here on 278's own justification: a
+//! [`channel_psk!`](crate::channel_psk) consumer cannot call
+//! [`Endpoint::connect_with`](crate::shell::Endpoint::connect_with)
+//! without naming the type, so leaving it out would mean the prelude
+//! covers one of the two patterns. Collision surface considered — the
+//! name is short, but it is also the Noise specification's own term for
+//! the thing, and a downstream `Psk` would be the same concept.
 
 pub use crate::compat::block_on;
 pub use crate::config::Config;
@@ -52,3 +60,4 @@ pub use crate::shell::{
     Proven, RecvStream, SendStream,
 };
 pub use hiss::noise::{AesGcm, Blake2b, ChaChaPoly, P256};
+pub use hiss::psk::Psk;

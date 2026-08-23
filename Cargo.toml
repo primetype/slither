@@ -431,3 +431,13 @@ required-features = ["test-util"]
 [[test]]
 name = "story_suite"
 required-features = ["test-util"]
+
+# Ruling 280's pairing window: `channel_psk!`'s IKpsk1 pattern driven end to
+# end on the paused clock — the ceremony establishes and carries traffic, a
+# wrong key is refused at §6.1's ordinary 2 DH, and a stranger the window
+# holds no key for is dropped at **one** `es`. Needs `test-util` for
+# `Network`/`Tap`: the DH-cost assertions read `CountingIdentity`'s counter,
+# and the wire-length assertions read the fabric's tap.
+[[test]]
+name = "story_pairing"
+required-features = ["test-util"]

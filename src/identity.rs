@@ -85,6 +85,11 @@ pub type PublicKeyOf<I> = <CurveOf<I> as Curve>::PublicKey;
 /// The private-key handle an identity's provider mints.
 pub type PrivateKeyOf<I> = <<I as Identity>::Provider as CryptoKeyProvider<CurveOf<I>>>::PrivateKey;
 
+/// The pre-shared key an identity's suite requires — `()` on every
+/// [`channel!`](crate::channel) suite, [`hiss::psk::Psk`] on a
+/// [`channel_psk!`](crate::channel_psk) one. Ruling 280.
+pub type PskOf<I> = <<I as Identity>::Suite as Handshake>::Psk;
+
 /// An endpoint's long-term static identity, as a **factory** for the
 /// per-handshake `(provider, static private key)` pair hiss consumes.
 ///

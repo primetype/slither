@@ -237,10 +237,51 @@ impl<I: Identity> Claimed<I> {
     /// Cancel-safe on the same terms as
     /// [`Intro::read_identity`](Intro::read_identity): a dropped future
     /// rejects the chain rather than orphaning it.
-    pub async fn authenticate(mut self) -> Result<Proven<I>, AuthError> {
+    ///
+    /// Defined only where the suite's pattern has no pre-shared key; a
+    /// [`channel_psk!`](crate::channel_psk) suite has
+    /// [`authenticate_with`](Claimed::authenticate_with) instead.
+    pub async fn authenticate(self) -> Result<Proven<I>, AuthError>
+    where
+        I::Suite: crate::packet::Handshake<Psk = ()>,
+    {
+        self.authenticate_with(()).await
+    }
+
+    /// [`authenticate`](Claimed::authenticate), naming the pre-shared key.
+    ///
+    /// # This is the stage the PSK belongs at, and the reason is the cost
+    ///
+    /// [`claimed_static`](Claimed::claimed_static) is already in your hand
+    /// — one `es`, and nothing else, has been spent — so the key is
+    /// selected **with the peer named**. That ordering is the whole reason
+    /// the pattern is `IKpsk1` and not a psk0 shape: its `psk` token sits
+    /// after msg1's `s`, so a stranger you have no key for is rejected by
+    /// *dropping this object*, at **1 DH**. Choosing inside the handshake
+    /// instead — hiss's `read_message_1_with` lookup closure, which fires
+    /// at the `psk` token and therefore after the proving `ss` — would cost
+    /// **2** (ruling 280).
+    ///
+    /// This is also why the key is not held by the endpoint: an endpoint
+    /// that already knew which PSK to use would have no use for the
+    /// identity this stage exists to reveal.
+    ///
+    /// # A wrong key is [`AuthError::HandshakeFailed`]
+    ///
+    /// The same undetailed verdict a forged identity gets, and the same
+    /// 2 DH. "You are not who you claim" and "you do not hold the pairing
+    /// secret" are one answer to one question, and §18.1 gives an
+    /// unauthenticated peer no oracle for telling them apart.
+    ///
+    /// Cancel-safe on the same terms as
+    /// [`authenticate`](Claimed::authenticate).
+    pub async fn authenticate_with(
+        mut self,
+        psk: crate::identity::PskOf<I>,
+    ) -> Result<Proven<I>, AuthError> {
         let shell = self.shell.clone();
         let id = self.id;
-        let result = round_trip(&shell, |reply| Command::Authenticate(id, reply)).await;
+        let result = round_trip(&shell, move |reply| Command::Authenticate(id, psk, reply)).await;
         self.consumed = true;
         match result {
             Some(Ok((peer_static, timestamp))) => Ok(Proven {

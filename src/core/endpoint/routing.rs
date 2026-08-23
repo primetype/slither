@@ -429,7 +429,32 @@ impl<I: Identity> Endpoint<I> {
         // "A forged claim of a pending static dies here at the msg1 tail's
         // AEAD tag. A failure leaves the in-flight outbound pending
         // untouched — nothing unauthenticated can reach the tie-break."
-        let Ok((payload, read)) = <I::Suite as Handshake>::complete(mid) else {
+        //
+        // **On a psk suite the key comes from the dial** (ruling 280).
+        // This is the one `complete()` with no application in the loop —
+        // §6.5 step 4 is explicit that here "the application learns no
+        // identity and makes no decision" — so `authenticate_with(psk)`
+        // can never reach it. It does not have to: the tie-break fires
+        // only when an inbound initiation claims *the static we hold a
+        // pending to*, so the PSK this application chose for that exact
+        // peer at `connect_with` is already in hand. Per-peer selection,
+        // arriving through the dial instead of the accept.
+        //
+        // A wrong or absent PSK is not a special case: it fails this same
+        // tag, at this same 2 DH, and leaves the pending untouched.
+        let completed = {
+            let Some(pending) = self.pendings.get(&conn) else {
+                debug_assert!(
+                    false,
+                    "§6.5's probed set answers only for statics whose row is \
+                     `Pending`, and `mint_pending` writes that row and the \
+                     pending together"
+                );
+                return;
+            };
+            <I::Suite as Handshake>::complete(mid, &pending.psk)
+        };
+        let Ok((payload, read)) = completed else {
             tracing::debug!(
                 target: "slither::policy",
                 event = "tiebreak_tag_death",
@@ -842,7 +867,7 @@ mod tests {
         fn dial(&mut self, now: Instant, to: SocketAddr, peer: &Pk) -> (ConnectionId, Drained) {
             let (id, _connection) = self
                 .ep
-                .mint_pending(now, to, *peer)
+                .mint_pending(now, to, *peer, ())
                 .expect("the static is NONE");
             self.ep.start_attempt(now, id);
             (id, self.drain())
@@ -928,7 +953,8 @@ mod tests {
         let resp = {
             let drained = b.feed(t, a.addr, &msg1);
             let (id, _src) = drained.intros[0];
-            b.ep.authenticate(t, id).expect("a real msg1 authenticates");
+            b.ep.authenticate(t, id, &())
+                .expect("a real msg1 authenticates");
             let (_conn, _c) = b.ep.accept(t, id).expect("B has no row for A");
             b.drain().transmits[0].data.clone()
         };
@@ -1002,7 +1028,8 @@ mod tests {
             "§6.5: `read_identity()` on a demoted entry is **0 incremental DH**"
         );
 
-        a.ep.authenticate(t, id).expect("a real msg1 authenticates");
+        a.ep.authenticate(t, id, &())
+            .expect("a real msg1 authenticates");
         assert_eq!(a.dhs.get(), 2, "§6.1: `authenticate()` is 2 DH cumulative");
         a.ep.accept(t, id).expect("C's static is NONE");
         assert_eq!(a.dhs.get(), 4, "§6.1: `accept()` is 4 DH cumulative");
@@ -1168,7 +1195,7 @@ mod tests {
         let replay = large.feed(t, small.addr, &crossing);
         if let Some((id, _)) = replay.intros.first() {
             assert!(
-                matches!(large.ep.authenticate(t, *id), Err(AuthError::Replay)),
+                matches!(large.ep.authenticate(t, *id, &()), Err(AuthError::Replay)),
                 "§17.1: the same initiation is no longer strictly greater"
             );
         }
@@ -1229,7 +1256,7 @@ mod tests {
         );
         assert!(
             matches!(
-                large.ep.mint_pending(t, small.addr, small.pk),
+                large.ep.mint_pending(t, small.addr, small.pk, ()),
                 Err(ConnectError::AlreadyConnected)
             ),
             "§16.1: one session per static, and the row was promoted rather than doubled"
@@ -1292,7 +1319,7 @@ mod tests {
                  (local_wins = {local_wins})"
             );
             assert!(
-                matches!(local.ep.authenticate(t, id), Err(AuthError::Expired)),
+                matches!(local.ep.authenticate(t, id, &()), Err(AuthError::Expired)),
                 "and the staged verbs say so"
             );
         }
@@ -1327,7 +1354,7 @@ mod tests {
 
         let claimed = small.ep.read_identity(t, id).expect("readable");
         assert_eq!(claimed.as_ref(), large.canonical());
-        let (_peer, timestamp) = small.ep.authenticate(t, id).expect("authenticates");
+        let (_peer, timestamp) = small.ep.authenticate(t, id, &()).expect("authenticates");
 
         let (dial, _) = small.dial(t, large.addr, &large.pk);
         let refused = small.ep.accept(t, id);
@@ -1404,7 +1431,7 @@ mod tests {
             let (id, _src) = drained.intros[0];
             third
                 .ep
-                .authenticate(t, id)
+                .authenticate(t, id, &())
                 .expect("a real msg1 authenticates");
             let (_conn, _c) = third.ep.accept(t, id).expect("third has no row for large");
             third.drain().transmits[0].data.clone()
@@ -1418,7 +1445,7 @@ mod tests {
         // The captured initiation surfaces, authenticates, and is refused.
         let drained = large.feed(t, addr(8, 4010), &captured);
         let (id2, _) = drained.intros[0];
-        let (_pk, captured_ts) = large.ep.authenticate(t, id2).expect("authenticates");
+        let (_pk, captured_ts) = large.ep.authenticate(t, id2, &()).expect("authenticates");
         assert_eq!(
             large.ep.greatest(third.canonical()),
             Some(captured_ts),
@@ -1470,7 +1497,7 @@ mod tests {
         let (id3, _) = again.intros[0];
         large
             .ep
-            .authenticate(t, id3)
+            .authenticate(t, id3, &())
             .expect("the same bytes authenticate a second time");
         assert_eq!(
             large.ep.greatest(third.canonical()),
@@ -1523,7 +1550,7 @@ mod tests {
         let from_small = lone_msg1(&mut small, t, &large);
         let drained = large.feed(t, addr(9, 4009), &from_small);
         let (id, _src) = drained.intros[0];
-        large.ep.authenticate(t, id).expect("authenticates");
+        large.ep.authenticate(t, id, &()).expect("authenticates");
 
         let (dial, _) = large.dial(t, small.addr, &small.pk);
         let accepted = large.ep.accept(t, id);
@@ -1608,7 +1635,7 @@ mod tests {
             let drained = a.feed(t, b.addr, &msg1);
             let (id, _src) = drained.intros[0];
             a.ep.read_identity(t, id).expect("readable");
-            a.ep.authenticate(t, id).expect("authenticates");
+            a.ep.authenticate(t, id, &()).expect("authenticates");
             let (a_dial, dial_out) = a.dial(t, b.addr, &b.pk);
             let accepted = a.ep.accept(t, id);
             let after_accept = a.drain();
@@ -1717,7 +1744,7 @@ mod tests {
         // `mint_pending` **only** — ruling 90's first half, no msg1.
         let (dial, _connection) = large
             .ep
-            .mint_pending(t, small.addr, small.pk)
+            .mint_pending(t, small.addr, small.pk, ())
             .expect("the static is NONE");
         let quiet = large.drain();
         assert!(
@@ -1764,7 +1791,7 @@ mod tests {
         let drained = small.feed(t, large.addr, &msg1);
         let (id, _src) = drained.intros[0];
         small.ep.read_identity(t, id).expect("readable");
-        small.ep.authenticate(t, id).expect("authenticates");
+        small.ep.authenticate(t, id, &()).expect("authenticates");
         let (_a_dial, dial_out) = small.dial(t, large.addr, &large.pk);
         let refused = small.ep.accept(t, id);
         assert!(

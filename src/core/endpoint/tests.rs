@@ -262,7 +262,7 @@ impl Ep {
     fn dial(&mut self, now: Instant, remote: SocketAddr, peer: &Pk) -> (ConnectionId, Drained) {
         let (id, _conn) = self
             .ep
-            .mint_pending(now, remote, *peer)
+            .mint_pending(now, remote, *peer, ())
             .expect("mint_pending should succeed for a static with no connection");
         self.ep.start_attempt(now, id);
         (id, self.drain())
@@ -273,7 +273,7 @@ impl Ep {
     fn mint_only(&mut self, now: Instant, remote: SocketAddr, peer: &Pk) -> ConnectionId {
         let (id, _conn) = self
             .ep
-            .mint_pending(now, remote, *peer)
+            .mint_pending(now, remote, *peer, ())
             .expect("mint_pending should succeed for a static with no connection");
         id
     }
@@ -677,7 +677,7 @@ fn a_demoted_intro_keeps_section_6_1s_cumulative_ladder() {
 
     local
         .ep
-        .authenticate(now, id)
+        .authenticate(now, id, &())
         .expect("a genuine msg1 authenticates");
     assert_eq!(local.dh(), 2, "§6.1: authenticate is 2 DH cumulative");
 
@@ -704,7 +704,7 @@ fn an_established_connections_address_is_not_a_hint() {
     let msg1 = real_msg1(&mut peer, now, &local);
     let d = local.feed(now, peer.addr, &msg1);
     let (id, _) = d.one_intro();
-    local.ep.authenticate(now, id).expect("genuine msg1");
+    local.ep.authenticate(now, id, &()).expect("genuine msg1");
     local.ep.accept(now, id).expect("NONE static, fresh accept");
     let _ = local.drain();
     assert!(
@@ -941,7 +941,7 @@ fn a_second_authenticate_is_idempotent_at_zero_incremental_dh() {
 
     let (first_peer, first_ts) = local
         .ep
-        .authenticate(now, id)
+        .authenticate(now, id, &())
         .expect("a genuine msg1 authenticates");
     let _ = local.drain();
 
@@ -962,7 +962,7 @@ fn a_second_authenticate_is_idempotent_at_zero_incremental_dh() {
     local.reset_dh();
     let (second_peer, second_ts) = local
         .ep
-        .authenticate(now, id)
+        .authenticate(now, id, &())
         .expect("ruling 267: authenticate() is idempotent at Proven");
     let d = local.drain();
 
@@ -1623,7 +1623,7 @@ fn the_post_mortem_pin_survives_orphan_aging_and_a_full_lru_flush() {
     let d = local.feed(inside, v4(9, 1), &msg1);
     let (replay, _) = d.one_intro();
     assert_eq!(
-        local.ep.authenticate(inside, replay),
+        local.ep.authenticate(inside, replay, &()),
         Err(AuthError::Replay),
         "§6.7: the captured initiation is single-use while its entry survives"
     );
@@ -1643,7 +1643,7 @@ fn the_post_mortem_pin_survives_orphan_aging_and_a_full_lru_flush() {
     let d = local.feed(after, v4(9, 2), &msg1);
     let (again, _) = d.one_intro();
     assert!(
-        local.ep.authenticate(after, again).is_ok(),
+        local.ep.authenticate(after, again, &()).is_ok(),
         "§6.7's single-use bound is conditional: past the horizon the same \
          captured initiation is re-admitted"
     );
@@ -1721,7 +1721,7 @@ fn the_tie_break_loser_installs_as_responder_and_a_msg2_completion_as_initiator(
     let (mut a, mut b) = sides(now, true);
     let msg1 = real_msg1(&mut a, now, &b);
     let (id, _) = b.feed(now, a.addr, &msg1).one_intro();
-    b.ep.authenticate(now, id).expect("genuine msg1");
+    b.ep.authenticate(now, id, &()).expect("genuine msg1");
     b.ep.accept(now, id).expect("NONE static, fresh accept");
     let msg2 = b.drain().one_transmit().1;
     let d = a.feed(now, b.addr, &msg2);
@@ -1916,7 +1916,7 @@ fn both_routes_to_the_comparison_reach_the_same_conclusion() {
         let (id, _) = d.one_intro();
         local.dial(now, peer.addr, &peer.public_static);
 
-        let authed = local.ep.authenticate(now, id);
+        let authed = local.ep.authenticate(now, id, &());
         if let Err(e) = &authed {
             assert_ne!(
                 *e,
@@ -1995,7 +1995,7 @@ fn ordinary_ordering(
 
     local
         .ep
-        .authenticate(now, intro)
+        .authenticate(now, intro, &())
         .expect("a genuine crossing msg1 authenticates");
     (intro, conn, ours)
 }
@@ -2071,7 +2071,7 @@ fn the_pending_branch_winner_returns_stale_and_is_the_one_stale_that_keeps_its_r
     let (id, _) = d.one_intro();
     plain
         .ep
-        .authenticate(now2, id)
+        .authenticate(now2, id, &())
         .expect("genuine msg1 authenticates");
     assert_eq!(
         plain.greatest(stranger.canonical()),
@@ -2188,7 +2188,7 @@ fn ordinary_api_ordering(local_is_winner: bool) {
     // 6–7. On the chain we already hold: §6.4's PENDING branch.
     local
         .ep
-        .authenticate(now, intro)
+        .authenticate(now, intro, &())
         .expect("a genuine crossing msg1 authenticates");
     let accepted = local.ep.accept(now, intro);
     let dl = local.drain();
@@ -2332,7 +2332,7 @@ fn the_ordinary_api_ordering_yields_exactly_one_resolution_per_dial() {
         let dp = peer.feed(now, local.addr, &msg1_local);
         peer_events.extend(resolutions(&dp, peer_conn));
 
-        local.ep.authenticate(now, intro).expect("genuine");
+        local.ep.authenticate(now, intro, &()).expect("genuine");
         let accepted = local.ep.accept(now, intro).is_ok();
         let dl = local.drain();
         local_events.extend(resolutions(&dl, local_conn));
@@ -2440,7 +2440,7 @@ fn a_minted_but_unattempted_pending_still_yields_one_connection_for_one_static()
         // If it surfaced, the application follows §6.4's ordering on it.
         if let Some((id, _)) = d.intros().first().copied() {
             if local.ep.read_identity(now, id).is_ok()
-                && local.ep.authenticate(now, id).is_ok()
+                && local.ep.authenticate(now, id, &()).is_ok()
                 && let Ok((accept_conn, _c)) = local.ep.accept(now, id)
             {
                 assert_ne!(accept_conn, conn, "an accept never returns the dial's id");

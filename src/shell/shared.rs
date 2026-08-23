@@ -1028,8 +1028,16 @@ pub(crate) enum Command<I: Identity> {
     /// §6.2's stage 1.
     ReadIdentity(IntroId, oneshot::Sender<Result<PublicKeyOf<I>, IntroError>>),
     /// §6.2's stage 2.
+    ///
+    /// Carries the **pre-shared key** — `()` on an `IK` suite, and the
+    /// application's per-peer choice on a `channel_psk!` one (ruling 280).
+    /// It travels with the verb rather than living on the endpoint
+    /// precisely so the responder can select it *using the claimed static
+    /// it has already paid one `es` for*; §6.2's typestate is what
+    /// guarantees that static is in the application's hand by now.
     Authenticate(
         IntroId,
+        crate::identity::PskOf<I>,
         oneshot::Sender<Result<(PublicKeyOf<I>, Timestamp), AuthError>>,
     ),
     /// §6.2's stage 3. Carries the proven static from the `Proven` handle:

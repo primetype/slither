@@ -53,8 +53,14 @@ use crate::packet::Channel;
 /// sight, and it appears in three signatures below.
 pub type PublicKeyFor<C> = <<C as Channel>::Curve as Curve>::PublicKey;
 
-/// The suite's IK handshake ladder. Implemented by [`crate::channel!`],
-/// never by hand.
+/// A suite's pre-shared key type — `()` on every `IK` suite.
+///
+/// The same convenience [`PublicKeyFor`] is: written out, the projection
+/// through two traits is a `clippy::type_complexity` on sight.
+pub type PskFor<C> = <C as Handshake>::Psk;
+
+/// The suite's handshake ladder — `IK`'s, or `IKpsk1`'s. Implemented by
+/// [`crate::channel!`] and [`crate::channel_psk!`], never by hand.
 ///
 /// The `Vec<u8>` returns carry the **Noise message only** — the caller
 /// frames it with a header and mac1. hiss returns owned fixed arrays
@@ -77,6 +83,27 @@ pub trait Handshake: Channel {
     /// `IKResponderMsg2<P>`. §6.1's stage 2.
     type ResponderRead<P: DhProvider<Self::Curve>>;
 
+    /// The pre-shared key this suite's **pattern** requires:
+    /// `()` for `IK`, [`hiss::psk::Psk`] for `IKpsk1`.
+    ///
+    /// # Why an associated type and not a parameter
+    ///
+    /// `core::Endpoint<I>` is generic over the
+    /// suite and cannot branch on the pattern, so the ladder below is
+    /// written **once** with a uniform signature and `()` is the
+    /// inhabitant that means "this pattern has no PSK". The `IK` impl
+    /// [`crate::channel!`] stamps takes `&()` and drops it.
+    ///
+    /// # It is also the switch on the public API
+    ///
+    /// §16.2's `connect()` and §6.2's `authenticate()` are defined on
+    /// `impl` blocks bounded `Handshake<Psk = ()>`, with
+    /// `connect_with`/`authenticate_with` alongside them for every suite.
+    /// An `IK` consumer's call sites are therefore untouched, and a psk
+    /// suite gets **only** the explicit form — there is no PSK-shaped
+    /// default to fall into (ruling 280).
+    type Psk;
+
     /// The completed handshake, before the datagram split. Provider-free.
     type Transport;
     /// The sealing half of the datagram pair (§16.4's "seal").
@@ -93,9 +120,18 @@ pub trait Handshake: Channel {
 
     /// Write msg1 — **2 DH** (`es`, `ss`) — over a fresh ephemeral hiss
     /// mints internally, carrying §5.2's 12-byte timestamp payload.
+    ///
+    /// `psk` is `&()` on an `IK` suite. On `IKpsk1` it is mixed at msg1's
+    /// trailing `psk` token, which puts **no bytes on the wire**: §2.3's
+    /// `MSG1_LEN` derivation is identical for both patterns.
+    ///
+    /// The argument sits **before** the payload because that is hiss's own
+    /// order — the generated `write_message_1` builds its parameter list
+    /// per token, and the declared payload's tail is appended last.
     fn write_msg1<P: DhProvider<Self::Curve>>(
         state: Self::Initiator<P>,
         static_key: <P as CryptoKeyProvider<Self::Curve>>::PrivateKey,
+        psk: &Self::Psk,
         payload: &[u8; constants::MSG1_PAYLOAD_LEN],
     ) -> Result<(Vec<u8>, Self::InitiatorSent<P>), HandshakeError>;
 
@@ -128,8 +164,21 @@ pub trait Handshake: Channel {
 
     /// Pay the proving `ss` — **1 DH** — and decrypt msg1's payload.
     /// §6.1's stage 2. Dropping the mid-state instead is the rejection.
+    ///
+    /// `psk` is `&()` on an `IK` suite. On `IKpsk1` the pre-shared key is
+    /// mixed **here**, which is the pattern's entire point: the claimed
+    /// static came back from
+    /// [`read_msg1_intro`](Handshake::read_msg1_intro) one `es` ago, so the
+    /// key is selected with the peer already named. A stranger with no
+    /// enrolled PSK is rejected having cost this endpoint **1 DH** — half
+    /// what a lookup at the `psk` token would cost, since that token sits
+    /// after the proving `ss`.
+    ///
+    /// A wrong PSK fails the same way a wrong key does: msg1's tail tag
+    /// does not verify, and the error carries no detail.
     fn complete<P: DhProvider<Self::Curve>>(
         mid: Self::Msg1Intro<P>,
+        psk: &Self::Psk,
     ) -> Result<([u8; constants::MSG1_PAYLOAD_LEN], Self::ResponderRead<P>), HandshakeError>;
 
     /// Write msg2 — **2 DH** (`ee`, `se`) — and finish the handshake.
