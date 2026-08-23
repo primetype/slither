@@ -62,10 +62,10 @@ records as the document nothing sweeps but deliberate intent.)*
   `cryptoxide` directly (the raw-primitive rule: it is a keyed hash over
   public data, not session cryptography). slither's `cryptoxide`
   requirement is pinned to **exactly the range hiss uses**
-  (`>=0.6.0, <0.7` as of hiss 0.3.2) — verify against hiss's Cargo.toml
+  (`>=0.6.3, <0.7` as of hiss 0.4.1) — verify against hiss's Cargo.toml
   when bumping either.
 - **`rand_core` must match the line hiss's public bounds name** (0.10 as
-  of hiss 0.3.2; `hiss::rand_core` re-exports it). Two rand_core majors
+  of hiss 0.4.1; `hiss::rand_core` re-exports it). Two rand_core majors
   in one graph produce an unsatisfiable `CryptoRng` bound, not a version
   error.
 - **No RustCrypto crates** for any slither cryptography.
