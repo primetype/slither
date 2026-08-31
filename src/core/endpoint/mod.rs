@@ -64,6 +64,11 @@ pub(crate) mod tables;
 #[cfg(test)]
 mod tests;
 
+// Ruling 284's independent clock-horizon acceptance tests. The file is
+// authored separately from the deadline implementation (working rule 6).
+#[cfg(test)]
+mod tests_safe_arithmetic;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -75,7 +80,7 @@ use rand_core::{Rng, SeedableRng};
 use crate::config::Config;
 use crate::constants;
 use crate::core::{
-    ConnSeed, Connection, ConnectionId, Disposition, EndpointOutput, EstablishedSession,
+    ConnSeed, Connection, ConnectionId, Deadline, Disposition, EndpointOutput, EstablishedSession,
     FlowWindows, Install, Role, Timestamp, ToEndpoint, Transmit,
 };
 use crate::error::ConnectError;
@@ -114,11 +119,13 @@ struct Pending<I: Identity> {
     state: Option<Box<InitiatorSent<I>>>,
     /// Armed at `RETRANSMIT_BASE + U[0, RETRANSMIT_JITTER_MAX]`. **Fixed,
     /// not exponential** — §13's exponential PTO governs the data path
-    /// alone.
-    next_retransmit: Instant,
+    /// alone. `Unreachable` keeps an interval beyond the platform clock's
+    /// horizon logically armed without announcing or firing it (ruling 284).
+    next_retransmit: Deadline,
     /// `HANDSHAKE_GIVEUP` after the **first** attempt, never re-based by a
-    /// retransmit.
-    give_up_at: Instant,
+    /// retransmit. It remains logically armed as `Unreachable` if that sum
+    /// is outside the platform clock's horizon.
+    give_up_at: Deadline,
     /// §5.5 rule 3: one completion attempt per retransmit interval.
     attempt_spent: bool,
     /// Whether **any** attempt has reached the wire. Ruling 72.
@@ -321,12 +328,15 @@ impl<I: Identity> Endpoint<I> {
     /// The guard's own deadline needs no clock at all: ruling 73 stamps an
     /// orphan with the instant its last **key-holder** pin was released,
     /// and ruling 80 gives every releasing verb a `now` to stamp with, so
-    /// the deadline is a stored value plus a constant.
+    /// the deadline is a stored value plus a constant. Ruling 284 narrows
+    /// the announced minimum to representable sums; unreachable logical
+    /// timers remain in their owning state.
     fn deadline(&self) -> Option<Instant> {
         let pendings = self
             .pendings
             .values()
-            .map(|p| p.next_retransmit.min(p.give_up_at))
+            .flat_map(|p| [p.next_retransmit, p.give_up_at])
+            .filter_map(Deadline::as_instant)
             .min();
         let intros = self.intros.next_deadline();
         let orphans = self.guard.next_orphan_deadline();
@@ -343,7 +353,8 @@ impl<I: Identity> Endpoint<I> {
     // ═══════════════════════════════════════════════════════════════════
 
     /// §16.6's per-connection sub-seed, **drawn even while unused**, and —
-    /// **[ruling 259(viii)]** — §10.2's advertised windows stamped on it.
+    /// **[rulings 259(viii), 282]** — §10.2's advertised windows and §7.5's
+    /// liveness profile stamped on it.
     ///
     /// The parenthesis in §16.6 is written for exactly this slice: the
     /// connection core uses no randomness until slice 4, and omitting the
@@ -364,6 +375,7 @@ impl<I: Identity> Endpoint<I> {
                 stream: self.config.stream_window(),
                 connection: self.config.connection_window(),
             },
+            timing_profile: self.config.timing_profile(),
         }
     }
 
@@ -372,10 +384,14 @@ impl<I: Identity> Endpoint<I> {
     /// A modulo draw. The bias against a 333 ms bound from a 32-bit draw is
     /// on the order of 2⁻²⁴ and this is scheduling jitter, not key
     /// material; the unpredictability requirement in §16.6 is on **indices**.
-    fn draw_retransmit_delay(&mut self) -> Duration {
-        let span = constants::RETRANSMIT_JITTER_MAX.as_nanos() as u64 + 1;
-        let jitter = u64::from(self.rng.next_u32()) % span;
-        constants::RETRANSMIT_BASE + Duration::from_nanos(jitter)
+    fn draw_retransmit_delay(&mut self) -> Option<Duration> {
+        // Draw before deriving the interval so the ordinary seeded stream is
+        // unchanged. The checked conversions keep even a future, enlarged
+        // constant from making timer arithmetic wrap or panic.
+        let draw = u128::from(self.rng.next_u32());
+        let span = constants::RETRANSMIT_JITTER_MAX.as_nanos().checked_add(1)?;
+        let jitter = u64::try_from(draw % span).ok()?;
+        constants::RETRANSMIT_BASE.checked_add(Duration::from_nanos(jitter))
     }
 
     fn next_connection_id(&mut self) -> ConnectionId {
@@ -465,8 +481,8 @@ impl<I: Identity> Endpoint<I> {
             psk,
             sender_index: None,
             state: None,
-            next_retransmit: now,
-            give_up_at: now + constants::HANDSHAKE_GIVEUP,
+            next_retransmit: Deadline::at(now),
+            give_up_at: Deadline::after(now, constants::HANDSHAKE_GIVEUP),
             attempt_spent: false,
             attempted: false,
             guard_pinned: false,
@@ -531,7 +547,10 @@ impl<I: Identity> Endpoint<I> {
         }
         pending.state = None;
         pending.attempt_spent = false;
-        pending.next_retransmit = now + self.draw_retransmit_delay();
+        pending.next_retransmit = match self.draw_retransmit_delay() {
+            Some(delay) => Deadline::after(now, delay),
+            None => Deadline::Unreachable,
+        };
 
         let sender_index = self.indices.mint(&mut self.rng);
         let timestamp = self.draw_timestamp();
@@ -879,7 +898,7 @@ impl<I: Identity> Endpoint<I> {
             // Normative: **give-up beats a same-instant retransmit**. The
             // comparison is `<=`, so an equality is a give-up and the
             // pending is gone before step (4) can look at it.
-            .filter(|(_, p)| p.give_up_at <= now)
+            .filter(|(_, p)| p.give_up_at.is_due(now))
             .map(|(id, _)| *id)
             .collect();
 
@@ -908,7 +927,7 @@ impl<I: Identity> Endpoint<I> {
         let due: Vec<ConnectionId> = self
             .pendings
             .iter()
-            .filter(|(_, p)| p.next_retransmit <= now)
+            .filter(|(_, p)| p.next_retransmit.is_due(now))
             .map(|(id, _)| *id)
             .collect();
 

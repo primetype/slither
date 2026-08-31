@@ -424,11 +424,7 @@ impl Recovery {
         let anchor = self.last_ack_eliciting?;
         let multiplier = 1u32 << self.pto_count.min(PTO_MAX_EXPONENT);
         debug_assert!(multiplier <= constants::PTO_BACKOFF_CAP);
-        let interval = self
-            .rtt
-            .pto_interval()
-            .checked_mul(multiplier)
-            .unwrap_or(Duration::MAX);
+        let interval = self.rtt.pto_interval()?.checked_mul(multiplier)?;
         anchor.checked_add(interval)
     }
 
@@ -539,11 +535,14 @@ impl Recovery {
             // an immediate wakeup, and the pair spins. It is ruling 131's
             // defect — "a timer that fires and declares nothing" — reaching
             // the same section by a second route.
-            let by_time = now.saturating_duration_since(packet.time_sent) >= loss_delay;
+            let by_time = loss_delay
+                .is_some_and(|delay| now.saturating_duration_since(packet.time_sent) >= delay);
 
             if by_count || by_time {
                 lost.push(*counter);
-            } else if let Some(at) = packet.time_sent.checked_add(loss_delay) {
+            } else if let Some(at) =
+                loss_delay.and_then(|delay| packet.time_sent.checked_add(delay))
+            {
                 self.loss_time = Some(match self.loss_time {
                     Some(current) => current.min(at),
                     None => at,
@@ -633,7 +632,7 @@ impl Recovery {
         let Some(period) = self
             .rtt
             .pto_interval()
-            .checked_mul(constants::PERSISTENT_CONGESTION_THRESHOLD)
+            .and_then(|interval| interval.checked_mul(constants::PERSISTENT_CONGESTION_THRESHOLD))
         else {
             return false;
         };
@@ -702,6 +701,10 @@ pub(crate) struct RttEstimator {
     rttvar: Duration,
     /// `None` before the first sample **and** after a roam re-seed (§13.1).
     min_rtt: Option<Duration>,
+    /// `false` only if a platform cannot represent an estimator
+    /// intermediate. Derived Loss/PTO deadlines then remain logically
+    /// enabled through recovery state but are not announced.
+    arithmetic_reachable: bool,
 }
 
 impl Default for RttEstimator {
@@ -718,6 +721,7 @@ impl RttEstimator {
             smoothed: None,
             rttvar: constants::K_INITIAL_RTT / 2,
             min_rtt: None,
+            arithmetic_reachable: true,
         }
     }
 
@@ -731,6 +735,7 @@ impl RttEstimator {
             self.smoothed = Some(latest);
             self.rttvar = latest / 2;
             self.min_rtt = Some(latest);
+            self.arithmetic_reachable = true;
             return;
         };
 
@@ -747,7 +752,10 @@ impl RttEstimator {
         // *"the peer's `ack_delay`, capped at `MAX_ACK_DELAY`, is subtracted
         // **only when doing so does not push the sample below `min_rtt`**"*.
         let capped = ack_delay.min(constants::MAX_ACK_DELAY);
-        let adjusted = if latest >= min_rtt + capped {
+        let adjusted = if min_rtt
+            .checked_add(capped)
+            .is_some_and(|floor| latest >= floor)
+        {
             latest - capped
         } else {
             latest
@@ -755,8 +763,18 @@ impl RttEstimator {
 
         // §13.1's `|smoothed_rtt − adjusted|`.
         let deviation = smoothed.abs_diff(adjusted);
-        self.rttvar = self.rttvar * 3 / 4 + deviation / 4;
-        self.smoothed = Some(smoothed * 7 / 8 + adjusted / 8);
+        let next_rttvar = duration_mul_ratio(self.rttvar, 3, 4)
+            .and_then(|weighted| weighted.checked_add(deviation / 4));
+        let next_smoothed = duration_mul_ratio(smoothed, 7, 8)
+            .and_then(|weighted| weighted.checked_add(adjusted / 8));
+        match (next_rttvar, next_smoothed) {
+            (Some(rttvar), Some(smoothed)) => {
+                self.rttvar = rttvar;
+                self.smoothed = Some(smoothed);
+                self.arithmetic_reachable = true;
+            }
+            _ => self.arithmetic_reachable = false,
+        }
     }
 
     /// `K_INITIAL_RTT` before any sample.
@@ -784,16 +802,23 @@ impl RttEstimator {
     /// The `max` with `latest_rtt` is load-bearing: on a rising path
     /// `smoothed_rtt` lags, and a threshold built from it alone declares
     /// stragglers lost that are merely late.
-    pub(crate) fn loss_delay(&self) -> Duration {
+    pub(crate) fn loss_delay(&self) -> Option<Duration> {
+        if !self.arithmetic_reachable {
+            return None;
+        }
         let base = self.smoothed_rtt().max(self.latest);
-        (base * 9 / 8).max(constants::K_GRANULARITY)
+        duration_mul_ratio(base, 9, 8).map(|delay| delay.max(constants::K_GRANULARITY))
     }
 
     /// §13.3's formula **with `pto_count = 0`** — §14.4 uses exactly this.
-    pub(crate) fn pto_interval(&self) -> Duration {
+    pub(crate) fn pto_interval(&self) -> Option<Duration> {
+        if !self.arithmetic_reachable {
+            return None;
+        }
+        let variance = self.rttvar.checked_mul(4)?.max(constants::K_GRANULARITY);
         self.smoothed_rtt()
-            + (self.rttvar * 4).max(constants::K_GRANULARITY)
-            + constants::MAX_ACK_DELAY
+            .checked_add(variance)?
+            .checked_add(constants::MAX_ACK_DELAY)
     }
 
     /// §13.1's roam clause: `min_rtt` MUST be allowed to rise, so the next
@@ -804,4 +829,18 @@ impl RttEstimator {
     pub(crate) fn reseed_min_rtt(&mut self) {
         self.min_rtt = None;
     }
+}
+
+/// `floor(value × numerator / denominator)` without overflowing a
+/// `Duration` intermediate. The ratio is evaluated in nanoseconds; `u128`
+/// is deliberately still checked so the invariant does not depend on the
+/// current platform's `Duration` range.
+fn duration_mul_ratio(value: Duration, numerator: u32, denominator: u32) -> Option<Duration> {
+    if denominator == 0 {
+        return None;
+    }
+    let nanos = value.as_nanos().checked_mul(u128::from(numerator))? / u128::from(denominator);
+    let seconds = u64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec_nanos = u32::try_from(nanos % 1_000_000_000).ok()?;
+    Some(Duration::new(seconds, subsec_nanos))
 }

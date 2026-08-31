@@ -600,9 +600,9 @@ impl<I: Identity> ShellLink for Shell<I> {
 /// application's is waiting on it, and `remote_address()` answers *where*
 /// without ever saying *when*. `Contested` and `ContestCleared` are §7.5's
 /// probe going out and being answered — a policy decision the transport
-/// took on the application's behalf, with a `KEEPALIVE_TIMEOUT` verdict
-/// hanging off it. Everything else §16.4 emits either wakes a parked verb
-/// or is the death, which is `closed()`'s.
+/// took on the application's behalf, with the connection's effective
+/// passive-keepalive verdict hanging off it. Everything else §16.4 emits
+/// either wakes a parked verb or is the death, which is `closed()`'s.
 ///
 /// `#[non_exhaustive]`, so a later wire line may add a kind without a
 /// breaking change.
@@ -628,9 +628,10 @@ pub enum Notification {
     ///
     /// **Never at the mark** (ruling 46's FAB-6): §7.3's budget can hold
     /// the probe, and the mark emits nothing while it does. An ACK covering
-    /// the probe floor must arrive within `KEEPALIVE_TIMEOUT` of *this*
-    /// instant or the connection ends with `ConnectionLost::TimedOut` —
-    /// which arrives on [`closed()`](super::Connection::closed), not here.
+    /// the probe floor must arrive within the connection's effective
+    /// passive-keepalive interval of *this* instant or the connection ends
+    /// with `ConnectionLost::TimedOut` — which arrives on
+    /// [`closed()`](super::Connection::closed), not here.
     Contested,
     /// That mark cleared — an ACK covered the probe floor.
     ///

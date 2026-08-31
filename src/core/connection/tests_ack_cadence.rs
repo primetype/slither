@@ -61,7 +61,7 @@ use std::time::{Duration, Instant};
 use super::stream_id::Dir;
 use super::streams::StreamRef;
 use super::testfix::*;
-use crate::constants::{FRAME_PING, K_INITIAL_RTT, MAX_ACK_DELAY};
+use crate::constants::{DEAD_TIMEOUT, FRAME_PING, K_INITIAL_RTT, MAX_ACK_DELAY};
 
 /// The reference suite, named locally: `testfix`'s own alias is private to
 /// that module and this file must not reach into it.
@@ -826,8 +826,8 @@ fn an_ack_only_emission_cannot_defer_death() {
 
     let after = *s.conn.liveness().expect("still installed");
     assert_eq!(
-        after.deadline(),
-        armed.deadline(),
+        after.deadline(DEAD_TIMEOUT),
+        armed.deadline(DEAD_TIMEOUT),
         "§7.4/ruling 33: an ACK-only emission does not defer the death \
          deadline"
     );

@@ -38,6 +38,7 @@
 use std::time::Instant;
 
 use crate::constants;
+use crate::core::Deadline;
 
 use super::frame::Close;
 
@@ -50,7 +51,7 @@ pub(crate) enum Lifecycle {
     /// §15.2's **draining**: reply-free, discarding late packets.
     Draining {
         /// The `CloseLinger` expiry. Never moved once set.
-        until: Instant,
+        until: Deadline,
     },
     /// State dropped, `Retired` emitted. Nothing further happens.
     Dead,
@@ -69,12 +70,18 @@ impl Lifecycle {
     }
 
     /// The post-mortem expiry, if one is running.
-    pub(crate) fn linger_until(&self) -> Option<Instant> {
+    pub(crate) fn linger_deadline(&self) -> Option<Deadline> {
         match self {
             Lifecycle::Live | Lifecycle::Dead => None,
             Lifecycle::Closing(closing) => Some(closing.until),
             Lifecycle::Draining { until } => Some(*until),
         }
+    }
+
+    /// The representable post-mortem expiry, if one can be announced.
+    #[cfg(test)]
+    pub(crate) fn linger_until(&self) -> Option<Instant> {
+        self.linger_deadline().and_then(Deadline::as_instant)
     }
 }
 
@@ -86,7 +93,7 @@ impl Lifecycle {
 /// nothing left for a STREAM or MAX_DATA frame to be applied *to*.
 pub(crate) struct Closing {
     /// The `CloseLinger` expiry.
-    until: Instant,
+    until: Deadline,
     /// The CLOSE we sent, re-sent verbatim as each reply.
     close: Close,
     /// When the last **reply** went out. `None` until the first one — the
@@ -98,14 +105,14 @@ impl Closing {
     /// Enter the closing state at `now`, having just emitted `close`.
     pub(crate) fn new(now: Instant, close: Close) -> Self {
         Self {
-            until: now + constants::CLOSE_LINGER,
+            until: Deadline::after(now, constants::CLOSE_LINGER),
             close,
             last_reply: None,
         }
     }
 
     /// The `CloseLinger` expiry.
-    pub(crate) fn until(&self) -> Instant {
+    pub(crate) fn until(&self) -> Deadline {
         self.until
     }
 
@@ -118,7 +125,9 @@ impl Closing {
     pub(crate) fn reply(&mut self, now: Instant) -> Option<Close> {
         let due = match self.last_reply {
             None => true,
-            Some(last) => now.duration_since(last) >= constants::CLOSE_REPLY_MIN_INTERVAL,
+            Some(last) => {
+                now.saturating_duration_since(last) >= constants::CLOSE_REPLY_MIN_INTERVAL
+            }
         };
         if !due {
             return None;
@@ -148,7 +157,10 @@ mod tests {
     fn closing_lingers_for_close_linger() {
         let now = Instant::now();
         let closing = Closing::new(now, close_frame());
-        assert_eq!(closing.until(), now + constants::CLOSE_LINGER);
+        assert_eq!(
+            closing.until(),
+            Deadline::after(now, constants::CLOSE_LINGER)
+        );
     }
 
     /// The first inbound packet is answered however soon it arrives — the
@@ -192,6 +204,25 @@ mod tests {
         );
     }
 
+    /// A stale shell timestamp cannot panic the core or move the reply
+    /// clock backwards. It is simply still inside the current rate window.
+    #[test]
+    fn a_backwards_timestamp_is_not_due_and_does_not_panic() {
+        let now = Instant::now();
+        let mut closing = Closing::new(now, close_frame());
+        assert_eq!(closing.reply(now), Some(close_frame()));
+
+        let stale = now
+            .checked_sub(Duration::from_nanos(1))
+            .expect("the ordinary test instant has a predecessor");
+        assert_eq!(closing.reply(stale), None);
+        assert_eq!(
+            closing.reply(now + constants::CLOSE_REPLY_MIN_INTERVAL),
+            Some(close_frame()),
+            "the stale observation must not move the real reply anchor"
+        );
+    }
+
     /// Every reply is the CLOSE we sent, verbatim.
     #[test]
     fn a_reply_is_the_original_close() {
@@ -214,7 +245,7 @@ mod tests {
         let expiry = closing.until();
 
         let draining = closing.into_draining();
-        assert_eq!(draining.linger_until(), Some(expiry));
+        assert_eq!(draining.linger_deadline(), Some(expiry));
         assert!(!draining.is_live());
     }
 

@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::constants;
+use crate::core::Deadline;
 use crate::core::connection::mobility::Contested;
 use crate::core::connection::testfix::{
     Pair, Solo, Wire, a_addr, b_addr, drain, put, t0, v4, write_all,
@@ -581,7 +582,7 @@ fn a_mark_on_a_validated_address_transmits_at_once() {
         Contested::Armed {
             floor,
             armed_at: now,
-            deadline: now + constants::KEEPALIVE_TIMEOUT,
+            deadline: Deadline::after(now, constants::KEEPALIVE_TIMEOUT),
         }
     );
     assert_eq!(

@@ -51,6 +51,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use crate::constants;
+use crate::core::Deadline;
 use crate::identity::Identity;
 
 use super::guard::{ChainPin, GuardUndo};
@@ -132,9 +133,11 @@ impl<I: Identity> IntroEntry<I> {
     /// A **consumed** chain needs no special case. §6.3 says its mid-state
     /// "expires 15 s after the initiation that fed it", and a consumed
     /// chain is never refreshed again — so its age key is frozen at that
-    /// initiation and this expression is already the right answer.
-    pub(crate) fn deadline(&self) -> Instant {
-        self.refreshed_at + constants::INTRO_TTL
+    /// initiation and this expression is already the right answer. If the
+    /// sum lies beyond the platform clock's horizon, the entry stays
+    /// logically expiring but is neither announced nor removed (ruling 284).
+    pub(crate) fn deadline(&self) -> Deadline {
+        Deadline::after(self.refreshed_at, constants::INTRO_TTL)
     }
 }
 
@@ -439,15 +442,19 @@ impl<I: Identity> IntroQueue<I> {
         let due: Vec<IntroId> = self
             .entries
             .values()
-            .filter(|entry| entry.deadline() <= now)
+            .filter(|entry| entry.deadline().is_due(now))
             .map(|entry| entry.id)
             .collect();
         due.into_iter().filter_map(|id| self.remove(id)).collect()
     }
 
-    /// The earliest expiry, for §16.5's min-deadline.
+    /// The earliest representable expiry, for §16.5's min-deadline.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.entries.values().map(IntroEntry::deadline).min()
+        self.entries
+            .values()
+            .map(IntroEntry::deadline)
+            .filter_map(Deadline::as_instant)
+            .min()
     }
 
     /// How many chains a source holds, both tiers.

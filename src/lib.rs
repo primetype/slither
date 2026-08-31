@@ -235,34 +235,41 @@
 //!      initiation lets a third party produce it at will, from any address,
 //!      against a peer that has done nothing. It reports *this initiation
 //!      is not fresh*, never *this peer misbehaved*.
-//! 3. **A connection with nothing to say dies — in 25 s, in silence.**
+//! 3. **A connection with nothing to say dies — in 25 s by default, in
+//!    silence.**
 //!    A connection that has received **no authenticated packet since it was
 //!    installed** transmits *nothing at all* and is torn down at
-//!    install + `DEAD_TIMEOUT` (25 s) with
+//!    the representable deadline at install + its effective dead timeout
+//!    (`DEAD_TIMEOUT`, 25 s, under the v1 profile) with
 //!    [`ConnectionLost::TimedOut`](error::ConnectionLost::TimedOut).
 //!    **Connecting ahead of need does not keep a path warm**, and this is
 //!    the single most surprising behaviour for a new consumer.
 //!
-//!    What keeps a connection alive is not a knob. §7.5's keepalive dance
-//!    is **automatic for any connection that has carried traffic**: one
-//!    application message, in **one** direction, puts the receiver into the
-//!    state that makes it answer every 10 s, which puts the sender into it,
-//!    and the pair then sustains itself indefinitely with no configuration
-//!    anywhere.
+//!    §7.5's keepalive dance is **automatic for any connection that has
+//!    carried traffic**: one application message, in **one** direction,
+//!    puts the receiver into the state that makes it answer every effective
+//!    passive interval (10 s under v1), which puts the sender into it, and
+//!    the pair then sustains itself indefinitely without a per-connection
+//!    opt-in. [`config::TimingProfile`] may change that endpoint-wide
+//!    cadence and its dead timeout together; peers do not negotiate it.
+//!    Every deadline calculation is checked: one beyond the platform clock
+//!    horizon remains logically enabled but is never replaced with an
+//!    invented earlier timeout.
 //!
 //!    The knob is for the case that leaves out — a link that is **mutually
 //!    idle** and must nonetheless stay open, through a NAT binding or a
 //!    firewall's idle reaper.
 //!    [`Connection::set_persistent_keepalive`](shell::Connection::set_persistent_keepalive)
-//!    takes an interval in `[1 s, 25 s)` and rejects anything outside it
-//!    rather than clamping. Enabling it on **one** side is enough: the
-//!    beacon reaches the peer, and the peer's automatic half answers.
+//!    takes an interval in `[1 s, effective dead timeout)` and rejects
+//!    anything outside it rather than clamping. Enabling it on **one** side
+//!    is enough: the beacon reaches the peer, and the peer's automatic half
+//!    answers.
 //!
 //!    A beacon does not defer death, and is not meant to. Both keepalives
 //!    are *marking* sends, so they **arm** the death clock; a connection
-//!    whose beacons are never answered still ends 25 s after the last
-//!    authenticated packet it received. Two consecutive lost beacons at the
-//!    10 s default is what that costs.
+//!    whose beacons are never answered still ends one effective dead timeout
+//!    after the last authenticated packet it received. Two consecutive lost
+//!    beacons at the v1 10 s recommendation is what the default costs.
 //! 4. **Teardown triggers on dropping every *handle*, not the endpoint.**
 //!    The connection lives as long as any handle to it does, and ends when
 //!    the last one is dropped — the opposite of the obvious guess, and
@@ -302,8 +309,9 @@
 //!    old connection and the new chain completes. Where it is one we
 //!    **dialled**, the basis is `None`, no initiation can replace it,
 //!    [`AcceptError::Stale`](error::AcceptError::Stale) comes back and
-//!    §6.8's restart instead resolves at liveness, at most `DEAD_TIMEOUT`
-//!    later. Either way the application
+//!    §6.8's restart instead resolves at the next representable liveness
+//!    deadline, ordinarily at most the effective dead timeout later. Either
+//!    way the application
 //!    side of it is the one instruction: keep accepting.
 //!
 //! # The spec is the authority

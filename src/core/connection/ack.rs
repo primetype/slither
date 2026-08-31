@@ -42,6 +42,7 @@
 use std::time::Instant;
 
 use crate::constants;
+use crate::core::Deadline;
 
 use super::frame::Ack;
 use super::session::ReplayWindow;
@@ -108,7 +109,7 @@ pub(crate) enum AckAction {
     ///   the moment the driver has nothing else ready, which is exactly the
     ///   end of the receive drain; until then every further packet of the
     ///   burst folds into the same ACK.
-    Arm(Instant),
+    Arm(Deadline),
 }
 
 impl AckState {
@@ -208,10 +209,10 @@ impl AckState {
                 return AckAction::Now;
             }
             self.pending = true;
-            return AckAction::Arm(now);
+            return AckAction::Arm(Deadline::at(now));
         }
 
-        AckAction::Arm(now + constants::MAX_ACK_DELAY)
+        AckAction::Arm(Deadline::after(now, constants::MAX_ACK_DELAY))
     }
 
     /// `true` iff an ACK is owed **and the pump must build a packet for it**.

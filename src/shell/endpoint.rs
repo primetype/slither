@@ -258,21 +258,23 @@ where
     /// # A connection you are not using dies — S5
     ///
     /// **Do not connect ahead of need.** slither has no idle state: a
-    /// session over which neither side sends dies at `DEAD_TIMEOUT` (25 s),
-    /// and this is deliberate rather than a gap. Dialling at start-up so the
-    /// path is "warm" for a request several minutes later gets you a dead
-    /// connection and a surprising error at the moment you first try to use
-    /// it.
+    /// session over which neither side sends dies at the representable
+    /// deadline for its effective dead timeout (`DEAD_TIMEOUT`, 25 s, under
+    /// the v1 profile), and this is deliberate rather than a gap. Dialling at
+    /// start-up so the path is
+    /// "warm" for a request several minutes later gets you a dead connection
+    /// and a surprising error at the moment you first try to use it.
     ///
     /// Two shapes work. **Dial when you need it** — the handshake is one
-    /// round trip. Or **keep it alive by using it**: §7.5's keepalive
-    /// machinery holds a session open only while there is traffic to hold
-    /// open, so an application-level heartbeat is what makes a long-lived
-    /// idle connection a real thing.
+    /// round trip. Or enable
+    /// [`Connection::set_persistent_keepalive`](super::Connection::set_persistent_keepalive)
+    /// for a mutually idle path that must remain open. Once ordinary traffic
+    /// has started §7.5's passive keepalive dance is automatic; no recurring
+    /// application heartbeat is required.
     ///
-    /// This is the single most surprising behaviour for a new consumer, and
-    /// it is the one with no code fix — the alternative is sessions that
-    /// outlive their usefulness and a `!Send` driver that never quiesces.
+    /// The default deliberately lets a never-used session quiesce. Keeping
+    /// one open is an explicit per-connection decision rather than an
+    /// endpoint-wide side effect of having dialled it once.
     pub fn connect(
         &self,
         remote: SocketAddr,
@@ -378,8 +380,10 @@ impl<I: Identity> Drop for Endpoint<I> {
 /// **Nothing is transmitted.** An attempt that never completed has no
 /// session to close and no wire signal to send, as in §15.4's
 /// endpoint-dropped row. If the peer already answered and installed a
-/// half-open session, it is *not* told: it reaps it at `DEAD_TIMEOUT`
-/// (25 s) in silence.
+/// half-open session, it is *not* told: it ordinarily reaps it at that
+/// endpoint's representable effective-dead-timeout deadline (25 s under the
+/// v1 profile) in silence. A deadline beyond the platform clock horizon is
+/// retained logically and never replaced by an earlier timeout.
 ///
 /// The cancellation is ordered **ahead of any endpoint verb issued after
 /// the drop returns**, so an immediate redial cannot observe the corpse.

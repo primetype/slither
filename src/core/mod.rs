@@ -10,10 +10,12 @@
 //! §16.4: *"every mutating call … is followed by draining `poll_output()`
 //! to the terminal `Timeout(Option<Instant>)`, which is simultaneously the
 //! drain sentinel and the next-deadline announcement — a driver cannot
-//! forget to drain."* `Timeout(None)` means drained with no deadline armed;
-//! `Timeout(Some(d))` means drained, next deadline `d`. **Output ordering
-//! within one drain preserves generation order** and is normative: a
-//! transmit and the event it caused come out in that order.
+//! forget to drain."* `Timeout(None)` means drained with no representable
+//! deadline to announce; logically enabled state may still lie beyond the
+//! platform clock horizon. `Timeout(Some(d))` means drained, next
+//! representable deadline `d`. **Output ordering within one drain preserves
+//! generation order** and is normative: a transmit and the event it caused
+//! come out in that order.
 //!
 //! # Scope of this slice
 //!
@@ -63,8 +65,9 @@ mod tests;
 mod psk_tests;
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::config::TimingProfile;
 use crate::constants;
 use crate::error::ConnectError;
 use crate::packet::{Handshake, Msg1Payload};
@@ -95,6 +98,53 @@ pub use self::connection::{Dir, StreamId};
 pub(crate) use self::connection::timers::TimerKind;
 #[allow(unused_imports)]
 pub(crate) use self::endpoint::Endpoint;
+
+/// A logically enabled monotonic deadline, including one beyond this
+/// platform clock's representable horizon.
+///
+/// Ruling 284 forbids turning arithmetic overflow into a panic, a wrapped
+/// instant, or an invented earlier timeout.  `Unreachable` therefore keeps
+/// the protocol state honest while [`as_instant`](Self::as_instant) omits the
+/// deadline from §16.4's announcement table.  A later state transition
+/// derives the deadline again from its new anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Deadline {
+    /// The deadline is representable and may be announced.
+    At(Instant),
+    /// The deadline lies beyond the platform clock's horizon.
+    Unreachable,
+}
+
+impl Deadline {
+    /// Preserve a deadline that has already been derived safely.
+    pub(crate) const fn at(at: Instant) -> Self {
+        Self::At(at)
+    }
+
+    /// Derive `anchor + delay` without panicking or fabricating a timeout.
+    pub(crate) fn after(anchor: Instant, delay: Duration) -> Self {
+        match anchor.checked_add(delay) {
+            Some(at) => Self::At(at),
+            None => Self::Unreachable,
+        }
+    }
+
+    /// The instant the timer table can announce, if it is representable.
+    pub(crate) const fn as_instant(self) -> Option<Instant> {
+        match self {
+            Self::At(at) => Some(at),
+            Self::Unreachable => None,
+        }
+    }
+
+    /// Whether this logical deadline is due at `now`.
+    pub(crate) fn is_due(self, now: Instant) -> bool {
+        match self {
+            Self::At(at) => at <= now,
+            Self::Unreachable => false,
+        }
+    }
+}
 
 /// A connection's identity inside one endpoint. Monotone, never reused.
 ///
@@ -197,9 +247,10 @@ pub struct Transmit {
 
 /// What an endpoint hands a connection at birth.
 ///
-/// **[ruling 259(viii)]** Two things, and they travel together on purpose.
-/// §16.6's per-connection sub-seed is the older half; §10.2's advertised
-/// receive windows are the new one. A connection is born on **two** paths —
+/// **[rulings 259(viii), 282]** Three things, and they travel together on
+/// purpose. §16.6's per-connection sub-seed is the oldest; §10.2's advertised
+/// receive windows and §7.5's liveness profile are endpoint policy. A
+/// connection is born on **two** paths —
 /// `connect()`'s pending ([`Endpoint::mint_pending`]) and `accept()`'s
 /// established (`endpoint::staged`'s `accept`) — and a policy that has to
 /// be threaded to both call sites is a policy two call sites can disagree
@@ -216,6 +267,8 @@ pub(crate) struct ConnSeed {
     pub(crate) sub_seed: [u8; 32],
     /// §10.2's two advertised receive windows.
     pub(crate) windows: FlowWindows,
+    /// §7.5's validated established-session liveness policy.
+    pub(crate) timing_profile: TimingProfile,
 }
 
 /// A bare seed carries §10.2's **ratified** windows.
@@ -228,6 +281,7 @@ impl From<[u8; 32]> for ConnSeed {
         Self {
             sub_seed,
             windows: FlowWindows::default(),
+            timing_profile: TimingProfile::default(),
         }
     }
 }

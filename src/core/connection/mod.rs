@@ -56,6 +56,11 @@ pub(crate) mod timers;
 #[cfg(test)]
 mod tests;
 
+// Ruling 284's independent clock-horizon acceptance tests. The file is
+// authored separately from the deadline implementation (working rule 6).
+#[cfg(test)]
+mod tests_safe_arithmetic;
+
 // Slice 4a's §9/§10 tests, written from `SPEC.md` and `CONTRACT-4a.md` in
 // an isolated worktree by an author who never saw this slice's code — and
 // whose 73 tests found three defects in the contract itself (Round 18).
@@ -161,6 +166,7 @@ use std::time::{Duration, Instant};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, SeedableRng};
 
+use crate::config::TimingProfile;
 use crate::constants;
 use crate::error::{
     ConfigError, ConnectionLost, DatagramError, MessageError, ReadError, WriteError,
@@ -184,12 +190,14 @@ use self::timers::{TimerKind, Timers};
 pub use self::stream_id::{Dir, StreamId};
 pub(crate) use self::streams::{StreamRef, Streams, StreamsExhausted};
 
-use super::{ConnSeed, EstablishedSession, Install, Role, ToEndpoint, Transmit};
+use super::{ConnSeed, Deadline, EstablishedSession, Install, Role, ToEndpoint, Transmit};
 
 /// A connection's core state machine. §16.4.
 pub(crate) struct Connection<C: Handshake> {
     session: Option<Session<C>>,
     sub_seed: [u8; 32],
+    /// Ruling 282's endpoint-wide liveness policy, fixed for this connection.
+    timing_profile: TimingProfile,
     /// §16.6's connection-side CSPRNG, seeded from [`sub_seed`](Self::sub_seed).
     ///
     /// **[rulings 208, 210(b)]** Its one consumer is §7.3's address-validation
@@ -289,7 +297,11 @@ impl<C: Handshake> Connection<C> {
     /// the **ratified** windows — which is what every caller that has no
     /// opinion should get.
     pub(crate) fn connecting(seed: impl Into<ConnSeed>) -> Self {
-        let ConnSeed { sub_seed, windows } = seed.into();
+        let ConnSeed {
+            sub_seed,
+            windows,
+            timing_profile,
+        } = seed.into();
         let mut streams = Streams::with_window(windows.stream);
         let mut flow = Flow::with_window(windows.connection);
         // §10.2's initial windows are never sent, so a peer assumes the
@@ -304,6 +316,7 @@ impl<C: Handshake> Connection<C> {
         Self {
             session: None,
             sub_seed,
+            timing_profile,
             rng: ChaCha20Rng::from_seed(sub_seed),
             outputs: VecDeque::new(),
             installed: false,
@@ -502,14 +515,17 @@ impl<C: Handshake> Connection<C> {
         self.persistent_keepalive
     }
 
+    /// The immutable endpoint profile stamped on this connection at birth.
+    pub(crate) fn timing_profile(&self) -> TimingProfile {
+        self.timing_profile
+    }
+
     /// §7.5's beacon. `None` disables it.
     ///
     /// Returns `Err(ConfigError::KeepaliveTooShort)` for an interval
     /// **strictly below** `PERSISTENT_KEEPALIVE_MIN` (1 s), and
-    /// `Err(ConfigError::KeepaliveTooLong)` for one **at or above**
-    /// `DEAD_TIMEOUT` (25 s) — the ceiling gets no constant of its own
-    /// (ruling 63: *"a second place `DEAD_TIMEOUT` is written down is a
-    /// place it can drift"*).
+    /// `Err(ConfigError::KeepaliveTooLong)` for one **at or above** this
+    /// connection's effective dead timeout (25 s under the v1 profile).
     ///
     /// On `Err` the current interval is **unchanged**: no clamp, no panic
     /// (ruling 44 — a panic is undefined behaviour across bubble-ffi to iOS,
@@ -527,7 +543,7 @@ impl<C: Handshake> Connection<C> {
         // §16.4 puts one on every mutating call and a signature that omits
         // it is one the next slice has to widen.
         let _ = now;
-        validate_persistent_keepalive(interval)?;
+        validate_persistent_keepalive(interval, self.timing_profile.dead_timeout())?;
         self.persistent_keepalive = interval;
         self.sync_liveness_timer();
         Ok(())
@@ -720,9 +736,9 @@ impl<C: Handshake> Connection<C> {
 
         for kind in self.timers.take_due(now).iter() {
             match kind {
-                // §7.4: no authenticated fresh receive for `DEAD_TIMEOUT`
-                // with an arming send outstanding. §15.4's first row —
-                // nothing transmitted, and no linger to run.
+                // §7.4: no authenticated fresh receive for the effective
+                // dead timeout with an arming send outstanding. §15.4's
+                // first row — nothing transmitted, and no linger to run.
                 TimerKind::Liveness => self.die(ConnectionLost::TimedOut),
                 // §15.2's linger expiry: drop all state. `Closed` was
                 // emitted at the death (ruling 81); only `Retired` is owed.
@@ -756,8 +772,8 @@ impl<C: Handshake> Connection<C> {
                 // §7.5's two keepalives. Both send §3.4's **empty
                 // plaintext** via the **marking** seal, and both are
                 // therefore arming sends: a connection whose entire output
-                // is beacons still dies at `R + DEAD_TIMEOUT` (ruling 40 —
-                // *"arming enables death, never defers it"*).
+                // is beacons still dies at `R + D_eff` (rulings 40 and 282
+                // — *"arming enables death, never defers it"*).
                 TimerKind::Keepalive => passive_keepalive = true,
                 TimerKind::PersistentKeepalive => beacon = true,
             }
@@ -1380,6 +1396,11 @@ impl<C: Handshake> Connection<C> {
             // instant rather than the first's, and on a real clock a long
             // enough burst would keep outrunning it.
             AckAction::Arm(at) => {
+                let Some(at) = at.as_instant() else {
+                    // The ACK remains pending in `AckState`; only its
+                    // concrete deadline lies beyond the clock horizon.
+                    return;
+                };
                 let at = self
                     .timers
                     .get(TimerKind::AckDelay)
@@ -1511,7 +1532,7 @@ impl<C: Handshake> Connection<C> {
     /// preceding `Contested`**, which is the unmatched-notification mis-read
     /// ruling 46 deleted `under_probe: bool` to prevent; and the
     /// unconditional send rule would emit a **stray probe**, arming a
-    /// `KEEPALIVE_TIMEOUT` verdict for a mark that no longer exists.
+    /// `K_eff` verdict for a mark that no longer exists.
     ///
     /// In every clearing case the §6.4 refusal **stands**; the basis rule is
     /// untouched.
@@ -1626,15 +1647,15 @@ impl<C: Handshake> Connection<C> {
     /// ack-eliciting send, the increment stops advancing once `pto_count`
     /// saturates, and a firing that can emit nothing moves neither. The
     /// single `!Send` driver **every** connection on the endpoint shares
-    /// then spins at 100 % of a core until `DEAD_TIMEOUT` reaps the session
-    /// — measured, silent in release, and reachable from any roam, which
-    /// zeroes the budget (§13.6).
+    /// then spins at 100 % of a core until the effective dead timeout reaps
+    /// the session — measured, silent in release, and reachable from any
+    /// roam, which zeroes the budget (§13.6).
     ///
     /// **The gate is on the announcement, not the state.** Sent map,
     /// `pto_count` and anchor are untouched while the budget is closed; the
     /// connection's `Timeout` falls to the next armed timer — `Liveness` at
-    /// the latest — and the session still dies at `DEAD_TIMEOUT`, which is
-    /// what §7.3 intends for an address that funds nothing.
+    /// the latest — and the session still dies at its effective dead
+    /// timeout, which is what §7.3 intends for an address that funds nothing.
     ///
     /// **Re-arming needs no machinery.** The budget grows only on an
     /// authenticated, window-fresh receive (§7.2, §7.3, ruling 169), every
@@ -1870,7 +1891,7 @@ impl<C: Handshake> Connection<C> {
                         reason: close.reason,
                     });
                     self.lifecycle = Lifecycle::Draining {
-                        until: now + constants::CLOSE_LINGER,
+                        until: Deadline::after(now, constants::CLOSE_LINGER),
                     };
                     self.enter_post_mortem_timers();
                     // Whatever followed the CLOSE in this packet has
@@ -1887,7 +1908,7 @@ impl<C: Handshake> Connection<C> {
         // synced before the frames were applied, so without this the
         // keepalive would stay unarmed until some later receive — and on a
         // connection that receives nothing further, a lifted hold that never
-        // re-arms is a session that goes quiet and dies at `DEAD_TIMEOUT`.
+        // re-arms is a session that goes quiet and dies at `D_eff`.
         self.sync_liveness_timer();
 
         // §16.4's generation order: the events a packet caused, then the
@@ -2369,8 +2390,8 @@ impl<C: Handshake> Connection<C> {
             // it a **lost** challenge is never re-emitted. §13.4 arms the PTO
             // on the challenge packet (it is ack-eliciting), the probe finds
             // nothing else owed, `packing.ping()` below builds a bare PING,
-            // and the address stays unvalidated until `DEAD_TIMEOUT` kills
-            // the session — *"sent once and lost forever, which §7.3's
+            // and the address stays unvalidated until `D_eff` kills the
+            // session — *"sent once and lost forever, which §7.3's
             // no-deadlock argument cannot survive"* (§8.7), verbatim and
             // measured.
             //
@@ -2383,7 +2404,7 @@ impl<C: Handshake> Connection<C> {
             //
             // No livelock: `probe` is set by a firing PTO and cleared after
             // the first iteration below, so this offers one challenge per
-            // probe on §13.3's doubling schedule, bounded by `DEAD_TIMEOUT`.
+            // probe on §13.3's doubling schedule, bounded by `D_eff`.
             // It is not the manufacture ruling 217's first draft attempted —
             // the packet exists because the PTO fired, not because the
             // challenge wanted one.
@@ -2538,7 +2559,7 @@ impl<C: Handshake> Connection<C> {
             //    nothing marking is sent"* (§7.3, *disarming*; §7.4), and
             //    `PATH_CHALLENGE` is itself ack-eliciting. A new address
             //    that never answers therefore still kills the session at
-            //    `DEAD_TIMEOUT`, with no new timer and no new variant.
+            //    `D_eff`, with no new timer and no new variant.
             //
             // It is self-limiting rather than rate-limited: a challenge that
             // lands is answered by a `PATH_RESPONSE` that disarms the
@@ -3031,8 +3052,8 @@ impl<C: Handshake> Connection<C> {
     /// # §7.5's passive rule
     ///
     /// With `S = last_send` (the **marking** clock) and
-    /// `R = last_authenticated_recv`: arm `Keepalive` at
-    /// `S + KEEPALIVE_TIMEOUT` **iff `R > S`**.
+    /// `R = last_authenticated_recv`: arm `Keepalive` at `S + K_eff` iff
+    /// the receive-since-marking-send state is set (ruling 195).
     ///
     /// **[ruling 182]** `S` counts **marking sends only**, which is §7.4's
     /// formal definition and *not* §7.5's prose *"has not sent"*. This is
@@ -3054,10 +3075,10 @@ impl<C: Handshake> Connection<C> {
     ///
     /// A connection with **no authenticated receive since install** has
     /// `S == R` at the install (§7.4 pins both clocks there), so `R > S` is
-    /// false from the start: it transmits nothing and dies at
-    /// install + `DEAD_TIMEOUT`. That is ruling 39's *"a connection with no
-    /// authenticated receive since install dies in silence"*, delivered by
-    /// the predicate rather than by a special case.
+    /// false from the start: it transmits nothing and dies at install plus
+    /// its effective dead timeout. That is ruling 39's *"a connection with
+    /// no authenticated receive since install dies in silence"*, delivered
+    /// by the predicate rather than by a special case.
     ///
     /// # Neither keepalive is armed while one cannot leave (**F1**)
     ///
@@ -3080,26 +3101,27 @@ impl<C: Handshake> Connection<C> {
     /// `Timeout(None)` and parks: **quiet, not immortal**.
     ///
     /// [`TimerKind::Liveness`] is deliberately **not** suppressed. The death
-    /// clock keeps whatever `Liveness::deadline()` returns; suppressing it
-    /// too would turn a spinning connection into an immortal one, which is
-    /// the collapse ruling 182's beacon proof warns about and is strictly
+    /// clock keeps whatever `Liveness::deadline(D_eff)` returns; suppressing
+    /// it too would turn a spinning connection into an immortal one, which
+    /// is the collapse ruling 182's beacon proof warns about and is strictly
     /// worse than the spin.
     ///
     /// # The vetoed keepalive arms the death clock (**[ruling 265]**)
     ///
-    /// **The paragraph above is true only where `Liveness::deadline()` is
-    /// `Some`, and that scope went unstated for a slice** — working rule 8's
-    /// exact shape, *a stated construction with an unstated scope*. `armed`
-    /// is cleared by every authenticated, window-fresh receive, and
-    /// `deadline()` returns `None` while it is clear (§7.4, `session.rs`).
-    /// *Not suppressing* a `None` suppresses nothing.
+    /// **The paragraph above is true only where
+    /// `Liveness::deadline(D_eff)` is `Some`, and that scope went unstated
+    /// for a slice** — working rule 8's exact shape, *a stated construction
+    /// with an unstated scope*. `armed` is cleared by every authenticated,
+    /// window-fresh receive, and `deadline(D_eff)` returns `None` while it
+    /// is clear (§7.4, `session.rs`). *Not suppressing* a `None` suppresses
+    /// nothing.
     ///
     /// So the suppression above has a hole, and it is the one §7.5's own
     /// soundness proof forbids. §7.4's death predicate has **two** conjuncts
-    /// — `now − last_authenticated_recv >= DEAD_TIMEOUT` **and** *"at least
-    /// one **arming** send has occurred since that last authenticated
-    /// receive"* — and the second is sound only because §7.5 promises an
-    /// arming send within `KEEPALIVE_TIMEOUT` of every receive. Ruling 182
+    /// — `now − last_authenticated_recv >= D_eff` **and** *"at least one
+    /// **arming** send has occurred since that last authenticated receive"*
+    /// — and the second is sound only because §7.5 promises an arming send
+    /// within `K_eff` of every receive. Ruling 182
     /// states the promise as *"every send that can establish `S > R` is a
     /// marking send, so the death clock is armed there"*. That quantifies
     /// over **sends**, and says nothing about a keepalive that is *owed and
@@ -3108,14 +3130,14 @@ impl<C: Handshake> Connection<C> {
     /// the death clock is disarmed — and [`keepalive_can_leave`] can veto
     /// it. Measured on a roamed connection whose budget one pure ACK
     /// exhausts: `Timeout(None)`, **no timer armed at all**, alive and
-    /// silent at 60 s — 2.4 × `DEAD_TIMEOUT`. That is the immortal half-open
-    /// session, reached through a door ruling 182 did not enumerate.
+    /// silent at 60 s — 2.4 × the v1 `DEAD_TIMEOUT`. That is the immortal
+    /// half-open session, reached through a door ruling 182 did not enumerate.
     ///
     /// **The fix is an anchor, not a new timer.** A keepalive of either kind
     /// that is owed and vetoed *is* the arming event §7.4's second conjunct
     /// is waiting for, so the death clock is announced in its place, at
-    /// `last_authenticated_recv + DEAD_TIMEOUT` — exactly what
-    /// `Liveness::deadline()` would return were `armed` set.
+    /// `last_authenticated_recv + D_eff` — exactly what
+    /// `Liveness::deadline(D_eff)` would return were `armed` set.
     ///
     /// **Why the backstop cannot misfire.** Both disjuncts of
     /// [`keepalive_can_leave`](Self::keepalive_can_leave) lift *only* on an
@@ -3150,11 +3172,14 @@ impl<C: Handshake> Connection<C> {
         // for is filled.
         let owed = clocks.is_some_and(|l| l.owes_passive_keepalive())
             || self.persistent_keepalive.is_some();
-        let deadline = clocks.and_then(|liveness| liveness.deadline()).or_else(|| {
-            clocks
-                .filter(|_| owed && !can_leave)
-                .map(|l| l.last_authenticated_recv() + constants::DEAD_TIMEOUT)
-        });
+        let dead_timeout = self.timing_profile.dead_timeout();
+        let deadline = clocks
+            .and_then(|liveness| liveness.deadline(dead_timeout))
+            .or_else(|| {
+                clocks
+                    .filter(|_| owed && !can_leave)
+                    .and_then(|l| l.last_authenticated_recv().checked_add(dead_timeout))
+            });
         self.timers.set(TimerKind::Liveness, deadline);
 
         // Ruling 195: the flag, not `R > S`. The comparison is false when
@@ -3164,7 +3189,10 @@ impl<C: Handshake> Connection<C> {
         let passive = clocks.filter(|l| l.owes_passive_keepalive() && can_leave);
         self.timers.set(
             TimerKind::Keepalive,
-            passive.map(|l| l.last_send() + constants::KEEPALIVE_TIMEOUT),
+            passive.and_then(|l| {
+                l.last_send()
+                    .checked_add(self.timing_profile.passive_keepalive())
+            }),
         );
 
         let beacon = self.persistent_keepalive.filter(|_| can_leave);
@@ -3172,7 +3200,7 @@ impl<C: Handshake> Connection<C> {
             TimerKind::PersistentKeepalive,
             clocks
                 .zip(beacon)
-                .map(|(liveness, interval)| liveness.last_send() + interval),
+                .and_then(|(liveness, interval)| liveness.last_send().checked_add(interval)),
         );
     }
 
@@ -3536,13 +3564,13 @@ impl<C: Handshake> Connection<C> {
             *owe_challenge = false;
         }
 
-        let deadline = now + constants::KEEPALIVE_TIMEOUT;
+        let deadline = Deadline::after(now, self.timing_profile.passive_keepalive());
         self.contested = Contested::Armed {
             floor,
             armed_at: now,
             deadline,
         };
-        self.timers.arm(TimerKind::Contested, deadline);
+        self.timers.set(TimerKind::Contested, deadline.as_instant());
         // Pushed straight to the drain rather than through `events`: §8.1
         // pins the order *`Transmit` then `Event(Contested)`*, and this is
         // reached from inside the pump, after the callers that drain
@@ -3552,7 +3580,7 @@ impl<C: Handshake> Connection<C> {
         tracing::debug!(
             target: "slither::policy",
             floor,
-            "the contested probe was transmitted; the verdict is due one KEEPALIVE_TIMEOUT on"
+            "the contested probe was transmitted; the effective keepalive verdict is now due"
         );
         true
     }
@@ -3566,10 +3594,10 @@ impl<C: Handshake> Connection<C> {
     fn enter_post_mortem_timers(&mut self) {
         let until = self
             .lifecycle
-            .linger_until()
+            .linger_deadline()
             .expect("called only on entering a post-mortem state");
         self.timers.disarm_all_except(TimerKind::CloseLinger);
-        self.timers.arm(TimerKind::CloseLinger, until);
+        self.timers.set(TimerKind::CloseLinger, until.as_instant());
     }
 
     fn emit_closed(&mut self, lost: ConnectionLost) {
@@ -3594,23 +3622,25 @@ impl<C: Handshake> Connection<C> {
 /// | `None` | `Ok(())` — the beacon is disabled |
 /// | `Duration::ZERO` … `999 ms` | `Err(KeepaliveTooShort)` |
 /// | **`1 s` exactly** | **`Ok(())`** — the floor is **inclusive** (ruling 42) |
-/// | `1 s + 1 ms` … `24.999 s` | `Ok(())` |
-/// | **`25 s` exactly** | **`Err(KeepaliveTooLong)`** — the ceiling is **exclusive** (ruling 40) |
-/// | `30 s`, `Duration::MAX` | `Err(KeepaliveTooLong)` |
+/// | anything from `1 s` up to the effective dead timeout | `Ok(())` |
+/// | the effective dead timeout exactly | **`Err(KeepaliveTooLong)`** — the ceiling is **exclusive** (rulings 40, 282) |
+/// | anything above that timeout | `Err(KeepaliveTooLong)` |
 ///
 /// Written once and used twice — the core's setter and the shell's — so the
-/// band cannot be stated in two places and drift. The ceiling is
-/// `DEAD_TIMEOUT` itself and gets **no named constant** (ruling 63: *"a
-/// named ceiling would be a second place `DEAD_TIMEOUT` is written down, and
-/// therefore a place it can drift"*).
-pub(crate) fn validate_persistent_keepalive(interval: Option<Duration>) -> Result<(), ConfigError> {
+/// band cannot be stated in two places and drift. The ceiling is the
+/// connection's effective dead timeout and gets **no second value** that can
+/// drift from the stamped [`TimingProfile`] (rulings 63, 282).
+pub(crate) fn validate_persistent_keepalive(
+    interval: Option<Duration>,
+    dead_timeout: Duration,
+) -> Result<(), ConfigError> {
     let Some(interval) = interval else {
         return Ok(());
     };
     if interval < constants::PERSISTENT_KEEPALIVE_MIN {
         return Err(ConfigError::KeepaliveTooShort);
     }
-    if interval >= constants::DEAD_TIMEOUT {
+    if interval >= dead_timeout {
         return Err(ConfigError::KeepaliveTooLong);
     }
     Ok(())

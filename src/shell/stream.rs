@@ -1016,7 +1016,8 @@ fn no_core() -> ConnectionLost {
 /// ruling 115 is what brings stream handles inside it. The ordinary shape it
 /// exists for: a task owns a stream, has let the `Connection` go, and
 /// finishes — that drop is the last handle to the connection, and without
-/// this the peer would learn nothing until `DEAD_TIMEOUT`.
+/// this the peer would learn nothing until its representable
+/// effective-dead-timeout deadline.
 ///
 /// Ruling 88's exception applies unchanged: when this is also the last
 /// handle **in the process**, the driver is already stopping and §15.4's

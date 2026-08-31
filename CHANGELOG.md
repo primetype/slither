@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Endpoint-wide established-session liveness profiles.**
+  `config::TimingProfile` validates a passive-keepalive interval and
+  receive-anchored dead timeout as one coherent value, and
+  `Config::with_timing_profile` stamps it onto both outbound and inbound
+  connections. The exact v1 10 s / 25 s behaviour remains the default;
+  no wire field or negotiation was added.
+
+### Changed
+
+- **Persistent keepalive now follows the connection's effective dead
+  timeout.** Its existing 1 s inclusive floor remains fixed, while its
+  exclusive ceiling is the configured profile's dead timeout rather than
+  always the 25 s v1 constant.
+
+### Fixed
+
+- **Monotonic deadlines are checked end to end.** Endpoint, connection,
+  recovery, and `test-util` delay arithmetic no longer relies on panicking
+  `Instant + Duration` or overflowing `Duration` intermediates. A logical
+  timer beyond the platform clock horizon remains in its owning state but
+  is not announced, fired early, clamped, or replaced by a fabricated
+  instant. Ordinary deadlines and wire behaviour are unchanged.
+
 ## [0.3.0] - 2026-08-23
 
 ### Added

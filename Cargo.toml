@@ -356,6 +356,13 @@ required-features = ["test-util"]
 name = "story_park"
 required-features = ["test-util"]
 
+# Ruling 284's public acceptance path drives the feature-gated in-memory
+# network at the platform clock horizon. Without the explicit stanza, Cargo
+# auto-discovers it in the feature-less gate and fails before it can skip.
+[[test]]
+name = "story_safe_arithmetic"
+required-features = ["test-util"]
+
 # ── Benchmarks ────────────────────────────────────────────────────────────
 # Throughput measurement, not a gate. Three things about this stanza are
 # load-bearing:

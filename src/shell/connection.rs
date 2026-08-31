@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::config::TimingProfile;
 use crate::constants;
 use crate::core::connection::{AckSnapshot, SendMessage, validate_persistent_keepalive};
 use crate::core::{Connection as CoreConnection, ConnectionId, Dir, StreamRef};
@@ -44,8 +45,10 @@ type PublicKeyFor<S> = <<S as Channel>::Curve as hiss::curve::Curve>::PublicKey;
 /// handle of any kind — **[RATIFIED 2026/08/15 — ruling 88]** the
 /// endpoint-dropped row governs and **no CLOSE is sealed**. A synchronous
 /// `Drop` cannot await the driver, and the driver is already stopping; the
-/// peer's cost is bounded at `DEAD_TIMEOUT` (25 s), which that row already
-/// accepts.
+/// peer's ordinary cost is bounded at this connection's representable
+/// effective-dead-timeout deadline (the v1 default is `DEAD_TIMEOUT`, 25 s),
+/// which that row already accepts. A deadline beyond the platform clock
+/// horizon remains logically enabled and is never replaced by an earlier one.
 ///
 /// This is documentation obligation #4 and it is drop-order sensitive: it
 /// is the opposite of the obvious guess, and which of the two rules fires
@@ -80,6 +83,9 @@ pub struct Connection<S: Handshake> {
     /// Fixed for the same reason, by §7.8: one session per connection, and
     /// no transport state ever crosses a handshake.
     session_id: hiss::noise::SessionId,
+    /// Ruling 282's immutable profile, retained after the core is released so
+    /// configuration validation has the same answer on a dead connection.
+    timing_profile: TimingProfile,
 }
 
 impl<S: Handshake> Connection<S> {
@@ -90,6 +96,12 @@ impl<S: Handshake> Connection<S> {
         remote_static: PublicKeyFor<S>,
         session_id: hiss::noise::SessionId,
     ) -> Self {
+        let timing_profile = cell
+            .borrow()
+            .core
+            .as_ref()
+            .expect("a connection handle is created while its core is live")
+            .timing_profile();
         shell.acquire();
         cell.borrow_mut().handles += 1;
         Self {
@@ -98,6 +110,7 @@ impl<S: Handshake> Connection<S> {
             id,
             remote_static,
             session_id,
+            timing_profile,
         }
     }
 
@@ -129,13 +142,16 @@ impl<S: Handshake> Connection<S> {
     /// general one is a feature-matrix job, recorded separately.
     #[cfg(feature = "tower")]
     pub(crate) fn clone_handle(&self) -> Self {
-        Self::new(
-            Rc::clone(&self.shell),
-            Rc::clone(&self.cell),
-            self.id,
-            self.remote_static.clone(),
-            self.session_id.clone(),
-        )
+        self.shell.acquire();
+        self.cell.borrow_mut().handles += 1;
+        Self {
+            shell: Rc::clone(&self.shell),
+            cell: Rc::clone(&self.cell),
+            id: self.id,
+            remote_static: self.remote_static.clone(),
+            session_id: self.session_id.clone(),
+            timing_profile: self.timing_profile,
+        }
     }
 
     // No `id()` accessor. §16.2's `Connection` surface is a list, and in
@@ -342,26 +358,27 @@ impl<S: Handshake> Connection<S> {
     ///
     /// # The admissible band
     ///
-    /// `[1 s, DEAD_TIMEOUT)` — **1 s inclusive, 25 s exclusive**. Outside it
-    /// the call returns [`ConfigError`] and **leaves the current interval
-    /// unchanged**: it never panics (which would be undefined behaviour
-    /// across an FFI boundary) and it never silently clamps (which would
-    /// report success while giving a beacon that does not do what was
-    /// asked).
+    /// `[1 s, effective dead timeout)` — **1 s inclusive and the ceiling
+    /// exclusive**. With [`TimingProfile::default`] that is `[1 s, 25 s)`.
+    /// Outside it the call returns [`ConfigError`] and **leaves the current
+    /// interval unchanged**: it never panics (which would be undefined
+    /// behaviour across an FFI boundary) and it never silently clamps
+    /// (which would report success while giving a beacon that does not do
+    /// what was asked).
     ///
-    /// Below 1 s the beacon is a flood; at or above 25 s it cannot keep a
-    /// connection alive at all, because the peer declares death at
-    /// `DEAD_TIMEOUT` of silence and a beacon at exactly that interval
-    /// arrives, at best, simultaneously with the verdict.
+    /// Below 1 s the beacon is a flood; at or above the effective dead
+    /// timeout it cannot keep a connection alive at all, because a beacon at
+    /// exactly that interval arrives, at best, simultaneously with the
+    /// verdict.
     ///
     /// # A beacon does not defer death
     ///
     /// Both keepalives are **marking** sends, so they *arm* §7.4's death
     /// clock rather than postponing it. A connection whose entire output is
-    /// beacons and which never hears back still ends at `DEAD_TIMEOUT` after
-    /// the last authenticated packet it received. That is the point: the
-    /// beacon keeps a *path* open, and the peer's answers are what keep the
-    /// *connection* alive.
+    /// beacons and which never hears back still ends at its effective dead
+    /// timeout after the last authenticated packet it received. That is the
+    /// point: the beacon keeps a *path* open, and the peer's answers are what
+    /// keep the *connection* alive.
     ///
     /// Synchronous — a shared-cell write like the accessors, not a command
     /// round trip. On a connection that has already ended, `None` still
@@ -370,7 +387,7 @@ impl<S: Handshake> Connection<S> {
         // Validated before the cell is touched, so a dead connection gives
         // the same verdict a live one would: the band is a property of the
         // value, not of the connection's state.
-        validate_persistent_keepalive(interval)?;
+        validate_persistent_keepalive(interval, self.timing_profile.dead_timeout())?;
         let applied = {
             let mut cell = self.cell.borrow_mut();
             match cell.core.as_mut() {
@@ -396,9 +413,9 @@ impl<S: Handshake> Connection<S> {
     /// makes *"a rejected call leaves the interval **unchanged**"* an
     /// acceptance criterion that nothing in §16.2's surface could observe.
     /// Without it the obligation is testable only by inferring the interval
-    /// from beacon cadence across a 3 × `DEAD_TIMEOUT` window, bracketed
-    /// from both sides so that neither an upward nor a downward clamp
-    /// survives — which a blind test author did, and should not have had to.
+    /// from beacon cadence across a long timing window, bracketed from both
+    /// sides so that neither an upward nor a downward clamp survives — which
+    /// a blind test author did, and should not have had to.
     /// A configuration setter whose effect cannot be read back is the
     /// defect; this is the fix.
     ///
@@ -611,11 +628,11 @@ impl<S: Handshake> Connection<S> {
     /// The drain window is the core's own: `CLOSE_LINGER` (5 s) after a
     /// peer CLOSE, and **zero** on the deaths that have no linger —
     /// liveness timeout, nonce exhaustion, `Replaced`, endpoint dropped
-    /// (ruling 133). A receiver killed by `DEAD_TIMEOUT` mid-transfer
-    /// cannot drain, which is honest: a path that produced no CLOSE
-    /// produced no finished sender either. After a **local** `close()` the
-    /// window is the linger as well — see [`RecvStream::read`] for the one
-    /// row of it ruling 133 expects to change.
+    /// (ruling 133). A receiver killed by its effective dead timeout
+    /// mid-transfer cannot drain, which is honest: a path that produced no
+    /// CLOSE produced no finished sender either. After a **local** `close()`
+    /// the window is the linger as well — see [`RecvStream::read`] for the
+    /// one row of it ruling 133 expects to change.
     ///
     /// [`RecvStream::read`]: super::RecvStream::read
     ///

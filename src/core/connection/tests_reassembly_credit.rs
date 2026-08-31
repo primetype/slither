@@ -109,6 +109,7 @@ fn installed_with_windows(now: Instant, stream: u64, connection: u64) -> Solo {
     let mut conn = Connection::connecting(ConnSeed {
         sub_seed: [0xa5u8; 32],
         windows: FlowWindows { stream, connection },
+        timing_profile: crate::config::TimingProfile::default(),
     });
     conn.handle_endpoint_event(
         now,

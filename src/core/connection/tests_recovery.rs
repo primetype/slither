@@ -223,7 +223,7 @@ mod rtt {
         assert_eq!(e.rttvar(), K_INITIAL_RTT / 2, "§13.1: 166.5 ms");
         assert_eq!(
             e.pto_interval(),
-            INITIAL_PTO,
+            Some(INITIAL_PTO),
             "§13.3: 333 + max(4 · 166.5, 1) + 25 = 1024 ms"
         );
     }
@@ -372,13 +372,13 @@ mod rtt {
         e.sample(ms(100), Duration::ZERO);
         assert_eq!(
             e.loss_delay(),
-            us(112_500),
+            Some(us(112_500)),
             "with smoothed == latest == 100, 9/8 · 100"
         );
 
         e.sample(ms(300), Duration::ZERO);
         assert_eq!(e.smoothed_rtt(), ms(125), "⅞ · 100 + ⅛ · 300");
-        assert_eq!(e.loss_delay(), us(337_500), "9/8 · max(125, 300)");
+        assert_eq!(e.loss_delay(), Some(us(337_500)), "9/8 · max(125, 300)");
     }
 
     /// §13.2's floor: `max(…, K_GRANULARITY)`.
@@ -397,7 +397,7 @@ mod rtt {
         let mut e = RttEstimator::new();
         e.sample(us(100), Duration::ZERO);
 
-        assert_eq!(e.loss_delay(), K_GRANULARITY, "§13.2's 1 ms floor");
+        assert_eq!(e.loss_delay(), Some(K_GRANULARITY), "§13.2's 1 ms floor");
     }
 
     /// §13.3's interval from a sampled estimator, and §14.4's use of the
@@ -416,7 +416,7 @@ mod rtt {
         let mut e = RttEstimator::new();
         e.sample(ms(100), Duration::ZERO);
 
-        assert_eq!(e.pto_interval(), ms(325), "100 + 200 + 25");
+        assert_eq!(e.pto_interval(), Some(ms(325)), "100 + 200 + 25");
     }
 
     /// §13.1's roam clause: *"`min_rtt` is re-seeded from the first

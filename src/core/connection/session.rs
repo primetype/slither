@@ -32,7 +32,7 @@
 
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use packtool::Packet;
 
@@ -239,9 +239,9 @@ impl Iterator for RangesDesc<'_> {
 
 /// §7.4's two clocks.
 ///
-/// *"The connection is dead when `now − last_authenticated_recv >
-/// DEAD_TIMEOUT` **and** at least one **arming** send has occurred since
-/// that last authenticated receive."*
+/// *"The connection is dead when `now − last_authenticated_recv >= D_eff`
+/// **and** at least one **arming** send has occurred since that last
+/// authenticated receive."*
 ///
 /// The death deadline is **derived** from `last_authenticated_recv` rather
 /// than stored, which is what makes §7.4's "is **not** re-armed by
@@ -283,10 +283,10 @@ impl Liveness {
     ///
     /// *"the handshake is the arming event, so the rule's second conjunct
     /// holds from install onward and no subsequent send is needed to enable
-    /// it."* This is what makes "a half-open session is reaped by liveness
-    /// in 25 s" a fact rather than an implementation choice — without it a
-    /// session that receives nothing would be held **forever**, since §7.6
-    /// is deleted and liveness is the only reaper.
+    /// it."* This is what makes "a half-open session is reaped by liveness"
+    /// a fact rather than an implementation choice — without it a session
+    /// that receives nothing would be held **forever**, since §7.6 is
+    /// deleted and liveness is the only reaper.
     pub(crate) fn pinned_at_install(now: Instant) -> Self {
         Self {
             last_authenticated_recv: now,
@@ -294,21 +294,21 @@ impl Liveness {
             armed: true,
             // Ruling 39: the dance must **not** bootstrap from the install
             // alone — a connection that carries nothing emits nothing and
-            // is reaped at 25 s.
+            // is reaped at its effective dead timeout.
             received_since_marking_send: false,
         }
     }
 
     /// The death deadline, if armed.
     ///
-    /// `last_authenticated_recv + DEAD_TIMEOUT`, fired at the deadline
-    /// rather than strictly after it — §7.4's own prose, twice: "dies at
-    /// install + `DEAD_TIMEOUT`" and "reaped by liveness in 25 s". See
-    /// `.slices/03-skeleton/IMPLEMENTATION.md` F2 for the strict-inequality
-    /// wording this reads against.
-    pub(crate) fn deadline(&self) -> Option<Instant> {
+    /// `last_authenticated_recv + dead_timeout`, fired at the deadline
+    /// rather than strictly after it. See §7.4 and
+    /// `.slices/03-skeleton/IMPLEMENTATION.md` F2 for the boundary wording
+    /// this reads against.
+    pub(crate) fn deadline(&self, dead_timeout: Duration) -> Option<Instant> {
         self.armed
-            .then(|| self.last_authenticated_recv + constants::DEAD_TIMEOUT)
+            .then(|| self.last_authenticated_recv.checked_add(dead_timeout))
+            .flatten()
     }
 
     /// Record a send. `marking` is §7.4's `seal`; `ack_eliciting` is
@@ -361,7 +361,7 @@ impl Liveness {
     /// comparison is the same predicate everywhere the two instants differ
     /// and is **wrong when they are equal**, which the driver's once-per-turn
     /// `now()` makes reachable — see the field's own note. A keepalive owed
-    /// here fires at `last_send() + KEEPALIVE_TIMEOUT`.
+    /// here fires at `last_send() + K_eff`.
     pub(crate) fn owes_passive_keepalive(&self) -> bool {
         self.received_since_marking_send
     }
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(liveness.last_authenticated_recv(), now);
         assert!(liveness.is_armed(), "§7.4: pinned *armed*");
         assert_eq!(
-            liveness.deadline(),
+            liveness.deadline(constants::DEAD_TIMEOUT),
             Some(now + constants::DEAD_TIMEOUT),
             "a session that receives nothing dies at install + DEAD_TIMEOUT"
         );
@@ -835,12 +835,12 @@ mod tests {
     fn later_sends_do_not_re_arm_or_defer_the_deadline() {
         let now = Instant::now();
         let mut liveness = Liveness::pinned_at_install(now);
-        let deadline = liveness.deadline();
+        let deadline = liveness.deadline(constants::DEAD_TIMEOUT);
 
         for step in 1..10 {
             liveness.on_send(now + Duration::from_secs(step), true, true);
             assert_eq!(
-                liveness.deadline(),
+                liveness.deadline(constants::DEAD_TIMEOUT),
                 deadline,
                 "the deadline hangs from the receive clock, not the send clock"
             );
@@ -855,10 +855,13 @@ mod tests {
 
         liveness.on_authenticated_fresh_recv(recv);
         assert!(!liveness.is_armed());
-        assert_eq!(liveness.deadline(), None);
+        assert_eq!(liveness.deadline(constants::DEAD_TIMEOUT), None);
 
         liveness.on_send(recv, false, true);
-        assert_eq!(liveness.deadline(), Some(recv + constants::DEAD_TIMEOUT));
+        assert_eq!(
+            liveness.deadline(constants::DEAD_TIMEOUT),
+            Some(recv + constants::DEAD_TIMEOUT)
+        );
     }
 }
 

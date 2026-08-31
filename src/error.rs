@@ -295,8 +295,8 @@ pub enum AcceptError {
 /// convenience** — the alternative is an `Rc` in the public error type.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectionLost {
-    /// No authenticated packet arrived for `DEAD_TIMEOUT`.
-    #[error("no authenticated packet arrived for DEAD_TIMEOUT")]
+    /// No authenticated packet arrived before the connection's dead timeout.
+    #[error("no authenticated packet arrived before the connection's dead timeout")]
     TimedOut,
     /// The send counter is exhausted.
     #[error("the send counter is exhausted")]
@@ -393,8 +393,9 @@ pub enum ConfigError {
     /// The persistent-keepalive interval is below the 1 s floor.
     #[error("the persistent-keepalive interval is below the 1 s floor")]
     KeepaliveTooShort,
-    /// The persistent-keepalive interval is at or above `DEAD_TIMEOUT`.
-    #[error("the persistent-keepalive interval is at or above DEAD_TIMEOUT")]
+    /// The persistent-keepalive interval is at or above the connection's
+    /// effective dead timeout.
+    #[error("the persistent-keepalive interval is at or above the connection's dead timeout")]
     KeepaliveTooLong,
     /// A flow-control window below §10.2's ratified initial value.
     ///

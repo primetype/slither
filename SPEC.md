@@ -52,6 +52,9 @@
 | 273 | §8.2 | the structural-failure consequence is scoped to a live connection: while closing/draining a violation is ignored entirely, and at most one structural trace fires per connection — what the code always did, now a rule |
 | 274 | amendment table | rulings 260/268/270's `O13`/`O53a`/`O53b` were dangling pointers into a never-committed audit file; the rows now cite Appendix B by bold title, with the provenance recorded above |
 | 275 | §18.2, STORIES.md §S22 | WARN ratified as the level of §18.2's failure events; S22's anchor line gains §4, §6.1 (clause 4's whole mechanism was unanchored); the `mod owed` registry discharged and the SECV5-5/6/8 pins written |
+| 282 | §5.7, §7.4, §7.5, §16.2, §16.4, §16.5, §18.1, Appendix B, constants tables | an endpoint-wide validated `TimingProfile` may vary established-session liveness; the v1 10 s / 25 s constants remain the exact default, every other timer remains fixed, and no wire field or negotiation is added |
+| 283 | §5.7, §7.5, Appendix B | ruling 282's one-loss validation counts two shell-lateness allowances because each successive keepalive firing can independently be late; defaults and wire remain unchanged |
+| 284 | §5.7, §7.5, §13.3, §16.4, §16.5, §17.5, Appendix B | every deadline derivation checks all `Duration` intermediates and the final `Instant + Duration`; a sum beyond the platform horizon remains logically enabled where state requires but is unreachable and unannounced — never panicked, wrapped, saturated, or replaced by an earlier timeout; later state changes recompute it; constructor-time profile rejection remains, and representable/default/wire behaviour is unchanged |
 > This document is the complete specification of the slither protocol at
 > **wire version 1 — the first released wire**. It supersedes all prior
 > slither wire and specification text **wholesale**: `SPEC.md` (2026/07/16
@@ -993,8 +996,8 @@ no separate per-static flag, and all three readers of "is this static
 PENDING?" — §6.4's branch, §6.5's hint set, and this rule — consult the
 same tables. The alternative reading routes an initiation arriving in
 the mint-to-send window down the **NONE** row, which installs a second
-session and leaves both sides mutually dark for `DEAD_TIMEOUT` —
-precisely the divergence ruling 35 exists to prevent.
+session and leaves both sides mutually dark until their effective dead
+timeouts — precisely the divergence ruling 35 exists to prevent.
 
 - **LIVE** — the initiation is a **candidate replacement**: it parks as
   an ordinary
@@ -1096,9 +1099,51 @@ key holder is the party whose claim is in question (§7.3).
 |---|---|---|
 | `RETRANSMIT_BASE` + jitter | 5 s + U[0, 333 ms] | WireGuard Rekey-Timeout + jitter, cross-checked in the paper, the kernel, and wireguard-go; fixed-interval is WireGuard's shipped shape |
 | `HANDSHAKE_GIVEUP` | 90 s | WireGuard Rekey-Attempt-Time |
-| `KEEPALIVE_TIMEOUT` | 10 s | WireGuard Keepalive-Timeout (§7.5) |
-| `DEAD_TIMEOUT` | 25 s | 2 × `KEEPALIVE_TIMEOUT` + 5 s grace — one-lost-keepalive tolerance, *in one direction* (below); the only idle killer (§7.5) |
-| `PERSISTENT_KEEPALIVE` | 10 s default; admissible range **[1 s, `DEAD_TIMEOUT`)** | `KEEPALIVE_TIMEOUT`, so one lost beacon is still tolerated inside `DEAD_TIMEOUT` (2 × 10 + 5); a recommended default, per-connection `Option<Duration>`, off by default; the handle rejects an interval **below 1 s** — the floor, ruling 42 — and **at or above** `DEAD_TIMEOUT` — the ceiling, ruling 40 (§7.5) |
+| `KEEPALIVE_TIMEOUT` | 10 s | WireGuard Keepalive-Timeout; the v1/default profile's passive cadence and contested verdict (§7.5) |
+| `DEAD_TIMEOUT` | 25 s | 2 × `KEEPALIVE_TIMEOUT` + 5 s grace — the v1/default profile's receive-anchored death timeout and one-lost-keepalive tolerance, *in one direction* (below); the only idle killer (§7.5) |
+| `PERSISTENT_KEEPALIVE` | 10 s default; admissible range **[1 s, effective dead timeout)** | `KEEPALIVE_TIMEOUT`, so the v1/default profile tolerates one lost beacon inside `DEAD_TIMEOUT` (2 × 10 + 5); a recommended default, per-connection `Option<Duration>`, off by default; the handle rejects an interval **below 1 s** — the floor, ruling 42 — and **at or above the connection's effective dead timeout** — the ceiling, rulings 40 and 282 (§7.5) |
+
+**Effective established-session liveness (rulings 282 and 283).** `Config` may
+carry one endpoint-wide, immutable, validated `TimingProfile`. Let
+`K_eff` be its passive-keepalive interval and `D_eff` its
+receive-anchored dead-peer timeout. The profile is stamped onto every
+connection born from that endpoint, through both outbound `connect()`
+and inbound `accept()`; it cannot vary by peer or be changed on a live
+connection. `Config::default()` carries the exact v1 profile:
+`K_eff = KEEPALIVE_TIMEOUT` (10 s) and `D_eff = DEAD_TIMEOUT` (25 s).
+The public constants remain unchanged and continue to pin those defaults.
+
+A profile is constructible only when `K_eff >= 1 s` and, with checked
+`Duration` arithmetic,
+
+```text
+D_eff > 2 × K_eff + K_INITIAL_RTT + 2 × SHELL_LATENESS_BOUND.
+```
+
+Overflow rejects the profile. Construction also rejects a dead timeout
+that cannot be added to the constructor's current monotonic `Instant`.
+That is early validation, not a lifetime proof about every later anchor:
+all deadline derivations also follow §16.5's checked, unreachable-deadline
+rule. The strict relation admits one lost keepalive under the initial-RTT
+assumption and leaves enough room for both successive keepalive firings
+to consume the shell's permitted lateness without making an arrival
+exactly at the verdict instant win by event-loop ordering (ruling 283).
+Each firing re-anchors the next deadline from its actual send instant, so
+both lateness allowances are necessary. The two values move only the
+coupled established-session rules: passive keepalive and the contested
+verdict both use `K_eff`; receive-anchored death and every liveness
+backstop both use `D_eff`; and the persistent-beacon ceiling is `D_eff`.
+Where §§7.4–7.5 and their cross-references say *effective keepalive* or
+*effective dead timeout*, these are the values meant.
+
+Nothing is negotiated or carried on the wire. Peers with different
+profiles remain wire-compatible but can reach different liveness
+verdicts; a deployment that depends on common loss or failover behaviour
+MUST configure the common profile out of band. Handshake retransmission
+and give-up, introduction and timestamp-guard retention, ACK/PTO
+recovery, close linger, and shell lateness remain the fixed v1 constants.
+In particular, `HANDSHAKE_GIVEUP` is not application dial patience:
+dropping `Connecting` remains the early-cancel mechanism (§16.3).
 
 `DEAD_TIMEOUT` is deliberately **two** keepalive periods plus grace, not
 one. At a single keepalive period plus grace, one lost keepalive killed a
@@ -1125,8 +1170,9 @@ cover is a connection that has had **no authenticated receive at all**
 since install:
 with `last_send` pinned equal to `last_authenticated_recv` at the install
 instant (§7.4) the entry condition is false from the start, the dance
-never begins, and such a connection is reaped at install +
-`DEAD_TIMEOUT`. The rule is stated in terms of *receiving* deliberately,
+never begins, and such a connection is reaped at install + `D_eff`
+(25 s under the v1/default profile). The rule is stated in terms of
+*receiving* deliberately,
 because that is what it is: the death deadline is armed at install and
 is reset only by an authenticated receive, so sending is useful here
 only instrumentally, by provoking the peer's passive keepalive. That
@@ -1146,10 +1192,11 @@ beacon could not keep a connection alive on its own, and that describes a
 **ceiling**. The *rule* was the half that was wrong — written as a floor,
 and a floor at `DEAD_TIMEOUT` is precisely what made the knob
 unreachable, since a beacon firing every 25 s cannot possibly sustain a
-25 s death timer. As ruled: `set_persistent_keepalive` rejects an
-interval **at or above** `DEAD_TIMEOUT` (§7.5, §16.2), and the
-recommended default moves 25 s → **10 s**, matching `KEEPALIVE_TIMEOUT`
-so that one lost beacon is still tolerated inside the 25 s deadline
+25 s death timer. As ruled and later generalized by ruling 282:
+`set_persistent_keepalive` rejects an interval **at or above `D_eff`**
+(§7.5, §16.2), and the v1 recommended default moved 25 s → **10 s**,
+matching `KEEPALIVE_TIMEOUT` so that one lost beacon is still tolerated
+inside the 25 s default deadline
 (2 × 10 + 5 — the same arithmetic that sizes `DEAD_TIMEOUT` itself).
 Ruling 38's derivation is **retained** in §7.5, re-framed as the proof
 that the old bound was inverted rather than as a claim that the knob is
@@ -1161,16 +1208,17 @@ defect: nothing in the text stopped `set_persistent_keepalive(1 ms)`, a
 conformant configuration emitting a thousand packets a second on a
 beacon §14.5 exempts from the congestion window, when §13.3 already
 condemns a 20-packet-per-second cadence as defeating §16.5's timer
-economy. The admissible range is therefore **[1 s, `DEAD_TIMEOUT`)**:
-the handle rejects an interval **below 1 s** as well as one at or above
-`DEAD_TIMEOUT`. The floor is deliberately far below the 10 s default —
+economy. The admissible range is therefore **[1 s, `D_eff`)**: the
+handle rejects an interval **below 1 s** as well as one at or above the
+connection's effective dead timeout. The floor is deliberately far
+below the 10 s default —
 it forecloses the degenerate configurations, not the useful short ones —
 and §7.5 records why 1 s and not something larger.
 
 The beacon remains a **marking** send, and admitting short intervals is
 safe precisely because arming **enables** death and never defers it
 (§7.4): a beacon fired into a void still dies at
-`last_authenticated_recv + DEAD_TIMEOUT`. What the beacon buys, and the
+`last_authenticated_recv + D_eff`. What the beacon buys, and the
 passive dance cannot, is that it fires **unconditionally** on its own
 timer — it does not require `last_authenticated_recv > last_send` — so it
 sustains a *mutually idle* link, one that never entered the dance because
@@ -1468,7 +1516,7 @@ rather than left to §7.5: an established connection **we dialled**
 (`replacement_basis` = `None`) does feel a parked `Intro` for its own
 static, because an `accept()` that **admits** that `Intro` and then
 refuses it on the basis rule marks the connection **contested** and puts
-it on a `KEEPALIVE_TIMEOUT` watch (§6.4, §7.5, ruling 177 — an
+it on a `K_eff` watch (§6.4, §7.5, rulings 177 and 282 — an
 un-admitted candidate, including a walk that exhausts, marks nothing). A
 live connection
 answers the probe and survives; what it costs is one ack-eliciting PING
@@ -1551,8 +1599,8 @@ human-in-the-loop accept decision. The rule:
   **`None`** basis marks that connection
   **contested**, which records a **probe floor** (the counter the next
   seal will use), sends an ack-eliciting PING on it, and requires an ACK
-  covering **any counter at or above that floor** within
-  `KEEPALIVE_TIMEOUT` of the probe's transmission, on pain of
+  covering **any counter at or above that floor** within the connection's
+  `K_eff` of the probe's transmission, on pain of
   `ConnectionLost::TimedOut` — the mechanism, its bound, why an ACK
   rather than a receive is what the question needs, and why the predicate
   is a high-water mark rather than that one packet (ruling 41) are
@@ -1645,8 +1693,9 @@ human-in-the-loop accept decision. The rule:
   initiation arriving in that window took §5.4's **NONE** row instead,
   we would install as responder and `start_attempt` would *then* fire,
   giving two sessions, two key sets, both msg2s dropped and both sides
-  mutually dark for `DEAD_TIMEOUT` — exactly the divergence ruling 35
-  exists to prevent. The mechanism was already verified in round 8: all
+  mutually dark until their effective dead timeouts — exactly the
+  divergence ruling 35 exists to prevent. The mechanism was already
+  verified in round 8: all
   three readers of "is this static PENDING?" consult the same pending
   tables that ruling 50's cancellation empties, and there is no separate
   per-static flag anywhere.
@@ -1670,8 +1719,9 @@ human-in-the-loop accept decision. The rule:
   still reach the peer, which reaches the *same* comparison by §6.6's
   internal route, loses, and installs as responder over *our* msg1. Two
   distinct sessions, two key sets, each side's msg2 dropped by the other,
-  mutually dark until `DEAD_TIMEOUT` (§7.5) — and both ends would compute
-  the same stream-ID parity, contradicting §6.7's parity consequence. When
+  mutually dark until their effective dead timeouts (§7.5) — and both ends
+  would compute the same stream-ID parity, contradicting §6.7's parity
+  consequence. When
   both applications use the `read_identity()` → `connect()` → `accept()`
   ordering, both sides take this branch and the divergence is certain, not
   a coin flip.
@@ -1931,8 +1981,8 @@ follow and neither may be dropped:
   vacuous-pass window reopens against a peer we have already admitted.
 
 The winner-side record above closes the same hole from the other
-direction, and the resulting session carries nothing and dies at
-`DEAD_TIMEOUT` (§7.5). It is strictly weaker than a capture-capable
+direction, and the resulting session carries nothing and dies at its
+effective dead timeout (§7.5). It is strictly weaker than a capture-capable
 attacker's baseline ability to drop our handshake outright.
 
 **One mitigation is declined, and recorded as declined so it is not
@@ -1982,7 +2032,7 @@ jump. Where the zombie is a connection we **dialled**, its basis is
 `AcceptError::Stale` (§6.4) and the `Intro` is refused, because we hold
 no initiation of that peer's against which a captured msg1 could be
 distinguished from a genuine reconnect. The restart still resolves with
-no machinery, delayed by at most `DEAD_TIMEOUT` — **but that bound rests
+no machinery, delayed by at most `D_eff` — **but that bound rests
 on a premise, and the premise must be named**: it holds when nothing
 authentic is still reaching the zombie. Absent an attacker it does: the
 zombie receives nothing it can open, so it dies at liveness; the static
@@ -1996,7 +2046,7 @@ it is ruled acceptable.
 what restores the bound.** §7.4's clock is driven by mere authenticated
 receipt, so an adversary who harvested genuine peer→us Data — dropping it
 so our replay window never advanced past it — can inject one harvested
-packet every less than `DEAD_TIMEOUT` from anywhere off-path and keep the
+packet every less than `D_eff` from anywhere off-path and keep the
 zombie's liveness clock reset forever, roaming the session to itself in
 the process. Nothing then dies: every genuine reconnect is refused
 against the `None` basis, `connect()` reports
@@ -2006,10 +2056,10 @@ long as the attacker keeps dripping. The
 refusal that would leave the wedge in place now demands an ACK covering a
 counter sealed *after* the doubt arose — the probe floor of ruling 41,
 which any post-mark packet's ACK satisfies — which no harvested traffic
-can supply, so the zombie dies within `KEEPALIVE_TIMEOUT` of the probe and
-the restart resolves after all. The delay is then bounded by the
-application's next `accept()` rather than by `DEAD_TIMEOUT`, and the
-`Intro` is still parked when it comes (§6.3's `INTRO_TTL`).
+can supply, so the zombie dies within its `K_eff` of the probe and the
+restart resolves after all. The delay is then bounded by the
+application's next `accept()` rather than by `D_eff`; under the v1/default
+profile the `Intro` is still parked when it comes (§6.3's `INTRO_TTL`).
 
 **[AMENDED 2026/08/16 — ruling 171]** *That bound rests on a premise this
 paragraph establishes and never joined to it, which is the failure this
@@ -2026,8 +2076,8 @@ to reap, so the carve-out cannot weaken this argument), and §7.3's
 **challenge** means an off-path injector cannot keep the address
 unvalidated in the first place, since it spoofs a source it does not
 receive at and therefore never sees the eight bytes it would have to echo
-(rulings 168, 208). *"Dies within `KEEPALIVE_TIMEOUT` of the probe"* is
-therefore true, and true for a named reason. **[AMENDED 2026/08/16 —
+(rulings 168, 208). *"Dies within `K_eff` of the probe"* is therefore
+true, and true for a named reason. **[AMENDED 2026/08/16 —
 ruling 208]** The reason survives the change of mechanism intact, and it
 is worth saying why it survives: this attacker is **off-path at the
 address it names**, which is the one adversary both the superseded ACK
@@ -2132,7 +2182,7 @@ The refusals are
 attacker-suppliable — that is exactly what §6.3's queue exists for — so
 this is an attacker-adjacent cost and belongs in this table's reasoning.
 **[AMENDED 2026/08/16 — ruling 175]** *The bound previously stated here
-— "at most one `MAX_DATAGRAM`-bounded packet per `KEEPALIVE_TIMEOUT` per
+— "at most one `MAX_DATAGRAM`-bounded packet per `K_eff` per
 live connection … no matter how many Intros arrive" — was false, and
 §7.5 stated the same false thing.* Ruling 41's collapse suppresses only
 refusals landing **while a mark is outstanding**; a live peer ACKs in
@@ -2608,7 +2658,7 @@ argument exactly once, for the congestion gate: *"a probe the gate could
 delay past its own deadline would silently convert congestion into a
 liveness verdict."* The argument transfers verbatim to the budget. The
 attack it forecloses: an adversary holding harvested peer→us Data injects
-one small packet just under `DEAD_TIMEOUT` **from a fresh source each
+one small packet just under `D_eff` **from a fresh source each
 time**, which refreshes liveness, roams the session (re-arming the
 counters at that one packet's bytes), and leaves too little budget for
 the probe to win against the ACK also owed — making the zombie the probe
@@ -2635,7 +2685,7 @@ already. §7.5 points the same way from the other side: a contested mark
 taken on an already-closing connection is a **no-op**, so the two states
 barely co-exist, and where a mark taken while live survives into closing
 its verdict is moot. A CLOSE the budget will not admit, by contrast, costs
-the peer a full `DEAD_TIMEOUT` to learn what one small packet would have
+the peer a full `D_eff` to learn what one small packet would have
 told it at once. Both are small and both are cwnd-exempt, so the ordering
 is free in the common case and decides only the scarce-budget case, which
 is what this rule is for.
@@ -2682,8 +2732,9 @@ the two sets deliberately differ.
 
 **The liveness anchor is the receive clock, armed by intent or by
 ack-eliciting output.** The connection is dead when
-`now − last_authenticated_recv >= DEAD_TIMEOUT` **[AMENDED 2026/08/15 —
-ruling 85; was `>`]** **and** at least one
+`now − last_authenticated_recv >= D_eff`, the connection's effective
+dead timeout (§5.7), **[AMENDED 2026/08/15 — ruling 85; was `>`]**
+**and** at least one
 **arming** send has occurred since that last authenticated receive. A send
 arms the death deadline if **either** it is a marking send (a `seal` —
 fresh application intent, or the keepalive) **or** it carries any
@@ -2691,9 +2742,10 @@ ack-eliciting frame, whether or not it marks; the two triggers are
 independent and either alone suffices. Equivalently: the deadline arms on
 the *first* arming send after a receive, is **not** re-armed by subsequent
 sends of either kind, and is reset by every authenticated, window-fresh
-receive (§7.2). A sender writing into a black hole therefore dies 25 s
-after its last authenticated receive no matter how often, or how quietly,
-it writes — the send clock never defers death, it only enables it.
+receive (§7.2). A sender writing into a black hole therefore dies
+`D_eff` after its last authenticated receive — 25 s under the
+v1/default profile — no matter how often, or how quietly, it writes. The
+send clock never defers death; it only enables it.
 
 **At install the clock is pinned, and it is pinned *armed*.** A newly
 installed session (§5.4) sets both `last_authenticated_recv` and
@@ -2701,13 +2753,14 @@ installed session (§5.4) sets both `last_authenticated_recv` and
 **already armed**: the handshake is the arming event, so the rule's
 second conjunct holds from install onward and no subsequent send is
 needed to enable it. Two consequences, both intended. A session that
-receives nothing after install dies at install + `DEAD_TIMEOUT` whether
-or not the application ever sends — which is what makes "a half-open
-session is reaped by liveness in 25 s" a fact rather than an
-implementation choice (§6.7, §17.1, and §15.4's endpoint-dropped row all
-rest on it), and without the pin an implementation that started the clock
-unarmed would hold such a session **forever**, since §7.6 is deleted and
-liveness is the only reaper. And with `last_send` equal to
+receives nothing after install dies at install + `D_eff` whether or not
+the application ever sends — 25 s under the v1/default profile — which
+is what makes "a half-open session is reaped by liveness" a fact rather
+than an implementation choice (§6.7, §17.1, and §15.4's
+endpoint-dropped row all rest on it), and without the pin an
+implementation that started the clock unarmed would hold such a session
+**forever**, since §7.6 is deleted and liveness is the only reaper. And
+with `last_send` equal to
 `last_authenticated_recv`, §7.5's passive rule — *received since its last
 marking send* (§7.5, ruling 182) — is false until the first authenticated
 receive, so a half-open
@@ -2746,9 +2799,9 @@ progress. Any authenticated, window-fresh packet resets it (§7.2),
 including one the peer sealed long ago that an attacker captured,
 withheld, and injected later from anywhere off-path: it is genuine, so it
 opens; the window never advanced past it, so it is fresh; and it therefore
-buys our side's zombie another full `DEAD_TIMEOUT` — and, because
-roaming keys on authenticated receipt too, moves the session to the
-injector's address (§7.3). Every "is this peer still there?" question in
+buys our side's zombie another full `D_eff` — and, because roaming keys
+on authenticated receipt too, moves the session to the injector's
+address (§7.3). Every "is this peer still there?" question in
 this document inherits that: liveness answers *something authentic
 arrived*, not *the peer is still there and still talking to us*. The
 **contested-connection probe** (§7.5) is the one place the spec
@@ -2767,18 +2820,18 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
 
 ### 7.5 Keepalive and liveness timers
 
-| Constant | Value |
-|---|---|
-| `KEEPALIVE_TIMEOUT` | 10 s |
-| `DEAD_TIMEOUT` | 25 s (= 2 × `KEEPALIVE_TIMEOUT` + 5 s grace — §5.7) |
-| `PERSISTENT_KEEPALIVE` | 10 s (recommended default; per-connection `Option<Duration>`, off by default; admissible range **[1 s, `DEAD_TIMEOUT`)** — at least 1 s, ruling 42, and strictly less than `DEAD_TIMEOUT`, ruling 40) |
+| Term | v1/default profile | Effective rule |
+|---|---|---|
+| passive keepalive / contested verdict | `KEEPALIVE_TIMEOUT` = 10 s | `K_eff` from the endpoint's `TimingProfile` |
+| receive-anchored death / liveness backstops | `DEAD_TIMEOUT` = 25 s | `D_eff` from the same profile |
+| `PERSISTENT_KEEPALIVE` | 10 s recommended; per-connection `Option<Duration>`, off by default | admissible range **[1 s, `D_eff`)** |
 
 - **The keepalive is the empty plaintext** (§3.4) — the cheapest possible
   liveness beacon, bypassing the frame layer, sealed via `seal`. Its
   classification, explicit: the keepalive is a **marking** send. Passive
   rule: a side that has received since its last **marking** send, and has
   not made a **marking** send for
-  `KEEPALIVE_TIMEOUT`, sends a keepalive.
+  `K_eff`, sends a keepalive.
   **[AMENDED 2026/08/16 — ruling 182]** *Both conjuncts read `S` =
   `last_send`, **marking sends only** (§7.4) — this rule previously said
   "has not sent", and wire traces diverge from the first non-marking send
@@ -2799,16 +2852,18 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   fires when no marking send has occurred for the configured interval,
   and re-arms from every marking send. `set_persistent_keepalive`
   **rejects an interval below 1 s, and an interval at or above
-  `DEAD_TIMEOUT`**, at the handle: the admissible range is
-  **[1 s, `DEAD_TIMEOUT`)**.
+  `D_eff`**, at the handle: the admissible range is **[1 s, `D_eff`)**.
   **[RATIFIED 2026/08/14, amended 2026/08/14]** The upper bound is a
   **ceiling**, and its job is the one this document has always stated for
   it: to reject an interval so long that the beacon could not keep a
   connection alive on its own. The recommended default is **10 s** —
   `KEEPALIVE_TIMEOUT`, which leaves one-lost-beacon tolerance inside the
   25 s deadline (2 × 10 + 5, the arithmetic that sizes `DEAD_TIMEOUT`
-  itself). Ruling 40 below records why the bound was briefly written as a
-  floor instead, and why that is now reversed. The flag's
+  itself). Under a custom profile, choosing `I = K_eff` is the
+  corresponding one-loss choice: rulings 282 and 283 leave the required
+  initial-RTT and two-firing shell-lateness margin inside `D_eff`. Ruling
+  40 below records why the bound was briefly written as a floor instead,
+  and why that is now reversed. The flag's
   other half — the idle-rekey rule, under which the keepalive consulted
   `REKEY_AGE` — is moot: there is no DH rekey to consult (§5.4, the
   ratchet-only ruling). The anchor correction itself
@@ -2826,23 +2881,24 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   holds a NAT binding open on a cadence the application picks. The two
   compose: a beacon
   arriving at the peer establishes `R > S` there, so the peer's passive
-  rule answers within `KEEPALIVE_TIMEOUT`, and that answer resets the
+  rule answers within `K_eff`, and that answer resets the
   beaconing side's own `R`. One side opting in is thus enough to keep the
   pair alive: at the 10 s default the pair settles into a 10 s ping-pong
   — the beacon arrives, and the peer answers at once, its own
-  `KEEPALIVE_TIMEOUT` having already elapsed — so a single lost beacon
+  `K_eff` having already elapsed — so a single lost beacon
   costs one extra interval and lands the next answer at 20 s, 5 s inside
   the deadline, while two consecutive losses end the connection. That is
   the same one-loss tolerance the dance itself has, and the reason the
-  default is `KEEPALIVE_TIMEOUT` rather than anything larger. A peer that
-  must remain reachable while idle — one behind a NAT that cannot
-  redial — sets it.
+  default is `KEEPALIVE_TIMEOUT` rather than anything larger. With a
+  custom profile, `I = K_eff` is the equivalent selection. A peer that
+  must remain reachable while idle — one behind a NAT that cannot redial
+  — sets it.
 
   **The beacon stays in the marking set**, and no special case is needed
   to make short intervals safe. Arming **enables** death; it never defers
   it (§7.4). A beacon fired into a void arms a deadline it cannot reset,
   so a connection whose entire output is beacons still dies at
-  `R + DEAD_TIMEOUT`, exactly as if it had sent nothing. Marking is
+  `R + D_eff`, exactly as if it had sent nothing. Marking is
   therefore harmless at every admissible interval, and the alternative
   once recorded here — admitting short intervals while excluding
   persistent keepalives from the marking set — is **unnecessary rather
@@ -2856,30 +2912,30 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   interval, `S` = `last_send` (marking sends only), and `R` =
   `last_authenticated_recv`. The beacon fires at `S + I` and re-arms from
   every marking send; receives do not reset it. Whenever `R > S` the
-  passive keepalive above fires at `S + KEEPALIVE_TIMEOUT`, and being
-  itself a marking send it drags `S` forward in 10 s steps and pushes the
+  passive keepalive above fires at `S + K_eff`, and being itself a
+  marking send it drags `S` forward in `K_eff` steps and pushes the
   beacon's deadline along with it — while the dance runs, the beacon
   never fires. The only state that blocks the dance is `S > R`; but every
-  send that can establish `S > R` is a marking send, so the death clock is
-  armed there (§7.4) and death arrives at `R + DEAD_TIMEOUT`, while the
-  beacon's deadline is `S + I > R + I ≥ R + DEAD_TIMEOUT` for every
-  `I ≥ DEAD_TIMEOUT` — **strictly after death**. That is a sound proof of
-  a narrow fact: *an interval at or above `DEAD_TIMEOUT` is inert*.
+  send that can establish `S > R` is a marking send, so the death clock
+  is armed there (§7.4) and death arrives at `R + D_eff`, while the
+  beacon's deadline is `S + I > R + I ≥ R + D_eff` for every
+  `I ≥ D_eff` — **strictly after death**. That is a sound proof of a
+  narrow fact: *an interval at or above `D_eff` is inert*.
   Ruling 38 read it as a property of the knob and documented the knob as
   a permanent no-op. Ruling 40 reads it as what it is — a proof that the
-  **bound** was inverted, because a floor at `DEAD_TIMEOUT` admits
+  **bound** was inverted, because a floor at `D_eff` admits
   precisely and only the intervals the derivation shows can never fire.
-  Making the bound a ceiling (`I < DEAD_TIMEOUT`) breaks that inequality
+  Making the bound a ceiling (`I < D_eff`) breaks that inequality
   exactly where it needs breaking. The beacon is useful precisely when
-  `S + I < R + DEAD_TIMEOUT`; under a floor that is unreachable by
+  `S + I < R + D_eff`; under a floor that is unreachable by
   construction, since `S ≥ R` in the blocking state gives
-  `S + I ≥ S + DEAD_TIMEOUT ≥ R + DEAD_TIMEOUT` for every admissible
+  `S + I ≥ S + D_eff ≥ R + D_eff` for every admissible
   `I`, with no configuration escaping it. Under a ceiling it is reachable
   — and it holds outright in the state ruling 39 reaps, a connection idle
   from install, where `S = R` at the install instant (§7.4) makes the
-  beacon's deadline `R + I < R + DEAD_TIMEOUT`. There the beacon fires
+  beacon's deadline `R + I < R + D_eff`. There the beacon fires
   while the connection is still alive, the peer's passive rule answers
-  it, and the answer resets `R` before `R + DEAD_TIMEOUT` arrives — so
+  it, and the answer resets `R` before `R + D_eff` arrives — so
   the knob does the job it was always described as doing.
   **What moves:** the bound becomes a ceiling, and the recommended
   default becomes 10 s. **What does not:** `DEAD_TIMEOUT` stays 25 s,
@@ -2906,8 +2962,9 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   is newly acked, and beacons are not ack-eliciting and never enter the
   sent map, so a connection whose entire output is beacons feeds the
   estimator nothing while filling the path. The admissible range is
-  therefore **[1 s, `DEAD_TIMEOUT`)** — reject below 1 s, reject at or
-  above 25 s, recommended default 10 s. **Why 1 s and not more:** the
+  therefore **[1 s, `D_eff`)** — reject below 1 s, reject at or above
+  the effective dead timeout (25 s under the v1/default profile), and
+  retain 10 s as the v1 recommended value. **Why 1 s and not more:** the
   floor's job is to foreclose the degenerate configurations, not to
   second-guess an application that knows its NAT. A 1 s beacon is one
   packet per second per connection, a rate any of this document's other
@@ -2920,21 +2977,23 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   **What the admissible band does and does not promise.** The range is
   wide on purpose, but only the lower part of it carries the tolerance
   the default advertises. A beacon at `I` must land, be answered, and
-  have the answer arrive before `R + DEAD_TIMEOUT`; §16.5's lateness
-  bound `L` (250 ms) applies to the beacon's own timer, and the answer
-  costs a round trip. At `I` = 10 s a lost beacon still leaves the next
-  one landing at 20 s with 5 s of margin — the one-lost-beacon tolerance
-  the default is chosen for. At any `I ≥ KEEPALIVE_TIMEOUT` there is no
-  such margin: a single lost beacon is fatal, since the next fires at
-  2 `I` ≥ 20 s and death lands at 25 s with `L` and the round trip still
-  to pay, and at the very top of the band (`I` within `L` + one RTT of
-  `DEAD_TIMEOUT`) the beacon cannot arrive in time even unlost. Those
-  intervals remain **admissible and are not rejected** — the handle
-  enforces a range, not a loss model, and an application that beacons at
-  20 s on a lossless link gets exactly what it asked for — but an
-  application choosing above 10 s should know it has bought a beacon
-  with no loss tolerance. This is why the recommendation is
-  `KEEPALIVE_TIMEOUT` and not the largest admissible value.
+  have the answer arrive before `R + D_eff`; §16.5's lateness
+  bound `L` (250 ms) applies independently to both successive beacon
+  timers, and the answer costs a round trip. At `I = K_eff`, one lost
+  beacon leaves the next one firing no later than `2 × K_eff + 2 × L`;
+  the profile's strict validation relation leaves more than
+  `K_INITIAL_RTT` after that second firing before death at `D_eff`.
+  Equality is
+  therefore the intended one-loss case — under the v1/default profile,
+  10 s then 20 s, with 5 s before the 25 s verdict. At `I > K_eff`, the
+  full default one-loss margin no longer follows: near the top of the
+  band (within `L` plus one RTT of `D_eff`) even an unlost beacon cannot
+  complete in time. Those intervals remain **admissible and are not
+  rejected** — the handle enforces a range, not a loss model, and an
+  application choosing a larger interval on a lossless link gets exactly
+  what it asked for — but it must not infer the profile's one-loss
+  guarantee. This is why the recommendation follows `K_eff`, not the
+  largest admissible value.
 - **Neither keepalive's deadline is announced while a keepalive cannot
   leave — and a vetoed keepalive arms the death clock.** **[RATIFIED
   2026/08/18 — ruling 265]** `Keepalive` and `PersistentKeepalive`
@@ -2959,24 +3018,27 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   arms, so the suppressed state can otherwise reach `Timeout(None)` with
   a keepalive owed and every timer dark: a connection that neither talks
   nor dies. The rule that closes it: **while a keepalive is owed and
-  vetoed, the connection announces `last_authenticated_recv +
-  DEAD_TIMEOUT`** — the death clock's own anchor, so the parked state
-  ends in death at 25 s or in recovery at the first qualifying receive,
-  which re-funds the budget, resumes the keepalive, and moves death out
-  by its own rule. Never silence.
-- **Liveness** (`DEAD_TIMEOUT`) keys on the receive clock (§7.4): a
+  vetoed, the connection announces the representable
+  `last_authenticated_recv + D_eff`** — the death clock's own anchor, so
+  the parked state ends in death at the effective timeout (25 s under the
+  v1/default profile) or in recovery at the first qualifying receive,
+  which re-funds the budget, resumes the keepalive, and moves death out by
+  its own rule. If the sum lies beyond the platform clock horizon, the
+  death obligation remains logically enabled but §16.5 permits no
+  fabricated earlier announcement.
+- **Liveness** (`D_eff`) keys on the receive clock (§7.4): a
   connection that has *armed* the clock since its last authenticated
   receive — by a marking send **or** by any ack-eliciting send — and then
-  receives nothing authenticated for 25 s is dead
+  receives nothing authenticated for `D_eff` is dead
   (`ConnectionLost::TimedOut`). It is **the only idle killer** — an idle
   session sustained by the keepalive dance keeps receiving, so it lives
   indefinitely *while the dance survives the path*. The residual is named,
-  not hidden — and it is **narrower than "two consecutive losses"**. At
-  25 s = 2 × `KEEPALIVE_TIMEOUT` + 5 s grace the tolerance is one lost
-  keepalive **in one direction**: if A's keepalive at t = 10 is lost but
-  B's arrives, A has received since its last marking send, keepalives
-  again at
-  t = 20, and lands inside B's deadline with 5 s to spare. A
+  not hidden — and it is **narrower than "two consecutive losses"**.
+  Under the v1/default profile, 25 s = 2 × `KEEPALIVE_TIMEOUT` + 5 s
+  grace, and the tolerance is one lost keepalive **in one direction**:
+  if A's keepalive at t = 10 is lost but B's arrives, A has received
+  since its last marking send, keepalives again at t = 20, and lands
+  inside B's deadline with 5 s to spare. A
   **simultaneous bidirectional** loss — one loss *event*, two packets, the
   same interval — is not tolerated at all: both sides then hold
   `last_send` > `last_authenticated_recv`, so the passive rule's first
@@ -3008,35 +3070,36 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   connection that has sent nothing". With `last_send` pinned equal to
   `last_authenticated_recv` at the install instant and the deadline armed
   there (§7.4), the entry condition is false from the start and stays
-  false, so the connection dies at install + `DEAD_TIMEOUT` in silence.
-  That is ruled as intended — a connection that never carries traffic is
-  reaped at 25 s and the application redials — and it is what makes "a
-  half-open session is reaped by liveness in 25 s" a fact (§6.7, §17.1,
-  §15.4).
+  false, so the connection dies at install + `D_eff` in silence. That is
+  ruled as intended — a connection that never carries traffic is reaped
+  at the effective timeout and the application redials — and it is what
+  makes "a half-open session is reaped by liveness" a fact (§6.7,
+  §17.1, §15.4). The v1/default value is 25 s.
 
   **Stating it as a receive rule is not pedantry; two consequences follow
   that a send rule would hide.** First, **a late first send does not
   save the connection**. A dialling side whose application sends its
-  first request at *t* = 24 s still has `last_authenticated_recv` at the
-  install instant, so it dies at *t* = 25 s unless the peer's answer
-  completes inside one second; if that first request is lost the sender
-  gets roughly one PTO (≈ 1.1 s at `K_INITIAL_RTT`) and then dies with
-  data still queued. The usable window for a first exchange **shrinks as
-  the connection ages**, from 25 s at install down to one round trip.
+  first request one second before `D_eff` still has
+  `last_authenticated_recv` at the install instant, so it dies at
+  `D_eff` unless the peer's answer completes inside that second; if that
+  first request is lost, the sender gets at most the recovery time that
+  remains and then dies with data still queued. The usable window for a
+  first exchange **shrinks as the connection ages**, from `D_eff` at
+  install down to one round trip.
   Second, the flows this reaps are **ordinary, not degenerate**:
   connect-ahead-of-use (dial at process start to hide handshake latency
   from the first user action), human-in-the-loop (dial, then wait for an
   operator to type), and responder-first-silence (a server with nothing
-  to say until asked, whose client stalls past 25 s). In each case both
+  to say until asked, whose client stalls past `D_eff`). In each case both
   sides emit nothing at all — the reap is silent by §7.4's own design —
   so `ConnectionLost::TimedOut` is indistinguishable from a real path
   failure, which is precisely the complaint this section levels at the
   declined all-opt-in alternative below, and it is fair against the
-  retained design too for the first 25 s of a connection's life.
+  retained design too for the first `D_eff` of a connection's life.
 
   **The application rule that follows, stated normatively.** An
   application that establishes a connection ahead of its first use MUST
-  either carry an exchange within `DEAD_TIMEOUT` of install or configure
+  either carry an exchange within `D_eff` of install or configure
   a persistent keepalive on it (§7.5's beacon, §16.2). Those are the two
   mechanisms; there is no third, and no protocol default rescues a
   connection that uses neither. This is the one place where slither's
@@ -3060,9 +3123,10 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   **considered and declined**, recorded so it is not re-proposed. It
   silently breaks every sparse-traffic application that does not opt in:
   a request/response peer with a 60 s idle gap works under this
-  specification and would begin dying at 25 s instead, with nothing on
-  the wire distinguishing that from a real path failure and no diagnosis
-  available to the application beyond reconnecting harder.
+  specification under the v1/default profile and would begin dying at
+  25 s instead, with nothing on the wire distinguishing that from a real
+  path failure and no diagnosis available to the application beyond
+  reconnecting harder.
 - Keepalives are admitted to the replay window (they appear
   opportunistically in ACK ranges; `ack_delay = 0` when the window's
   largest was not frame-seen — §12.3) but never reach recovery, never
@@ -3084,9 +3148,10 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   sends an ack-eliciting **PING** (§8.3) — ordinarily the first packet at
   or above that floor, though the floor is what binds and it is recorded
   at the mark whether or not the PING is the very next seal — and it arms
-  a `KEEPALIVE_TIMEOUT` deadline **at that PING's transmission**. The mark clears on **any ACK covering any
-  counter at or above the probe floor** — the probe's own counter, or any
-  later one. If such an ACK arrives before the deadline the mark clears
+  a `K_eff` deadline **at that PING's transmission**. The mark clears on
+  **any ACK covering any counter at or above the probe floor** — the
+  probe's own counter, or any later one. If such an ACK arrives before
+  the deadline the mark clears
   and nothing else happens — the refusal stands and the basis rule is
   untouched; a genuinely live peer simply answered, and it does not
   matter *which* post-mark packet it answered. If none arrives by the
@@ -3096,7 +3161,9 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   fresh `accept()` on the application's next attempt.
 
   **One mark per connection.** A connection is contested or it is not:
-  the state is a single `Option<(probe_floor, deadline)>`, never a set. A
+  the state retains one `(probe_floor, deadline)`, never a set. The
+  deadline may be unreachable at the platform clock horizon (§16.5), but
+  the mark and its floor remain armed. A
   refusal that lands while the connection is **already** contested is
   **not** a second mark — it leaves the existing floor and the existing
   deadline exactly where they are, and sends no second PING. It does
@@ -3104,7 +3171,7 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   optimisation: re-arming on each refusal would hand the attacker — who
   supplies the Intros that cause refusals (§6.3) — a way to postpone the
   verdict indefinitely by dripping one captured initiation in just under
-  every `KEEPALIVE_TIMEOUT`, which is precisely the zombie the probe
+  every `K_eff`, which is precisely the zombie the probe
   exists to reap. The verdict lands on the clock set by the *first*
   refusal, whatever arrives after it.
 
@@ -3132,7 +3199,7 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
   harvested genuine peer→us Data — dropping it, so our replay window never
   advances past it — keep the resulting zombie's receive clock alive
   indefinitely by injecting one harvested packet every less than
-  `DEAD_TIMEOUT` from anywhere off-path, roaming the session to itself as
+  `D_eff` from anywhere off-path, roaming the session to itself as
   it goes; meanwhile every genuine reconnect is refused and `connect()`
   reports `ConnectError::AlreadyConnected` (§16.1), so without this probe
   the pair is wedged permanently and the only escape is to `close()` a
@@ -3264,8 +3331,8 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
     (§16.4 now states the matching rule) — and the send rule *"the
     endpoint sends it, and arms, at the first instant the budget
     allows"* carried no condition, so a **stray probe** would go out and
-    arm a `KEEPALIVE_TIMEOUT` verdict deadline for a mark that no longer
-    exists. That deadline would then be uncancellable by §16.5's disarm
+    arm a `K_eff` verdict deadline for a mark that no longer exists. That
+    deadline would then be uncancellable by §16.5's disarm
     rule, which disarms on an ACK covering a floor that has *already*
     been satisfied.
   - **The connection roams again while the mark is still pending.** The
@@ -3275,11 +3342,16 @@ retransmissions, PTO probes) is liveness-neutral **and** arming.
     prospects, not the question it asks. §13.6 lists it among the roam
     seam's per-connection outcomes for exactly this reason (ruling 173).
 
-  The probe's `KEEPALIVE_TIMEOUT` deadline is deliberately shorter than
-  `INTRO_TTL` (§6.3), and the peer's retransmit train re-mints an
-  initiation every ≈ 5 s (§5.5), so the `Intro` that provoked the probe
-  is still parked — or has been refreshed by a newer one — when the
-  verdict lands.
+  Under the v1/default profile the probe's 10 s `K_eff` deadline is
+  shorter than `INTRO_TTL` (§6.3), and the peer's retransmit train
+  re-mints an initiation every ≈ 5 s (§5.5), so the `Intro` that provoked
+  the probe is still parked — or has been refreshed by a newer one —
+  when the verdict lands. A custom profile does not stretch either fixed
+  admission timer: if its `K_eff` outlives `INTRO_TTL` or the peer's
+  fixed handshake train, the parked candidate may be gone when the
+  verdict lands. That is an intentional consequence of keeping
+  admission and handshake timing outside `TimingProfile`, not an implied
+  extension of either timer.
 
 ### 7.6 [deleted 2026/08/14 — the ratchet-only ruling]
 
@@ -3348,7 +3420,7 @@ liveness closes it **unconditionally** at the longer timeout: nothing
 opens, `last_authenticated_recv` stops advancing, and the traffic
 producing the drift is ack-eliciting by construction, so the death clock
 is armed whether or not that sender ever marked (§7.4) — the session dies
-at `DEAD_TIMEOUT` with no epoch-specific machinery.
+at its effective dead timeout with no epoch-specific machinery.
 **Implementations must not chase epochs.**
 
 **The epoch size is config-supplied for tests, `REKEY_EPOCH_MSGS`
@@ -4862,24 +4934,26 @@ anchored at the last ack-eliciting send, doubled per consecutive
 unanswered probe (`2^pto_count`), capped at `PTO_BACKOFF_CAP` = 2³
 **[AMENDED 2026/08/17 — ruling 254]**.
 `pto_count` resets to 0 whenever any packet is newly acknowledged. The
-probe train is ended by liveness (`DEAD_TIMEOUT` — under symmetric loss
-and, since the anchor is the receive clock, under asymmetric loss too,
-§7.4) — and the cap is sized to that window, not to overflow
+probe train is ended by liveness (`D_eff` — under symmetric loss and,
+since the anchor is the receive clock, under asymmetric loss too, §7.4).
+The cap is sized to the v1/default 25 s window, not to overflow
 **[AMENDED 2026/08/17 — ruling 254]**: at the inherited 2⁶ the later
 rungs could not fire inside 25 s at any warm RTT, silently converting the
 train's tail from probing into waiting — measured at 50 % sustained loss,
 transfers timed out at 2⁶ that complete at 2³, at zero observed
 honest-path cost (every virtual-time budget in the suite sits at ≤ 3
-doublings). At 2³ the whole ladder fits inside `DEAD_TIMEOUT` and
-liveness still decides. The survival envelope this buys, stated: under
-sustained random loss the probe cadence never thins beyond 8 × PTO, so
-completion degrades gracefully toward the `DEAD_TIMEOUT` verdict rather
-than cliffing — an Appendix B obligation pins the ladder shape and a
-≥ 30 % completion floor at 50 % loss (the audit's E5a/E5b). The ending is unconditional, and that is
+doublings). At 2³ the whole ladder fits inside the v1 `DEAD_TIMEOUT` and
+liveness still decides. A shorter custom profile may end the train sooner;
+ruling 282 deliberately does not retune PTO. The survival envelope the v1
+profile buys, stated: under sustained random loss the probe cadence never
+thins beyond 8 × PTO, so completion degrades gracefully toward the
+liveness verdict rather than cliffing — an Appendix B obligation pins
+the ladder shape and a ≥ 30 % completion floor at 50 % loss (the audit's
+E5a/E5b). The ending is unconditional, and that is
 ruling 33's doing: a probe is ack-eliciting, so the *first* probe arms the
 death deadline even when the connection has marked nothing since its last
 receive, and no later probe re-arms it. A probe train therefore always
-terminates within `DEAD_TIMEOUT` of the last authenticated receive; it can
+terminates within `D_eff` of the last authenticated receive; it can
 neither defer death nor run in a black hole unobserved.
 
 **The `Pto` timer is armed only while at least one ack-eliciting packet
@@ -4895,14 +4969,15 @@ saturated backoff at a closed budget re-arms itself in the past forever:
 the anchor moves only at an ack-eliciting send, the increment advances the
 deadline only until `pto_count` saturates, and a firing that can emit
 nothing changes neither — so the one driver every connection shares spins
-until `DEAD_TIMEOUT` (ruling 249's measured livelock, reachable from any
+until `D_eff` (ruling 249's measured livelock, reachable from any
 roam, which zeroes the budget, §13.6). The second precondition gates the
 **announcement**, not the state: sent map, `pto_count` and anchor are
 untouched while the budget is closed, the connection's `Timeout` falls to
-the next armed timer — `Liveness` at the latest — and the deadline is
-announced again at the authenticated, window-fresh receive that refunds
-the budget (§7.2, §7.3; every receive recomputes the `Timeout`, so no
-dedicated re-arm machinery exists). This is §16.4's `Contested` principle
+the next representable armed timer — ordinarily `Liveness` at the latest,
+or `None` if every logical deadline is beyond the clock horizon — and the
+deadline is announced again at the authenticated, window-fresh receive that
+refunds the budget (§7.2, §7.3; every receive recomputes the `Timeout`, so
+no dedicated re-arm machinery exists). This is §16.4's `Contested` principle
 — a deadline is never announced for output that cannot leave — applied to
 `Pto`.
 
@@ -4935,7 +5010,7 @@ remains subject to §7.3's budget (below), which is what bounds the
 re-offer: while the budget has no room for the 39-byte challenge datagram
 the `Pto` deadline is not announced at all **[AMENDED 2026/08/17 — ruling
 249]** (§13.3) — nothing fires and nothing is emitted, and the session
-still dies at `DEAD_TIMEOUT` as §7.3 intends.
+still dies at `D_eff` as §7.3 intends.
 
 Probes are sealed
 `seal_quiet` (liveness-neutral, §7.4) **and** exempt from the congestion
@@ -5105,7 +5180,7 @@ send permitted  iff  bytes_in_flight + candidate_size ≤ cwnd
   stay probeable; the exemption is orthogonal to, and coexists with, the
   probe's liveness-neutral `seal_quiet`.
 - **The contested-connection probe** (§7.5) — same reasoning, one step
-  sharper: the probe carries its own `KEEPALIVE_TIMEOUT` deadline, and a
+  sharper: the probe carries its own `K_eff` deadline, and a
   gate that could delay it past that deadline would turn a congestion
   answer into a liveness verdict. As with the PTO probe, the exemption is
   from **admission only**: the probe is ack-eliciting, so §13.5 records
@@ -5313,7 +5388,7 @@ reserved cleartext close packet type (`0x04`) stays dead.
   construction. The no-linger deaths — liveness (§7.4), nonce
   exhaustion (§7.9), `Replaced` (§5.4), endpoint dropped — retain
   nothing, and the consequence is stated rather than left to be found: a
-  receiver killed by `DEAD_TIMEOUT` mid-transfer cannot drain, which is
+  receiver killed by `D_eff` mid-transfer cannot drain, which is
   honest, because a path that produced no CLOSE produced no finished
   sender either.
 - **Protocol violations by the authenticated peer** (§8.2's semantic
@@ -5352,26 +5427,28 @@ what each side observes:
 
 | Cause | Transmitted | Local surface | Peer's view |
 |---|---|---|---|
-| liveness — 25 s without an authenticated fresh receive (§7.5) | nothing | `ConnectionLost::TimedOut` | its own liveness fires ≈ symmetrically |
-| **contested** — a contested-connection probe unanswered: `KEEPALIVE_TIMEOUT` (10 s) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41) | the probe's packet — the PING, plus the owed path frames when room admits (ruling 250) — at the mark, or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output but CLOSE** to that address (§7.3, rulings 171 and 186 — this cell read "all other output" and did not carry ruling 186's amendment across; §7.3's list is the normative one, and the once-flagged interaction with ruling 208's `PATH_CHALLENGE` was closed by ruling 215 and resolved into coalescing by ruling 250: the probe carries the owed path frames when room admits); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `DEAD_TIMEOUT`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
+| liveness — `D_eff` without an authenticated fresh receive (25 s under the v1/default profile; §7.5) | nothing | `ConnectionLost::TimedOut` | its own liveness fires according to its local profile |
+| **contested** — a contested-connection probe unanswered: the connection's `K_eff` (10 s under the v1/default profile) after the probe's **transmission** with no ACK covering its probe floor, and authenticated receives may well have been arriving throughout (§7.5, §6.4, rulings 36/41/282) | the probe's packet — the PING, plus the owed path frames when room admits (ruling 250) — at the mark, or at the first instant §7.3's budget admits it, which is also when the deadline arms and when `Contested` is emitted (§7.5, §16.4), and where a pending probe **outranks all other output but CLOSE** to that address (§7.3, rulings 171 and 186 — this cell read "all other output" and did not carry ruling 186's amendment across; §7.3's list is the normative one, and the once-flagged interaction with ruling 208's `PATH_CHALLENGE` was closed by ruling 215 and resolved into coalescing by ruling 250: the probe carries the owed path frames when room admits); **nothing** at the verdict, and **nothing at all** if the mark clears while still pending, which cancels the probe (§7.5, ruling 176) | `ConnectionLost::TimedOut` — the same variant, no new one | **asymmetric.** A healthy peer is unaffected and keeps its side for its own `D_eff`; the peer this case is aimed at has already restarted and holds nothing, and its parked `Intro` is accepted next |
 | nonce exhaustion (§7.9) | nothing | `ConnectionLost::NonceExhausted` | liveness |
 | local `close(code, reason)` / last-handle drop (§16.2) | CLOSE, then ≤ 1 reply/s for 5 s | `ConnectionLost::LocallyClosed` | `PeerClosed { code, reason }` |
 | peer's CLOSE received | nothing (drain only) | `ConnectionLost::PeerClosed { code, reason }` | (it closed) |
 | protocol violation by the peer — semantic or post-AEAD structural (§8.2, §15.2) | CLOSE(code), linger | `ConnectionLost::ProtocolViolation { code }` | `PeerClosed { code, reason }` |
 | replaced — an `Intro` proving this connection's static was **accepted**; the teardown fires at the replacing `accept()` (§5.4, §6.4) | nothing on the old connection | a fresh `Intro` first, then `ConnectionLost::Replaced` at its `accept()` | (it reconnected; its new connection proceeds) |
-| endpoint dropped — every handle gone (§16.3) | nothing | — (the driver stops) | liveness, ≤ 25 s |
+| endpoint dropped — every handle gone (§16.3) | nothing | — (the driver stops) | liveness, ≤ its local `D_eff` |
 
 `ConnectionLost::EndpointDropped` is the answer a surviving verb call
 receives when the driver has stopped mid-flight (§18.1) — it is a
 handle-side observation, not a teardown cause of its own.
 
 **The two `TimedOut` rows are distinct causes sharing one variant, and
-that is deliberate.** The liveness row is the plain idle death: 25 s, no
-authenticated fresh receive, and both ends reach it at about the same
-moment because both are watching the same silence. The contested row is
-neither — it fires at 10 s, it fires *while* authenticated receives may
-still be arriving (that is the whole point: the receives are the
-attacker's replayed harvest, §7.5), and the peer sees nothing at all.
+that is deliberate.** The liveness row is the plain idle death: `D_eff`
+(25 s under the v1/default profile), no authenticated fresh receive, and
+both ends reach it at about the same moment when their local profiles
+match because both are watching the same silence. The contested row is
+neither — it fires at `K_eff` (10 s under the v1/default profile), it
+fires *while* authenticated receives may still be arriving (that is the
+whole point: the receives are the attacker's replayed harvest, §7.5), and
+the peer sees nothing at all.
 The application gets one variant because from its side the fact is the
 same one — this connection stopped being usable and re-establishment is
 a fresh `connect()` (§16.2) — and because a new variant would be wire-
@@ -5379,8 +5456,8 @@ visible policy in an enum §18.1 keeps deliberately small. Operators who
 need to tell them apart have `slither::policy`, which carries the mark,
 the probe and the verdict (§18.2). The application's only synchronous
 hint is the `AcceptError::Stale` that provoked the mark: it does not say
-that a live connection is now on a 10 s watch, and the spec states that
-rather than implying otherwise.
+that a live connection is now on a `K_eff` watch, and the spec states
+that rather than implying otherwise.
 
 ## 16. Object model and the sans-io core
 
@@ -5436,6 +5513,35 @@ tie-break's equal-statics case unrepresentable (§6.7). This forecloses
 multi-connection-per-peer for this wire line.
 
 ### 16.2 Shell surface
+
+`TimingProfile` lives at `slither::config::TimingProfile`; it is not
+added to the prelude. Construction validates the complete pair before an
+endpoint can own it, and configuration accepts only that value object:
+
+```rust
+impl TimingProfile {
+    pub fn try_new(
+        passive_keepalive: Duration,
+        dead_timeout: Duration,
+    ) -> Result<Self, TimingProfileError>;
+}
+
+#[non_exhaustive]
+pub enum TimingProfileError {
+    // the concrete reasons are §5.7's floor, strict relation, and overflow
+}
+
+impl Config {
+    pub fn with_timing_profile(self, profile: TimingProfile) -> Self;
+}
+```
+
+`TimingProfileError` is a dedicated, non-exhaustive construction error.
+It does not widen the exhaustive `ConfigError`, and
+`with_timing_profile` is infallible because its argument is already
+valid. `Config::default()` supplies the 10 s / 25 s v1 profile (§5.7).
+The profile is endpoint-wide and immutable; this surface deliberately
+offers neither a per-peer override nor a setter on `Connection`.
 
 ```rust
 impl Endpoint {
@@ -5580,8 +5686,8 @@ CLOSE frame is sealed and the closing state is entered (§15.2), and truncates `
 setter's reader, and it exists because ruling 44 made *"a rejected call
 leaves the interval **unchanged**"* an acceptance criterion that **nothing
 in this surface could observe**. Without it the obligation is testable
-only by inferring the interval from beacon cadence across a
-3 × `DEAD_TIMEOUT` window, bracketed from both sides so that neither an
+only by inferring the interval from beacon cadence across a long timing
+window, bracketed from both sides so that neither an
 upward nor a downward clamp survives — which a blind test author did, and
 should not have had to. A configuration setter whose effect cannot be read
 back is the defect; the getter is the fix. *Note the shape for Appendix
@@ -5590,13 +5696,14 @@ whose **observability was never checked** — working rule 11's cousin,
 applied to an obligation rather than to a mechanism.*
 
 `set_persistent_keepalive` admits exactly
-the range **[1 s, `DEAD_TIMEOUT`)**: it rejects an interval **below 1 s**
+the range **[1 s, `D_eff`)**: it rejects an interval **below 1 s**
 (the floor — ruling 42, which keeps the beacon from becoming an
 unthrottled load generator on a class §14.5 exempts from the congestion
-window) and an interval **at or above `DEAD_TIMEOUT`** (the ceiling —
-ruling 40, which rejects an interval too long to keep a connection alive
-at all). `None` disables the beacon and is always accepted. The
-recommended interval is 10 s (§7.5).
+window) and an interval **at or above the connection's `D_eff`** (the
+ceiling — rulings 40 and 282, which reject an interval too long to keep
+a connection alive at all). `None` disables the beacon and is always
+accepted. The v1 recommended interval is 10 s; for a custom profile,
+`K_eff` is the corresponding one-loss choice (§7.5).
 
 **[RATIFIED 2026/08/14 — ruling 44]** *Rejection is a
 `Result`, never a panic.* `set_persistent_keepalive` returns
@@ -5860,8 +5967,9 @@ endpoint-dropped row governs: no CLOSE is sealed. A synchronous `Drop`
 cannot await the driver, and the driver is already stopping; ruling 50
 takes the same position for the analogous `Connecting` case ("an
 attempt that never completed has no session to close and no wire signal
-to send"), and the peer's cost is bounded at `DEAD_TIMEOUT`, which that
-row already accepts. This is S26's `⚠ CHECK` — drop-order sensitive and
+to send"), and the peer's cost is bounded at its effective dead timeout,
+which that row already accepts. This is S26's `⚠ CHECK` — drop-order
+sensitive and
 the opposite of the obvious guess — and it belongs in the rustdoc beside
 S3a's.
 
@@ -6002,7 +6110,8 @@ can always `close()` — there would be no handle left to close.
 *What the peer is not told, stated honestly.* If the peer already
 answered and installed a half-open session (it sent msg2, and we dropped
 before or during completion), that session is **not** told. It dies by
-liveness at `DEAD_TIMEOUT` (25 s): §7.4's install pin arms the death
+liveness at its effective dead timeout (25 s under the v1 profile):
+§7.4's install pin arms the death
 deadline at install and sets `last_send` equal to
 `last_authenticated_recv`, so a session that receives nothing after
 install emits nothing at all and is reaped in silence — exactly ruling
@@ -6099,7 +6208,7 @@ variant. This is a deliberate design position, not an omission:
   to give up early can do so at that seam — where the information is
   richest — and slither's obligation is the one thing the application
   cannot do from there: make the failure **explicable afterwards**, so an
-  operator reading a `DEAD_TIMEOUT` death finds the burst of send
+operator reading a receive-driven timeout finds the burst of send
   failures that explains it instead of a bare timeout.
 
 ### 16.4 The two cores and the poll contract
@@ -6144,6 +6253,14 @@ impl<I: Identity> core::Endpoint<I> {
     fn intro_sender_index(&self, id: IntroId) -> Option<u32>;
 }
 ```
+
+`core::Endpoint::new` retains `config`'s validated `TimingProfile` and
+stamps it onto both connection birth paths: the connection returned by
+`connect()` and the connection returned by `accept()`. The profile is
+part of the connection's immutable construction state; `Install` neither
+carries nor changes it. This symmetry is normative: configuring only the
+initiator-shaped core would make one endpoint apply two liveness policies
+depending on which peer happened to send msg1.
 
 **The `Identity` seam.** **[AMENDED 2026/08/18 — ruling 264]** `I:
 Identity` is the static-key and DH-provider abstraction (§2.4's
@@ -6290,7 +6407,7 @@ enum ToEndpoint {
   `Notification` (§16.2), which is the surface an application actually
   sees; these two core events are what the shell translates.
   - **`Contested` is emitted at the probe's transmission**, not at the
-    mark. That is the same instant §7.5 arms the `KEEPALIVE_TIMEOUT`
+    mark. That is the same instant §7.5 arms the connection's `K_eff`
     deadline, and it is deliberate: the two moments **can** separate —
     a probe §7.3's amplification budget will not yet admit leaves the
     mark *pending*, which is reachable exactly when the connection has
@@ -6384,8 +6501,10 @@ enum ToEndpoint {
   shell-side bookkeeping (else the index route and the guard-entry pin
   leak for the endpoint's life). The all-handles-dropped case is exempt
   (the driver simply stops).
-- **`Timeout(None)`** = drained and no deadline armed; `Timeout(Some(d))`
-  = drained, next deadline `d`. Identical semantics for both cores.
+- **`Timeout(None)`** = drained and no representable deadline can be
+  announced; a logically enabled deadline may still lie beyond the
+  platform clock horizon. `Timeout(Some(d))` = drained, next representable
+  deadline `d`. Identical semantics for both cores.
 - **Output ordering within one drain preserves generation order** — a
   transmit and the event it caused come out in that order. Normative;
   tests and logs depend on it.
@@ -6396,12 +6515,23 @@ enum ToEndpoint {
   cores never read a clock. The initiation timestamp (§5.3) is the one
   wall-clock read, behind a clock service injected in the endpoint
   config. `poll_output` takes no `now`.
+- **Every monotonic deadline derivation uses checked arithmetic**
+  **[RATIFIED 2026/08/31 — ruling 284]**, for both intermediate
+  `Duration` calculations and the final addition to its anchor. If
+  `anchor.checked_add(delay)` returns `None`, the deadline lies beyond the
+  platform clock's representable horizon: the core retains any logically
+  enabled timer state but does not announce or fire that deadline. It MUST
+  NOT panic, wrap, clamp, saturate, substitute `now`, or fabricate any
+  other earlier instant. Other representable deadlines still participate
+  normally in the minimum. Every later state transition that re-derives
+  the timer performs the checked calculation again. Exact-instant,
+  ordering, and lateness rules are unchanged for representable deadlines.
 - **Named timers, single min-deadline out.** The connection core's timer
   table: `Keepalive`, `PersistentKeepalive`, `Liveness`, `Loss`, `Pto`,
   `AckDelay`, `CloseLinger`, `Contested`. `Contested` is the
   contested-connection probe's deadline (§7.5): it is armed at the
   probe's **transmission** — never at the mark, which may wait on §7.3's
-  budget — for `KEEPALIVE_TIMEOUT`, and it is disarmed by any ACK
+  budget — for the connection's `K_eff`, and it is disarmed by any ACK
   covering the mark's probe floor. It is **one deadline per connection,
   not one per refusal**: ruling 41 collapses concurrent marks into a
   single contested state, so a refusal arriving while `Contested` is
@@ -6411,7 +6541,7 @@ enum ToEndpoint {
   covers refusals arriving while the mark is **outstanding**; once it
   clears, the next admitted refusal is a fresh mark with a fresh floor
   and arms this timer again — the timer is one-at-a-time, not
-  once-per-`KEEPALIVE_TIMEOUT` (ruling 175). And a mark that clears
+  once-per-`K_eff` (ruling 175). And a mark that clears
   **while still pending** cancels its pending probe, so this timer is
   never armed for it (ruling 176) — which matters here because the
   disarm rule above keys on an ACK covering the floor, and a floor
@@ -6430,10 +6560,14 @@ enum ToEndpoint {
   plaintext — but the predicate is one predicate; `Liveness` is armed by the first
   **marking or ack-eliciting** send after an authenticated, window-fresh
   receive, is not re-armed by later sends of either kind, and is disarmed
-  and re-anchored by every such receive (§7.4). The endpoint core's
-  deadline is the min over
-  its pendings' retransmit/give-up deadlines, the parked intros'
-  expiries, and the timestamp-guard orphan aging (§17.1).
+  and re-anchored by every such receive for the connection's `D_eff`
+  (§7.4). `Keepalive`, `Contested`, and `Liveness` therefore read the
+  immutable profile stamped at birth; `PersistentKeepalive` reads its
+  own optional interval but validates it against that same `D_eff`. The
+  endpoint core's deadline is the min over its representable pendings'
+  retransmit/give-up deadlines, parked-intro expiries, and timestamp-guard
+  orphan-aging deadlines (§17.1). Unreachable members remain in their
+  owning state under the rule above.
 - **`handle_timeout` is idempotent**: each due timer is stopped before its
   logic runs, so spurious or repeated calls no-op. For `Loss`/`Pto` the
   idempotency additionally rests on synchronous sealing (§16.7).
@@ -6501,10 +6635,10 @@ enum ToEndpoint {
 |---|---|
 | `L` (shell lateness bound) | 250 ms |
 
-> Every armed deadline `D` fires no earlier than `D` and no later than
+> Every announced deadline `D` fires no earlier than `D` and no later than
 > `D + L`. `L` is a **conformance parameter of the shell, not of the
-> protocol**: the cores expose exact deadlines, and a shell may batch or
-> tick provided it honours `L`.
+> protocol**: the cores expose exact representable deadlines, and a shell
+> may batch or tick provided it honours `L`.
 
 ### 16.6 RNG
 
@@ -6721,7 +6855,7 @@ rather than a read/write direction split — which is how it was written,
 the comment having sat on the `WriteError` line alone.
 
 `TimedOut` is lifted out of both columns because `io::ErrorKind::TimedOut`
-exists and a `DEAD_TIMEOUT` death is exactly what it names; collapsing it
+exists and a liveness-timeout death is exactly what it names; collapsing it
 would make every death look alike to a consumer whose only view is
 `io::Error`.
 
@@ -7060,7 +7194,7 @@ authenticate-then-drop churn. One `Timestamp` per connection
 every replacement, and that refusal is what keeps a passively captured
 msg1 from destroying a connection we dialled (§6.4). Its price is **not**
 merely a bounded delay: absent an attacker the peer's restart resolves in
-at most `DEAD_TIMEOUT` (§6.8), but an attacker who drips withheld genuine
+at most `D_eff` (§6.8), but an attacker who drips withheld genuine
 Data into the zombie holds its liveness clock open indefinitely, and
 against a `None` basis no reconnect can ever displace it — a permanent
 wedge, not a delay (§6.8, §7.4). That is why ruling 36 attaches the
@@ -7095,7 +7229,7 @@ policy:
 | stage-0 entries + consumed chains | one budget of `INTRO_QUEUE_CAP` (1024) slots | ≈ 484 B each — 288 B struct + 196 B msg1 heap, measured (ruling 272; the pre-272 ≈ 220 B counted the raw bytes alone) — ≈ 496 KB |
 | staged mid-states (consumed chains + carried pre-read entries) | ≤ `INTRO_QUEUE_CAP` | ≈ 0.5–1 KB live key material each, ≈ 1 MB — and each holds the endpoint's static provider: for a hardware/enclave static this is up to 1024 concurrent provider handles, an operationally scarce resource the TTL bounds in time |
 | timestamp-guard map | `TS_GUARD_ORPHAN_CAP` (1024) orphans + pinned (≤ connections + pendings + mid-states) | ≈ 45 B each |
-| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by §10.6's ceiling — `REASSEMBLY_CHUNKS_MAX` at the ratified window and `window / REASSEMBLY_MIN_CONFORMING_FRAME + 1` above it (ruling 270), ~40 B per stored range: ~40 KiB against 256 KiB of credit at the ratified window, ~320 KiB against 8 MiB at a raised one — under 4 % either way, which is what makes the credit term the dominant term rather than a 25–50× underestimate — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, a single optional `(probe_floor, deadline)` per connection, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
+| established connections | **application-governed — unbounded by the protocol**, with the caveat below | per connection, the receive commitment is the advertised credit — ≤ the advertised connection window (`INITIAL_MAX_DATA`, 1 MiB, unless config raised it — ruling 259(viii), the operator's deliberate purchase) plus per-stream book-keeping and reassembly metadata bounded by §10.6's ceiling — `REASSEMBLY_CHUNKS_MAX` at the ratified window and `window / REASSEMBLY_MIN_CONFORMING_FRAME + 1` above it (ruling 270), ~40 B per stored range: ~40 KiB against 256 KiB of credit at the ratified window, ~320 KiB against 8 MiB at a raised one — under 4 % either way, which is what makes the credit term the dominant term rather than a 25–50× underestimate — plus the datagram queues (≈ 146 KiB, §11.3), the replay window (256 B), a sent map bounded by cwnd **plus the §14.5 admission exemptions in flight** (the one-packet PTO probe of §13.4 and, at most, one contested-connection probe — each ≤ `MAX_DATAGRAM`, so the overshoot is ≤ 2 400 B and never grows with the attack), the contested mark itself, one `(probe_floor, deadline)` state per connection whose concrete deadline may be unreachable under §16.5, **§7.3's amplification state — two byte counters, one 8-byte outstanding challenge and one validated flag (an `Option<[u8; 8]>` carries both), plus at most one 8-byte `PATH_RESPONSE` owed to the peer, overwritten by a newer challenge and never queued; per connection and never per address (rulings 170, 208)** — and ruling 46's notification slots (one per kind, §16.2 — O(1) by construction, which is why they need no queue bound here); the credit term dominates |
 
 **The caveat on the sent map, stated because ruling 43 changed what it
 covers.** "Bounded by cwnd" is exact for congestion-controlled output
@@ -7235,20 +7369,22 @@ have updated §15.3 and §9.8 but neither of the two places that restate
 them.)*
 
 **[RATIFIED 2026/08/14 — ruling 61]** *`#[non_exhaustive]` goes only
-where a variant is actually reserved.* The taxonomy is closed by process,
-and the type system should say the same thing wherever that is true. So
-**`WriteError` alone** carries `#[non_exhaustive]` — §19 explicitly
-reserves `Stopped` for the STOP_SENDING round, so that type demonstrably
-will gain a variant — and **every other error type is exhaustive**. A
-consumer therefore matches without a `_` arm and gets a **compile error**
-the day a variant is added, which for a transport is the loud failure
-worth having: a wildcard arm would silently swallow a new error into a
-branch written for the old ones. The cost is that adding a variant to any
-other type is a major version bump, which is the correct price and a
+where a variant is actually reserved.* The protocol-error taxonomy is
+closed by process, and the type system should say the same thing wherever
+that is true. So **`WriteError` alone among §18.1's protocol errors**
+carries `#[non_exhaustive]` — §19 explicitly reserves `Stopped` for the
+STOP_SENDING round, so that type demonstrably will gain a variant — and
+every other error type in this section is exhaustive. A consumer
+therefore matches without a `_` arm and gets a **compile error** the day
+a variant is added, which for a transport is the loud failure worth
+having: a wildcard arm would silently swallow a new error into a branch
+written for the old ones. The cost is that adding a variant to any other
+§18.1 type is a major version bump, which is the correct price and a
 useful brake. (§16.2's `Notification` remains `#[non_exhaustive]` on its
 own reasoning — it is a signal set a later wire line may extend, not an
-error taxonomy — and `ConfigError` sits outside §18.1 entirely, by
-ruling 44.)
+error taxonomy. `ConfigError` and the non-exhaustive
+`TimingProfileError` both sit outside §18.1 entirely, by rulings 44 and
+282 respectively.)
 
 ### 18.2 Trace targets — the operator contract
 
@@ -7269,9 +7405,9 @@ subscriber, defeating the post-mortem the rows exist for. Counters and
 non-failure events may sit lower.
 
 **[RATIFIED 2026/08/14 — ruling 49]** `slither::io` exists to make one
-specific post-mortem answerable. A
-connection that dies at `DEAD_TIMEOUT` because the host's routing table
-was broken for 25 s, and one that dies because the peer went away, are
+specific post-mortem answerable. A connection that dies at its effective
+dead timeout because the host's routing table was broken for that whole
+window, and one that dies because the peer went away, are
 indistinguishable in every other target — same variant, same matrix row,
 same silence. The obligation costs nothing on a healthy path (`send_to`
 does not fail) and is the difference between "the network was down, here
@@ -7650,12 +7786,13 @@ clock (§16.10); no test sleeps.
 - **PTO-disarm** (§13.3, amended by ruling 249): an idle connection with
   an empty sent map arms no `Pto` — no self-sustaining PING train — and a
   **non-empty** map under a closed §7.3 budget announces no `Pto` either:
-  the announced `Timeout` falls to the next armed timer — `Liveness`,
-  or ruling 265's vetoed-keepalive backstop, at the latest **[AMENDED
-  2026/08/18 — ruling 265]** (the livelock separation — the pre-249 build announces a
-  past deadline and spins the shared driver), re-announcing at the
-  receive that refunds the budget. The timer re-arms with the next
-  ack-eliciting send **the budget admits**.
+  the announced `Timeout` falls to the next representable armed timer —
+  ordinarily `Liveness`, or ruling 265's vetoed-keepalive backstop, at the
+  latest **[AMENDED 2026/08/18 — ruling 265]** (the livelock separation —
+  the pre-249 build announces a past deadline and spins the shared driver);
+  `None` is permitted only at the platform clock horizon. The timer is
+  re-announced at the receive that refunds the budget and re-arms with the
+  next ack-eliciting send **the budget admits**.
 - **Keepalive-disarm and the parked-state backstop** (§7.5, ruling 265):
   at a budget with no room for the 30-byte empty plaintext, and —
   separately — at a **pending** contested mark with room for the
@@ -7667,17 +7804,17 @@ clock (§16.10); no test sleeps.
   non-retrospection assertion and has deleted §7.5. And the backstop,
   both sides: a starved passive keepalive ends in **death or a send,
   never silence** (the premise read at the ACK instant, the verdict read
-  past `DEAD_TIMEOUT`), while a peer that returns and re-funds the
+  past `D_eff`), while a peer that returns and re-funds the
   budget is **not** reaped — the mirror a build with an unconditional
   `Liveness` fails. Discharged: `tests_livelock.rs` (the gate),
   `tests_park.rs` and `story_park.rs` (the backstop).
 - **The backoff ladder and the survival envelope** (§13.3, ruling 254):
   probe intervals under a black-holed path are **not all equal** and are
   **capped at 8 ×** the base PTO with the capped rung reached — both
-  sides, so an always-at-base build and an uncapped build each fail; and
-  at 50 % random loss a bounded transfer completes inside `DEAD_TIMEOUT`
-  in ≥ 30 % of runs (the audit's E5a/E5b, discharged by the story
-  suite).
+  sides, so an always-at-base build and an uncapped build each fail; and,
+  under the v1/default profile, at 50 % random loss a bounded transfer
+  completes inside `DEAD_TIMEOUT` in ≥ 30 % of runs (the audit's E5a/E5b,
+  discharged by the story suite).
 - NewReno: slow start, congestion avoidance (ABC), recovery-period
   one-cut, **no cwnd growth from ACKs of pre-recovery-period packets**
   (§14.3), persistent congestion (3× the un-backed-off PTO —
@@ -7715,15 +7852,46 @@ clock (§16.10); no test sleeps.
   a prior with `min_rtt` re-seeded (§13.1, §13.6, §14.6).
 
 **Liveness and amplification.**
+- **The endpoint timing profile** (§5.7, §7.5, §16.2, rulings 282 and
+  283): pin
+  `Config::default()` to the exact public v1 constants, 10 s and 25 s.
+  Pin every construction boundary independently: a passive interval
+  below 1 s is rejected and 1 s is admitted; a dead timeout equal to
+  `2 × K_eff + K_INITIAL_RTT + 2 × SHELL_LATENESS_BOUND` is rejected and
+  the smallest representable value above it is admitted; overflowing checked
+  arithmetic is rejected. Both connection birth paths — outbound
+  `connect()` and inbound `accept()` — must receive the configured pair.
+  With a short valid profile on the paused clock, pin passive keepalive
+  and the contested verdict to `K_eff`, and receive-anchored death plus
+  the vetoed-keepalive backstop to `D_eff`. Pin the persistent-beacon
+  ceiling to that same `D_eff`: one representable instant below is
+  accepted, equality is rejected, and rejection leaves the prior setting
+  unchanged. Finally, connect endpoints with asymmetric valid profiles
+  and assert wire interoperability while each endpoint keeps its own
+  local deadlines. No test may make handshake, admission, ACK/PTO, close,
+  or shell-lateness timing follow the profile.
+- **The monotonic clock horizon** (§16.4–§16.5, ruling 284): drive every
+  endpoint and connection timer family from an anchor close enough to the
+  platform horizon that its final addition, or one of recovery's
+  `Duration` intermediates, is unrepresentable. Assert no panic, wrap,
+  clamp, saturation, fabricated earlier deadline, premature firing, or
+  loss of the owning logical state. Other representable deadlines must
+  remain ordered and announced normally, and a later state change must
+  recompute from its new anchor. Repeat ordinary-anchor cases to pin exact
+  default timing and wire behaviour unchanged. The families are handshake
+  retransmit/give-up, intro expiry, guard orphan aging/exemption, passive
+  and persistent keepalive, liveness and its veto backstop, delayed ACK,
+  contested verdict, close linger, Loss, and PTO.
 - **The liveness anchor** (§7.4): a sender writing into a black hole
-  dies at `DEAD_TIMEOUT` after its last authenticated receive — the
+  dies at `D_eff` after its last authenticated receive — the
   deadline arms on the first **marking or ack-eliciting** send after a
   receive and no send ever re-arms it, so neither a write loop nor a PTO
   train defers death (§13.3), and a connection whose entire output is
   quiet-set-but-ack-eliciting (credit frames, retransmissions, probes)
   dies on schedule rather than sitting undetected; a healthy receiving
   session never dies; the `PERSISTENT_KEEPALIVE` range rejection at the
-  handle — the admissible band is `[1 s, DEAD_TIMEOUT)`, so
+  handle — the admissible band is `[1 s, D_eff)`, so under the
+  v1/default profile
   `set_persistent_keepalive` accepts 1 s and 10 s and rejects both 500 ms
   and 25 s (§7.5, rulings 40 and 42), **each rejection returning
   `Err(ConfigError::…)` rather than panicking** — assert the `Err`, and
@@ -7738,7 +7906,8 @@ clock (§16.10); no test sleeps.
   since neither can re-fire the one-shot passive rule and keepalives are
   never retransmitted), with no handshake ever re-run and no built-in
   reconnect (§5.4, §7.5).
-- **The clock is armed at install** (§7.4, SECV5-2): install a session
+- **The clock is armed at install** (§7.4, SECV5-2): under the
+  v1/default profile, install a session
   and drive **nothing** — no application send, no receive — and assert it
   dies with `ConnectionLost::TimedOut` at exactly install +
   `DEAD_TIMEOUT` on the paused clock, and that it transmits **nothing** in
@@ -7749,6 +7918,7 @@ clock (§16.10); no test sleeps.
   immortal session — this is the obligation under §6.7's and §17.1's
   "reaped by liveness in 25 s".
 - **The dance is automatic once traffic has flowed** (§7.5, ruling 39):
+  under the v1/default profile,
   install a pair, exchange **one** application message in one direction
   only, then drive nothing further, and assert on the paused clock that
   both sides are still alive well past install + `DEAD_TIMEOUT` — the
@@ -7756,7 +7926,8 @@ clock (§16.10); no test sleeps.
   call anywhere in the test. The companion is the negative already above:
   the same pair with **no** exchange at all dies at install + 25 s.
 - **Connect-ahead-of-use is reaped, and the two escapes work** (§7.5,
-  §5.7, ruling 39): the reap is a *receive*-within-`DEAD_TIMEOUT` rule,
+  §5.7, ruling 39): under the v1/default profile, the reap is a
+  *receive*-within-`DEAD_TIMEOUT` rule,
   not a *send* rule, and the tests must say so. (a) Install a pair, send
   the first application message at *t* = 24 s on the paused clock, and
   assert the sender still dies at *t* = 25 s unless the peer's answer
@@ -7768,7 +7939,8 @@ clock (§16.10); no test sleeps.
   obligation exists so an implementation cannot quietly turn the reap
   into a send-based rule that would pass the "drive nothing" test above
   while breaking the connect-early/use-later shape.
-- **The beacon sustains a mutually idle link** (§7.5, ruling 40): install
+- **The beacon sustains a mutually idle link** (§7.5, ruling 40): under
+  the v1/default profile, install
   a pair, call `set_persistent_keepalive(Some(10 s))` on **one** side
   only, drive no application traffic in either direction, and assert on
   the paused clock that both sides live indefinitely — the beacon fires
@@ -7777,7 +7949,8 @@ clock (§16.10); no test sleeps.
   kills neither side — the next answer lands at 20 s, 5 s inside the
   deadline — and that dropping two consecutive ones kills both at 25 s.
 - **The keepalive interval is bounded above *and* below** (§7.5, §16.2,
-  rulings 40 and 42): assert `set_persistent_keepalive` **accepts** every
+  rulings 40, 42, and 282): under the v1/default profile, assert
+  `set_persistent_keepalive` **accepts** every
   interval in `[1 s, DEAD_TIMEOUT)` — 10 s, the recommended default, and
   the floor value 1 s itself, which is admissible **inclusive** — and
   **rejects** everything outside it. Above: 25 s (`DEAD_TIMEOUT` exactly)
@@ -7790,7 +7963,8 @@ clock (§16.10); no test sleeps.
   a test asserting that 1 s is *rejected* is the mirror regression
   against over-reading ruling 42.
 - **The contested-connection probe** (§7.5, §6.4, rulings 36, 41 and
-  43): with a connection we **dialled** (basis `None`) live, park an
+  43): under the v1/default profile, with a connection we **dialled**
+  (basis `None`) live, park an
   `Intro` for the same static and call `accept()`. Assert (a) it returns
   `AcceptError::Stale`, (b) a PING goes out on the live connection
   immediately, and (c) the two outcomes on the paused clock — an ACK
@@ -7932,8 +8106,8 @@ clock (§16.10); no test sleeps.
 - **`closed()` resolves on every death, with no verb in flight** (§16.2,
   §15.4). Park a task on `closed()` and nothing else — no `read`, no
   `recv_message`, no send — and drive each teardown row in turn:
-  `PeerClosed` (the peer closes), `TimedOut` (silence past
-  `DEAD_TIMEOUT`, and separately the contested verdict), `Replaced` (a
+  `PeerClosed` (the peer closes), `TimedOut` (silence past `D_eff`, and
+  separately the contested verdict), `Replaced` (a
   replacing `accept()`), `ProtocolViolation` (a semantic violation),
   `LocallyClosed`. Assert the correct `ConnectionLost` arrives in each,
   on the paused clock, **without the application ever calling a verb** —
@@ -7973,8 +8147,8 @@ clock (§16.10); no test sleeps.
   connection **survives** — no teardown, no verb resolving with an
   error, no notification — that a `slither::io` trace was emitted per
   failed send carrying the destination address, and that traffic
-  resumes when the seam heals. Then hold the failure past
-  `DEAD_TIMEOUT` and assert the death is still the ordinary
+  resumes when the seam heals. Then hold the failure past `D_eff` and
+  assert the death is still the ordinary
   receive-driven `TimedOut` (§7.4) with the traces present to explain
   it. A `FlakyWire` that can fail sends is the fixture; the obligation
   is unreachable without one.
@@ -7992,8 +8166,9 @@ clock (§16.10); no test sleeps.
   drop takes the ordinary staged accept and never §6.4's PENDING branch.
   Then the peer-side half: let the peer answer, drop the `Connecting`
   after its msg2 is on the wire, and assert the peer's half-open session
-  transmits nothing and dies at `DEAD_TIMEOUT` (25 s) — ruling 39's reap
-  case (§7.4), which is the cost this ruling accepts.
+  transmits nothing and dies at its `D_eff` (25 s under the v1/default
+  profile) — ruling 39's reap case (§7.4), which is the cost this ruling
+  accepts.
 
 **The composability surface (§16.11, rulings 55–58, 226, 227).**
 
@@ -8118,8 +8293,8 @@ measured, pinned obligation — the constants stay ratified either way.]**
 | `LOSS_REDUCTION_FACTOR` / `PERSISTENT_CONGESTION_THRESHOLD` | 0.5 / 3 | §14.2 / §14.4 |
 | `RETRANSMIT_BASE` / `RETRANSMIT_JITTER_MAX` | 5 s / 333 ms | §5.5 |
 | `HANDSHAKE_GIVEUP` | 90 s | §5.5 |
-| `KEEPALIVE_TIMEOUT` / `DEAD_TIMEOUT` | 10 s / 25 s | §7.5 |
-| `PERSISTENT_KEEPALIVE` (default, per-connection) | 10 s; admissible range **[1 s, `DEAD_TIMEOUT`)** — handle-rejected **below 1 s** (floor, ruling 42) and **at or above** `DEAD_TIMEOUT` (ceiling, ruling 40) | §7.5 |
+| `KEEPALIVE_TIMEOUT` / `DEAD_TIMEOUT` | 10 s / 25 s; the exact v1/default `TimingProfile` | §5.7, §7.5 |
+| `PERSISTENT_KEEPALIVE` (default, per-connection) | 10 s; admissible range **[1 s, effective dead timeout)** — handle-rejected **below 1 s** (floor, ruling 42) and **at or above** the connection's `D_eff` (ceiling, rulings 40 and 282) | §7.5 |
 | `AMPLIFICATION_FACTOR` | 3 (× authenticated, window-fresh bytes received, per unvalidated address, per session; disarmed by a `PATH_RESPONSE` echoing the arming's 8-byte challenge — rulings 168–170, superseded in the disarm predicate only by ruling 208) | §7.3 |
 | `INTRO_QUEUE_CAP` / `INTRO_MAX_PER_SOURCE` / `INTRO_TTL` | 1024 / 4 / 15 s | §6.3 |
 | `TS_GUARD_ORPHAN_CAP` | 1024 | §17.1 |
@@ -8169,12 +8344,13 @@ unimplementable without a guess.
    `1u32 << 64` was undefined, so the compile-time pins
    (`PTO_BACKOFF_CAP == 1 << 3`, `PTO_MAX_EXPONENT == 3`) are
    load-bearing rather than belt-and-braces.
-2. **A range stated in prose against one named constant** — the
-   admissible `[1 s, DEAD_TIMEOUT)` for `PERSISTENT_KEEPALIVE` — becomes
-   two or three identifiers in code. Name the **default** and the
-   **floor**, and leave the ceiling as a comparison against
-   `DEAD_TIMEOUT`: a named ceiling would be a second place for
-   `DEAD_TIMEOUT` to be written down, and therefore a place it can drift.
+2. **A range stated in prose against one policy value** — the admissible
+   `[1 s, D_eff)` for `PERSISTENT_KEEPALIVE` — becomes two identifiers
+   and one live comparison in code. Name the **default** and the
+   **floor**, and leave the ceiling as a comparison against the
+   connection's effective dead timeout: a named ceiling would duplicate
+   a value that now varies by endpoint and can drift from the policy
+   actually governing that connection.
 
 A future constant SHOULD be added to the table with an identifier, not
 only a value, and a prose-stated ratio SHOULD carry its unit.
