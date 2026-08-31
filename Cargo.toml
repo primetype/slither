@@ -1,6 +1,6 @@
 [package]
 name = "slither"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # Tracks the hiss MSRV (edition 2024, MSRV 1.96) — same policy: a recent
 # stable, floored at `stable - 3`, bumped in lockstep with the `msrv` CI job.
