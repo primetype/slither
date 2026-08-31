@@ -71,7 +71,7 @@ const CASES = [
       "both sides died on the liveness bound": (() => {
         const lost = ev.filter((e) => e.kind === "lost");
         return (
-          lost.length === 2 && lost.every((e) => /DEAD_TIMEOUT/.test(e.cause))
+          lost.length === 2 && lost.every((e) => /dead timeout/.test(e.cause))
         );
       })(),
     }),
