@@ -55,7 +55,7 @@ fn read_kind(err: &ReadError) -> io::ErrorKind {
 /// having sat on the `WriteError` line alone.
 ///
 /// `TimedOut` is lifted out of both columns because
-/// [`io::ErrorKind::TimedOut`] exists and a `DEAD_TIMEOUT` death is exactly
+/// [`io::ErrorKind::TimedOut`] exists and a liveness-timeout death is exactly
 /// what it names; collapsing it would make every death look alike to a
 /// consumer whose only view is an [`io::Error`].
 //

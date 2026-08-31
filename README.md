@@ -95,8 +95,10 @@ echo`). It is compiled by every `cargo test` run.
 - **A reliable message is at most 262 144 B** (256 KiB); an unreliable datagram
   payload at most **1 169 B**. Every wire datagram is **≤ 1 200 B**, never
   fragmented.
-- **A connection carrying no traffic dies in 25 s, in silence.** Connecting
-  ahead of need does not keep a path warm.
+- **A connection carrying no traffic dies in 25 s by default, in silence.**
+  Connecting ahead of need does not keep a path warm. Applications may choose
+  a validated endpoint-wide liveness profile, but the values are not
+  negotiated: peers relying on a custom profile must share it out of band.
 - **One session per peer static** — reconnecting is `close()` then dial; and
   **messages and streams do not mix on one connection**.
 - **Reliability lives inside a connection**; what a dead connection had not
@@ -104,6 +106,35 @@ echo`). It is compiled by every `cargo test` run.
 
 Each is stated in full, at its call site, under **Before you integrate** on
 [docs.rs](https://docs.rs/slither).
+
+### Liveness profiles
+
+The v1 10 s passive keepalive and 25 s dead-peer timeout remain the exact
+defaults. An application that needs faster failure detection can opt in to a
+coherent pair:
+
+```rust
+use std::time::Duration;
+use slither::config::{Config, TimingProfile};
+
+let timing = TimingProfile::try_new(
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+)
+.expect("the pair preserves the required one-loss margin");
+let config = Config::new().with_timing_profile(timing);
+```
+
+This changes local established-session liveness only. It changes no wire byte
+and does not shorten handshake give-up; cancel a `Connecting` future when the
+application wants a shorter dial deadline. Persistent keepalive remains a
+per-connection setting whose exclusive ceiling follows the effective dead
+timeout.
+
+All timer arithmetic is checked. If a deliberately extreme duration would
+place a logical deadline beyond the platform monotonic clock's representable
+horizon, slither retains the state but announces no invented earlier timeout;
+ordinary/default deadlines are unchanged.
 
 ## How it works
 
@@ -113,8 +144,8 @@ Each is stated in full, at its call site, under **Before you integrate** on
 </picture>
 
 slither borrows WireGuard's homework — a keyed-BLAKE2b mac1 DoS gate,
-fresh-ephemeral handshake retransmission, an RFC 6479 replay window, roaming
-and the keepalive/liveness/rekey timers — over
+fresh-ephemeral handshake retransmission, an RFC 6479 replay window, roaming,
+keepalive/liveness timers, and a counter-driven key ratchet — over
 [`hiss`](https://crates.io/crates/hiss)'s Noise **IK** (**P-256 /
 ChaCha20-Poly1305 / BLAKE2b** by reference; an **AES-256-GCM** sibling suite
 is offered where the hardware carries it — 1.63× measured on Apple Silicon;

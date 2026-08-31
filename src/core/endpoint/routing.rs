@@ -81,7 +81,7 @@ use std::time::Instant;
 use crate::constants;
 use crate::core::endpoint::handshake as framing;
 use crate::core::{
-    ConnectionId, EndpointOutput, EstablishedSession, Install, Role, Timestamp, Transmit,
+    ConnectionId, Deadline, EndpointOutput, EstablishedSession, Install, Role, Timestamp, Transmit,
 };
 use crate::error::ConnectError;
 use crate::identity::{Identity, PublicKeyOf};
@@ -708,8 +708,10 @@ impl<I: Identity> Endpoint<I> {
     /// being wrong the other way re-arms the replay §6.7 says the bound
     /// "may not be dropped".
     pub(super) fn extend_guard_exemption(&mut self, now: Instant, peer_static: &[u8]) {
-        self.guard
-            .extend_exemption(peer_static, now + constants::HANDSHAKE_GIVEUP);
+        self.guard.extend_exemption(
+            peer_static,
+            Deadline::after(now, constants::HANDSHAKE_GIVEUP),
+        );
     }
 
     /// §6.4's PENDING branch, loser side: cancel the dial that lost.

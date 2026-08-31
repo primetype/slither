@@ -505,22 +505,33 @@ pub const HANDSHAKE_GIVEUP: Duration = Duration::from_millis(HANDSHAKE_GIVEUP_MS
 // Liveness timers (§7.5)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Silence after which a keepalive is sent. §7.5.
+/// The v1-default silence after which a passive keepalive is sent. §7.5.
+///
+/// [`TimingProfile`](crate::config::TimingProfile) may replace the effective
+/// value endpoint-wide without changing this wire-version pin.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(KEEPALIVE_TIMEOUT_MS);
 
-/// Silence after which the connection is declared dead. §7.5.
+/// The v1-default silence after which a connection is declared dead. §7.5.
+///
+/// [`TimingProfile`](crate::config::TimingProfile) may replace the effective
+/// value endpoint-wide without changing this wire-version pin.
 pub const DEAD_TIMEOUT: Duration = Duration::from_millis(DEAD_TIMEOUT_MS);
 
-/// The default persistent-keepalive interval. §7.5.
+/// The v1 recommended persistent-keepalive interval. §7.5.
+///
+/// Persistent keepalive remains off by default. A custom
+/// [`TimingProfile`](crate::config::TimingProfile) may have a lower dead
+/// timeout, in which case this recommendation is outside that connection's
+/// admissible band and the caller must choose a shorter interval.
 pub const PERSISTENT_KEEPALIVE_DEFAULT: Duration =
     Duration::from_millis(PERSISTENT_KEEPALIVE_DEFAULT_MS);
 
 /// The **inclusive** floor of the admissible persistent-keepalive
 /// interval. §7.5.
 ///
-/// The ceiling has no constant of its own: it is [`DEAD_TIMEOUT`],
-/// exclusive, and the validator compares against that directly so the two
-/// cannot drift.
+/// The ceiling has no constant of its own: it is the connection's effective
+/// dead timeout, exclusive, and the validator reads that connection's
+/// [`TimingProfile`](crate::config::TimingProfile) so the two cannot drift.
 pub const PERSISTENT_KEEPALIVE_MIN: Duration = Duration::from_millis(PERSISTENT_KEEPALIVE_MIN_MS);
 
 // ═══════════════════════════════════════════════════════════════════════

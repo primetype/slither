@@ -18,11 +18,121 @@
 use std::fmt;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::constants;
 use crate::core::Timestamp;
 use crate::error::ConfigError;
+
+/// An endpoint's established-session liveness policy.
+///
+/// **[RATIFIED 2026/08/31 — ruling 282; amended by ruling 283]** The v1
+/// values remain the default, but an application may choose a shorter or
+/// longer coherent pair for all connections born from one endpoint. Nothing
+/// is negotiated on the wire: deployments that rely on a custom profile's
+/// loss/failover guarantees must configure their peers out of band.
+///
+/// This deliberately covers only the two coupled established-session clocks.
+/// Handshake retransmission/give-up, introduction retention, ACK/PTO recovery,
+/// close linger, and shell lateness remain the fixed v1 constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingProfile {
+    passive_keepalive: Duration,
+    dead_timeout: Duration,
+}
+
+impl TimingProfile {
+    /// The ratified v1 liveness profile: 10 s passive keepalive, 25 s death.
+    pub const V1: Self = Self {
+        passive_keepalive: constants::KEEPALIVE_TIMEOUT,
+        dead_timeout: constants::DEAD_TIMEOUT,
+    };
+
+    /// Construct a validated liveness profile.
+    ///
+    /// The passive interval must be at least
+    /// [`PERSISTENT_KEEPALIVE_MIN`](crate::constants::PERSISTENT_KEEPALIVE_MIN)
+    /// (1 s): below that, an uncongested keepalive becomes a load generator.
+    /// The death timeout must be **strictly greater** than two passive
+    /// intervals plus the protocol's initial RTT and twice the shell lateness
+    /// bound. Each of two successive keepalive firings can independently be
+    /// late because a firing re-anchors the next deadline from the actual send
+    /// instant. This preserves one-lost-keepalive room under v1's initial RTT
+    /// assumption and avoids making an arrival at the verdict instant depend
+    /// on timer ordering. A value that cannot be added to the monotonic clock
+    /// at construction is rejected as arithmetic overflow. Every later
+    /// deadline derivation is checked again: reaching the platform horizon
+    /// retains the logical timer but announces no fabricated earlier instant.
+    ///
+    /// No peer sees these values. A custom profile is deployment policy, not
+    /// negotiation; mismatched peers remain wire-compatible but may make
+    /// different liveness decisions.
+    pub fn try_new(
+        passive_keepalive: Duration,
+        dead_timeout: Duration,
+    ) -> Result<Self, TimingProfileError> {
+        if passive_keepalive < constants::PERSISTENT_KEEPALIVE_MIN {
+            return Err(TimingProfileError::KeepaliveTooShort);
+        }
+
+        let minimum_dead = passive_keepalive
+            .checked_mul(2)
+            .and_then(|twice| twice.checked_add(constants::K_INITIAL_RTT))
+            .and_then(|with_rtt| with_rtt.checked_add(constants::SHELL_LATENESS_BOUND))
+            .and_then(|with_first_lateness| {
+                with_first_lateness.checked_add(constants::SHELL_LATENESS_BOUND)
+            })
+            .ok_or(TimingProfileError::ArithmeticOverflow)?;
+        if dead_timeout <= minimum_dead {
+            return Err(TimingProfileError::DeadTimeoutTooShort);
+        }
+        if Instant::now().checked_add(dead_timeout).is_none() {
+            return Err(TimingProfileError::ArithmeticOverflow);
+        }
+
+        Ok(Self {
+            passive_keepalive,
+            dead_timeout,
+        })
+    }
+
+    /// The passive keepalive cadence and contested-connection verdict.
+    pub const fn passive_keepalive(&self) -> Duration {
+        self.passive_keepalive
+    }
+
+    /// The receive-anchored dead-peer timeout.
+    pub const fn dead_timeout(&self) -> Duration {
+        self.dead_timeout
+    }
+}
+
+impl Default for TimingProfile {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+/// Why a [`TimingProfile`] could not be constructed.
+///
+/// Non-exhaustive so validation can tighten without widening the exhaustive
+/// [`ConfigError`] surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TimingProfileError {
+    /// The passive interval is below the 1 s load floor.
+    #[error("the passive-keepalive interval is below the 1 s floor")]
+    KeepaliveTooShort,
+    /// The death timeout leaves no full one-loss keepalive margin.
+    #[error(
+        "the dead timeout is too short for two keepalives, initial RTT, and two shell-lateness allowances"
+    )]
+    DeadTimeoutTooShort,
+    /// The relation or constructor-time monotonic deadline is not
+    /// representable.
+    #[error("the timing profile overflows duration or monotonic-instant arithmetic")]
+    ArithmeticOverflow,
+}
 
 /// The one wall-clock reading the protocol performs (§5.3, §16.5).
 ///
@@ -54,7 +164,8 @@ impl WallClock for SystemClock {
 ///
 /// The two introduction-queue bounds are configurable because §6.3 says so
 /// in as many words ("configurable in `Config`"). `INTRO_TTL` is **not** —
-/// it is a ratified timer, not a knob, and there is no field for it.
+/// it remains a ratified admission timer. Ruling 282 separately admits a
+/// validated [`TimingProfile`] for established-session liveness only.
 #[derive(Clone)]
 pub struct Config {
     intro_queue_cap: usize,
@@ -62,6 +173,7 @@ pub struct Config {
     epoch_size: NonZeroU64,
     stream_window: u64,
     connection_window: u64,
+    timing_profile: TimingProfile,
     clock: Rc<dyn WallClock>,
 }
 
@@ -73,6 +185,7 @@ impl fmt::Debug for Config {
             .field("epoch_size", &self.epoch_size)
             .field("stream_window", &self.stream_window)
             .field("connection_window", &self.connection_window)
+            .field("timing_profile", &self.timing_profile)
             .finish_non_exhaustive()
     }
 }
@@ -85,6 +198,7 @@ impl Default for Config {
             epoch_size: Config::DEFAULT_EPOCH_SIZE,
             stream_window: Config::DEFAULT_STREAM_WINDOW,
             connection_window: Config::DEFAULT_CONNECTION_WINDOW,
+            timing_profile: TimingProfile::default(),
             clock: Rc::new(SystemClock),
         }
     }
@@ -116,7 +230,7 @@ impl Config {
     pub const DEFAULT_CONNECTION_WINDOW: u64 = constants::INITIAL_MAX_DATA;
 
     /// The defaults: §6.3's ratified caps, §7.7's epoch size, §10.2's two
-    /// receive windows and a `SystemTime` clock.
+    /// receive windows, v1's liveness profile, and a `SystemTime` clock.
     pub fn new() -> Self {
         Self::default()
     }
@@ -296,6 +410,17 @@ impl Config {
         Ok(self)
     }
 
+    /// Set the endpoint-wide established-session liveness profile.
+    ///
+    /// The profile has already been validated by [`TimingProfile::try_new`],
+    /// so installing it is infallible. It is copied into every connection
+    /// born through either `connect()` or `accept()`.
+    #[must_use]
+    pub fn with_timing_profile(mut self, timing_profile: TimingProfile) -> Self {
+        self.timing_profile = timing_profile;
+        self
+    }
+
     /// Replace the wall-clock service (§16.5).
     #[must_use]
     pub fn with_clock(mut self, clock: Rc<dyn WallClock>) -> Self {
@@ -327,6 +452,11 @@ impl Config {
     /// advertises it.
     pub fn connection_window(&self) -> u64 {
         self.connection_window
+    }
+
+    /// The endpoint-wide established-session liveness profile.
+    pub fn timing_profile(&self) -> TimingProfile {
+        self.timing_profile
     }
 
     /// The injected wall clock.

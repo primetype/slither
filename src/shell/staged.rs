@@ -362,7 +362,8 @@ impl<I: Identity> Proven<I> {
     /// the driver has built the connection drops that `Connection` — the
     /// last handle to it — which performs §16.2's `close(NO_ERROR, "")`.
     /// That is the right answer for a session nobody claimed: the peer is
-    /// told at once rather than waiting out `DEAD_TIMEOUT`.
+    /// told at once rather than waiting out its representable
+    /// effective-dead-timeout deadline.
     pub async fn accept(mut self) -> Result<Connection<I::Suite>, AcceptError> {
         let shell = self.shell.clone();
         let id = self.id;

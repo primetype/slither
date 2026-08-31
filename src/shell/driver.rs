@@ -232,8 +232,8 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             //    that a real socket leaves `Pending` on a full send buffer —
             //    queued a `Transmit` on an already-drained core, which a
             //    deadline read after the yield then destroyed: a silently
-            //    lost CLOSE and 25 s of `DEAD_TIMEOUT` for the peer. Ruling
-            //    262 removed the destruction rather than the discipline; see
+            //    lost CLOSE and one effective dead-timeout window for the
+            //    peer. Ruling 262 removed the destruction rather than the discipline; see
             //    `deadline` for why the discipline alone was never enough.
             //
             //    It stays here because the value is freshest here, and
@@ -354,8 +354,8 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
     /// rather than pops — but nothing here posts a `Command::Dirty` either,
     /// so an undrained `Transmit` is held until some unrelated event wakes
     /// the driver. A silent exhaustion therefore still degrades to a CLOSE
-    /// the peer may wait out `DEAD_TIMEOUT` for; the loss became a stall,
-    /// which is not an improvement worth being quiet about.
+    /// the peer may wait one effective dead-timeout window for; the loss
+    /// became a stall, which is not an improvement worth being quiet about.
     ///
     /// Panicking is now also *cheaper* than it was when this loop was
     /// written: [`Driver`]'s `Drop` runs [`stop`](Self::stop) on an unwind,

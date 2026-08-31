@@ -950,7 +950,7 @@ mod policy {
         let first = a.on_recv(t, 1, Some(0), true, true);
         assert_eq!(
             first,
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "§12.4: the 1st unacknowledged ack-eliciting packet arms"
         );
         assert!(!a.is_ready(), "§12.4: one is not two — nothing is due yet");
@@ -958,7 +958,7 @@ mod policy {
         let second = a.on_recv(t, 2, Some(1), true, true);
         assert_eq!(
             second,
-            AckAction::Arm(t),
+            AckAction::Arm(Deadline::at(t)),
             "§12.4 (ruling 271): the 2nd arms at `now` itself, already due"
         );
         assert!(a.is_ready(), "…and the ACK rides the next packet built");
@@ -985,7 +985,7 @@ mod policy {
         let later = t + Duration::from_millis(400);
         assert_eq!(
             a.on_recv(later, 1, Some(0), true, true),
-            AckAction::Arm(later + Duration::from_millis(25)),
+            AckAction::Arm(Deadline::after(later, Duration::from_millis(25))),
             "§12.4: MAX_ACK_DELAY is 25 ms, measured from this packet"
         );
     }
@@ -1044,7 +1044,7 @@ mod policy {
         a.on_ack_packed();
         assert_eq!(
             a.on_recv(t, 6, Some(5), true, true),
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "§12.4: exactly one greater is in order, so the 1st only arms"
         );
     }
@@ -1079,7 +1079,7 @@ mod policy {
         // ack-eliciting packet must still be only the *first*.
         assert_eq!(
             a.on_recv(t, 10, Some(9), true, true),
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "§2.1: a non-eliciting packet does not advance `since_ack`"
         );
     }
@@ -1158,7 +1158,10 @@ mod policy {
         a.on_ack_packed();
 
         a.on_recv(t, 1, Some(0), true, true); // 1st → Arm at +25 ms
-        assert_eq!(a.on_recv(t, 2, Some(1), true, true), AckAction::Arm(t)); // 2nd
+        assert_eq!(
+            a.on_recv(t, 2, Some(1), true, true),
+            AckAction::Arm(Deadline::at(t))
+        ); // 2nd
         a.on_ack_packed();
         assert!(!a.is_owed());
         assert!(
@@ -1168,7 +1171,7 @@ mod policy {
 
         assert_eq!(
             a.on_recv(t, 3, Some(2), true, true),
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "§12.4: after packing, this is the 1st unacknowledged again"
         );
     }
@@ -1250,13 +1253,13 @@ mod policy {
 
         assert_eq!(
             a.on_recv(t, 1, Some(0), true, true),
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "the 1st since the pack arms long, valve or no valve"
         );
         for c in 2..VALVE {
             assert_eq!(
                 a.on_recv(t, c, Some(c - 1), true, true),
-                AckAction::Arm(t),
+                AckAction::Arm(Deadline::at(t)),
                 "counter {c}: under the valve the burst folds — it does not flush"
             );
             assert!(!a.is_owed(), "counter {c}: due is not owed");
@@ -1275,7 +1278,7 @@ mod policy {
         a.on_ack_packed();
         assert_eq!(
             a.on_recv(t, VALVE + 1, Some(VALVE), true, true),
-            AckAction::Arm(t + MAX_ACK_DELAY),
+            AckAction::Arm(Deadline::after(t, MAX_ACK_DELAY)),
             "the valve resets the every-2nd counter, not only the debt"
         );
     }

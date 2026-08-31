@@ -370,10 +370,41 @@ impl FlakyPolicy {
 ///
 /// Ordered by `(deliver_at, seq)`. The sequence number breaks ties, which
 /// keeps equal-deadline datagrams FIFO and, more importantly, keeps the
-/// heap **deterministic**.
+/// heap **deterministic**. An unreachable delivery sorts after every
+/// representable one, remains queued, and cannot block a later ordinary
+/// datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DeliveryTime {
+    At(Instant),
+    Unreachable,
+}
+
+impl DeliveryTime {
+    fn after(anchor: Instant, delay: Duration) -> Self {
+        match anchor.checked_add(delay) {
+            Some(at) => Self::At(at),
+            None => Self::Unreachable,
+        }
+    }
+
+    const fn as_instant(self) -> Option<Instant> {
+        match self {
+            Self::At(at) => Some(at),
+            Self::Unreachable => None,
+        }
+    }
+
+    fn is_due(self, now: Instant) -> bool {
+        match self {
+            Self::At(at) => at <= now,
+            Self::Unreachable => false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Queued {
-    deliver_at: Instant,
+    deliver_at: DeliveryTime,
     seq: u64,
     src: SocketAddr,
     bytes: Vec<u8>,
@@ -571,12 +602,12 @@ impl Network {
     pub fn inject(&self, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
         let mut inner = self.0.borrow_mut();
         let now = Instant::now();
-        deliver(&mut inner, from, to, bytes.to_vec(), now);
+        deliver(&mut inner, from, to, bytes.to_vec(), DeliveryTime::At(now));
     }
 }
 
 /// Push one datagram into `to`'s inbox, or drop it.
-fn deliver(inner: &mut Inner, src: SocketAddr, dst: SocketAddr, bytes: Vec<u8>, at: Instant) {
+fn deliver(inner: &mut Inner, src: SocketAddr, dst: SocketAddr, bytes: Vec<u8>, at: DeliveryTime) {
     if inner.partitioned.contains(&dst) {
         return;
     }
@@ -723,14 +754,17 @@ impl FlakyWire {
     /// One delay draw: `base_delay + uniform[0, jitter)`.
     ///
     /// The draw is taken **even when `jitter` is zero**, so a delivery
-    /// always consumes exactly one `u64` from the stream.
-    fn draw_delay(&self, policy: &FlakyPolicy) -> Duration {
+    /// always consumes exactly one `u64` from the stream. `None` means the
+    /// `Duration` sum itself is beyond the representable range; the queued
+    /// datagram then retains an unreachable delivery time.
+    fn draw_delay(&self, policy: &FlakyPolicy) -> Option<Duration> {
         let raw = self.rng.borrow_mut().next_u64();
-        let jitter_ns = policy.jitter.as_nanos() as u64;
+        let jitter_ns = policy.jitter.as_nanos();
         if jitter_ns == 0 {
-            policy.base_delay
+            Some(policy.base_delay)
         } else {
-            policy.base_delay + Duration::from_nanos(raw % jitter_ns)
+            let jitter = u64::try_from(u128::from(raw) % jitter_ns).ok()?;
+            policy.base_delay.checked_add(Duration::from_nanos(jitter))
         }
     }
 }
@@ -816,9 +850,12 @@ impl Wire for FlakyWire {
         // 6. Queue.
         let now = Instant::now();
         for _ in 0..deliveries {
-            let delay = self.draw_delay(&policy);
+            let deliver_at = match self.draw_delay(&policy) {
+                Some(delay) => DeliveryTime::after(now, delay),
+                None => DeliveryTime::Unreachable,
+            };
             let mut net = self.net.borrow_mut();
-            deliver(&mut net, src, addr, buf.to_vec(), now + delay);
+            deliver(&mut net, src, addr, buf.to_vec(), deliver_at);
         }
 
         Ok(buf.len())
@@ -854,7 +891,8 @@ impl Wire for FlakyWire {
                 let net = self.net.borrow();
                 net.endpoints
                     .get(&me)
-                    .and_then(|ep| ep.inbox.peek().map(|Reverse(q)| q.deliver_at))
+                    .and_then(|ep| ep.inbox.peek())
+                    .and_then(|Reverse(q)| q.deliver_at.as_instant())
             };
 
             let Some(deliver_at) = next else {
@@ -880,7 +918,7 @@ impl Wire for FlakyWire {
             let due = ep
                 .inbox
                 .peek()
-                .is_some_and(|Reverse(q)| q.deliver_at <= Instant::now());
+                .is_some_and(|Reverse(q)| q.deliver_at.is_due(Instant::now()));
             if !due {
                 continue;
             }

@@ -73,7 +73,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::constants;
-use crate::core::Timestamp;
+use crate::core::{Deadline, Timestamp};
 
 /// What a §17.1 pin proves about whoever holds it. **Ruling 77.**
 ///
@@ -128,7 +128,10 @@ pub(crate) struct GuardEntry {
     /// death, written by [`extend_exemption`](TimestampGuard::extend_exemption)
     /// at the instant the entry's last §17.1 pin is released — which is the
     /// instant §17.1 dates the window from, for both of the cases it names.
-    pub(crate) exempt_until: Option<Instant>,
+    /// The outer `Option` distinguishes no exemption from an enabled one;
+    /// [`Deadline::Unreachable`] distinguishes an enabled exemption beyond
+    /// the platform clock's representable horizon (ruling 284).
+    pub(crate) exempt_until: Option<Deadline>,
     /// LRU recency. **Admission only** (mitigation (iii)): it refreshes on
     /// a successful post-`ss` record and never on a failed check, which is
     /// what keeps the write path key-holder-only.
@@ -167,7 +170,7 @@ pub(crate) struct GuardEntry {
 
 impl GuardEntry {
     fn pinned(&self, now: Instant) -> bool {
-        self.pins > 0 || self.exempt_until.is_some_and(|until| until > now)
+        self.pins > 0 || self.exempt_until.is_some_and(|until| !until.is_due(now))
     }
 
     /// When this entry becomes eligible for aging out, or `None` while a
@@ -186,16 +189,18 @@ impl GuardEntry {
     /// Computed without a `now`, so §16.5's min-deadline scan needs no
     /// clock: a `HANDSHAKE_GIVEUP` exemption (§6.6/§6.7, slice 7) simply
     /// pushes the instant out rather than being tested against the present.
+    /// A sum beyond the clock horizon remains `Unreachable`, so it is
+    /// retained but neither announced nor swept (ruling 284).
     ///
     /// **The clock runs from `orphaned_at`, not `last_admitted`** (ruling
     /// 73). This is the single source of truth for the aging decision —
     /// [`age_orphans`](TimestampGuard::age_orphans) sweeps by it too, so the
     /// announced deadline and the sweep that honours it cannot drift.
-    fn age_deadline(&self) -> Option<Instant> {
+    fn age_deadline(&self) -> Option<Deadline> {
         if self.pins > 0 {
             return None;
         }
-        let base = self.orphaned_at? + constants::TS_GUARD_ORPHAN_TTL;
+        let base = Deadline::after(self.orphaned_at?, constants::TS_GUARD_ORPHAN_TTL);
         Some(match self.exempt_until {
             Some(until) if until > base => until,
             _ => base,
@@ -436,12 +441,13 @@ impl TimestampGuard {
     /// and §17.1 dates the window from that death. An existing exemption
     /// is extended, never shortened — a second tie-break write against a
     /// static whose first connection has already died must not pull the
-    /// first one's window in.
+    /// first one's window in. An unreachable extension consequently wins
+    /// over every representable extension.
     ///
     /// Absent entries are a no-op: like [`pin`](Self::pin), this **never
     /// creates an entry**. An extension exists to protect a record, and
     /// there is nothing to protect where no key-holder ever wrote one.
-    pub(crate) fn extend_exemption(&mut self, key: &[u8], until: Instant) {
+    pub(crate) fn extend_exemption(&mut self, key: &[u8], until: Deadline) {
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
@@ -463,8 +469,11 @@ impl TimestampGuard {
     /// same `now`, so the aging at step (3) reads a **fresh** window rather
     /// than an expired one.
     pub(crate) fn age_orphans(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, entry| entry.age_deadline().is_none_or(|deadline| deadline > now));
+        self.entries.retain(|_, entry| {
+            entry
+                .age_deadline()
+                .is_none_or(|deadline| !deadline.is_due(now))
+        });
     }
 
     /// When the next orphan ages out, if any is unpinned. §16.5's third
@@ -473,6 +482,7 @@ impl TimestampGuard {
         self.entries
             .values()
             .filter_map(GuardEntry::age_deadline)
+            .filter_map(Deadline::as_instant)
             .min()
     }
 

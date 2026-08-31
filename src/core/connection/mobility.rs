@@ -21,6 +21,7 @@
 use std::time::Instant;
 
 use crate::constants;
+use crate::core::Deadline;
 
 /// §7.3's per-**session** anti-amplification budget (ruling 170).
 ///
@@ -274,8 +275,8 @@ pub(crate) enum Contested {
         floor: u64,
         /// When the probe was transmitted.
         armed_at: Instant,
-        /// `armed_at + KEEPALIVE_TIMEOUT`.
-        deadline: Instant,
+        /// `armed_at + K_eff`.
+        deadline: Deadline,
     },
 }
 
@@ -413,7 +414,7 @@ mod tests {
         let armed = Contested::Armed {
             floor: 12,
             armed_at: now,
-            deadline: now + constants::KEEPALIVE_TIMEOUT,
+            deadline: Deadline::after(now, constants::KEEPALIVE_TIMEOUT),
         };
         assert!(!armed.is_pending(), "armed is not pending");
         assert_eq!(armed.floor(), Some(12));
