@@ -89,19 +89,20 @@ pub struct Connection<S: Handshake> {
 }
 
 impl<S: Handshake> Connection<S> {
+    /// Total, deliberately (ruling 286): the profile is the caller's to
+    /// supply, because the driver reads it off the live core it already
+    /// holds — a constructor that borrowed the cell to fetch it would
+    /// panic on a released core, and handles can outlive the core (that is
+    /// why [`clone_handle`](Self::clone_handle) exists). The one shared
+    /// `!Send` driver task must have no panic path here.
     pub(crate) fn new(
         shell: Rc<dyn ShellLink>,
         cell: Rc<RefCell<ConnCell<S>>>,
         id: ConnectionId,
         remote_static: PublicKeyFor<S>,
         session_id: hiss::noise::SessionId,
+        timing_profile: TimingProfile,
     ) -> Self {
-        let timing_profile = cell
-            .borrow()
-            .core
-            .as_ref()
-            .expect("a connection handle is created while its core is live")
-            .timing_profile();
         shell.acquire();
         cell.borrow_mut().handles += 1;
         Self {
@@ -142,16 +143,14 @@ impl<S: Handshake> Connection<S> {
     /// general one is a feature-matrix job, recorded separately.
     #[cfg(feature = "tower")]
     pub(crate) fn clone_handle(&self) -> Self {
-        self.shell.acquire();
-        self.cell.borrow_mut().handles += 1;
-        Self {
-            shell: Rc::clone(&self.shell),
-            cell: Rc::clone(&self.cell),
-            id: self.id,
-            remote_static: self.remote_static.clone(),
-            session_id: self.session_id.clone(),
-            timing_profile: self.timing_profile,
-        }
+        Self::new(
+            Rc::clone(&self.shell),
+            Rc::clone(&self.cell),
+            self.id,
+            self.remote_static.clone(),
+            self.session_id.clone(),
+            self.timing_profile,
+        )
     }
 
     // No `id()` accessor. §16.2's `Connection` surface is a list, and in

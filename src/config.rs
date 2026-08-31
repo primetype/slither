@@ -469,6 +469,20 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// **[ruling 286]** `V1` (and `Default`) is built directly from the
+    /// constants and never routed through `try_new`, so nothing else pins
+    /// the default pair against ruling 283's relation: a constants edit
+    /// could ship a default profile `try_new` would reject, with every gate
+    /// green. This closes that hole — the ratified default must satisfy its
+    /// own validation.
+    #[test]
+    fn the_default_profile_satisfies_its_own_validation() {
+        assert_eq!(
+            TimingProfile::try_new(constants::KEEPALIVE_TIMEOUT, constants::DEAD_TIMEOUT),
+            Ok(TimingProfile::V1)
+        );
+    }
+
     /// Ruling 82 splits the boundary behaviour from the constant, so the
     /// constant needs its own pin: a `Config` nobody configured ratchets on
     /// §7.7's ratified schedule.

@@ -271,11 +271,25 @@ pub(crate) struct ConnSeed {
     pub(crate) timing_profile: TimingProfile,
 }
 
-/// A bare seed carries §10.2's **ratified** windows.
+/// Test-fixture convenience: a bare seed carries §10.2's **ratified**
+/// windows and §7.5's v1 profile.
 ///
-/// This is what makes the knob's default path unmissable rather than
-/// remembered: a caller that says nothing about windows gets the
-/// constants, and there is no third value the conversion could produce.
+/// **`#[cfg(test)]` on purpose (ruling 286).** Both production birth
+/// paths go through [`Endpoint::mint_conn_seed`], which answers the
+/// policy questions this struct exists to centralise from the endpoint's
+/// `Config`. Left available to production code, this conversion was a
+/// third, untyped birth path: a future in-crate caller written against
+/// `[u8; 32]` would compile cleanly and mint the v1 defaults on an
+/// endpoint configured otherwise — contradicting §5.7's "stamped onto
+/// every connection born from that endpoint" — and surface only as an
+/// asymmetric liveness verdict on the wire. Gated, it cannot.
+///
+/// The gate also means every core-level unit test that uses it runs the
+/// v1 defaults; a fixture that wants a non-default profile or windows
+/// spells the `ConnSeed` literally.
+///
+/// [`Endpoint::mint_conn_seed`]: endpoint::Endpoint::mint_conn_seed
+#[cfg(test)]
 impl From<[u8; 32]> for ConnSeed {
     fn from(sub_seed: [u8; 32]) -> Self {
         Self {

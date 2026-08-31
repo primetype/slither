@@ -1,8 +1,16 @@
 //! Acceptance tests for the application-configurable connection timing profile.
 //!
 //! These tests exercise the public timing-profile API ratified by ruling 282
-//! and its validation strengthened by ruling 283. They are intentionally
-//! authored independently from the implementation.
+//! and its validation strengthened by ruling 283.
+//!
+//! **Provenance (corrected by ruling 286):** this file first claimed it was
+//! "authored independently from the implementation". It was not — tests and
+//! implementation arrived together, one external author, one commit (PR #1,
+//! `fcc182a`), so `required_dead_margin` below re-derives ruling 283's
+//! relation with the same checked chain as `src/config.rs` and is **not** an
+//! outside check on it (working rule 6's mutually-consistent shape). The
+//! independent re-derivation of the boundary values, done from the ruling
+//! text alone, is recorded in ruling 286.
 
 use std::fmt::Debug;
 use std::time::Duration;
@@ -86,6 +94,23 @@ fn construction_enforces_the_flood_floor_and_strict_liveness_margin() {
         .expect("one nanosecond beyond the strict margin is admissible");
     assert_eq!(profile.passive_keepalive(), passive);
     assert_eq!(profile.dead_timeout(), exact_margin + NS);
+}
+
+/// **[ruling 286]** Ruling 283 names two short application profiles as
+/// remaining valid beside the default, and until this pin only 2 s / 5 s
+/// was asserted anywhere. Both clear the strengthened margin by exactly
+/// 167 ms — less than one `SHELL_LATENESS_BOUND` — so they are the named
+/// values most sensitive to any future strengthening of the relation, and
+/// the independent re-derivation flagged them for precisely that reason.
+#[test]
+fn the_named_short_application_profiles_are_admitted() {
+    for (keepalive, dead) in [(1, 3), (2, 5)] {
+        let profile =
+            TimingProfile::try_new(Duration::from_secs(keepalive), Duration::from_secs(dead))
+                .expect("ruling 283 names this profile as remaining valid");
+        assert_eq!(profile.passive_keepalive(), Duration::from_secs(keepalive));
+        assert_eq!(profile.dead_timeout(), Duration::from_secs(dead));
+    }
 }
 
 /// Checked arithmetic is observable API behaviour, not merely an

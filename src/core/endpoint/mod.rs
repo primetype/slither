@@ -64,8 +64,11 @@ pub(crate) mod tables;
 #[cfg(test)]
 mod tests;
 
-// Ruling 284's independent clock-horizon acceptance tests. The file is
-// authored separately from the deadline implementation (working rule 6).
+// Ruling 284's clock-horizon acceptance tests. This declaration first
+// claimed the file was "authored separately from the deadline
+// implementation (working rule 6)" — it was not: both arrived in one
+// commit from one external author (PR #1, `fcc182a`), with no blind
+// split. Corrected by ruling 286.
 #[cfg(test)]
 mod tests_safe_arithmetic;
 

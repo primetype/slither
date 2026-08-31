@@ -442,7 +442,15 @@ impl TimestampGuard {
     /// is extended, never shortened — a second tie-break write against a
     /// static whose first connection has already died must not pull the
     /// first one's window in. An unreachable extension consequently wins
-    /// over every representable extension.
+    /// over every representable extension — and **latches** (ruling 285):
+    /// nothing ever lowers or clears `exempt_until`, so an unreachable
+    /// extension pins its entry for the table's life, outside the unpinned
+    /// cap, retained by aging and eviction alike, and no bound in code
+    /// limits how many entries do this. Priced and accepted: it is
+    /// reachable only while `now` sits within `HANDSHAKE_GIVEUP` (90 s) of
+    /// the platform clock horizon — where the clock cannot represent the
+    /// window's end at all — and before ruling 284 the same input
+    /// panicked.
     ///
     /// Absent entries are a no-op: like [`pin`](Self::pin), this **never
     /// creates an entry**. An extension exists to protect a record, and

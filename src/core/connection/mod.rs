@@ -56,8 +56,11 @@ pub(crate) mod timers;
 #[cfg(test)]
 mod tests;
 
-// Ruling 284's independent clock-horizon acceptance tests. The file is
-// authored separately from the deadline implementation (working rule 6).
+// Ruling 284's clock-horizon acceptance tests. This declaration first
+// claimed the file was "authored separately from the deadline
+// implementation (working rule 6)" — it was not: both arrived in one
+// commit from one external author (PR #1, `fcc182a`), with no blind
+// split. Corrected by ruling 286.
 #[cfg(test)]
 mod tests_safe_arithmetic;
 
@@ -292,10 +295,12 @@ impl<C: Handshake> Connection<C> {
     /// A connection `connect()` created: no session until its `Install`
     /// arrives.
     ///
-    /// **[ruling 259(viii)]** `seed` carries §10.2's advertised windows
-    /// beside §16.6's sub-seed. A bare `[u8; 32]` converts, and converts to
-    /// the **ratified** windows — which is what every caller that has no
-    /// opinion should get.
+    /// **[ruling 259(viii)]** `seed` carries §10.2's advertised windows and
+    /// §7.5's liveness profile beside §16.6's sub-seed. In production the
+    /// one caller is the endpoint, and it passes the `ConnSeed` its
+    /// `mint_conn_seed` built from `Config`; the bare-`[u8; 32]` conversion
+    /// that fills in the ratified defaults is `#[cfg(test)]` (ruling 286),
+    /// so no production path can mint policy by omission.
     pub(crate) fn connecting(seed: impl Into<ConnSeed>) -> Self {
         let ConnSeed {
             sub_seed,
@@ -3098,7 +3103,9 @@ impl<C: Handshake> Connection<C> {
     /// path ends in this function, so the timer is restored on the one event
     /// that can lift the hold. That is *held, not dropped* expressed in the
     /// timer table, and the resulting state is a connection that announces
-    /// `Timeout(None)` and parks: **quiet, not immortal**.
+    /// `Timeout(None)` and parks: **quiet, not immortal** — at representable
+    /// anchors; the horizon note at the end of this comment is the one case
+    /// where that claim does not hold, and ruling 285 prices it.
     ///
     /// [`TimerKind::Liveness`] is deliberately **not** suppressed. The death
     /// clock keeps whatever `Liveness::deadline(D_eff)` returns; suppressing
@@ -3160,6 +3167,21 @@ impl<C: Handshake> Connection<C> {
     /// named because ruling 265 is stated over *"a keepalive, active or
     /// passive"* and a reader must not have to re-derive the implication to
     /// see that the code covers both.
+    ///
+    /// # The backstop has a horizon (**[ruling 285]**)
+    ///
+    /// Both the primary `deadline(D_eff)` and the `or_else` arm compute
+    /// `last_authenticated_recv + D_eff` with checked arithmetic, so within
+    /// `D_eff` of the platform clock's horizon **both are `None`** — the
+    /// backstop cannot cover a `None` it reproduces. `Keepalive` hangs off
+    /// `last_send + K_eff` instead, which stays representable for a window
+    /// at least `D_eff − K_eff` wide: in that window the connection keeps
+    /// sending passive keepalives with **no death clock armed**, and once
+    /// every anchor overflows it goes quiet *and* immortal. Ruling 285
+    /// prices and accepts this residue: it is reachable only within
+    /// `D_eff` of the horizon, no representable anchor can produce it, and
+    /// ruling 284 forbids every cheap escape (an invented earlier instant
+    /// most of all).
     fn sync_liveness_timer(&mut self) {
         if !self.lifecycle.is_live() {
             return;
@@ -3570,6 +3592,15 @@ impl<C: Handshake> Connection<C> {
             armed_at: now,
             deadline,
         };
+        // **[ruling 285]** The verdict timer's only arming site, and
+        // `as_instant()` is `None` within `K_eff` of the platform clock
+        // horizon: the verdict is then armed-but-unannounced, nothing else
+        // converts an unanswered probe into `die(TimedOut)`, and §6.8's
+        // restart-resolution bound is unenforced in that window — while
+        // authenticated traffic that keeps arriving keeps `Liveness` from
+        // reaping the zombie either. Priced and accepted: reachable only
+        // that close to the horizon, and ruling 284 forbids inventing an
+        // earlier instant.
         self.timers.set(TimerKind::Contested, deadline.as_instant());
         // Pushed straight to the drain rather than through `events`: §8.1
         // pins the order *`Transmit` then `Event(Contested)`*, and this is
@@ -3591,6 +3622,18 @@ impl<C: Handshake> Connection<C> {
     /// nothing about the other four. A surviving `Liveness` would fire
     /// mid-linger and produce a **second** `Closed` behind a latch that is
     /// already resolved — which is the invariant `closed()` rests on.
+    ///
+    /// **[ruling 285]** `until` is the post-mortem state's "never moved
+    /// once set" deadline, so this is also `CloseLinger`'s only arming
+    /// site. When the anchor sits within `CLOSE_LINGER` of the platform
+    /// clock horizon, `as_instant()` is `None` and the connection holds
+    /// **zero** armed timers: the only self-driven path to
+    /// `ToEndpoint::Retired` never runs, and the endpoint's index route
+    /// and guard-entry pin are retained for the endpoint's life. Priced
+    /// and accepted: ruling 284's "a later transition recomputes it"
+    /// escape cannot apply to a deadline that is never moved, and every
+    /// cheap alternative — an invented earlier instant most of all — is
+    /// what 284 exists to forbid.
     fn enter_post_mortem_timers(&mut self) {
         let until = self
             .lifecycle

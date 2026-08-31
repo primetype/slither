@@ -701,10 +701,6 @@ pub(crate) struct RttEstimator {
     rttvar: Duration,
     /// `None` before the first sample **and** after a roam re-seed (§13.1).
     min_rtt: Option<Duration>,
-    /// `false` only if a platform cannot represent an estimator
-    /// intermediate. Derived Loss/PTO deadlines then remain logically
-    /// enabled through recovery state but are not announced.
-    arithmetic_reachable: bool,
 }
 
 impl Default for RttEstimator {
@@ -721,7 +717,6 @@ impl RttEstimator {
             smoothed: None,
             rttvar: constants::K_INITIAL_RTT / 2,
             min_rtt: None,
-            arithmetic_reachable: true,
         }
     }
 
@@ -735,7 +730,6 @@ impl RttEstimator {
             self.smoothed = Some(latest);
             self.rttvar = latest / 2;
             self.min_rtt = Some(latest);
-            self.arithmetic_reachable = true;
             return;
         };
 
@@ -767,13 +761,19 @@ impl RttEstimator {
             .and_then(|weighted| weighted.checked_add(deviation / 4));
         let next_smoothed = duration_mul_ratio(smoothed, 7, 8)
             .and_then(|weighted| weighted.checked_add(adjusted / 8));
-        match (next_rttvar, next_smoothed) {
-            (Some(rttvar), Some(smoothed)) => {
-                self.rttvar = rttvar;
-                self.smoothed = Some(smoothed);
-                self.arithmetic_reachable = true;
-            }
-            _ => self.arithmetic_reachable = false,
+        // Both weighted sums are bounded by their inputs — `x·3/4 + y/4`
+        // and `x·7/8 + y/8` under floor rounding never exceed `max(x, y)`
+        // — so neither checked chain can actually return `None`. The
+        // checked shape is kept for ruling 284 (never panic), but there is
+        // deliberately **no** cross-call latch behind it: a sticky
+        // `arithmetic_reachable` flag shipped here once, provably
+        // untrippable and pinned by nothing, and was removed by ruling
+        // 286 (working rule 9: a name is not a pin). If a future edit
+        // makes an intermediate unrepresentable, that sample is dropped
+        // and the next one recomputes from scratch.
+        if let (Some(rttvar), Some(smoothed)) = (next_rttvar, next_smoothed) {
+            self.rttvar = rttvar;
+            self.smoothed = Some(smoothed);
         }
     }
 
@@ -803,18 +803,12 @@ impl RttEstimator {
     /// `smoothed_rtt` lags, and a threshold built from it alone declares
     /// stragglers lost that are merely late.
     pub(crate) fn loss_delay(&self) -> Option<Duration> {
-        if !self.arithmetic_reachable {
-            return None;
-        }
         let base = self.smoothed_rtt().max(self.latest);
         duration_mul_ratio(base, 9, 8).map(|delay| delay.max(constants::K_GRANULARITY))
     }
 
     /// §13.3's formula **with `pto_count = 0`** — §14.4 uses exactly this.
     pub(crate) fn pto_interval(&self) -> Option<Duration> {
-        if !self.arithmetic_reachable {
-            return None;
-        }
         let variance = self.rttvar.checked_mul(4)?.max(constants::K_GRANULARITY);
         self.smoothed_rtt()
             .checked_add(variance)?

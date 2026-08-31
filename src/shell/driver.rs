@@ -782,10 +782,17 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             return;
         };
 
-        let anchor = {
+        // The profile is read here, off the live core, because
+        // `Connection::new` is total and takes it as an argument — the
+        // constructor must not borrow a possibly-released core (ruling 286).
+        let (anchor, timing_profile) = {
             let borrow = cell.borrow();
-            match borrow.core.as_ref().and_then(CoreConnection::session) {
-                Some(session) => session.anchor,
+            let live = borrow.core.as_ref().and_then(|core| {
+                core.session()
+                    .map(|session| (session.anchor, core.timing_profile()))
+            });
+            match live {
+                Some(pair) => pair,
                 None => {
                     debug_assert!(false, "ConnEvent::Established without an installed session");
                     return;
@@ -812,6 +819,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             id,
             record.remote_static.clone(),
             session_id,
+            timing_profile,
         );
         resolve_slot(&slot, PendingOutcome::Ready(handle));
     }
@@ -1291,6 +1299,9 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
         // and the core exposes no per-connection static accessor. The
         // handle's value *is* the proven one — `Proven` is only reachable
         // through `authenticate()`, which returned it.
+        // Read before the core moves into the cell: `Connection::new` is
+        // total and must not borrow the cell for this (ruling 286).
+        let timing_profile = core.timing_profile();
         let cell = Rc::new(RefCell::new(ConnCell::new(core, anchor)));
 
         // §5.4's NONE → LIVE was written by `core::Endpoint::accept` itself,
@@ -1303,6 +1314,7 @@ impl<I: Identity + 'static, W: Wire> Driver<I, W> {
             conn_id,
             remote_static.clone(),
             session_id,
+            timing_profile,
         );
         self.conns.insert(
             conn_id,
